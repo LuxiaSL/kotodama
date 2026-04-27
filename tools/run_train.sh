@@ -3,7 +3,7 @@
 # Activates shared venv, sets env, runs torchrun.
 # Usage: tools/run_train.sh --config configs/proxy-benchmark.yaml [extra args...]
 set -e
-cd ~/workspace/luxia-base
+cd ~/workspace/kotodama
 VENV=~/workspace/.venv-shared
 export PATH="$VENV/bin:$PATH"
 export VIRTUAL_ENV="$VENV"
