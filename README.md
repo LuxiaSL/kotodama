@@ -100,7 +100,7 @@ These attention circuits — structured routing patterns with form but no semant
 
 After NCA training, the model transitions to language by reinitializing the embedding and LM head layers to the language vocabulary (49,152 tokens) while keeping all transformer weights (attention, MLP, norms). AttnRes routing weights are co-trained during NCA rather than initialized fresh at language transition — this co-training is critical, as fresh AttnRes without NCA-trained structure actually degrades representation quality.
 
-Reference implementation: [nca-pre-pretraining](https://github.com/LuxiaSL/nca-pre-pretraining)
+Reference implementation: [nca-pre-pretraining](https://github.com/danihyunlee/nca-pre-pretraining)
 
 ## Training
 
