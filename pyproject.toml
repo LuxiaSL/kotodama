@@ -1,0 +1,54 @@
+[project]
+name = "luxia-base"
+version = "0.2.0"
+description = "Pretraining, fine-tuning, and RL for conversational research models"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # Core
+    "torch>=2.11.0",
+    "transformers>=4.50.0",
+    "tokenizers",
+    "accelerate",
+    "safetensors",
+    "datasets",
+    "sentencepiece",
+    "protobuf",
+    "numpy",
+    "wandb",
+]
+
+[project.optional-dependencies]
+# Training: LoRA, flash attention, kernel optimizations
+training = [
+    "peft",
+    "trl",
+    "flash-attn",
+    "liger-kernel",
+    "einops",
+]
+
+# Eval: benchmarks, analysis, visualization
+eval = [
+    "lm-eval",
+    "weightwatcher",
+    "scikit-learn",
+    "scikit-dimension",
+    "scipy",
+    "matplotlib",
+]
+
+# NCA: neural cellular automata experiments (JAX-based)
+nca = [
+    "jax[cuda12]",
+    "flax",
+    "einops",
+]
+
+# Everything
+all = [
+    "luxia-base[training,eval,nca]",
+]
+
+[tool.uv]
+find-links = ["https://download.pytorch.org/whl/cu128"]

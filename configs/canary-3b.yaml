@@ -1,0 +1,50 @@
+# Canary throughput benchmark — 3B model (luxia-base-3B)
+# Measures steady-state tok/s with AttnRes, async checkpoints, compile, Liger.
+# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/canary-3b.yaml
+
+model_size: 3b
+sequence_length: 4096
+micro_batch_size: 4
+global_batch_tokens: 2097152
+
+# 5k steps for steady-state measurement
+total_steps: 5000
+warmup_steps: 200
+decay_start_pct: 0.95
+decay_type: cosine
+
+# Optimizer
+muon_lr: 0.02
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+adamw_lr: 6e-4
+adamw_beta1: 0.9
+adamw_beta2: 0.95
+adamw_weight_decay: 0.1
+gradient_clip: 1.0
+
+# AttnRes: 8 uniform blocks (yields 7 blocks of 4 on 28 layers)
+attn_res: true
+attn_res_n_blocks: 8
+
+# Data
+random_data: true
+seed: 42
+
+# Checkpointing — async, save every 500 steps to measure overhead
+checkpoint_dir: checkpoints/canary-3b
+save_every: 500
+keep_checkpoints: 3
+async_checkpoint: true
+
+# Optimizations
+use_liger: true
+attn_impl: auto
+compile: true
+activation_checkpointing: true
+
+# Logging
+log_every: 10
+wandb: false

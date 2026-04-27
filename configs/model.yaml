@@ -1,0 +1,65 @@
+# luxia-base model configuration
+# Architecture: Llama-family with QK-norm, matched to spec v2
+
+model:
+  name: "luxia-base-3b"
+  type: "llama"
+
+  # Core dimensions
+  hidden_size: 3072
+  num_layers: 28
+  num_attention_heads: 24      # query heads
+  num_kv_heads: 8              # GQA ratio 3:1
+  head_dim: 128                # hidden_size / num_attention_heads
+  intermediate_size: 8192      # SwiGLU FFN, ~2.67x expansion
+
+  # Vocabulary
+  vocab_size: 49152            # SmolLM2 tokenizer
+  tokenizer: "HuggingFaceTB/SmolLM2-135M"  # tokenizer source (shares vocab with larger SmolLM2)
+
+  # Positional encoding
+  rope_theta: 500000.0
+  max_position_embeddings: 4096
+
+  # Normalization
+  norm_type: "rmsnorm"
+  norm_eps: 1.0e-5
+  qk_norm: true                # RMSNorm on Q and K after projection
+
+  # Architecture flags
+  tie_word_embeddings: true
+  bias: false
+  hidden_act: "silu"           # SwiGLU activation
+
+  # Stability
+  z_loss_weight: 1.0e-5        # Prevents logit explosion
+
+  # Attention
+  attn_implementation: "sdpa"  # Use SDPA for training (eager for Anamnesis extraction)
+
+# Proxy model (300M, same depth)
+proxy:
+  hidden_size: 512
+  num_layers: 28
+  num_attention_heads: 4
+  num_kv_heads: 2
+  head_dim: 128
+  intermediate_size: 1408
+
+# 8B model (Llama 3.1-8B shape, our vocab — ~7.2B params)
+8b:
+  hidden_size: 4096
+  num_layers: 32
+  num_attention_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  intermediate_size: 14336
+
+# Intermediate validation model (1B)
+intermediate:
+  hidden_size: 1024
+  num_layers: 28
+  num_attention_heads: 8
+  num_kv_heads: 4
+  head_dim: 128
+  intermediate_size: 2816

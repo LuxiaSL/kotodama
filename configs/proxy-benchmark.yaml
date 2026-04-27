@@ -1,0 +1,45 @@
+# Proxy benchmark config — 300M model, short run for throughput measurement
+# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/proxy-benchmark.yaml
+# CLI overrides: --config configs/proxy-benchmark.yaml --use_liger --attn_impl fa2
+
+model_size: proxy
+sequence_length: 2048
+micro_batch_size: 4
+global_batch_tokens: 131072
+
+# Training scale
+total_tokens: 500_000_000
+warmup_steps: 100
+decay_start_pct: 0.90
+decay_type: cosine
+
+# Optimizer
+muon_lr: 0.02
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+adamw_lr: 6e-4
+adamw_beta1: 0.9
+adamw_beta2: 0.95
+adamw_weight_decay: 0.1
+gradient_clip: 1.0
+
+# Data
+random_data: true
+seed: 42
+
+# Checkpointing
+checkpoint_dir: checkpoints/benchmark
+save_every: 999999  # don't save during benchmark
+keep_checkpoints: 1
+
+# Logging
+log_every: 10
+wandb: false
+
+# Optimization (toggle per benchmark run via CLI)
+# use_liger: false
+# attn_impl: auto
+# compile: false
+# activation_checkpointing: false
