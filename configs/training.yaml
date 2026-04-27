@@ -1,0 +1,82 @@
+# luxia-base training configuration
+# Spec v2: Muon + AdamW hybrid, WSD schedule, 80B tokens
+
+training:
+  total_tokens: 80_000_000_000  # 80B
+  precision: "bf16"              # Default BF16; FP8 pending proxy validation
+
+  # Batch size
+  global_batch_size_tokens: 2_097_152  # 2M tokens
+  initial_batch_size_tokens: 524_288   # 512K tokens (ramp over first 5%)
+  batch_ramp_steps_pct: 0.05
+  sequence_length: 2048                # Increases to 4096 in Phase 3
+
+  # Optimizer: Muon for 2D weights
+  muon:
+    lr: 0.03                    # UNVALIDATED at dense 3B — sweep 0.01-0.04 at proxy
+    momentum: 0.95
+    nesterov: true
+    weight_decay: 0.01
+    newton_schulz_iterations: 5 # Default from MoonshotAI
+
+  # Optimizer: AdamW for embeddings, norms, LM head
+  adamw:
+    lr: 6.0e-4
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+  # Schedule: Warmup-Stable-Decay
+  schedule:
+    type: "wsd"
+    warmup_steps: 2000
+    stable_pct: 0.88             # 88% of training at stable LR
+    decay_type: "sqrt"           # sqrt decay to 0 over final 10%
+    min_lr: 0.0
+
+  # Gradient
+  gradient_clip: 1.0
+  gradient_accumulation_steps: auto  # Computed from batch size and per-GPU batch
+
+  # Parallelism
+  parallelism:
+    strategy: "fsdp2"
+    num_gpus: 8
+    activation_checkpointing: "selective"  # Attention layers only if needed
+    compile: true                          # torch.compile
+
+  # Checkpointing
+  checkpointing:
+    save_every_tokens: 1_000_000_000  # Every 1B tokens (weights-only)
+    full_save_tokens: [0, 8_000_000_000, 24_000_000_000, 48_000_000_000, 80_000_000_000]  # Tier 3
+    keep_last_n: 5                    # Rolling window for weights-only
+    format: "safetensors"
+    async_save: true
+
+  # Context scheduling
+  context_schedule:
+    - {start_tokens: 0, seq_len: 2048}
+    - {start_tokens: 55_000_000_000, seq_len: 4096}  # Phase 3
+
+  # Data phases
+  data_phases:
+    - {name: "phase1_structure", start_tokens: 0, end_tokens: 15_000_000_000}
+    - {name: "phase2_diversity", start_tokens: 15_000_000_000, end_tokens: 55_000_000_000}
+    - {name: "phase3_annealing", start_tokens: 55_000_000_000, end_tokens: 80_000_000_000}
+
+# Proxy validation sweep
+proxy_sweep:
+  tokens: 6_000_000_000
+  runs:
+    - {name: "baseline_adamw", optimizer: "adamw", lr: 8.0e-4, nca: false}
+    - {name: "muon_lr001", optimizer: "muon", lr: 0.01, nca: false}
+    - {name: "muon_lr002", optimizer: "muon", lr: 0.02, nca: false}
+    - {name: "muon_lr003", optimizer: "muon", lr: 0.03, nca: false}
+    - {name: "muon_lr004", optimizer: "muon", lr: 0.04, nca: false}
+    - {name: "muon_best_nca", optimizer: "muon", lr: auto, nca: true, nca_tokens: 50_000_000}
+    - {name: "muon_best_fp8", optimizer: "muon", lr: auto, precision: "fp8", nca: false}
+
+# Wandb
+wandb:
+  project: "luxia-base"
+  entity: null  # Uses default from API key
+  tags: ["pretraining", "3b", "muon", "nca", "anamnesis"]

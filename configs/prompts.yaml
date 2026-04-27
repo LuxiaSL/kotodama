@@ -1,0 +1,59 @@
+# Prompt sets for evaluation and extraction.
+#
+# Three sets:
+#   standard: 5 prompts used across all eval scripts
+#   trajectory: 12 prompts for layer trajectory extraction (Track 5)
+#   extended: 19 prompts for temperature matrix evaluation
+#
+# Usage:
+#   import yaml
+#   prompts = yaml.safe_load(open("configs/prompts.yaml"))
+#   standard = prompts["standard"]
+
+standard:
+  - "The most interesting thing about language is"
+  - "In a surprising turn of events, the researchers discovered that"
+  - "To understand why this works, consider the following analogy:"
+  - "The debate between the two philosophers centered on whether"
+  - "Once upon a time, in a small village by the sea,"
+
+trajectory:
+  - "The capital of France is"
+  - "Water boils at a temperature of"
+  - "Once upon a time, in a small village by the sea,"
+  - "The detective examined the evidence carefully and concluded that"
+  - "The fundamental theorem of calculus states that"
+  - "In quantum mechanics, the wave function describes"
+  - "What is the most efficient way to sort a list of"
+  - "Why do birds migrate south during the winter?"
+  - "To solve this equation, first isolate the variable by"
+  - "The recipe calls for the following ingredients:"
+  - "The relationship between consciousness and the physical world remains"
+  - "If we consider the implications of this argument,"
+
+# Indices into trajectory prompts for attention heatmaps
+# 0=factual, 2=narrative, 4=technical
+trajectory_attention_indices: [0, 2, 4]
+
+extended:
+  # Standard set
+  - "The most interesting thing about language is"
+  - "In a surprising turn of events, the researchers discovered that"
+  - "To understand why this works, consider the following analogy:"
+  - "The debate between the two philosophers centered on whether"
+  - "Once upon a time, in a small village by the sea,"
+  # Additional for temperature matrix
+  - "The capital of France is"
+  - "Water boils at a temperature of"
+  - "The fundamental theorem of calculus states that"
+  - "In quantum mechanics, the wave function describes"
+  - "The detective examined the evidence carefully and concluded that"
+  - "What is the most efficient way to sort a list of"
+  - "Why do birds migrate south during the winter?"
+  - "To solve this equation, first isolate the variable by"
+  - "The recipe calls for the following ingredients:"
+  - "The relationship between consciousness and the physical world remains"
+  - "If we consider the implications of this argument,"
+  - "According to the latest research,"
+  - "The main difference between classical and quantum computing is"
+  - "One of the most underappreciated aspects of machine learning is"

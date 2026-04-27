@@ -1,0 +1,205 @@
+# Concept sets for manifold geometry extraction (Track 6).
+#
+# Each concept set has:
+#   concepts: list of concept strings
+#   topology: geometric structure (cyclic, ordinal, geographic, paired, unknown)
+#   tier: confidence level (1=high, 2=likely, 3=speculative, 4=relational)
+#   category: human-readable category used in template substitution
+#
+# Templates use {category} and {X} placeholders:
+#   "The {category} is {X}" -> "The month is January"
+#
+# Usage:
+#   import yaml
+#   config = yaml.safe_load(open("configs/concepts.yaml"))
+#   templates = config["templates"]
+#   for cs in config["concept_sets"]:
+#       print(cs["name"], cs["concepts"])
+
+templates:
+  - "The {category} is {X}"
+  - "In the {category} of {X},"
+  - "{X}"
+
+concept_sets:
+  # === Tier 1 — high confidence ===
+  - name: months
+    concepts: ["January", "February", "March", "April", "May", "June",
+               "July", "August", "September", "October", "November", "December"]
+    topology: cyclic
+    tier: 1
+    category: month
+
+  - name: digits
+    concepts: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    topology: ordinal
+    tier: 1
+    category: number
+
+  - name: weekdays
+    concepts: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    topology: cyclic
+    tier: 1
+    category: day
+
+  - name: number_words
+    concepts: ["one", "two", "three", "four", "five", "six", "seven",
+               "eight", "nine", "ten", "eleven", "twelve", "thirteen",
+               "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+               "nineteen", "twenty"]
+    topology: ordinal
+    tier: 1
+    category: number
+
+  # === Tier 2 — likely ===
+  - name: colors
+    concepts: ["red", "orange", "yellow", "green", "blue", "indigo", "violet"]
+    topology: cyclic
+    tier: 2
+    category: color
+
+  - name: seasons
+    concepts: ["spring", "summer", "autumn", "winter"]
+    topology: cyclic
+    tier: 2
+    category: season
+
+  - name: sizes
+    concepts: ["tiny", "small", "little", "medium", "large", "big", "huge", "enormous"]
+    topology: ordinal
+    tier: 2
+    category: size
+
+  - name: compass
+    concepts: ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"]
+    topology: cyclic
+    tier: 2
+    category: direction
+
+  # === Tier 3 — speculative ===
+  - name: alphabet
+    concepts: ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+               "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"]
+    topology: ordinal
+    tier: 3
+    category: letter
+
+  - name: temperature
+    concepts: ["freezing", "cold", "cool", "warm", "hot", "boiling"]
+    topology: ordinal
+    tier: 3
+    category: temperature
+
+  - name: frequency
+    concepts: ["never", "rarely", "sometimes", "often", "always"]
+    topology: ordinal
+    tier: 3
+    category: frequency
+
+  # === Tier 4 — relational / compositional ===
+  - name: antonyms_hot
+    concepts: ["hot", "cold", "big", "small", "fast", "slow", "light", "dark",
+               "high", "low", "old", "young", "hard", "soft", "loud", "quiet"]
+    topology: paired
+    tier: 4
+    category: word
+
+  - name: bio_hierarchy
+    concepts: ["atom", "molecule", "cell", "tissue", "organ", "organism",
+               "population", "ecosystem"]
+    topology: ordinal
+    tier: 4
+    category: level
+
+  - name: pronouns_subj
+    concepts: ["I", "you", "he", "she", "it", "we", "they"]
+    topology: unknown
+    tier: 4
+    category: pronoun
+
+  - name: pronouns_obj
+    concepts: ["me", "you", "him", "her", "it", "us", "them"]
+    topology: unknown
+    tier: 4
+    category: pronoun
+
+  - name: countries
+    concepts: ["France", "Germany", "Japan", "China", "India", "Brazil",
+               "Egypt", "Canada", "Russia", "Australia", "Mexico", "Italy"]
+    topology: unknown
+    tier: 4
+    category: country
+
+  - name: emotions
+    concepts: ["joy", "sadness", "anger", "fear", "surprise", "disgust",
+               "trust", "anticipation"]
+    topology: unknown
+    tier: 4
+    category: emotion
+
+  # === V3 additions ===
+  - name: us_states
+    concepts: ["Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+               "Connecticut", "Delaware", "Florida", "Georgia", "Idaho", "Illinois",
+               "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana", "Maine",
+               "Maryland", "Massachusetts", "Michigan", "Minnesota", "Mississippi",
+               "Missouri", "Montana", "Nebraska", "Nevada", "Ohio", "Oklahoma",
+               "Oregon", "Pennsylvania", "Tennessee", "Texas", "Utah", "Vermont",
+               "Virginia", "Washington", "Wisconsin", "Wyoming"]
+    topology: geographic
+    tier: 1
+    category: state
+
+  - name: years
+    concepts: ["1800", "1805", "1810", "1815", "1820", "1825", "1830", "1835",
+               "1840", "1845", "1850", "1855", "1860", "1865", "1870", "1875",
+               "1880", "1885", "1890", "1895", "1900", "1905", "1910", "1915",
+               "1920", "1925", "1930", "1935", "1940", "1945", "1950", "1955",
+               "1960", "1965", "1970", "1975", "1980", "1985", "1990", "1995",
+               "2000", "2005", "2010", "2015", "2020"]
+    topology: ordinal
+    tier: 2
+    category: year
+
+# Geographic coordinates for US states (latitude, longitude)
+# Used for geographic probing in concept geometry analysis
+state_coordinates:
+  Alabama: [32.8, -86.8]
+  Alaska: [64.2, -152.5]
+  Arizona: [34.3, -111.7]
+  Arkansas: [34.8, -92.2]
+  California: [37.2, -119.5]
+  Colorado: [39.0, -105.5]
+  Connecticut: [41.6, -72.7]
+  Delaware: [39.0, -75.5]
+  Florida: [28.6, -82.4]
+  Georgia: [32.7, -83.4]
+  Idaho: [44.4, -114.6]
+  Illinois: [40.0, -89.2]
+  Indiana: [39.8, -86.3]
+  Iowa: [42.0, -93.5]
+  Kansas: [38.5, -98.3]
+  Kentucky: [37.8, -85.7]
+  Louisiana: [31.0, -92.0]
+  Maine: [45.4, -69.2]
+  Maryland: [39.0, -76.8]
+  Massachusetts: [42.3, -71.8]
+  Michigan: [44.3, -84.6]
+  Minnesota: [46.3, -94.3]
+  Mississippi: [32.7, -89.7]
+  Missouri: [38.4, -92.5]
+  Montana: [47.0, -109.6]
+  Nebraska: [41.5, -99.8]
+  Nevada: [39.3, -116.6]
+  Ohio: [40.4, -82.8]
+  Oklahoma: [35.5, -97.5]
+  Oregon: [44.0, -120.5]
+  Pennsylvania: [40.9, -77.8]
+  Tennessee: [35.8, -86.4]
+  Texas: [31.5, -99.3]
+  Utah: [39.3, -111.7]
+  Vermont: [44.1, -72.6]
+  Virginia: [37.5, -78.9]
+  Washington: [47.4, -120.7]
+  Wisconsin: [44.6, -89.8]
+  Wyoming: [43.0, -107.6]

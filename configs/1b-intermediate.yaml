@@ -1,0 +1,57 @@
+# 1B intermediate validation config
+# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/1b-intermediate.yaml
+
+model_size: intermediate
+sequence_length: 2048
+micro_batch_size: 4
+global_batch_tokens: 524288
+
+# Training scale
+total_tokens: 4_000_000_000
+warmup_steps: 500
+decay_start_pct: 0.90
+decay_type: sqrt
+
+# Optimizer
+muon_lr: 0.02
+muon_ns_coefficients: gram_ns
+adamw_lr: 6e-4
+gradient_clip: 1.0
+
+# Batch ramp
+batch_ramp_initial: 0.25
+batch_ramp_pct: 0.05
+
+# Data
+data_path: data/fineweb_edu_6b.bin
+
+# AttnRes (DD-v1 boundaries, re-derive from 1B NCA profile)
+attn_res: true
+attn_res_boundaries: "0,3,7,12,21,25"
+
+# NCA resume
+# resume_nca: checkpoints/nca_1b/step_XXXXX.pt
+
+# Checkpointing
+checkpoint_dir: checkpoints/1b_intermediate
+save_every: 2000
+keep_checkpoints: 5
+async_checkpoint: true
+checkpoint_compress: true
+
+# Monitoring
+geo_monitor: true
+geo_monitor_tier1_every: 50
+geo_monitor_tier2_every: 500
+activation_checkpointing: true
+
+# Optimization
+use_liger: true
+attn_impl: auto
+compile: true
+
+# Logging
+log_every: 50
+wandb: true
+wandb_project: luxia-base
+wandb_run_name: 1b-intermediate-ddv1

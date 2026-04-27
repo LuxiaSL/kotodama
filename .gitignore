@@ -1,0 +1,40 @@
+# Artifacts — large binary data, checkpoints, outputs
+data/
+checkpoints/
+outputs/
+wandb/
+/analysis/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv*/
+venv/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ruff cache
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Profiler traces
+*.json.gz
+*.chrome_trace.json
+
+# Compiled HTML reports
+*.html

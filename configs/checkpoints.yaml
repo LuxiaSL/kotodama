@@ -1,0 +1,73 @@
+# Checkpoint registry for luxia-base analysis pipeline.
+# Maps checkpoint names to paths and AttnRes configuration.
+#
+# AttnRes config:
+#   attn_res: true/false
+#   attn_res_n_blocks: N (divides layers into N equal blocks)
+#   attn_res_boundaries: [list of boundary layer indices] (explicit, overrides n_blocks)
+#
+# Usage:
+#   from src.eval.model_loader import load_checkpoint_registry
+#   registry = load_checkpoint_registry()
+
+proxy_sweep:
+  checkpoints:
+    P1-AdamW:
+      path: checkpoints/proxy_sweep/p1-adamw/step_00045775.pt
+      tags: [adamw, baseline]
+
+    P3-Muon-002:
+      path: checkpoints/proxy_sweep/p3-muon-002/step_00045775.pt
+      tags: [muon, lr-002]
+
+    P4-Muon-003:
+      path: checkpoints/proxy_sweep/p4-muon-003/step_00045775.pt
+      tags: [muon, lr-003]
+
+nca_proxy:
+  checkpoints:
+    NCA-002:
+      path: checkpoints/nca_proxy/nca-proxy-muon-002/step_00045775.pt
+      tags: [muon, nca, lr-002]
+
+    NCA-003:
+      path: checkpoints/nca_proxy/nca-proxy-muon-003/step_00045775.pt
+      tags: [muon, nca, lr-003]
+
+attnres_sweep:
+  checkpoints:
+    P3-AttnRes:
+      path: checkpoints/attnres_sweep/p3-muon-002-attnres/step_00045775.pt
+      attn_res: true
+      attn_res_n_blocks: 7
+      tags: [muon, attnres, lr-002]
+
+    NCA-AttnRes:
+      path: checkpoints/attnres_sweep/nca-002-attnres/step_00045775.pt
+      attn_res: true
+      attn_res_n_blocks: 7
+      tags: [muon, nca, attnres, lr-002]
+
+language_full:
+  checkpoints:
+    Lang-Baseline:
+      path: checkpoints/language_full/baseline/step_00045775.pt
+      attn_res: true
+      attn_res_n_blocks: 4
+      tags: [language-full, baseline]
+
+    Lang-DDv1:
+      path: checkpoints/language_full/ddv1/step_00045775.pt
+      attn_res: true
+      attn_res_boundaries: [0, 3, 7, 12, 21, 25]
+      tags: [language-full, data-driven]
+
+# Metrics JSONL files associated with runs (for Track 1+2)
+# These map run names to their training metrics files.
+metrics_files:
+  P3: data/sweep_p3_muon002_metrics.jsonl
+  P3-AR: data/attnres_p3_muon002_metrics.jsonl
+  NCA: data/nca_proxy_muon002_full_metrics.jsonl
+  NCA-AR: data/attnres_nca002_metrics.jsonl
+  Lang-Baseline: data/lang_full_baseline_metrics.jsonl
+  Lang-DDv1: data/lang_full_ddv1_metrics.jsonl
