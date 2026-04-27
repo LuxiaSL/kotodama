@@ -14,7 +14,7 @@ BENCH_DIR="${1:-outputs/benchmark-$(date +%Y%m%d-%H%M%S)}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$(dirname "$SCRIPT_DIR")"
 
-cd ~/luxi-files/luxia-base
+cd ~/luxi-files/kotodama
 source ~/luxi-files/.venv-shared/bin/activate
 export OMP_NUM_THREADS=16
 export CPATH=~/luxi-files/python3.12-include
