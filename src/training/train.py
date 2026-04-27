@@ -279,6 +279,19 @@ def train(args: argparse.Namespace) -> None:
     # Enable TF32 for fp32 matmuls outside autocast (grad norm, loss compute)
     torch.set_float32_matmul_precision("high")
 
+    # FP8 training: convert Linear layers to Float8Linear (before compile)
+    if getattr(args, "fp8", False):
+        try:
+            from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+            fp8_config = Float8LinearConfig()
+            convert_to_float8_training(model, config=fp8_config)
+            if is_main:
+                logger.info("FP8 training enabled via torchao (Float8Linear)")
+        except ImportError:
+            raise ImportError(
+                "--fp8 requires torchao. Install with: uv pip install torchao"
+            )
+
     # torch.compile for throughput (compile before DDP)
     if args.compile:
         if args.attn_impl == "fa4":
@@ -611,6 +624,7 @@ def train(args: argparse.Namespace) -> None:
             iters_per_sec = log_steps / max(elapsed, 1e-6)
             lrs = scheduler.get_last_lr()
             gpu_mem = torch.cuda.max_memory_allocated(device) / 1e9
+            _grad_norm_scalar = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
 
             logger.info(
                 "step=%d/%d | loss=%.4f | z_loss=%.6f | grad_norm=%.3f | "
@@ -620,7 +634,7 @@ def train(args: argparse.Namespace) -> None:
                 total_steps,
                 avg_loss,
                 avg_z_loss,
-                grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                _grad_norm_scalar,
                 lrs["muon_lr"],
                 lrs["adamw_lr"],
                 tokens_per_sec,
@@ -629,14 +643,12 @@ def train(args: argparse.Namespace) -> None:
                 gpu_mem,
             )
 
-            # Wandb: log training metrics
             if wb is not None:
-                _grad_norm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
                 wb.log_step(
                     step=step,
                     loss=avg_loss,
                     z_loss=avg_z_loss,
-                    grad_norm=_grad_norm,
+                    grad_norm=_grad_norm_scalar,
                     muon_lr=lrs["muon_lr"],
                     adamw_lr=lrs["adamw_lr"],
                     tokens_per_sec=tokens_per_sec,
@@ -646,12 +658,10 @@ def train(args: argparse.Namespace) -> None:
                     step_time_s=elapsed / max(log_steps, 1),
                 )
 
-            # Heimdall: log same metrics in parallel
             if is_main:
-                _grad_norm_hm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
                 hm_log(
                     step,
-                    **{"train/loss": avg_loss, "train/grad_norm": _grad_norm_hm,
+                    **{"train/loss": avg_loss, "train/grad_norm": _grad_norm_scalar,
                        "train/perplexity": math.exp(min(avg_loss, 20)),
                        "perf/tokens_per_sec": tokens_per_sec},
                 )
@@ -842,13 +852,12 @@ class _NoOpOptimizer:
         pass
 
 
-def _compute_grad_norm(params: Any) -> float:
-    """Compute total gradient norm (for logging when clipping is disabled)."""
-    total_norm_sq = 0.0
-    for p in params:
-        if p.grad is not None:
-            total_norm_sq += p.grad.data.float().norm().item() ** 2
-    return total_norm_sq**0.5
+def _compute_grad_norm(params: Any) -> torch.Tensor:
+    """Compute total gradient norm on GPU (single sync when .item() is called)."""
+    norms = [p.grad.data.float().norm() for p in params if p.grad is not None]
+    if not norms:
+        return torch.tensor(0.0)
+    return torch.stack(norms).square().sum().sqrt()
 
 
 def _per_layer_grad_norms(model: torch.nn.Module) -> dict[str, float]:
@@ -859,24 +868,25 @@ def _per_layer_grad_norms(model: torch.nn.Module) -> dict[str, float]:
         return metrics
 
     for i, layer in enumerate(model.layers):
-        # Only log every 4th layer to avoid clutter
         if i % 4 != 0 and i != len(model.layers) - 1:
             continue
 
-        attn_norm_sq = 0.0
-        mlp_norm_sq = 0.0
+        attn_norms = []
+        mlp_norms = []
 
         for name, param in layer.named_parameters():
             if param.grad is None:
                 continue
-            g_norm_sq = param.grad.data.float().norm().item() ** 2
+            norm = param.grad.data.float().norm()
             if "attn" in name:
-                attn_norm_sq += g_norm_sq
+                attn_norms.append(norm)
             elif "ffn" in name:
-                mlp_norm_sq += g_norm_sq
+                mlp_norms.append(norm)
 
-        metrics[f"grad/layer_{i}/attn"] = attn_norm_sq**0.5
-        metrics[f"grad/layer_{i}/mlp"] = mlp_norm_sq**0.5
+        attn_total = torch.stack(attn_norms).square().sum().sqrt().item() if attn_norms else 0.0
+        mlp_total = torch.stack(mlp_norms).square().sum().sqrt().item() if mlp_norms else 0.0
+        metrics[f"grad/layer_{i}/attn"] = attn_total
+        metrics[f"grad/layer_{i}/mlp"] = mlp_total
 
         # Attn/MLP ratio (useful for detecting gradient flow imbalance)
         if mlp_norm_sq > 1e-10:
@@ -1081,6 +1091,13 @@ def parse_args() -> argparse.Namespace:
         "--reinit_mlps",
         action="store_true",
         help="Also reinitialize MLPs after NCA (default: keep NCA-trained MLPs)",
+    )
+
+    # FP8 training
+    p.add_argument(
+        "--fp8",
+        action="store_true",
+        help="Enable FP8 training via torchao (Linear layers only, Muon NS stays fp16)",
     )
 
     # Liger fused kernels

@@ -1,0 +1,50 @@
+# Canary throughput benchmark — 3B model, FP8 forward/backward + fp16 Muon NS
+# Tests FP8 via torchao Float8Linear for throughput improvement
+# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/canary-3b-fp8.yaml
+
+model_size: 3b
+sequence_length: 4096
+micro_batch_size: 4
+global_batch_tokens: 2097152
+
+# 150 steps: ~50 warmup/compile, ~100 steady-state
+total_steps: 150
+warmup_steps: 30
+decay_start_pct: 0.95
+decay_type: cosine
+
+# Optimizer
+muon_lr: 0.02
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+adamw_lr: 6e-4
+adamw_beta1: 0.9
+adamw_beta2: 0.95
+adamw_weight_decay: 0.1
+gradient_clip: 1.0
+
+# AttnRes: 8 uniform blocks
+attn_res: true
+attn_res_n_blocks: 8
+
+# Data
+random_data: true
+seed: 42
+
+# No saves
+checkpoint_dir: checkpoints/canary-3b-fp8
+save_every: 999999
+keep_checkpoints: 1
+
+# Optimizations
+fp8: true
+use_liger: true
+attn_impl: auto
+compile: true
+activation_checkpointing: true
+
+# Logging
+log_every: 10
+wandb: false

@@ -7,9 +7,9 @@ sequence_length: 4096
 micro_batch_size: 4
 global_batch_tokens: 2097152
 
-# 5k steps for steady-state measurement
-total_steps: 5000
-warmup_steps: 200
+# 500 steps: ~100 warmup/compile, ~400 steady-state measurement
+total_steps: 500
+warmup_steps: 50
 decay_start_pct: 0.95
 decay_type: cosine
 
@@ -33,10 +33,10 @@ attn_res_n_blocks: 8
 random_data: true
 seed: 42
 
-# Checkpointing — async, save every 500 steps to measure overhead
+# Checkpointing — async, save at step 250 to measure overhead mid-run
 checkpoint_dir: checkpoints/canary-3b
-save_every: 500
-keep_checkpoints: 3
+save_every: 250
+keep_checkpoints: 2
 async_checkpoint: true
 
 # Optimizations
