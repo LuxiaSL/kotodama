@@ -1,14 +1,12 @@
-# Canary throughput benchmark — 8B model (Llama 3.1-8B shape, our vocab)
-# d=4096, L=32, 32Q/8KV (4:1 GQA), hdim=128, inter=14336 — ~7.2B params
-# Measures steady-state tok/s with AttnRes, async checkpoints, compile, Liger.
-# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/canary-8b.yaml
+# Canary throughput benchmark — 8B model, FP8 forward/backward + fp16 Muon NS
+# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/canary-8b-fp8.yaml
 
 model_size: 8b
 sequence_length: 4096
 micro_batch_size: 2
 global_batch_tokens: 2097152
 
-# 150 steps: ~50 warmup/compile, ~100 steady-state measurement
+# 150 steps: ~50 warmup/compile, ~100 steady-state
 total_steps: 150
 warmup_steps: 30
 decay_start_pct: 0.95
@@ -34,13 +32,13 @@ attn_res_n_blocks: 8
 random_data: true
 seed: 42
 
-# Checkpointing — skip saves, async overhead already validated on 3B
-checkpoint_dir: checkpoints/canary-8b
+# No saves
+checkpoint_dir: checkpoints/canary-8b-fp8
 save_every: 999999
 keep_checkpoints: 1
-async_checkpoint: true
 
 # Optimizations
+fp8: true
 use_liger: true
 attn_impl: auto
 compile: true

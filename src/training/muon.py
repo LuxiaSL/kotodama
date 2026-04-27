@@ -130,7 +130,7 @@ def newton_schulz_orthogonalize(
 
     coeffs = _resolve_ns_coefficients(ns_coefficients, num_iterations)
     orig_dtype = M.dtype
-    X = M.bfloat16()
+    X = M.half()
 
     # Transpose tall matrices: NS converges faster when ncols >= nrows
     transposed = False
@@ -165,7 +165,7 @@ def _batched_newton_schulz(
     """
     coeffs = _resolve_ns_coefficients(ns_coefficients, num_iterations)
     orig_dtype = M.dtype
-    X = M.bfloat16()
+    X = M.half()
 
     # Transpose if tall
     transposed = False
