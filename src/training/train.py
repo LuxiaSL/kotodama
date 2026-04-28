@@ -199,8 +199,19 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device(f"cuda:{local_rank}")
     is_main = rank == 0
 
+    # -- Tensor parallelism groups ---------------------------------------------
+    tp_size = getattr(args, "tp_size", 1)
+    tp_group = None
+    dp_group = None
+    if tp_size > 1:
+        from src.training.tensor_parallel import create_process_groups
+        tp_group, dp_group = create_process_groups(world_size, tp_size)
+    dp_size = world_size // tp_size
+
     if is_main:
         logger.info("World size: %d, device: %s", world_size, device)
+        if tp_size > 1:
+            logger.info("TP=%d, DP=%d", tp_size, dp_size)
         job_id = os.environ.get("HEIMDALL_JOB_ID", "local")
         logger.info("Heimdall job ID: %s", job_id)
 
@@ -279,6 +290,14 @@ def train(args: argparse.Namespace) -> None:
     # Enable TF32 for fp32 matmuls outside autocast (grad norm, loss compute)
     torch.set_float32_matmul_precision("high")
 
+    # Tensor parallelism: shard projection weights across TP group
+    if tp_group is not None:
+        from src.training.tensor_parallel import apply_tensor_parallelism
+        apply_tensor_parallelism(model, tp_group)
+        if is_main:
+            tp_param_count = sum(p.numel() for p in model.parameters())
+            logger.info("After TP sharding: %.1fM params per rank", tp_param_count / 1e6)
+
     # FP8 training: convert Linear layers to Float8Linear (before compile)
     if getattr(args, "fp8", False):
         try:
@@ -306,20 +325,28 @@ def train(args: argparse.Namespace) -> None:
         if is_main:
             logger.info("Compilation registered (will compile on first forward)")
 
-    # Wrap in DDP with optimized communication
-    model = DDP(
-        model,
-        device_ids=[local_rank],
-        gradient_as_bucket_view=True,  # avoid gradient copy
-        # NOTE: static_graph=True crashes with AttnRes (dynamic torch.cat shapes)
-    )
+    # Wrap in DDP for gradient synchronization across data-parallel ranks.
+    # Pure TP (tp_size == world_size): no DDP — all ranks are in the same
+    # TP group with identical replicated-param gradients.
+    if dp_size > 1:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            process_group=dp_group,
+            gradient_as_bucket_view=True,
+        )
+    else:
+        if is_main:
+            logger.info("Pure TP mode (TP=%d = world_size) — skipping DDP", tp_size)
 
     # -- Optimizer -------------------------------------------------------------
+    raw_model = model.module if hasattr(model, "module") else model
+
     if args.adamw_only:
         # Pure AdamW baseline (no Muon) — all params in one optimizer
         from torch.optim import AdamW as TorchAdamW
 
-        all_params = [p for p in model.module.parameters() if p.requires_grad]
+        all_params = [p for p in raw_model.parameters() if p.requires_grad]
         adamw_opt = TorchAdamW(
             all_params,
             lr=args.adamw_lr,
@@ -333,7 +360,7 @@ def train(args: argparse.Namespace) -> None:
             logger.info("AdamW-only mode: %d params (%.1fM)", total_p, total_p / 1e6)
     else:
         muon_opt, adamw_opt = build_hybrid_optimizer(
-            model.module,
+            raw_model,
             muon_lr=args.muon_lr,
             muon_momentum=args.muon_momentum,
             muon_weight_decay=args.muon_weight_decay,
@@ -348,7 +375,9 @@ def train(args: argparse.Namespace) -> None:
     seq_len = args.sequence_length
     micro_batch = args.micro_batch_size
     tokens_per_micro = micro_batch * seq_len  # per GPU
-    tokens_per_global_micro = tokens_per_micro * world_size
+    # Under TP, all ranks in a TP group process the same data.
+    # Only data-parallel replicas contribute unique tokens.
+    tokens_per_global_micro = tokens_per_micro * dp_size
 
     if args.total_steps is not None:
         total_steps = args.total_steps
@@ -384,12 +413,16 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # -- Data ------------------------------------------------------------------
+    # Under TP, all ranks in a TP group must see the same data.
+    # Partition by dp_rank so TP peers share batches.
+    dp_rank = dist.get_rank(dp_group) if dp_group is not None else 0
+
     if args.random_data:
         dataset = RandomTokenDataset(
             vocab_size=config.vocab_size,
             seq_len=seq_len,
             seed=args.seed,
-            rank=rank,
+            rank=dp_rank,
         )
         if is_main:
             logger.info("Using random data (vocab=%d)", config.vocab_size)
@@ -399,8 +432,8 @@ def train(args: argparse.Namespace) -> None:
         dataset = TokenizedDataset(
             path=args.data_path,
             seq_len=seq_len,
-            rank=rank,
-            world_size=world_size,
+            rank=dp_rank,
+            world_size=dp_size,
             seed=args.seed,
         )
 
@@ -493,7 +526,9 @@ def train(args: argparse.Namespace) -> None:
                 "adamw_lr": args.adamw_lr,
                 "warmup_steps": args.warmup_steps,
                 "precision": "bf16",
-                "parallelism": "ddp",
+                "parallelism": f"tp{tp_size}" if tp_size > 1 else "ddp",
+                "tp_size": tp_size,
+                "dp_size": dp_size,
                 "activation_checkpointing": args.activation_checkpointing,
                 "use_liger": getattr(args, "use_liger", False),
                 "attn_impl": getattr(args, "attn_impl", "auto"),
@@ -563,10 +598,11 @@ def train(args: argparse.Namespace) -> None:
 
             input_ids = input_ids.to(device, non_blocking=True)
 
-            # Skip gradient sync on all but the last micro-step
+            # Skip gradient sync on all but the last micro-step.
+            # no_sync() only exists on DDP-wrapped models.
             sync_ctx = (
                 model.no_sync()
-                if micro_step < current_grad_accum - 1
+                if hasattr(model, "no_sync") and micro_step < current_grad_accum - 1
                 else nullcontext()
             )
 
@@ -595,7 +631,7 @@ def train(args: argparse.Namespace) -> None:
 
         # Per-layer gradient analysis (before optimizer step clears grads)
         if wb is not None and step % 50 == 0:
-            grad_metrics = _per_layer_grad_norms(model.module)
+            grad_metrics = _per_layer_grad_norms(raw_model)
             wb.log_custom(step, grad_metrics)
 
         # Optimizer step
@@ -888,11 +924,8 @@ def _per_layer_grad_norms(model: torch.nn.Module) -> dict[str, float]:
         metrics[f"grad/layer_{i}/attn"] = attn_total
         metrics[f"grad/layer_{i}/mlp"] = mlp_total
 
-        # Attn/MLP ratio (useful for detecting gradient flow imbalance)
-        if mlp_norm_sq > 1e-10:
-            metrics[f"grad/layer_{i}/attn_mlp_ratio"] = (
-                attn_norm_sq**0.5 / (mlp_norm_sq**0.5 + 1e-10)
-            )
+        if mlp_total > 1e-10:
+            metrics[f"grad/layer_{i}/attn_mlp_ratio"] = attn_total / (mlp_total + 1e-10)
 
     return metrics
 
@@ -1114,6 +1147,14 @@ def parse_args() -> argparse.Namespace:
         help="Attention backend. 'auto': FA2 if available, else SDPA. "
              "'fa2': Flash Attention 2. 'fa4': CuTeDSL SM100 (lazy import, breaks compile). "
              "'sdpa': PyTorch SDPA.",
+    )
+
+    # Tensor parallelism
+    p.add_argument(
+        "--tp_size",
+        type=int,
+        default=1,
+        help="Tensor parallelism degree (1 = DDP only, 8 = full TP on 8 GPUs)",
     )
 
     # torch.compile

@@ -263,6 +263,7 @@ class Muon(Optimizer):
             params_with_grads: list[torch.Tensor] = []
             updates_to_orthogonalize: list[torch.Tensor] = []
             scales: list[float] = []
+            tp_infos: list[Optional[dict[str, Any]]] = []
 
             for p in group["params"]:
                 if p.grad is None:
@@ -278,18 +279,34 @@ class Muon(Optimizer):
                 buf.mul_(momentum).add_(grad)
 
                 if nesterov:
-                    updates_to_orthogonalize.append(momentum * buf + grad)
+                    update = momentum * buf + grad
                 else:
-                    updates_to_orthogonalize.append(buf.clone())
+                    update = buf.clone()
 
+                # TP: all-gather to full matrix for NS, compute scale from full shape
+                tp_info: Optional[dict[str, Any]] = None
+                if hasattr(p, "_tp_shard_dim"):
+                    from src.training.tensor_parallel import all_gather_along_dim
+                    tp_info = {
+                        "shard_dim": p._tp_shard_dim,
+                        "group": p._tp_group,
+                        "tp_rank": p._tp_rank,
+                        "local_size": update.shape[p._tp_shard_dim],
+                    }
+                    update = all_gather_along_dim(update, p._tp_shard_dim, p._tp_group)
+
+                updates_to_orthogonalize.append(update)
                 params_with_grads.append(p)
-                scales.append(max(1.0, (grad.shape[0] / grad.shape[1]) ** 0.5))
+                tp_infos.append(tp_info)
+                scales.append(max(1.0, (update.shape[0] / update.shape[1]) ** 0.5))
 
             if not params_with_grads:
                 continue
 
             # Batch NS by shape: group matrices with same shape
-            # and orthogonalize them as a single batched operation
+            # and orthogonalize them as a single batched operation.
+            # Under TP, updates are already gathered to full shape,
+            # so batching groups match the non-TP case.
             shape_groups: dict[tuple[int, int], list[int]] = {}
             for i, M in enumerate(updates_to_orthogonalize):
                 shape = (M.shape[0], M.shape[1])
@@ -297,11 +314,10 @@ class Muon(Optimizer):
                     shape_groups[shape] = []
                 shape_groups[shape].append(i)
 
-            orthogonalized = [None] * len(updates_to_orthogonalize)
+            orthogonalized: list[Optional[torch.Tensor]] = [None] * len(updates_to_orthogonalize)
 
             for shape, indices in shape_groups.items():
                 if len(indices) == 1:
-                    # Single matrix — use regular NS
                     idx = indices[0]
                     orthogonalized[idx] = newton_schulz_orthogonalize(
                         updates_to_orthogonalize[idx],
@@ -309,7 +325,6 @@ class Muon(Optimizer):
                         ns_coefficients=self._ns_coefficients,
                     )
                 else:
-                    # Batch: stack matrices and do batched NS
                     batch = torch.stack(
                         [updates_to_orthogonalize[i] for i in indices]
                     )
@@ -320,11 +335,20 @@ class Muon(Optimizer):
                     for j, idx in enumerate(indices):
                         orthogonalized[idx] = result[j]
 
-            # Apply updates
+            # Apply updates — slice TP params back to local shard
             for i, p in enumerate(params_with_grads):
+                orth = orthogonalized[i]
+
+                if tp_infos[i] is not None:
+                    info = tp_infos[i]
+                    start = info["tp_rank"] * info["local_size"]
+                    orth = orth.narrow(
+                        info["shard_dim"], start, info["local_size"]
+                    ).contiguous()
+
                 if weight_decay > 0:
                     p.mul_(1 - lr * weight_decay)
-                p.add_(orthogonalized[i], alpha=-lr * scales[i])
+                p.add_(orth, alpha=-lr * scales[i])
 
         return loss
 
