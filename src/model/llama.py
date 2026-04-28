@@ -248,6 +248,7 @@ class GQAttention(nn.Module):
         self.num_kv_groups = config.num_kv_groups
         self._attn_impl = _resolve_attn_impl(config)
         self._use_liger_rope = config.use_liger and _LIGER_AVAILABLE
+        self.tp_group = None  # set by apply_tensor_parallelism
 
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
@@ -366,12 +367,21 @@ class GQAttention(nn.Module):
         rope_sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.tp_group is not None:
+            from src.training.tensor_parallel import copy_to_parallel_region, reduce_from_parallel_region
+            x = copy_to_parallel_region(x, self.tp_group)
+
         # FA4/FA2 don't accept arbitrary masks — fall back to SDPA when mask is provided
         if self._attn_impl == "fa4" and mask is None:
-            return self._forward_fa4(x, rope_cos, rope_sin)
-        if self._attn_impl == "fa2" and mask is None:
-            return self._forward_fa2(x, rope_cos, rope_sin)
-        return self._forward_sdpa(x, rope_cos, rope_sin, mask)
+            out = self._forward_fa4(x, rope_cos, rope_sin)
+        elif self._attn_impl == "fa2" and mask is None:
+            out = self._forward_fa2(x, rope_cos, rope_sin)
+        else:
+            out = self._forward_sdpa(x, rope_cos, rope_sin, mask)
+
+        if self.tp_group is not None:
+            out = reduce_from_parallel_region(out, self.tp_group)
+        return out
 
 
 class SwiGLUFFN(nn.Module):
@@ -383,13 +393,23 @@ class SwiGLUFFN(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self._use_liger = config.use_liger and _LIGER_AVAILABLE
+        self.tp_group = None  # set by apply_tensor_parallelism
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.tp_group is not None:
+            from src.training.tensor_parallel import copy_to_parallel_region, reduce_from_parallel_region
+            x = copy_to_parallel_region(x, self.tp_group)
+
         if self._use_liger:
-            return self.down_proj(
+            out = self.down_proj(
                 LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x))
             )
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        else:
+            out = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+        if self.tp_group is not None:
+            out = reduce_from_parallel_region(out, self.tp_group)
+        return out
 
 
 class TransformerBlock(nn.Module):
