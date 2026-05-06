@@ -46,7 +46,6 @@ fp8: true
 use_liger: true
 attn_impl: auto
 compile: true
-activation_checkpointing: true
 
 # Logging
 log_every: 10
