@@ -49,6 +49,15 @@ except ImportError:
     LigerFusedLinearCrossEntropyLoss = None  # type: ignore[assignment,misc]
     liger_rotary_pos_emb = None  # type: ignore[assignment,misc]
 
+# ── Optional fused Triton AttnRes kernels ───────────────────────────────────
+_TRITON_ATTN_RES_AVAILABLE = False
+try:
+    import triton  # noqa: F401
+    from .flash_attn_res import phase_1_batched_attention_triton_op  # noqa: F401
+    _TRITON_ATTN_RES_AVAILABLE = True
+except Exception:
+    pass
+
 # ── Optional Flash Attention 2 import ────────────────────────────────────────
 _FA2_AVAILABLE = False
 try:
@@ -529,6 +538,13 @@ class LuxiaBaseModel(nn.Module):
             masks[2 * config.num_layers, :n_committed + 1] = True
             self.register_buffer("_attn_res_masks", masks, persistent=False)
 
+            active_counts = [int(masks[j].sum().item()) for j in range(masks.shape[0])]
+            self.register_buffer(
+                "_attn_res_active_counts",
+                torch.tensor(active_counts, dtype=torch.int32),
+                persistent=False,
+            )
+
         # Precompute RoPE frequencies
         rope_cos, rope_sin = precompute_rope_frequencies(
             config.head_dim, config.max_position_embeddings, config.rope_theta
@@ -567,32 +583,39 @@ class LuxiaBaseModel(nn.Module):
         query: torch.Tensor,
         norm: nn.Module,
         active_mask: torch.Tensor,
+        num_active: int = 0,
     ) -> torch.Tensor:
         """Compute Block Attention Residual routing with fixed-shape masked softmax.
 
         All tensor shapes are static (determined by max_sources at init), enabling
         torch.compile to trace a single graph without breaks.
 
+        When Triton is available (CUDA), uses fused Phase 1 kernel from
+        flash-attention-residuals. Falls back to PyTorch on CPU.
+
         Args:
             buf: (max_S, B, T, D) padded source buffer (inactive slots are zero)
             query: (D,) learned pseudo-query
             norm: RMSNorm for keys (per-layer, NOT shared)
             active_mask: (max_S,) bool — True for active slots
+            num_active: number of active sources (avoids .sum() on mask at runtime)
         Returns:
             h: (B, T, D) attended mixture of active sources
         """
         qw = query * norm.weight  # (D,)
         eps = norm.eps
 
-        # Vectorized logit computation over all slots
+        if buf.is_cuda and _TRITON_ATTN_RES_AVAILABLE:
+            from .flash_attn_res.ops.phase_1 import phase_1_batched_attention_triton_op
+            out, _lse = phase_1_batched_attention_triton_op(
+                buf, qw.unsqueeze(0), eps, num_active=num_active or int(active_mask.sum().item()),
+            )
+            return out[0]
+
         rsqrt = torch.rsqrt(buf.pow(2).mean(-1) + eps)  # (max_S, B, T)
         logits = (buf * qw).sum(-1) * rsqrt  # (max_S, B, T)
-
-        # Mask inactive slots to -inf before softmax (they get weight 0)
         logits = logits.masked_fill(~active_mask.view(-1, 1, 1), float("-inf"))
         weights = F.softmax(logits, dim=0)  # (max_S, B, T)
-
-        # Weighted sum over all slots (zero-weighted inactive slots contribute nothing)
         return (weights.unsqueeze(-1) * buf).sum(0)  # (B, T, D)
 
     def _block_attn_res_from_list(
@@ -634,6 +657,7 @@ class LuxiaBaseModel(nn.Module):
         boundary_set = self._attn_res_boundary_set
         max_s = self._attn_res_max_sources
         masks = self._attn_res_masks
+        active_counts = self._attn_res_active_counts
         rope_cos = self.rope_cos
         rope_sin = self.rope_sin
         zero = torch.zeros_like(embed)  # reusable padding tensor
@@ -646,30 +670,24 @@ class LuxiaBaseModel(nn.Module):
             return torch.stack(sources, dim=0)  # (max_S, B, T, D)
 
         for i, layer in enumerate(self.layers):
-            # Pre-attention AttnRes: route over committed + partial
             buf = _pad_and_stack(committed, partial)
-            h = self._route_static(buf, layer.attn_res_query, layer.attn_res_norm, masks[2 * i])
+            h = self._route_static(buf, layer.attn_res_query, layer.attn_res_norm, masks[2 * i], int(active_counts[2 * i]))
 
-            # Block boundary: snapshot partial into committed, start fresh
             if i in boundary_set:
                 committed.append(partial.clone())
                 partial = zero.clone()
 
-            # Attention sub-layer
             attn_out = layer.attn(layer.attn_norm(h), rope_cos, rope_sin, mask)
             partial = partial + attn_out
 
-            # Pre-MLP AttnRes: route over committed + updated partial
             buf = _pad_and_stack(committed, partial)
-            h = self._route_static(buf, layer.mlp_res_query, layer.mlp_res_norm, masks[2 * i + 1])
+            h = self._route_static(buf, layer.mlp_res_query, layer.mlp_res_norm, masks[2 * i + 1], int(active_counts[2 * i + 1]))
 
-            # MLP sub-layer
             mlp_out = layer.ffn(layer.ffn_norm(h))
             partial = partial + mlp_out
 
-        # Final aggregation
         buf = _pad_and_stack(committed, partial)
-        x = self._route_static(buf, self.final_res_query, self.final_res_norm, masks[2 * self.config.num_layers])
+        x = self._route_static(buf, self.final_res_query, self.final_res_norm, masks[2 * self.config.num_layers], int(active_counts[2 * self.config.num_layers]))
         return self.norm(x)
 
     def forward(
