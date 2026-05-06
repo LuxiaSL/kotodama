@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 
 # ── Autograd communication primitives ──────────────────────────────────────
+#
+# Uses functional collectives (torch.distributed._functional_collectives)
+# where possible — they return new tensors (no in-place mutation),
+# have proper autograd integration, and don't cause torch.compile graph breaks.
 
 
 class _CopyToModelParallelRegion(torch.autograd.Function):
@@ -38,8 +42,9 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
-        return grad_output, None
+        grad = grad_output.clone()
+        dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=ctx.group)
+        return grad, None
 
 
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
@@ -51,8 +56,9 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
-        dist.all_reduce(input, op=dist.ReduceOp.SUM, group=group)
-        return input
+        output = input.clone()
+        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=group)
+        return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
@@ -264,3 +270,61 @@ def all_gather_along_dim(
     gathered = [torch.empty_like(tensor) for _ in range(world_size)]
     dist.all_gather(gathered, tensor.contiguous(), group=group)
     return torch.cat(gathered, dim=dim)
+
+
+# ── Post-backward gradient fixes for TP ────────────────────────────────────
+
+
+def sync_tp_replicated_grads(
+    model: torch.nn.Module,
+    tp_group: dist.ProcessGroup,
+) -> None:
+    """Sync gradients for replicated params that see sharded activations.
+
+    QK-norm weights operate per-head AFTER column-sharding, so each rank's
+    gradient only reflects its local heads. Must all-reduce (SUM) to get
+    the full gradient before the optimizer step.
+    """
+    for layer in model.layers:
+        attn = layer.attn
+        if not hasattr(attn, "q_norm"):
+            continue
+        for norm in (attn.q_norm, attn.k_norm):
+            for p in norm.parameters():
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=tp_group)
+
+
+def tp_clip_grad_norm(
+    model: torch.nn.Module,
+    max_norm: float,
+    tp_group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """Gradient clipping that accounts for TP-sharded param norms.
+
+    Sharded params have partial gradient norms on each rank. All-reduce
+    the squared norms across the TP group before computing the global
+    norm and clipping.
+    """
+    sharded_sq = torch.tensor(0.0, device="cuda")
+    replicated_sq = torch.tensor(0.0, device="cuda")
+
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        norm_sq = p.grad.data.float().norm() ** 2
+        if hasattr(p, "_tp_shard_dim"):
+            sharded_sq += norm_sq
+        else:
+            replicated_sq += norm_sq
+
+    dist.all_reduce(sharded_sq, op=dist.ReduceOp.SUM, group=tp_group)
+    total_norm = (sharded_sq + replicated_sq).sqrt()
+
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1.0:
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.data.mul_(clip_coef)
+
+    return total_norm

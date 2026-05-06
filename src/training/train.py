@@ -621,11 +621,20 @@ def train(args: argparse.Namespace) -> None:
         step_loss = _loss_accum.item() / current_grad_accum
         step_z_loss = _z_loss_accum.item() / current_grad_accum
 
-        # Gradient clipping (on the DDP model's parameters)
+        # TP: sync QK-norm gradients (they see sharded heads, need SUM)
+        if tp_group is not None and dp_size == 1:
+            from src.training.tensor_parallel import sync_tp_replicated_grads
+            sync_tp_replicated_grads(raw_model, tp_group)
+
+        # Gradient clipping — TP-aware norm when TP is active
         if args.gradient_clip > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), args.gradient_clip
-            )
+            if tp_group is not None:
+                from src.training.tensor_parallel import tp_clip_grad_norm
+                grad_norm = tp_clip_grad_norm(model, args.gradient_clip, tp_group)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.gradient_clip
+                )
         else:
             grad_norm = _compute_grad_norm(model.parameters())
 
