@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_EOS_TOKENS = [0, 1, 2]
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def generate(
     model: LuxiaBaseModel,
     input_ids: torch.Tensor,
@@ -28,12 +28,12 @@ def generate(
     temperature: float = 0.7,
     top_p: float | None = None,
     eos_tokens: list[int] | None = None,
-    max_seq_len: int = 2048,
+    max_seq_len: int = 4096,
 ) -> torch.Tensor:
-    """Autoregressive generation with temperature and optional top-p sampling.
+    """Autoregressive generation with KV cache and temperature sampling.
 
-    Uses a sliding window to respect the model's context length. Generation
-    stops when an EOS token is produced or max_new_tokens is reached.
+    Uses KV cache for O(n) generation instead of O(n²) full recomputation.
+    Falls back to full recomputation if the model doesn't return cache.
 
     Args:
         model: The model in eval mode.
@@ -43,7 +43,7 @@ def generate(
         top_p: Nucleus sampling threshold. None disables top-p.
         eos_tokens: Token IDs that signal end of generation.
             Defaults to [0, 1, 2] (SmolLM2 EOS tokens).
-        max_seq_len: Maximum sequence length for sliding window.
+        max_seq_len: Maximum sequence length.
 
     Returns:
         Full sequence tensor (prompt + generated), shape (1, total_len).
@@ -60,32 +60,45 @@ def generate(
         eos_tokens = DEFAULT_EOS_TOKENS
     eos_set = set(eos_tokens)
 
-    generated = input_ids.clone()
     device = input_ids.device
+    generated_ids: list[int] = input_ids[0].tolist()
+    past_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
-    for _ in range(max_new_tokens):
-        # Sliding window to respect context length
-        context = generated[:, -max_seq_len:]
+    # Prefill: process entire prompt
+    output = model(input_ids, use_cache=True)
+    logits = output["logits"] if isinstance(output, dict) else output
+    past_kv = output.get("past_kv") if isinstance(output, dict) else None
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            output = model(context)
-            logits = output["logits"] if isinstance(output, dict) else output
+    next_logits = logits[:, -1, :] / temperature
+    if top_p is not None:
+        next_logits = _apply_top_p(next_logits, top_p)
+    probs = F.softmax(next_logits, dim=-1)
+    next_token = torch.multinomial(probs, 1)
+    generated_ids.append(next_token.item())
 
-        # Sample next token
+    if next_token.item() in eos_set:
+        return torch.tensor([generated_ids], device=device)
+
+    # Decode: one token at a time with KV cache
+    for _ in range(max_new_tokens - 1):
+        if len(generated_ids) >= max_seq_len:
+            break
+
+        output = model(next_token, use_cache=True, past_kv=past_kv)
+        logits = output["logits"] if isinstance(output, dict) else output
+        past_kv = output.get("past_kv") if isinstance(output, dict) else None
+
         next_logits = logits[:, -1, :] / temperature
-
         if top_p is not None:
             next_logits = _apply_top_p(next_logits, top_p)
-
         probs = F.softmax(next_logits, dim=-1)
         next_token = torch.multinomial(probs, 1)
-
-        generated = torch.cat([generated, next_token], dim=1)
+        generated_ids.append(next_token.item())
 
         if next_token.item() in eos_set:
             break
 
-    return generated
+    return torch.tensor([generated_ids], device=device)
 
 
 def generate_text(

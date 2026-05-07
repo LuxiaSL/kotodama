@@ -184,6 +184,8 @@ def load_model(
 
     model.eval()
     model.to(device)
+    if "cuda" in str(device):
+        model.bfloat16()
 
     param_count = sum(p.numel() for p in model.parameters())
     logger.info(
