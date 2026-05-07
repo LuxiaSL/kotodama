@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -307,8 +307,9 @@ class GQAttention(nn.Module):
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """SDPA path: (B, nheads, S, D) layout."""
+        past_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """SDPA path: (B, nheads, S, D) layout. Returns (output, (cached_k, cached_v))."""
         bsz, seq_len, _ = x.shape
 
         q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -319,25 +320,31 @@ class GQAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
+        pos_offset = past_kv[0].shape[2] if past_kv is not None else 0
+
         if self._use_liger_rope:
-            # Liger fused RoPE — processes Q and K jointly in one Triton kernel
-            # MUST unsqueeze(0) — kernel uses cos.shape[0] as batch count
-            cos = rope_cos[:seq_len].unsqueeze(0)  # (1, S, D)
-            sin = rope_sin[:seq_len].unsqueeze(0)
+            cos = rope_cos[pos_offset:pos_offset + seq_len].unsqueeze(0)
+            sin = rope_sin[pos_offset:pos_offset + seq_len].unsqueeze(0)
             q, k = liger_rotary_pos_emb(q, k, cos, sin)
         else:
-            q = apply_rope(q, rope_cos[:seq_len], rope_sin[:seq_len])
-            k = apply_rope(k, rope_cos[:seq_len], rope_sin[:seq_len])
+            q = apply_rope(q, rope_cos[pos_offset:pos_offset + seq_len], rope_sin[pos_offset:pos_offset + seq_len])
+            k = apply_rope(k, rope_cos[pos_offset:pos_offset + seq_len], rope_sin[pos_offset:pos_offset + seq_len])
+
+        if past_kv is not None:
+            k = torch.cat([past_kv[0], k], dim=2)
+            v = torch.cat([past_kv[1], v], dim=2)
+
+        new_kv = (k, v)
 
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
-            is_causal=mask is None,
+            is_causal=(past_kv is None and mask is None),
             enable_gqa=True,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-        return self.o_proj(attn_output)
+        return self.o_proj(attn_output), new_kv
 
     def _forward_fa4(
         self,
@@ -375,21 +382,36 @@ class GQAttention(nn.Module):
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        past_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if self.tp_group is not None:
             from src.training.tensor_parallel import copy_to_parallel_region, reduce_from_parallel_region
             x = copy_to_parallel_region(x, self.tp_group)
 
+        new_kv: tuple[torch.Tensor, torch.Tensor] | None = None
+
+        if (past_kv is not None or use_cache) and self._attn_impl != "sdpa":
+            # KV cache only implemented for SDPA; fall through
+            pass
+
         # FA4/FA2 don't accept arbitrary masks — fall back to SDPA when mask is provided
-        if self._attn_impl == "fa4" and mask is None:
+        # KV cache forces SDPA path
+        if past_kv is not None or use_cache:
+            out, new_kv = self._forward_sdpa(x, rope_cos, rope_sin, mask, past_kv)
+        elif self._attn_impl == "fa4" and mask is None:
             out = self._forward_fa4(x, rope_cos, rope_sin)
         elif self._attn_impl == "fa2" and mask is None:
             out = self._forward_fa2(x, rope_cos, rope_sin)
         else:
             out = self._forward_sdpa(x, rope_cos, rope_sin, mask)
+            out = out[0]  # discard unused cache
 
         if self.tp_group is not None:
             out = reduce_from_parallel_region(out, self.tp_group)
+
+        if use_cache:
+            return out, new_kv
         return out
 
 
@@ -447,9 +469,17 @@ class TransformerBlock(nn.Module):
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin, mask)
+        past_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if use_cache:
+            attn_out, new_kv = self.attn(self.attn_norm(x), rope_cos, rope_sin, mask, past_kv, use_cache=True)
+            x = x + attn_out
+        else:
+            x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin, mask)
         x = x + self.ffn(self.ffn_norm(x))
+        if use_cache:
+            return x, new_kv
         return x
 
 
@@ -538,12 +568,7 @@ class LuxiaBaseModel(nn.Module):
             masks[2 * config.num_layers, :n_committed + 1] = True
             self.register_buffer("_attn_res_masks", masks, persistent=False)
 
-            active_counts = [int(masks[j].sum().item()) for j in range(masks.shape[0])]
-            self.register_buffer(
-                "_attn_res_active_counts",
-                torch.tensor(active_counts, dtype=torch.int32),
-                persistent=False,
-            )
+            self._attn_res_active_counts = [int(masks[j].sum().item()) for j in range(masks.shape[0])]
 
         # Precompute RoPE frequencies
         rope_cos, rope_sin = precompute_rope_frequencies(
@@ -690,39 +715,94 @@ class LuxiaBaseModel(nn.Module):
         x = self._route_static(buf, self.final_res_query, self.final_res_norm, masks[2 * self.config.num_layers], int(active_counts[2 * self.config.num_layers]))
         return self.norm(x)
 
+    def _forward_attn_res_cached(
+        self,
+        embed: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        past_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """AttnRes forward with KV cache support for autoregressive decoding."""
+        committed: list[torch.Tensor] = []
+        partial = embed
+        boundary_set = self._attn_res_boundary_set
+        max_s = self._attn_res_max_sources
+        masks = self._attn_res_masks
+        active_counts = self._attn_res_active_counts
+        rope_cos = self.rope_cos
+        rope_sin = self.rope_sin
+        zero = torch.zeros_like(embed)
+        new_kv_list: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        def _pad_and_stack(committed: list[torch.Tensor], partial: torch.Tensor) -> torch.Tensor:
+            sources = committed + [partial]
+            while len(sources) < max_s:
+                sources.append(zero)
+            return torch.stack(sources, dim=0)
+
+        for i, layer in enumerate(self.layers):
+            buf = _pad_and_stack(committed, partial)
+            h = self._route_static(buf, layer.attn_res_query, layer.attn_res_norm, masks[2 * i], int(active_counts[2 * i]))
+
+            if i in boundary_set:
+                committed.append(partial.clone())
+                partial = zero.clone()
+
+            layer_past = past_kv[i] if past_kv is not None else None
+            attn_out, layer_kv = layer.attn(layer.attn_norm(h), rope_cos, rope_sin, mask, layer_past, use_cache=True)
+            new_kv_list.append(layer_kv)
+            partial = partial + attn_out
+
+            buf = _pad_and_stack(committed, partial)
+            h = self._route_static(buf, layer.mlp_res_query, layer.mlp_res_norm, masks[2 * i + 1], int(active_counts[2 * i + 1]))
+
+            mlp_out = layer.ffn(layer.ffn_norm(h))
+            partial = partial + mlp_out
+
+        buf = _pad_and_stack(committed, partial)
+        x = self._route_static(buf, self.final_res_query, self.final_res_norm, masks[2 * self.config.num_layers], int(active_counts[2 * self.config.num_layers]))
+        return self.norm(x), new_kv_list
+
     def forward(
         self,
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        past_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
     ) -> dict[str, torch.Tensor]:
         x = self.embed_tokens(input_ids)
+        new_kv_list: list[tuple[torch.Tensor, torch.Tensor]] = []
 
         if self.config.attn_res:
-            # AttnRes has its own layer iteration with routing interleaved.
-            # Activation checkpointing is NOT applied here — the routing's shared
-            # committed state makes per-layer checkpointing unsound, and memory
-            # analysis shows 3B/6B/8B fit on 183GB B200s without it.
             if self.config.activation_checkpointing and self.training:
                 logger.warning_once(
                     "activation_checkpointing has no effect with attn_res=True. "
                     "AttnRes routing shares state across layers, making per-layer "
                     "checkpointing unsound. Memory fits without it on B200."
                 )
-            x = self._forward_attn_res(x, mask)
+            if use_cache:
+                x, new_kv_list = self._forward_attn_res_cached(x, mask, past_kv)
+            else:
+                x = self._forward_attn_res(x, mask)
         else:
-            for layer in self.layers:
+            for i, layer in enumerate(self.layers):
+                layer_past = past_kv[i] if past_kv is not None else None
                 if self.config.activation_checkpointing and self.training:
                     x = torch_checkpoint(
                         layer, x, self.rope_cos, self.rope_sin, mask,
                         use_reentrant=False,
-                        preserve_rng_state=False,  # no dropout anywhere — skip RNG stash/replay
+                        preserve_rng_state=False,
                     )
+                elif use_cache:
+                    x, layer_kv = layer(x, self.rope_cos, self.rope_sin, mask, layer_past, use_cache=True)
+                    new_kv_list.append(layer_kv)
                 else:
                     x = layer(x, self.rope_cos, self.rope_sin, mask)
             x = self.norm(x)
 
-        output: dict[str, torch.Tensor] = {}
+        output: dict[str, Any] = {}
+        if use_cache:
+            output["past_kv"] = new_kv_list
 
         if labels is not None:
             if self.fused_linear_ce_loss is not None and self.training:

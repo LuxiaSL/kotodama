@@ -34,6 +34,7 @@ Usage in training loop::
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -269,27 +270,27 @@ class GeometricMonitor:
                 healthy = sum(1 for a in all_alphas if 2.0 < a < 4.0)
                 metrics["geo/ww_alpha_healthy_frac"] = healthy / len(all_alphas)
 
-                # Per-weight-type breakdown (more useful than per-layer)
+                # Per-layer and per-weight-type breakdown
+                _type_buckets: dict[str, list[float]] = {}
                 for idx, row in details.iterrows():
                     name = str(row.get("name", ""))
                     alpha = row["alpha"]
                     if str(alpha) == "nan":
                         continue
-                    # Classify by weight type
+
+                    layer_match = re.search(r"layers\.(\d+)\.", name)
+                    layer_idx = int(layer_match.group(1)) if layer_match else None
+
                     for wtype in ["q_proj", "k_proj", "v_proj", "o_proj",
                                   "gate_proj", "up_proj", "down_proj"]:
                         if wtype in name:
-                            key = f"geo/ww_alpha_by_type/{wtype}"
-                            if key not in metrics:
-                                metrics[key] = []
-                            metrics[key].append(alpha)
+                            if layer_idx is not None:
+                                metrics[f"geo/ww_alpha/layer_{layer_idx}/{wtype}"] = alpha
+                            _type_buckets.setdefault(wtype, []).append(alpha)
+                            break
 
-                # Average per weight type
-                for key in list(metrics.keys()):
-                    if key.startswith("geo/ww_alpha_by_type/") and isinstance(metrics[key], list):
-                        vals = metrics[key]
-                        wtype = key.split("/")[-1]
-                        metrics[f"geo/ww_alpha_by_type/{wtype}"] = sum(vals) / len(vals)
+                for wtype, vals in _type_buckets.items():
+                    metrics[f"geo/ww_alpha_by_type/{wtype}"] = sum(vals) / len(vals)
 
         except ImportError:
             logger.warning("weightwatcher not installed — using proxy alpha")

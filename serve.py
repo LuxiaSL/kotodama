@@ -183,7 +183,7 @@ def _warmup_triton_kernels(model: LuxiaBaseModel, ctx: FastAttnResContext) -> No
     logger.info("Triton warmup done in %.1fs", time.time() - t0)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda") -> tuple[LuxiaBaseModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False) -> tuple[LuxiaBaseModel, AutoTokenizer]:
     global _device, _fast_ctx
     _device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", _device)
@@ -208,8 +208,12 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> tuple[LuxiaBaseMod
 
     model = model.to(_device).eval()
     if _device.type == "cuda":
-        # bfloat16: required by flash-attn-res Triton kernels (phase 1 outputs bf16)
         model = model.bfloat16()
+
+    if compile and _device.type == "cuda":
+        logger.info("Compiling model with torch.compile(dynamic=True)...")
+        model = torch.compile(model, dynamic=True)
+        logger.info("Compilation registered (will compile on first forward)")
 
     if use_fast:
         _fast_ctx = FastAttnResContext(model)
@@ -330,13 +334,35 @@ def generate(
     generated_ids: list[int] = []
     t0 = time.perf_counter()
 
-    for _ in range(request.max_new_tokens):
-        if input_ids.shape[1] >= model.config.max_position_embeddings:
+    # Prefill: process entire prompt, cache KV
+    output = model(input_ids, use_cache=True)
+    logits = output["logits"]
+    past_kv = output.get("past_kv")
+
+    next_logits = logits[0, -1]
+    token_id = sample_next_token(
+        next_logits, request.temperature, request.top_k, request.top_p,
+        request.repetition_penalty, generated_ids,
+    )
+
+    if token_id == tokenizer.eos_token_id:
+        elapsed = time.perf_counter() - t0
+        return GenerateResponse(text="", prompt_tokens=prompt_len,
+                                completion_tokens=0, tokens_per_second=0.0)
+
+    generated_ids.append(token_id)
+    next_input = torch.tensor([[token_id]], device=_device)
+
+    # Decode: one token at a time with KV cache
+    for _ in range(request.max_new_tokens - 1):
+        if prompt_len + len(generated_ids) >= model.config.max_position_embeddings:
             break
 
-        logits = model_forward(model, input_ids)
-        next_logits = logits[0, -1]
+        output = model(next_input, use_cache=True, past_kv=past_kv)
+        logits = output["logits"]
+        past_kv = output.get("past_kv")
 
+        next_logits = logits[0, -1]
         token_id = sample_next_token(
             next_logits, request.temperature, request.top_k, request.top_p,
             request.repetition_penalty, generated_ids,
@@ -346,7 +372,7 @@ def generate(
             break
 
         generated_ids.append(token_id)
-        input_ids = torch.cat([input_ids, torch.tensor([[token_id]], device=_device)], dim=1)
+        next_input = torch.tensor([[token_id]], device=_device)
 
         if request.stop_strings:
             decoded_so_far = tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -381,12 +407,37 @@ async def generate_stream(
     generated_ids: list[int] = []
     prev_text = ""
 
-    for _ in range(request.max_new_tokens):
-        if input_ids.shape[1] >= model.config.max_position_embeddings:
+    # Prefill
+    output = model(input_ids, use_cache=True)
+    past_kv = output.get("past_kv")
+    next_logits = output["logits"][0, -1]
+
+    token_id = sample_next_token(
+        next_logits, request.temperature, request.top_k, request.top_p,
+        request.repetition_penalty, generated_ids,
+    )
+
+    if token_id == tokenizer.eos_token_id:
+        yield f"data: {json.dumps({'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': 0})}\n\n"
+        return
+
+    generated_ids.append(token_id)
+    next_input = torch.tensor([[token_id]], device=_device)
+
+    current_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    delta = current_text
+    prev_text = current_text
+    if delta:
+        yield f"data: {json.dumps({'token': delta})}\n\n"
+
+    # Decode with KV cache
+    for _ in range(request.max_new_tokens - 1):
+        if prompt_len + len(generated_ids) >= model.config.max_position_embeddings:
             break
 
-        logits = model_forward(model, input_ids)
-        next_logits = logits[0, -1]
+        output = model(next_input, use_cache=True, past_kv=past_kv)
+        past_kv = output.get("past_kv")
+        next_logits = output["logits"][0, -1]
 
         token_id = sample_next_token(
             next_logits, request.temperature, request.top_k, request.top_p,
@@ -397,7 +448,7 @@ async def generate_stream(
             break
 
         generated_ids.append(token_id)
-        input_ids = torch.cat([input_ids, torch.tensor([[token_id]], device=_device)], dim=1)
+        next_input = torch.tensor([[token_id]], device=_device)
 
         current_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
         delta = current_text[len(prev_text):]
@@ -416,12 +467,13 @@ async def generate_stream(
 # ── App ─────────────────────────────────────────────────────────────────────────
 
 _checkpoint_path = DEFAULT_CHECKPOINT
+_compile_arg = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _model, _tokenizer
-    _model, _tokenizer = load_model(_checkpoint_path, _device_arg)
+    _model, _tokenizer = load_model(_checkpoint_path, _device_arg, compile=_compile_arg)
     yield
 
 
@@ -550,12 +602,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="luxia-base DD-v1 inference server")
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT, help="Path to checkpoint .pt file")
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile(dynamic=True) for faster inference")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
 
     _checkpoint_path = args.checkpoint
     _device_arg = args.device
+    _compile_arg = args.compile
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

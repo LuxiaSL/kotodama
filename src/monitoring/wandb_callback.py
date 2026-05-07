@@ -59,6 +59,8 @@ class WandbLogger:
         self._wandb_run = None
         self._jsonl_path: Optional[Path] = None
         self._jsonl_file = None
+        self._geo_jsonl_path: Optional[Path] = None
+        self._geo_jsonl_file = None
 
         if not enabled:
             logger.info("Wandb logging disabled")
@@ -68,12 +70,15 @@ class WandbLogger:
         self._loss_history: deque[tuple[int, float]] = deque(maxlen=100)
         self._rankme_history: deque[tuple[int, float]] = deque(maxlen=50)
 
-        # Set up JSONL local log
+        # Set up JSONL local logs
         log_dir_path = Path(log_dir)
         log_dir_path.mkdir(parents=True, exist_ok=True)
         self._jsonl_path = log_dir_path / "metrics.jsonl"
         self._jsonl_file = open(self._jsonl_path, "a")
+        self._geo_jsonl_path = log_dir_path / "geo_metrics.jsonl"
+        self._geo_jsonl_file = open(self._geo_jsonl_path, "a")
         logger.info("JSONL metrics log: %s", self._jsonl_path)
+        logger.info("JSONL geo metrics log: %s", self._geo_jsonl_path)
 
         # Initialize wandb
         try:
@@ -114,6 +119,7 @@ class WandbLogger:
         tokens_consumed: int,
         gpu_mem_gb: float,
         step_time_s: float,
+        iters_per_sec: float = 0.0,
     ) -> None:
         """Log core training metrics for one optimizer step."""
         # Track loss history for slope computation
@@ -127,6 +133,7 @@ class WandbLogger:
             "optim/muon_lr": muon_lr,
             "optim/adamw_lr": adamw_lr,
             "perf/tokens_per_sec": tokens_per_sec,
+            "perf/iters_per_sec": iters_per_sec,
             "perf/gpu_mem_gb": gpu_mem_gb,
             "perf/step_time_s": step_time_s,
             "data/tokens_consumed": tokens_consumed,
@@ -152,6 +159,15 @@ class WandbLogger:
             if len(self._rankme_history) >= 5:
                 slope = _linear_slope(list(self._rankme_history))
                 geo_metrics["geo/rankme_slope"] = slope
+
+        # Full-fidelity geo dump (dedicated JSONL, includes per-layer detail)
+        if self._geo_jsonl_file is not None:
+            try:
+                record = {"step": step, "timestamp": time.time(), **geo_metrics}
+                self._geo_jsonl_file.write(json.dumps(record) + "\n")
+                self._geo_jsonl_file.flush()
+            except Exception as e:
+                logger.debug("Geo JSONL write failed: %s", e)
 
         self._log(step, geo_metrics)
 
@@ -209,6 +225,12 @@ class WandbLogger:
         if self._jsonl_file is not None:
             try:
                 self._jsonl_file.close()
+            except Exception:
+                pass
+
+        if self._geo_jsonl_file is not None:
+            try:
+                self._geo_jsonl_file.close()
             except Exception:
                 pass
 
