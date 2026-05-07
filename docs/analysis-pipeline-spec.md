@@ -327,31 +327,57 @@ Composite health score (experimental):
 
 **Replaces:** `eval_lang_full.py`, `eval_lang_full_multisample.py`, `eval_full_matrix.py`, `eval_temperature_matrix.py`, `eval_nca_vs_p3.py`, `eval_proxy_sweep.py`
 
-**Script:** `scripts/analysis/eval_generate.py`
+**Preferred method: serve.py + eval_via_server.py**
 
-**Input:**
-- Checkpoint path(s) via CLI
-- Prompt set (standard/extended/custom via config)
-- Generation config (temperature, top_p, max_tokens, n_samples)
+The fastest generation path uses `serve.py` (inference server with KV cache, bf16, optional torch.compile, Triton-fused AttnRes) combined with `eval_via_server.py` (client that hits the server and produces Track 3 JSON).
 
-**Output:** `analysis/generations.json`
+```bash
+# 1. Launch serve.py on a GPU node (via Heimdall or directly)
+heimdall submit 'tools/run_eval.sh serve.py --checkpoint <path> --device cuda --port 2222 --compile' \
+    --name eval-serve --type custom --gpus 1 --node node2 \
+    --workdir /home/athuser/luxi-files/kotodama
+
+# 2. Hit it from local with the eval client
+python scripts/analysis/eval_via_server.py \
+    --url http://node2.datasci.ath:2222 \
+    --name <run-name> \
+    --prompt-set extended --n-samples 3 --temperature 0.7 --max-tokens 512
+
+# 3. Kill the server when done
+heimdall cancel <job-id>
+```
+
+**Alternative: eval_generate.py** (standalone, slower)
+
+`scripts/analysis/eval_generate.py` loads the model directly and generates without a server. Uses KV cache but does not use the Triton-fused AttnRes path. Suitable for quick tests or when serve.py isn't available.
+
+```bash
+# Via Heimdall
+heimdall submit 'tools/run_eval.sh scripts/analysis/eval_generate.py \
+    --checkpoint <path> --name <run-name> \
+    --attn-res "boundaries=0,3,7,12,21,25" --no-ppl \
+    --prompt-set extended --n-samples 3' \
+    --name eval-gen --type custom --gpus 1 --node node2 \
+    --workdir /home/athuser/luxi-files/kotodama
+```
+
+**Output:** `analysis/{run_name}/generations.json`
 ```json
 {
-  "config": {"temperature": 0.7, "top_p": null, "max_tokens": 1024, "n_samples": 5},
+  "config": {"temperature": 0.7, "top_p": null, "max_tokens": 512, "n_samples": 3},
   "runs": [
     {
-      "name": "lang-ddv1",
+      "name": "owt-ddv1",
       "checkpoint": "path/to/checkpoint.pt",
-      "eval_loss": 2.899,
-      "eval_ppl": 18.15,
       "samples": [
         {
           "prompt_idx": 0,
           "prompt": "The most interesting thing about language is",
           "sample_idx": 0,
           "continuation": "...",
-          "n_tokens": 342,
-          "stopped_by": "eos"
+          "n_tokens": 512,
+          "tokens_per_second": 45.6,
+          "stopped_by": "max_tokens"
         }
       ]
     }
@@ -359,7 +385,7 @@ Composite health score (experimental):
 }
 ```
 
-Uses shared modules: model_loader, generate, perplexity, prompt sets.
+**Performance:** serve.py with KV cache: ~45 tok/s on B200 (108M model, no compile). Without KV cache: ~2.4 tok/s (O(n²) recomputation — do not use).
 
 **Requires:** GPU
 
