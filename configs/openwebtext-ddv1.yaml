@@ -1,0 +1,57 @@
+# OpenWebText DD-v1 comparison run
+# Matches lang-full-ddv1 proxy setup but trained on OpenWebText (~9.3B tokens)
+# Purpose: matched-data comparison vs GPT-2 (same data, different architecture)
+
+# Model
+model_size: proxy
+
+# AttnRes DD-v1
+attn_res: true
+attn_res_boundaries: "0,3,7,12,21,25"
+
+# Data
+data_path: /dev/shm/luxia-data/openwebtext_smollm2.bin
+sequence_length: 4096
+micro_batch_size: 16
+
+# Training
+total_tokens: 9_300_000_000
+lr: 0.02
+adamw_lr: 0.0006
+warmup_steps: 2000
+decay_start_pct: 0.90
+decay_type: sqrt
+gradient_clip: 1.0
+
+# Muon
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+
+# NCA resume
+resume_nca: checkpoints/nca-seed17-flat/step_00005500.pt
+
+# Optimizations
+compile: true
+attn_impl: auto
+fp8: true
+use_liger: false
+
+# Checkpointing — async, save every ~1B tokens, keep all for geometric analysis
+checkpoint_dir: checkpoints/openwebtext-ddv1
+save_every: 3800
+keep_checkpoints: 20
+async_checkpoint: true
+checkpoint_shm_dir: /dev/shm/luxia-base-ckpts
+
+# Geometric monitoring
+geo_monitor: true
+geo_monitor_tier1_every: 75
+geo_monitor_tier2_every: 500
+
+# Logging
+log_every: 10
+wandb: true
+wandb_project: kotodama-ddv1-openwebtext
+wandb_run_name: openwebtext-ddv1-9B
