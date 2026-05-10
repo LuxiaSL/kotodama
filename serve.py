@@ -1,8 +1,16 @@
 """
-Inference server for luxia-base proxy DD-v1 model.
+Inference server for kotodama 108M models.
 
 Usage:
-    python serve.py [--checkpoint PATH] [--device cuda|cpu] [--port 8000] [--host 0.0.0.0]
+    python serve.py --model kotodama-108m-base-fc [--compile]
+    python serve.py --model kotodama-108m-instruct-fc [--compile]
+    python serve.py --checkpoint /path/to/custom.pt --mode chat
+
+Models (resolved from checkpoints/serving/):
+    kotodama-108m-base-fc       — fullcorpus pretrained (text completion)
+    kotodama-108m-base-bcpt     — books CPT pretrained (text completion)
+    kotodama-108m-instruct-fc   — fullcorpus SFT (chat, auto-detected)
+    kotodama-108m-instruct-bcpt — books CPT SFT (chat, auto-detected)
 
 Requires: fastapi, uvicorn, transformers (tokenizer only), torch
 Optional: triton (enables fused AttnRes kernels, ~2x routing speedup)
@@ -11,16 +19,28 @@ Optional: triton (enables fused AttnRes kernels, ~2x routing speedup)
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
+import os
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
+
+# CPU threading: 2 threads is optimal for single-request GPU inference.
+# cuDNN SDPA needs >= 2 threads; beyond that, overhead is kernel launch
+# latency (not parallelizable). Avoids 128-thread default on large Xeons.
+_SERVE_THREADS = int(os.environ.get("LUXIA_SERVE_THREADS", "2"))
+os.environ.setdefault("OMP_NUM_THREADS", str(_SERVE_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(_SERVE_THREADS))
 
 import torch
 import torch.nn.functional as F
+
+torch.set_num_threads(_SERVE_THREADS)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -47,9 +67,30 @@ except Exception:
 
 # ── Defaults ────────────────────────────────────────────────────────────────────
 
-DEFAULT_CHECKPOINT = "checkpoints/lang-full-ddv1/step_00045775.pt"
+SERVING_DIR = Path("checkpoints/serving")
+KNOWN_MODELS: dict[str, str] = {
+    "kotodama-108m-base-fc": "kotodama-108m-base-fc.pt.zst",
+    "kotodama-108m-base-bcpt": "kotodama-108m-base-bcpt.pt.zst",
+    "kotodama-108m-instruct-fc": "kotodama-108m-instruct-fc.pt",
+    "kotodama-108m-instruct-bcpt": "kotodama-108m-instruct-bcpt.pt",
+}
+DEFAULT_CHECKPOINT = str(SERVING_DIR / KNOWN_MODELS["kotodama-108m-base-fc"])
 TOKENIZER_NAME = "HuggingFaceTB/SmolLM2-135M"
 DDV1_BOUNDARIES = [0, 3, 7, 12, 21, 25]
+
+CHATML_TEMPLATE = (
+    "{% for message in messages %}"
+    "<|im_start|>{{ message['role'] }}\n"
+    "{{ message['content'] }}<|im_end|>\n"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"
+    "<|im_start|>assistant\n"
+    "{% endif %}"
+)
+IM_END_TOKEN_ID = 2
+
+BASE_STOP_TOKEN_IDS = frozenset({0})
+CHAT_STOP_TOKEN_IDS = frozenset({0, 2})
 
 PROXY_CONFIG = dict(
     hidden_size=512,
@@ -167,9 +208,12 @@ def fast_forward_attn_res(ctx: FastAttnResContext, embed: torch.Tensor) -> torch
 # ── Global state ────────────────────────────────────────────────────────────────
 
 _model: LuxiaBaseModel | None = None
+_compiled_model: torch.nn.Module | None = None
 _tokenizer: AutoTokenizer | None = None
 _device: torch.device = torch.device("cpu")
 _fast_ctx: FastAttnResContext | None = None
+_serve_mode: str = "base"
+_stop_token_ids: frozenset[int] = BASE_STOP_TOKEN_IDS
 
 
 @torch.inference_mode()
@@ -183,9 +227,75 @@ def _warmup_triton_kernels(model: LuxiaBaseModel, ctx: FastAttnResContext) -> No
     logger.info("Triton warmup done in %.1fs", time.time() - t0)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False) -> tuple[LuxiaBaseModel, AutoTokenizer]:
-    global _device, _fast_ctx
-    _device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
+@torch.inference_mode()
+def _warmup_sdpa_cache(model: LuxiaBaseModel, max_seq_len: int = 4096, step: int = 64) -> None:
+    """Prime SDPA plan cache by decoding across representative KV lengths.
+
+    cuDNN SDPA selects an algorithm per unique KV shape. Without warmup,
+    each novel shape costs ~300ms of CPU-side plan selection. This runs a
+    single decode sweep so all shapes are cached before serving.
+    """
+    logger.info("Warming up SDPA plan cache (up to %d tokens, step %d)...", max_seq_len, step)
+    t0 = time.time()
+
+    dummy_ids = torch.zeros(1, 1, dtype=torch.long, device=_device)
+    out = model(dummy_ids, use_cache=True)
+    past_kv = out["past_kv"]
+    tok = out["logits"][0, -1].argmax().unsqueeze(0).unsqueeze(0)
+
+    target_positions = list(range(step, max_seq_len, step))
+    pos = 1
+    for target in target_positions:
+        while pos < target:
+            out = model(tok, use_cache=True, past_kv=past_kv)
+            past_kv = out["past_kv"]
+            tok = out["logits"][0, -1].argmax().unsqueeze(0).unsqueeze(0)
+            pos += 1
+
+    torch.cuda.synchronize()
+    logger.info("SDPA warmup done in %.1fs (%d positions)", time.time() - t0, pos)
+
+
+@torch.inference_mode()
+def _warmup_compile(model: LuxiaBaseModel, compiled_model: torch.nn.Module) -> None:
+    """Trigger torch.compile specialization for the decode path.
+
+    Warms compiled decode after prefills at multiple prompt lengths to cover
+    the shape specializations that real requests will hit. The first 2-3
+    compiled decode steps trigger inductor compilation (~30-45s total on cold
+    cache, faster with inductor cache). After that, decode is stable.
+    """
+    logger.info("Warming up torch.compile decode path...")
+    t0 = time.time()
+
+    for plen in [16, 128, 1024]:
+        dummy_ids = torch.zeros(1, plen, dtype=torch.long, device=_device)
+        out = model(dummy_ids, use_cache=True)
+        torch.cuda.synchronize(_device)
+        past_kv = out["past_kv"]
+        tok = out["logits"][0, -1].argmax().unsqueeze(0).unsqueeze(0)
+
+        for i in range(4):
+            t_step = time.time()
+            out = compiled_model(tok, use_cache=True, past_kv=past_kv)
+            torch.cuda.synchronize(_device)
+            elapsed = time.time() - t_step
+            past_kv = out["past_kv"]
+            tok = out["logits"][0, -1].argmax().unsqueeze(0).unsqueeze(0)
+            if elapsed > 1.0:
+                logger.info("  Compile warmup plen=%d step %d: %.1fs (compilation)", plen, i, elapsed)
+
+    logger.info("Compile warmup done in %.1fs", time.time() - t0)
+
+
+def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False, mode: str = "base") -> tuple[LuxiaBaseModel, torch.nn.Module | None, AutoTokenizer]:
+    global _device, _fast_ctx, _serve_mode, _stop_token_ids
+    _serve_mode = mode
+    _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
+    if device.startswith("cuda") and torch.cuda.is_available():
+        _device = torch.device(device)
+    else:
+        _device = torch.device("cpu")
     logger.info("Device: %s", _device)
 
     use_fast = _FAST_ATTNRES_AVAILABLE and _device.type == "cuda"
@@ -200,7 +310,16 @@ def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     logger.info("Loading checkpoint: %s", ckpt_path)
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if ckpt_path.suffix == ".zst":
+        import zstandard as zstd
+        logger.info("Decompressing zstd checkpoint...")
+        dctx = zstd.ZstdDecompressor()
+        with open(ckpt_path, "rb") as f_in:
+            decompressed = dctx.decompress(f_in.read())
+        ckpt = torch.load(io.BytesIO(decompressed), map_location="cpu", weights_only=False)
+        del decompressed
+    else:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     state_dict = ckpt.get("model", ckpt)
     model.load_state_dict(state_dict, strict=True)
@@ -209,11 +328,6 @@ def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False
     model = model.to(_device).eval()
     if _device.type == "cuda":
         model = model.bfloat16()
-
-    if compile and _device.type == "cuda":
-        logger.info("Compiling model with torch.compile(dynamic=True)...")
-        model = torch.compile(model, dynamic=True)
-        logger.info("Compilation registered (will compile on first forward)")
 
     if use_fast:
         _fast_ctx = FastAttnResContext(model)
@@ -224,18 +338,54 @@ def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False
         if _device.type == "cuda":
             logger.info("Triton not available, using standard AttnRes forward")
 
+    if _device.type == "cuda":
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        logger.info("cuDNN SDP disabled (using flash/math backend)")
+
+    compiled_model: torch.nn.Module | None = None
+    if compile and _device.type == "cuda":
+        logger.info("Creating torch.compile(dynamic=True) decode model...")
+        compiled_model = torch.compile(model, dynamic=True)
+        _warmup_compile(model, compiled_model)
+    else:
+        _warmup_sdpa_cache(model, config.max_position_embeddings, step=64)
+
+    # Run a few prefills at different lengths to warm any remaining caches
+    if _device.type == "cuda":
+        logger.info("Warming up prefill path...")
+        with torch.inference_mode():
+            for plen in [1, 16, 128, 512]:
+                dummy = torch.zeros(1, plen, dtype=torch.long, device=_device)
+                model(dummy, use_cache=True)
+            torch.cuda.synchronize(_device)
+        logger.info("Prefill warmup done")
+
+        # Release warmup workspace back to the CUDA allocator
+        torch.cuda.empty_cache()
+        alloc = torch.cuda.memory_allocated(_device) / 1e9
+        reserved = torch.cuda.memory_reserved(_device) / 1e9
+        logger.info("Post-warmup memory: %.3f GB allocated, %.3f GB reserved", alloc, reserved)
+
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    logger.info("Tokenizer loaded: %s (vocab %d)", TOKENIZER_NAME, len(tokenizer))
+    if mode == "chat":
+        tokenizer.chat_template = CHATML_TEMPLATE
+    logger.info("Tokenizer loaded: %s (vocab %d, mode=%s)", TOKENIZER_NAME, len(tokenizer), mode)
 
-    return model, tokenizer
+    return model, compiled_model, tokenizer
 
 
 # ── Request/response schemas ────────────────────────────────────────────────────
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
 class GenerateRequest(BaseModel):
-    prompt: str
+    prompt: str | None = None
+    messages: list[ChatMessage] | None = None
     max_new_tokens: int = Field(default=256, ge=1, le=2048)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_k: int = Field(default=50, ge=0)
@@ -250,15 +400,32 @@ class GenerateResponse(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     tokens_per_second: float
+    timing: dict[str, float] | None = None
 
 
 class ModelInfo(BaseModel):
     name: str
+    mode: str
     params: int
     config: dict
     device: str
     checkpoint: str
-    fast_attnres: bool
+    triton_attn_res: bool
+    compiled_decode: bool
+
+
+def _resolve_prompt(request: GenerateRequest, tokenizer: AutoTokenizer) -> str:
+    """Resolve prompt text from either raw prompt or messages array."""
+    if request.messages is not None:
+        if _serve_mode != "chat":
+            raise HTTPException(400, "messages field requires --mode chat")
+        msgs = [{"role": m.role, "content": m.content} for m in request.messages]
+        return tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True,
+        )
+    if request.prompt is not None:
+        return request.prompt
+    raise HTTPException(400, "Either 'prompt' or 'messages' must be provided")
 
 
 # ── Sampling ────────────────────────────────────────────────────────────────────
@@ -325,8 +492,14 @@ def generate(
     tokenizer: AutoTokenizer,
     request: GenerateRequest,
 ) -> GenerateResponse:
-    input_ids = tokenizer.encode(request.prompt, return_tensors="pt").to(_device)
+    timing: dict[str, float] = {}
+
+    # Tokenization
+    t_tok = time.perf_counter()
+    prompt_text = _resolve_prompt(request, tokenizer)
+    input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
     prompt_len = input_ids.shape[1]
+    timing["tokenize_ms"] = (time.perf_counter() - t_tok) * 1000
 
     if prompt_len >= model.config.max_position_embeddings:
         raise HTTPException(400, f"Prompt too long: {prompt_len} tokens (max {model.config.max_position_embeddings})")
@@ -334,53 +507,96 @@ def generate(
     generated_ids: list[int] = []
     t0 = time.perf_counter()
 
-    # Prefill: process entire prompt, cache KV
+    # Use compiled model for decode if available, eager for prefill
+    decode_model = _compiled_model if _compiled_model is not None else model
+
+    # Prefill: process entire prompt, cache KV (always eager — variable prompt shapes)
+    if _device.type == "cuda":
+        torch.cuda.synchronize(_device)
+    t_prefill = time.perf_counter()
     output = model(input_ids, use_cache=True)
+    if _device.type == "cuda":
+        torch.cuda.synchronize(_device)
+    timing["prefill_ms"] = (time.perf_counter() - t_prefill) * 1000
+
     logits = output["logits"]
     past_kv = output.get("past_kv")
 
+    t_sample = time.perf_counter()
     next_logits = logits[0, -1]
     token_id = sample_next_token(
         next_logits, request.temperature, request.top_k, request.top_p,
         request.repetition_penalty, generated_ids,
     )
+    timing["first_sample_ms"] = (time.perf_counter() - t_sample) * 1000
 
-    if token_id == tokenizer.eos_token_id:
+    if token_id in _stop_token_ids:
         elapsed = time.perf_counter() - t0
         return GenerateResponse(text="", prompt_tokens=prompt_len,
-                                completion_tokens=0, tokens_per_second=0.0)
+                                completion_tokens=0, tokens_per_second=0.0,
+                                timing=timing)
 
     generated_ids.append(token_id)
     next_input = torch.tensor([[token_id]], device=_device)
 
-    # Decode: one token at a time with KV cache
+    # Decode: one token at a time with KV cache (compiled if available)
+    decode_forward_ms = 0.0
+    decode_sample_ms = 0.0
+    decode_stop_ms = 0.0
+    decode_text_ms = 0.0
+
     for _ in range(request.max_new_tokens - 1):
         if prompt_len + len(generated_ids) >= model.config.max_position_embeddings:
             break
 
-        output = model(next_input, use_cache=True, past_kv=past_kv)
+        if _device.type == "cuda":
+            torch.cuda.synchronize(_device)
+        t_fwd = time.perf_counter()
+        output = decode_model(next_input, use_cache=True, past_kv=past_kv)
+        if _device.type == "cuda":
+            torch.cuda.synchronize(_device)
+        decode_forward_ms += (time.perf_counter() - t_fwd) * 1000
+
         logits = output["logits"]
         past_kv = output.get("past_kv")
 
+        t_samp = time.perf_counter()
         next_logits = logits[0, -1]
         token_id = sample_next_token(
             next_logits, request.temperature, request.top_k, request.top_p,
             request.repetition_penalty, generated_ids,
         )
+        decode_sample_ms += (time.perf_counter() - t_samp) * 1000
 
-        if token_id == tokenizer.eos_token_id:
+        if token_id in _stop_token_ids:
             break
 
         generated_ids.append(token_id)
         next_input = torch.tensor([[token_id]], device=_device)
 
         if request.stop_strings:
+            t_stop = time.perf_counter()
             decoded_so_far = tokenizer.decode(generated_ids, skip_special_tokens=True)
             if any(s in decoded_so_far for s in request.stop_strings):
+                decode_stop_ms += (time.perf_counter() - t_stop) * 1000
                 break
+            decode_stop_ms += (time.perf_counter() - t_stop) * 1000
 
     elapsed = time.perf_counter() - t0
+
+    t_decode_text = time.perf_counter()
     completion_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    timing["final_decode_ms"] = (time.perf_counter() - t_decode_text) * 1000
+
+    n_decode_tokens = max(len(generated_ids) - 1, 0)
+    timing["decode_forward_total_ms"] = round(decode_forward_ms, 2)
+    timing["decode_sample_total_ms"] = round(decode_sample_ms, 2)
+    timing["decode_stop_total_ms"] = round(decode_stop_ms, 2)
+    if n_decode_tokens > 0:
+        timing["decode_forward_per_token_ms"] = round(decode_forward_ms / n_decode_tokens, 2)
+        timing["decode_sample_per_token_ms"] = round(decode_sample_ms / n_decode_tokens, 2)
+    timing["total_ms"] = round(elapsed * 1000, 2)
+
     tps = len(generated_ids) / elapsed if elapsed > 0 else 0.0
 
     return GenerateResponse(
@@ -388,6 +604,7 @@ def generate(
         prompt_tokens=prompt_len,
         completion_tokens=len(generated_ids),
         tokens_per_second=round(tps, 1),
+        timing=timing,
     )
 
 
@@ -397,7 +614,8 @@ async def generate_stream(
     tokenizer: AutoTokenizer,
     request: GenerateRequest,
 ):
-    input_ids = tokenizer.encode(request.prompt, return_tensors="pt").to(_device)
+    prompt_text = _resolve_prompt(request, tokenizer)
+    input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
     prompt_len = input_ids.shape[1]
 
     if prompt_len >= model.config.max_position_embeddings:
@@ -407,7 +625,9 @@ async def generate_stream(
     generated_ids: list[int] = []
     prev_text = ""
 
-    # Prefill
+    decode_model = _compiled_model if _compiled_model is not None else model
+
+    # Prefill (always eager)
     output = model(input_ids, use_cache=True)
     past_kv = output.get("past_kv")
     next_logits = output["logits"][0, -1]
@@ -417,7 +637,7 @@ async def generate_stream(
         request.repetition_penalty, generated_ids,
     )
 
-    if token_id == tokenizer.eos_token_id:
+    if token_id in _stop_token_ids:
         yield f"data: {json.dumps({'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': 0})}\n\n"
         return
 
@@ -430,12 +650,12 @@ async def generate_stream(
     if delta:
         yield f"data: {json.dumps({'token': delta})}\n\n"
 
-    # Decode with KV cache
+    # Decode with KV cache (compiled if available)
     for _ in range(request.max_new_tokens - 1):
         if prompt_len + len(generated_ids) >= model.config.max_position_embeddings:
             break
 
-        output = model(next_input, use_cache=True, past_kv=past_kv)
+        output = decode_model(next_input, use_cache=True, past_kv=past_kv)
         past_kv = output.get("past_kv")
         next_logits = output["logits"][0, -1]
 
@@ -444,7 +664,7 @@ async def generate_stream(
             request.repetition_penalty, generated_ids,
         )
 
-        if token_id == tokenizer.eos_token_id:
+        if token_id in _stop_token_ids:
             break
 
         generated_ids.append(token_id)
@@ -468,16 +688,28 @@ async def generate_stream(
 
 _checkpoint_path = DEFAULT_CHECKPOINT
 _compile_arg = False
+_mode_arg = "base"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model, _tokenizer
-    _model, _tokenizer = load_model(_checkpoint_path, _device_arg, compile=_compile_arg)
+    global _model, _compiled_model, _tokenizer
+    _model, _compiled_model, _tokenizer = load_model(
+        _checkpoint_path, _device_arg, compile=_compile_arg, mode=_mode_arg,
+    )
     yield
 
 
-app = FastAPI(title="luxia-base DD-v1", lifespan=lifespan)
+def _model_name() -> str:
+    ckpt_stem = Path(_checkpoint_path).stem.removesuffix(".pt")
+    for name in KNOWN_MODELS:
+        if ckpt_stem.startswith(name):
+            return name
+    suffix = "instruct" if _serve_mode == "chat" else "base"
+    return f"kotodama-108m-{suffix}-unknown"
+
+
+app = FastAPI(title="luxia DD-v1", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -496,13 +728,27 @@ async def info():
     if _model is None:
         raise HTTPException(503, "Model not loaded")
     return ModelInfo(
-        name="luxia-base-proxy-ddv1",
+        name=_model_name(),
+        mode=_serve_mode,
         params=_model.config.param_count(),
         config=asdict(_model.config),
         device=str(_device),
         checkpoint=_checkpoint_path,
-        fast_attnres=_fast_ctx is not None,
+        triton_attn_res=_FAST_ATTNRES_AVAILABLE and _device.type == "cuda",
+        compiled_decode=_compiled_model is not None,
     )
+
+
+@app.get("/memory")
+async def memory():
+    if _device.type != "cuda":
+        return {"device": "cpu"}
+    return {
+        "device": str(_device),
+        "allocated_gb": round(torch.cuda.memory_allocated(_device) / 1e9, 3),
+        "reserved_gb": round(torch.cuda.memory_reserved(_device) / 1e9, 3),
+        "peak_gb": round(torch.cuda.max_memory_allocated(_device) / 1e9, 3),
+    }
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -523,7 +769,7 @@ async def generate_endpoint(request: GenerateRequest):
 
 class OAICompletionRequest(BaseModel):
     prompt: str
-    model: str = "luxia-base-proxy-ddv1"
+    model: str = ""
     max_tokens: int = Field(default=256, ge=1, le=2048)
     n: int = Field(default=1, ge=1, le=8)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
@@ -572,7 +818,7 @@ async def oai_completions(request: OAICompletionRequest):
         "id": f"cmpl-luxia-{int(time.time())}",
         "object": "text_completion",
         "created": int(time.time()),
-        "model": "luxia-base-proxy-ddv1",
+        "model": _model_name(),
         "choices": choices,
         "usage": {
             "prompt_tokens": prompt_tokens,
@@ -584,13 +830,131 @@ async def oai_completions(request: OAICompletionRequest):
 
 @app.get("/v1/models")
 async def oai_models():
+    active = _model_name()
     return {
         "object": "list",
-        "data": [{
-            "id": "luxia-base-proxy-ddv1",
-            "object": "model",
-            "owned_by": "aethera-gp",
-        }],
+        "data": [
+            {
+                "id": name,
+                "object": "model",
+                "owned_by": "aethera-gp",
+                "active": name == active,
+            }
+            for name in KNOWN_MODELS
+        ],
+    }
+
+
+# ── OpenAI-compatible /v1/chat/completions (chat mode) ────────────────────────
+
+
+class OAIChatRequest(BaseModel):
+    messages: list[ChatMessage]
+    model: str = ""
+    max_tokens: int = Field(default=256, ge=1, le=2048)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.0, ge=0.0, le=1.0)
+    frequency_penalty: float = Field(default=0.0, ge=0.0, le=2.0)
+    presence_penalty: float = Field(default=0.0, ge=0.0, le=2.0)
+    stop: list[str] | str | None = None
+    stream: bool = False
+    n: int = Field(default=1, ge=1, le=8)
+
+
+@app.post("/v1/chat/completions")
+async def oai_chat_completions(request: OAIChatRequest):
+    if _model is None or _tokenizer is None:
+        raise HTTPException(503, detail="Model not loaded")
+    if _serve_mode != "chat":
+        raise HTTPException(400, detail="/v1/chat/completions requires --mode chat")
+
+    msgs = [{"role": m.role, "content": m.content} for m in request.messages]
+    prompt_text = _tokenizer.apply_chat_template(
+        msgs, tokenize=False, add_generation_prompt=True,
+    )
+
+    stop_strings: list[str] = []
+    if isinstance(request.stop, str):
+        stop_strings = [request.stop]
+    elif isinstance(request.stop, list):
+        stop_strings = request.stop
+
+    if request.stream:
+        gen_req = GenerateRequest(
+            prompt=prompt_text,
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            repetition_penalty=1.0 + request.frequency_penalty,
+            stop_strings=stop_strings,
+            stream=True,
+        )
+
+        async def chat_stream():
+            async for chunk in generate_stream(_model, _tokenizer, gen_req):
+                data = json.loads(chunk.removeprefix("data: ").strip())
+                if "token" in data:
+                    oai_chunk = {
+                        "id": f"chatcmpl-luxia-{int(time.time())}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": _model_name(),
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": data["token"]},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(oai_chunk)}\n\n"
+                elif data.get("done"):
+                    final_chunk = {
+                        "id": f"chatcmpl-luxia-{int(time.time())}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": _model_name(),
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }],
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+        return StreamingResponse(chat_stream(), media_type="text/event-stream")
+
+    choices = []
+    total_completion_tokens = 0
+    for i in range(request.n):
+        gen_req = GenerateRequest(
+            prompt=prompt_text,
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            repetition_penalty=1.0 + request.frequency_penalty,
+            stop_strings=stop_strings,
+        )
+        result = generate(model=_model, tokenizer=_tokenizer, request=gen_req)
+        total_completion_tokens += result.completion_tokens
+        choices.append({
+            "index": i,
+            "message": {"role": "assistant", "content": result.text},
+            "finish_reason": "length" if result.completion_tokens >= request.max_tokens else "stop",
+        })
+
+    prompt_tokens = _tokenizer.encode(prompt_text, add_special_tokens=False, return_tensors="pt").shape[1]
+
+    return {
+        "id": f"chatcmpl-luxia-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": _model_name(),
+        "choices": choices,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": prompt_tokens + total_completion_tokens,
+        },
     }
 
 
@@ -599,16 +963,34 @@ async def oai_models():
 _device_arg = "cuda"
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="luxia-base DD-v1 inference server")
-    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT, help="Path to checkpoint .pt file")
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    parser = argparse.ArgumentParser(
+        description="kotodama inference server",
+        epilog="Available models: " + ", ".join(KNOWN_MODELS),
+    )
+    ckpt_group = parser.add_mutually_exclusive_group()
+    ckpt_group.add_argument("--model", choices=list(KNOWN_MODELS), metavar="NAME",
+                            help="Model name (resolves to checkpoints/serving/)")
+    ckpt_group.add_argument("--checkpoint", help="Direct path to checkpoint .pt/.pt.zst file")
+    parser.add_argument("--device", default="cuda", help="Device: cuda, cuda:N, or cpu")
+    parser.add_argument("--mode", choices=["base", "chat"], default=None,
+                        help="Serving mode (auto-detected from model name if omitted)")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile(dynamic=True) for faster inference")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
 
-    _checkpoint_path = args.checkpoint
+    if args.model:
+        _checkpoint_path = str(SERVING_DIR / KNOWN_MODELS[args.model])
+        inferred_mode = "chat" if "instruct" in args.model else "base"
+    elif args.checkpoint:
+        _checkpoint_path = args.checkpoint
+        inferred_mode = "chat" if "instruct" in args.checkpoint else "base"
+    else:
+        _checkpoint_path = DEFAULT_CHECKPOINT
+        inferred_mode = "base"
+
     _device_arg = args.device
+    _mode_arg = args.mode if args.mode is not None else inferred_mode
     _compile_arg = args.compile
 
     import uvicorn

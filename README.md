@@ -4,6 +4,64 @@ From-scratch transformer language model. NCA pre-pretraining + Block Attention R
 
 Research model targeting rich geometric structure formation and conversational quality at the 3B–8B scale. Full writeup at [aetherawi.red/kotodama](https://aetherawi.red/kotodama).
 
+## Kotodama-108m
+
+108M-parameter proxy models trained on the full pipeline. Available on HuggingFace:
+
+| Model | HuggingFace | Description |
+|-------|-------------|-------------|
+| **kotodama-108m-base** | [aethera-gp/kotodama-108m-base](https://huggingface.co/aethera-gp/kotodama-108m-base) | Base pretrained (170B tokens, fullcorpus + books CPT) |
+| **kotodama-108m-instruct** | [aethera-gp/kotodama-108m-instruct](https://huggingface.co/aethera-gp/kotodama-108m-instruct) | ChatML instruct-tuned (OASST2 SFT, fullcorpus + books CPT variants) |
+
+### Serving
+
+The inference server supports both base (text completion) and instruct (chat) models with an OpenAI-compatible API.
+
+```bash
+# Serve an instruct model (auto-detects chat mode from model name)
+python serve.py --model kotodama-108m-instruct-fc --compile --port 2222
+
+# Serve a base model
+python serve.py --model kotodama-108m-base-fc --compile --port 2222
+
+# Custom checkpoint with explicit mode
+python serve.py --checkpoint /path/to/checkpoint.pt --mode chat --port 2222
+```
+
+Available `--model` names (resolved from `checkpoints/serving/`):
+
+| Name | Variant | Mode |
+|------|---------|------|
+| `kotodama-108m-base-fc` | Fullcorpus pretrained | base |
+| `kotodama-108m-base-bcpt` | Books CPT pretrained | base |
+| `kotodama-108m-instruct-fc` | Fullcorpus SFT | chat (auto) |
+| `kotodama-108m-instruct-bcpt` | Books CPT SFT | chat (auto) |
+
+**Endpoints:**
+
+- `POST /v1/chat/completions` — OpenAI-compatible chat API (chat mode only)
+- `POST /v1/completions` — OpenAI-compatible text completion
+- `POST /generate` — Native API (accepts `prompt` or `messages`)
+- `GET /v1/models` — List available models
+- `GET /info` — Model metadata, mode, device
+- `GET /health` — Health check
+
+**Chat example:**
+
+```bash
+curl http://localhost:2222/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 128}'
+```
+
+**Cluster deployment** (via Scheduler):
+
+```bash
+scheduler submit "tools/run_serve.sh --model kotodama-108m-instruct-fc --compile --port 2222" \
+  --name kotodama-serve --gpus 1 --node gpu-host --always-on \
+  --workdir ~/workspace/kotodama
+```
+
 ## Architecture
 
 Two model scales sharing the same training infrastructure, tokenizer, and methodology.
