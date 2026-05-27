@@ -1,40 +1,30 @@
 """
 Geometric health monitoring for luxia-base pretraining.
 
-Implements the three-tier monitoring framework from the deep research
-synthesis (research/pretraining/deep-research-synthesis.md):
-
-Tier 1 (every N steps, <1% overhead):
+Metrics computed per monitoring step:
   - RankMe (effective rank) on probe batch hidden states
   - Stable rank per layer (weight-space)
   - Anisotropy (average pairwise cosine similarity)
   - Dead unit fraction per layer
   - Attention entropy distribution
-
-Tier 2 (every checkpoint, minutes):
-  - WeightWatcher alpha per layer (weight-only, no forward pass)
   - TwoNN intrinsic dimensionality at sampled layers
-  - Eigenspectrum decay rate (alpha-ReQ proxy)
+  - EoC Jacobian spectral radius per layer
 
-Tier 3 (5 key checkpoints, longer):
-  - Full WeightWatcher analysis
-  - Full Anamnesis extraction
-  - (Deferred to Track D)
+EoS sharpness is computed separately (requires live gradients).
 
 Usage in training loop::
 
     monitor = GeometricMonitor(model, config)
     # In training loop:
-    if step % tier1_every == 0:
-        metrics = monitor.tier1(probe_batch, step)
-    if step % tier2_every == 0:
-        metrics = monitor.tier2(step)
+    if monitor.should_monitor(step):
+        sharpness = monitor.compute_sharpness(step)  # before optimizer.step()
+        ...
+        metrics = monitor.compute_all(step)           # after optimizer.step()
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -47,33 +37,67 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class MonitorSchedule:
+    """Step-function schedule for decaying monitoring cadence.
+
+    Parsed from "start:interval,..." e.g. "0:25,2000:50,10000:200,50000:500".
+    At each step, the last phase whose start_step <= step determines the interval.
+    """
+
+    phases: list[tuple[int, int]] = field(default_factory=lambda: [(0, 500)])
+
+    @classmethod
+    def from_string(cls, s: str) -> MonitorSchedule:
+        phases: list[tuple[int, int]] = []
+        for part in s.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            start_s, interval_s = part.split(":")
+            phases.append((int(start_s), int(interval_s)))
+        phases.sort(key=lambda x: x[0])
+        if not phases:
+            raise ValueError(f"Empty schedule: {s!r}")
+        return cls(phases=phases)
+
+    @classmethod
+    def fixed(cls, every: int) -> MonitorSchedule:
+        return cls(phases=[(0, every)])
+
+    def should_fire(self, step: int) -> bool:
+        interval = self.interval_at(step)
+        return interval > 0 and step % interval == 0
+
+    def interval_at(self, step: int) -> int:
+        result = self.phases[0][1]
+        for start, interval in self.phases:
+            if step >= start:
+                result = interval
+            else:
+                break
+        return result
+
+
+@dataclass
 class MonitorConfig:
     """Configuration for geometric monitoring."""
 
-    # Tier 1: lightweight streaming metrics
-    tier1_every: int = 500  # steps between Tier 1 measurements
+    schedule: Optional[MonitorSchedule] = None
+
+    # Probe / layer sampling
     tier1_probe_size: int = 1024  # number of samples in probe batch
     tier1_sample_layers: list[int] = field(
         default_factory=lambda: []
     )  # empty = auto-select
 
-    # Tier 2: checkpoint-level metrics
-    tier2_every: int = 5000  # steps between Tier 2 measurements
     tier2_twonn_samples: int = 3000  # samples for TwoNN ID estimation
     tier2_twonn_layers: list[int] = field(
         default_factory=lambda: []
     )  # empty = auto-select (5 evenly spaced)
 
-    # Tier 3: deep analysis (at specific token counts)
-    tier3_token_checkpoints: list[int] = field(
-        default_factory=lambda: [
-            0,
-            8_000_000_000,
-            24_000_000_000,
-            48_000_000_000,
-            80_000_000_000,
-        ]
-    )
+    # Legacy cadence fields (used when schedule is None)
+    tier1_every: int = 500
+    tier2_every: int = 5000
 
     # General
     device: str = "cuda"
@@ -135,6 +159,10 @@ class GeometricMonitor:
         # AttnRes diagnostics (populated during _probe_forward_attn_res)
         self._attn_res_diagnostics: dict[str, float] = {}
 
+        # Warm-start vectors for Jacobian spectral radius (EoC)
+        self._warm_vectors: dict[str, torch.Tensor] = {}
+        self._eoc_call_count: int = 0
+
         logger.info(
             "GeometricMonitor: %d layers, tier1 layers=%s, tier2 ID layers=%s",
             num_layers,
@@ -151,6 +179,437 @@ class GeometricMonitor:
         """
         self._probe_batch = input_ids.clone()
         logger.info("Probe batch set: shape %s", tuple(input_ids.shape))
+
+    def should_monitor(self, step: int) -> bool:
+        """Check if monitoring should fire at this step."""
+        if self.config.schedule is not None:
+            return self.config.schedule.should_fire(step)
+        return self.config.tier1_every > 0 and step % self.config.tier1_every == 0
+
+    # =========================================================================
+    # Edge of Stability: finite-difference sharpness along gradient direction
+    # =========================================================================
+
+    def compute_sharpness(
+        self, step: int, epsilon: float = 0.1, n_sequences: int = 8,
+    ) -> dict[str, float]:
+        """
+        Compute directional sharpness along the current gradient direction.
+
+        Must be called while gradients are still on model parameters (before
+        optimizer.zero_grad). Uses finite differences on a probe batch subset:
+            sharpness = (L(θ+εĝ) - 2L(θ) + L(θ-εĝ)) / ε²
+        where ĝ = g/‖g‖ is the unit gradient direction.
+
+        At edge of stability: sharpness ≈ 2/lr. Values exceeding this indicate
+        the optimizer is actively reducing sharpness.
+
+        Note: ε=0.1 (not 0.01) because at 3B+ scale, unit-normalized gradient
+        components are O(1/√D) ≈ 6e-6, and smaller ε causes per-parameter
+        perturbations to fall below bf16 precision.
+        """
+        if self._probe_batch is None:
+            return {}
+
+        params_with_grad = [
+            p for p in self.model.parameters() if p.grad is not None
+        ]
+        if not params_with_grad:
+            logger.warning("No gradients available for sharpness computation")
+            return {}
+
+        t0 = time.time()
+        device = next(self.model.parameters()).device
+        torch.cuda.empty_cache()
+        batch = self._probe_batch[:n_sequences].to(device)
+
+        grad_norm = torch.sqrt(
+            sum(p.grad.float().pow(2).sum() for p in params_with_grad)
+        )
+        if grad_norm < 1e-10:
+            return {}
+
+        embed_params = {id(self.model.embed_tokens.weight)}
+        embed_grad_sq = sum(
+            p.grad.float().pow(2).sum()
+            for p in params_with_grad if id(p) in embed_params
+        )
+        embed_grad_frac = (embed_grad_sq / grad_norm.pow(2)).item()
+
+        was_training = self.model.training
+        self.model.eval()
+
+        metrics: dict[str, float] = {}
+        # Track perturbation state for safe recovery: 0=original, 1=+ε, -1=-ε
+        perturbation_state = 0
+
+        try:
+            with torch.no_grad():
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    L0 = self.model(batch, labels=batch)["loss"].float().item()
+
+                # Perturb +ε along gradient direction
+                for p in params_with_grad:
+                    p.data.add_(p.grad.float() / grad_norm, alpha=epsilon)
+                perturbation_state = 1
+
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    L_plus = self.model(batch, labels=batch)["loss"].float().item()
+
+                # Perturb to -ε (subtract 2ε from current +ε position)
+                for p in params_with_grad:
+                    p.data.add_(p.grad.float() / grad_norm, alpha=-2.0 * epsilon)
+                perturbation_state = -1
+
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    L_minus = self.model(batch, labels=batch)["loss"].float().item()
+
+                # Restore original weights
+                for p in params_with_grad:
+                    p.data.add_(p.grad.float() / grad_norm, alpha=epsilon)
+                perturbation_state = 0
+
+            sharpness = (L_plus - 2.0 * L0 + L_minus) / (epsilon ** 2)
+            metrics["eos/sharpness"] = sharpness
+            metrics["eos/L0_probe"] = L0
+            metrics["eos/L_plus"] = L_plus
+            metrics["eos/L_minus"] = L_minus
+            metrics["eos/grad_norm"] = grad_norm.item()
+            metrics["eos/embed_grad_frac"] = embed_grad_frac
+            metrics["eos/time_s"] = time.time() - t0
+
+            logger.info(
+                "EoS [step %d]: sharpness=%.4f, L0=%.4f, embed_grad=%.1f%%, time=%.2fs",
+                step, sharpness, L0, embed_grad_frac * 100, time.time() - t0,
+            )
+
+        except Exception as e:
+            logger.warning("Sharpness computation failed: %s", e)
+            # Restore weights from current perturbation state
+            if perturbation_state != 0:
+                try:
+                    for p in params_with_grad:
+                        p.data.add_(
+                            p.grad.float() / grad_norm,
+                            alpha=-perturbation_state * epsilon,
+                        )
+                except Exception:
+                    logger.error("CRITICAL: failed to restore weights after sharpness error")
+                    pass
+
+        if was_training:
+            self.model.train()
+
+        return metrics
+
+    # =========================================================================
+    # Edge of Chaos: per-layer Jacobian spectral radius
+    # =========================================================================
+
+    def compute_jacobian_spectral(
+        self, step: int, n_iters: int = 5, n_sequences: int = 4,
+    ) -> dict[str, float]:
+        """
+        Compute per-layer Jacobian spectral norm via warm-started power iteration.
+
+        For each sampled layer, estimates σ_max(J_ℓ) where J_ℓ = ∂output/∂input.
+        σ_max > 1 → layer amplifies perturbations (chaotic regime).
+        σ_max < 1 → layer damps perturbations (ordered regime).
+        σ_max ≈ 1 → edge of chaos (critical regime).
+
+        For AttnRes models, computes separate σ for attn and MLP sub-layers
+        (since they receive independently routed inputs in the actual forward).
+
+        Uses warm-started eigenvectors from previous call for faster convergence.
+        """
+        if self._probe_batch is None:
+            return {}
+
+        t0 = time.time()
+        device = next(self.model.parameters()).device
+        torch.cuda.empty_cache()
+        batch = self._probe_batch[:n_sequences].to(device)
+
+        was_training = self.model.training
+        self.model.eval()
+
+        metrics: dict[str, float] = {}
+
+        try:
+            # Get hidden states at each sampled layer via probe forward
+            with torch.no_grad():
+                hidden_states, _ = self._probe_forward(batch)
+
+            use_attn_res = getattr(self.model.config, "attn_res", False)
+
+            for layer_idx in self.config.tier1_sample_layers:
+                if layer_idx not in hidden_states:
+                    continue
+
+                h_detached = hidden_states[layer_idx].detach()
+                layer = self.model.layers[layer_idx]
+                rope_cos = self.model.rope_cos
+                rope_sin = self.model.rope_sin
+
+                if use_attn_res:
+                    # AttnRes: compute separate σ for attn and MLP sub-layers
+                    # (they receive independently routed inputs in actual forward)
+                    for sublayer_name, sublayer_fn in [
+                        ("attn", lambda h: h + layer.attn(layer.attn_norm(h), rope_cos, rope_sin)),
+                        ("mlp", lambda h: h + layer.ffn(layer.ffn_norm(h))),
+                    ]:
+                        warm_key = f"jacobian_v_{layer_idx}_{sublayer_name}"
+                        sigma = self._power_iterate(
+                            h_detached, sublayer_fn, warm_key, device, n_iters
+                        )
+                        metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/{sublayer_name}"] = sigma
+                    # Composite: max of sub-layers as the layer's amplification bound
+                    s_attn = metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/attn"]
+                    s_mlp = metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/mlp"]
+                    metrics[f"eoc/jacobian_sigma/layer_{layer_idx}"] = max(s_attn, s_mlp)
+                else:
+                    warm_key = f"jacobian_v_{layer_idx}"
+                    sigma = self._power_iterate(
+                        h_detached,
+                        lambda h: layer(h, rope_cos, rope_sin),
+                        warm_key, device, n_iters,
+                    )
+                    metrics[f"eoc/jacobian_sigma/layer_{layer_idx}"] = sigma
+
+            if metrics:
+                # Layer 0 has anomalously high σ due to embedding-to-residual
+                # scale mismatch (see "Spike No More", Takase et al. COLM 2025).
+                # Report it separately; aggregate only interior layers.
+                layer0_key = "eoc/jacobian_sigma/layer_0"
+                if layer0_key in metrics:
+                    metrics["eoc/layer0_sigma"] = metrics[layer0_key]
+
+                interior_sigmas = [
+                    v for k, v in metrics.items()
+                    if k.startswith("eoc/jacobian_sigma/layer_")
+                    and k[-1].isdigit()
+                    and k != layer0_key
+                ]
+                if interior_sigmas:
+                    metrics["eoc/sigma_max"] = max(interior_sigmas)
+                    metrics["eoc/sigma_min"] = min(interior_sigmas)
+                    metrics["eoc/sigma_mean"] = sum(interior_sigmas) / len(interior_sigmas)
+
+            metrics["eoc/time_s"] = time.time() - t0
+
+            logger.info(
+                "EoC [step %d]: σ_max=%.4f, σ_mean=%.4f, layer0=%.1f, time=%.2fs",
+                step,
+                metrics.get("eoc/sigma_max", 0),
+                metrics.get("eoc/sigma_mean", 0),
+                metrics.get("eoc/layer0_sigma", 0),
+                time.time() - t0,
+            )
+
+        except Exception as e:
+            logger.warning("Jacobian spectral computation failed: %s", e)
+
+        if was_training:
+            self.model.train()
+
+        return metrics
+
+    def _power_iterate(
+        self,
+        h_detached: torch.Tensor,
+        layer_fn: Any,
+        warm_key: str,
+        device: torch.device,
+        n_iters: int,
+    ) -> float:
+        """Run power iteration for σ_max of the Jacobian of layer_fn at h_detached.
+
+        Re-randomizes the warm vector every 10 calls to prevent drift onto
+        subdominant eigenvalues. Uses extra iterations (20) when starting cold.
+        """
+        cold_start = warm_key not in self._warm_vectors
+        rerandomize = (self._eoc_call_count % 10 == 0) and not cold_start
+
+        if cold_start or rerandomize:
+            v = torch.randn_like(h_detached)
+            if cold_start:
+                n_iters = max(n_iters, 20)
+        else:
+            v = self._warm_vectors[warm_key].to(device)
+            if v.shape != h_detached.shape:
+                v = torch.randn_like(h_detached)
+                n_iters = max(n_iters, 20)
+        v = v / v.norm()
+
+        sigma = 0.0
+        for _ in range(n_iters):
+            h_input = h_detached.clone().requires_grad_(True)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                layer_out = layer_fn(h_input)
+            Jt_v = torch.autograd.grad(
+                (layer_out * v).sum(), h_input,
+            )[0].float()
+            sigma = Jt_v.norm().item()
+            if sigma < 1e-10:
+                break
+            v = (Jt_v / sigma).detach()
+
+        self._warm_vectors[warm_key] = v.cpu()
+        return sigma
+
+    # =========================================================================
+    # Unified monitoring: shared probe forward, all metrics
+    # =========================================================================
+
+    def compute_all(self, step: int, n_eoc_iters: int = 5) -> dict[str, float]:
+        """
+        Unified geometric monitoring with a single shared probe forward.
+
+        Computes tier1 metrics (RankMe, stable rank, anisotropy, dead units,
+        attention entropy), TwoNN intrinsic dimensionality, and EoC Jacobian
+        spectral radius from one forward pass.
+
+        NOT decorated @torch.no_grad — EoC power iteration needs autograd.
+        The probe forward and no-grad metrics use explicit context blocks.
+        """
+        if self._probe_batch is None:
+            logger.warning("No probe batch set — skipping compute_all")
+            return {}
+
+        t0 = time.time()
+        device = next(self.model.parameters()).device
+        torch.cuda.empty_cache()
+        batch = self._probe_batch.to(device)
+
+        was_training = self.model.training
+        self.model.eval()
+
+        metrics: dict[str, float] = {}
+
+        try:
+            # == Phase 1: probe forward + activation-based metrics (no grad) ==
+            with torch.no_grad():
+                hidden_states, attn_weights = self._probe_forward(batch)
+
+                # -- RankMe (effective rank) on last-layer hidden states --
+                last_layer_idx = len(self.model.layers) - 1
+                if last_layer_idx in hidden_states:
+                    last_hidden = hidden_states[last_layer_idx]
+                    H = last_hidden.reshape(-1, last_hidden.shape[-1]).float()
+                    metrics["geo/rankme_last"] = _rankme(H)
+
+                # -- Per-layer metrics --
+                for layer_idx in self.config.tier1_sample_layers:
+                    prefix = f"geo/layer_{layer_idx}"
+                    layer = self.model.layers[layer_idx]
+
+                    for name, param in [
+                        ("q_proj", layer.attn.q_proj.weight),
+                        ("k_proj", layer.attn.k_proj.weight),
+                        ("o_proj", layer.attn.o_proj.weight),
+                        ("gate_proj", layer.ffn.gate_proj.weight),
+                        ("down_proj", layer.ffn.down_proj.weight),
+                    ]:
+                        metrics[f"{prefix}/stable_rank_{name}"] = _stable_rank(param)
+
+                    if layer_idx in hidden_states:
+                        h = hidden_states[layer_idx]
+                        metrics[f"{prefix}/dead_units"] = _dead_unit_fraction(h)
+                        h_flat = h.reshape(-1, h.shape[-1])
+                        metrics[f"{prefix}/anisotropy"] = _anisotropy(h_flat, max_samples=512)
+
+                    if layer_idx in attn_weights:
+                        ent_mean, ent_std = _attention_entropy_stats(attn_weights[layer_idx])
+                        metrics[f"{prefix}/attn_entropy_mean"] = ent_mean
+                        metrics[f"{prefix}/attn_entropy_std"] = ent_std
+
+                # -- AttnRes diagnostics --
+                if self._attn_res_diagnostics:
+                    metrics.update(self._attn_res_diagnostics)
+
+                # -- TwoNN intrinsic dimensionality --
+                for layer_idx in self.config.tier2_twonn_layers:
+                    if layer_idx in hidden_states:
+                        h = hidden_states[layer_idx].reshape(
+                            -1, hidden_states[layer_idx].shape[-1]
+                        )
+                        n = min(self.config.tier2_twonn_samples, h.shape[0])
+                        idx = torch.randperm(h.shape[0])[:n]
+                        h_sub = h[idx].float()
+                        id_est = _twonn_id(h_sub)
+                        if id_est is not None:
+                            metrics[f"geo/twonn_id/layer_{layer_idx}"] = id_est
+
+            # == Phase 2: EoC Jacobian spectral radius (needs autograd) ==
+            self._eoc_call_count += 1
+            use_attn_res = getattr(self.model.config, "attn_res", False)
+
+            for layer_idx in self.config.tier1_sample_layers:
+                if layer_idx not in hidden_states:
+                    continue
+
+                h_detached = hidden_states[layer_idx][:4].detach()
+                layer = self.model.layers[layer_idx]
+                rope_cos = self.model.rope_cos
+                rope_sin = self.model.rope_sin
+
+                if use_attn_res:
+                    for sublayer_name, sublayer_fn in [
+                        ("attn", lambda h, _l=layer: h + _l.attn(_l.attn_norm(h), rope_cos, rope_sin)),
+                        ("mlp", lambda h, _l=layer: h + _l.ffn(_l.ffn_norm(h))),
+                    ]:
+                        warm_key = f"jacobian_v_{layer_idx}_{sublayer_name}"
+                        sigma = self._power_iterate(
+                            h_detached, sublayer_fn, warm_key, device, n_eoc_iters,
+                        )
+                        metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/{sublayer_name}"] = sigma
+                    s_attn = metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/attn"]
+                    s_mlp = metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/mlp"]
+                    metrics[f"eoc/jacobian_sigma/layer_{layer_idx}"] = max(s_attn, s_mlp)
+                else:
+                    warm_key = f"jacobian_v_{layer_idx}"
+                    sigma = self._power_iterate(
+                        h_detached,
+                        lambda h, _l=layer: _l(h, rope_cos, rope_sin),
+                        warm_key, device, n_eoc_iters,
+                    )
+                    metrics[f"eoc/jacobian_sigma/layer_{layer_idx}"] = sigma
+
+            # EoC aggregates
+            layer0_key = "eoc/jacobian_sigma/layer_0"
+            if layer0_key in metrics:
+                metrics["eoc/layer0_sigma"] = metrics[layer0_key]
+
+            interior_sigmas = [
+                v for k, v in metrics.items()
+                if k.startswith("eoc/jacobian_sigma/layer_")
+                and k[-1].isdigit()
+                and k != layer0_key
+            ]
+            if interior_sigmas:
+                metrics["eoc/sigma_max"] = max(interior_sigmas)
+                metrics["eoc/sigma_min"] = min(interior_sigmas)
+                metrics["eoc/sigma_mean"] = sum(interior_sigmas) / len(interior_sigmas)
+
+        except Exception as e:
+            logger.warning("compute_all failed: %s", e, exc_info=True)
+
+        if was_training:
+            self.model.train()
+
+        elapsed = time.time() - t0
+        metrics["geo/compute_all_time_s"] = elapsed
+        metrics["geo/step"] = float(step)
+
+        logger.info(
+            "Geo [step %d]: RankMe=%.1f, σ_max=%.4f, time=%.2fs",
+            step,
+            metrics.get("geo/rankme_last", 0),
+            metrics.get("eoc/sigma_max", 0),
+            elapsed,
+        )
+
+        return metrics
 
     # =========================================================================
     # Tier 1: Lightweight streaming metrics (< 1% overhead)
@@ -247,89 +706,10 @@ class GeometricMonitor:
         """
         Compute Tier 2 geometric health metrics.
 
-        Weight-space metrics (WeightWatcher alpha) use the real WeightWatcher
-        library for proper power-law fitting. TwoNN ID estimation requires
-        a forward pass.
+        TwoNN intrinsic dimensionality at sampled layers.
         """
         t0 = time.time()
         metrics: dict[str, float] = {}
-
-        # -- WeightWatcher alpha (real library) --
-        try:
-            import weightwatcher as ww
-
-            watcher = ww.WeightWatcher(model=self.model)
-            details = watcher.analyze(min_evals=10, plot=False)
-
-            all_alphas = details["alpha"].dropna().tolist()
-            if all_alphas:
-                metrics["geo/ww_alpha_mean"] = sum(all_alphas) / len(all_alphas)
-                metrics["geo/ww_alpha_std"] = _std(all_alphas)
-                metrics["geo/ww_alpha_min"] = min(all_alphas)
-                metrics["geo/ww_alpha_max"] = max(all_alphas)
-                healthy = sum(1 for a in all_alphas if 2.0 < a < 4.0)
-                metrics["geo/ww_alpha_healthy_frac"] = healthy / len(all_alphas)
-
-                # Per-layer and per-weight-type breakdown
-                _type_buckets: dict[str, list[float]] = {}
-                for idx, row in details.iterrows():
-                    name = str(row.get("name", ""))
-                    alpha = row["alpha"]
-                    if str(alpha) == "nan":
-                        continue
-
-                    layer_match = re.search(r"layers\.(\d+)\.", name)
-                    layer_idx = int(layer_match.group(1)) if layer_match else None
-
-                    for wtype in ["q_proj", "k_proj", "v_proj", "o_proj",
-                                  "gate_proj", "up_proj", "down_proj"]:
-                        if wtype in name:
-                            if layer_idx is not None:
-                                metrics[f"geo/ww_alpha/layer_{layer_idx}/{wtype}"] = alpha
-                            _type_buckets.setdefault(wtype, []).append(alpha)
-                            break
-
-                for wtype, vals in _type_buckets.items():
-                    metrics[f"geo/ww_alpha_by_type/{wtype}"] = sum(vals) / len(vals)
-
-        except ImportError:
-            logger.warning("weightwatcher not installed — using proxy alpha")
-            # Fallback to proxy computation for all layers
-            for layer_idx in range(len(self.model.layers)):
-                layer = self.model.layers[layer_idx]
-                for name, param in [
-                    ("q_proj", layer.attn.q_proj.weight),
-                    ("o_proj", layer.attn.o_proj.weight),
-                    ("gate_proj", layer.ffn.gate_proj.weight),
-                    ("down_proj", layer.ffn.down_proj.weight),
-                ]:
-                    alpha = _weightwatcher_alpha(param)
-                    if alpha is not None:
-                        metrics[f"geo/ww_alpha/layer_{layer_idx}/{name}"] = alpha
-            all_alphas = [v for k, v in metrics.items() if "ww_alpha" in k and isinstance(v, (int, float))]
-            if all_alphas:
-                metrics["geo/ww_alpha_mean"] = sum(all_alphas) / len(all_alphas)
-                healthy = sum(1 for a in all_alphas if 2.0 < a < 4.0)
-                metrics["geo/ww_alpha_healthy_frac"] = healthy / len(all_alphas)
-        except Exception as e:
-            logger.warning("WeightWatcher analysis failed (%s): %s — falling back to proxy alpha", type(e).__name__, e)
-            # Fall back to proxy computation
-            for layer_idx in range(len(self.model.layers)):
-                layer = self.model.layers[layer_idx]
-                for name, param in [
-                    ("q_proj", layer.attn.q_proj.weight),
-                    ("o_proj", layer.attn.o_proj.weight),
-                    ("gate_proj", layer.ffn.gate_proj.weight),
-                    ("down_proj", layer.ffn.down_proj.weight),
-                ]:
-                    alpha = _weightwatcher_alpha(param)
-                    if alpha is not None:
-                        metrics[f"geo/ww_alpha/layer_{layer_idx}/{name}"] = alpha
-            all_alphas = [v for k, v in metrics.items() if "ww_alpha" in k and isinstance(v, (int, float))]
-            if all_alphas:
-                metrics["geo/ww_alpha_mean"] = sum(all_alphas) / len(all_alphas)
-                healthy = sum(1 for a in all_alphas if 2.0 < a < 4.0)
-                metrics["geo/ww_alpha_healthy_frac"] = healthy / len(all_alphas)
 
         # -- TwoNN intrinsic dimensionality at sampled layers --
         batch = probe_batch if probe_batch is not None else self._probe_batch
@@ -355,10 +735,9 @@ class GeometricMonitor:
         metrics["geo/tier2_time_s"] = elapsed
 
         logger.info(
-            "Tier 2 [step %d]: WW_alpha_mean=%.2f, healthy=%.0f%%, time=%.1fs",
+            "Tier 2 [step %d]: TwoNN layers=%d, time=%.1fs",
             step,
-            metrics.get("geo/ww_alpha_mean", 0),
-            metrics.get("geo/ww_alpha_healthy_frac", 0) * 100,
+            sum(1 for k in metrics if k.startswith("geo/twonn_id")),
             elapsed,
         )
 
@@ -395,7 +774,13 @@ class GeometricMonitor:
 
         use_attn_res = getattr(self.model.config, "attn_res", False)
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        # Cap probe batch: the uncompiled model forward under DDP crashes with
+        # large batches (64 seq) but works fine with <=16.  16 × seq_len tokens
+        # is more than enough for geometric statistics.
+        if use_attn_res and input_ids.shape[0] > 16:
+            input_ids = input_ids[:16]
+
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             if use_attn_res:
                 hidden_states, attn_weights = self._probe_forward_attn_res(
                     input_ids, needed_layers
@@ -427,92 +812,64 @@ class GeometricMonitor:
         self, input_ids: torch.Tensor, needed_layers: set[int]
     ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
         """
-        AttnRes-aware probe forward pass.
+        AttnRes-aware probe forward pass using hooks on the model's own forward.
 
-        Runs the actual AttnRes routing (matching training) while capturing
-        the pre-attention hidden state `h` at each layer. For the last layer,
-        captures the final AttnRes aggregation (the actual model output).
+        Instead of manually re-implementing the AttnRes routing (which uses
+        different Triton kernel call patterns than training and can crash under
+        DDP), we hook into the model's own forward path — the same one that
+        compute_sharpness uses successfully.
+
+        Forward pre-hooks on attn_norm capture the routed hidden state h (input
+        to normalization) at each layer. A pre-hook on the final norm captures
+        the last-layer AttnRes aggregation output.
         """
         hidden_states: dict[int, torch.Tensor] = {}
         attn_weights: dict[int, torch.Tensor] = {}
+        captured_normed: dict[int, torch.Tensor] = {}
 
         model = self.model
-        embed = model.embed_tokens(input_ids)
-        committed: list[torch.Tensor] = []
-        partial = embed
-        boundary_set = model._attn_res_boundary_set
+        last_layer_idx = len(model.layers) - 1
+        hooks: list[Any] = []
+
+        def _make_norm_hook(layer_idx: int):
+            def hook(_module: nn.Module, args: tuple, output: torch.Tensor) -> None:
+                hidden_states[layer_idx] = args[0].detach()
+                if layer_idx in self.config.tier1_sample_layers:
+                    captured_normed[layer_idx] = output.detach()
+            return hook
+
+        def _final_norm_hook(_module: nn.Module, args: tuple) -> None:
+            hidden_states[last_layer_idx] = args[0].detach()
+
+        for i in needed_layers:
+            if i < len(model.layers):
+                hooks.append(
+                    model.layers[i].attn_norm.register_forward_hook(
+                        _make_norm_hook(i)
+                    )
+                )
+        hooks.append(model.norm.register_forward_pre_hook(_final_norm_hook))
+
+        try:
+            model(input_ids)
+        finally:
+            for h in hooks:
+                h.remove()
+
         rope_cos = model.rope_cos
         rope_sin = model.rope_sin
-        last_layer_idx = len(model.layers) - 1
+        for layer_idx, normed_h in captured_normed.items():
+            attn_w = self._get_attention_weights(
+                model.layers[layer_idx], normed_h,
+                rope_cos, rope_sin, input_ids.shape[1],
+            )
+            if attn_w is not None:
+                attn_weights[layer_idx] = attn_w
 
-        max_s = model._attn_res_max_sources
-        masks = model._attn_res_masks
-        zero = torch.zeros_like(embed)
-
-        def _pad_and_stack(committed: list[torch.Tensor], partial: torch.Tensor) -> torch.Tensor:
-            sources = committed + [partial]
-            while len(sources) < max_s:
-                sources.append(zero)
-            return torch.stack(sources, dim=0)
-
-        for i, layer in enumerate(model.layers):
-            # AttnRes routing (matches _forward_attn_res exactly)
-            buf = _pad_and_stack(committed, partial)
-            h = model._route_static(buf, layer.attn_res_query, layer.attn_res_norm, masks[2 * i])
-
-            # Block boundary
-            if i in boundary_set:
-                committed.append(partial.clone())
-                partial = torch.zeros_like(embed)
-
-            # Capture h
-            if i in needed_layers:
-                hidden_states[i] = h.detach()
-
-                if i in self.config.tier1_sample_layers:
-                    attn_w = self._get_attention_weights(
-                        layer, layer.attn_norm(h),
-                        rope_cos, rope_sin, input_ids.shape[1]
-                    )
-                    if attn_w is not None:
-                        attn_weights[i] = attn_w
-
-            # Attention sub-layer
-            attn_out = layer.attn(layer.attn_norm(h), rope_cos, rope_sin)
-            partial = partial + attn_out
-
-            # Pre-MLP routing
-            buf = _pad_and_stack(committed, partial)
-            h = model._route_static(buf, layer.mlp_res_query, layer.mlp_res_norm, masks[2 * i + 1])
-
-            # MLP sub-layer
-            mlp_out = layer.ffn(layer.ffn_norm(h))
-            partial = partial + mlp_out
-
-        # Final aggregation
-        buf = _pad_and_stack(committed, partial)
-        final_h = model._route_static(buf, model.final_res_query, model.final_res_norm, masks[2 * len(model.layers)])
-        hidden_states[last_layer_idx] = final_h.detach()
-
-        # --- AttnRes diagnostics ---
+        # --- AttnRes diagnostics (computed by _forward_attn_res during eval) ---
         self._attn_res_diagnostics.clear()
-        try:
-            # Compute routing weights for the final aggregation
-            qw = model.final_res_query * model.final_res_norm.weight
-            eps = model.final_res_norm.eps
-            rsqrt = torch.rsqrt(buf.pow(2).mean(-1) + eps)
-            logits = (buf * qw).sum(-1) * rsqrt
-            final_mask = masks[2 * len(model.layers)]
-            logits = logits.masked_fill(~final_mask.view(-1, 1, 1), float("-inf"))
-            alpha_weights = F.softmax(logits, dim=0)
-            avg_alpha = alpha_weights.mean(dim=(1, 2)).detach()
-            n_active = final_mask.sum().item()
-            for block_idx in range(n_active):
-                self._attn_res_diagnostics[f"attnres/final_alpha/block_{block_idx}"] = avg_alpha[block_idx].item()
-                norm_val = buf[block_idx].detach().float().norm(dim=-1).mean().item()
-                self._attn_res_diagnostics[f"attnres/block_norm/{block_idx}"] = norm_val
-        except Exception as e:
-            logger.debug("AttnRes diagnostics failed: %s", e)
+        if hasattr(model, "_last_attn_res_diagnostics"):
+            self._attn_res_diagnostics.update(model._last_attn_res_diagnostics)
 
         return hidden_states, attn_weights
 
@@ -665,63 +1022,6 @@ def _attention_entropy_stats(
     return per_head.mean().item(), per_head.std().item()
 
 
-def _weightwatcher_alpha(
-    W: torch.Tensor, min_sv: int = 10
-) -> Optional[float]:
-    """
-    Estimate WeightWatcher power-law alpha for a weight matrix.
-
-    Fits a power law to the eigenspectrum of W^T W.
-    Alpha in (2, 4) = well-trained. Alpha > 6 = undertrained.
-
-    This is a simplified version — full WeightWatcher uses
-    more sophisticated fitting (KS test, xmin estimation).
-    We use a log-log linear regression on the sorted eigenvalues
-    as a fast proxy.
-    """
-    try:
-        W_f = W.float().detach()
-        # Get eigenvalues of W^T W (= squared singular values)
-        S = torch.linalg.svdvals(W_f)
-        eigs = S.pow(2)
-
-        if len(eigs) < min_sv:
-            return None
-
-        # Sort descending, take top portion (skip very small eigenvalues)
-        eigs_sorted = eigs.sort(descending=True).values
-        # Use all eigenvalues above a threshold
-        threshold = eigs_sorted[0] * 1e-10
-        eigs_valid = eigs_sorted[eigs_sorted > threshold]
-
-        if len(eigs_valid) < min_sv:
-            return None
-
-        # Log-log linear regression: log(eig) ~ -alpha * log(rank)
-        n = len(eigs_valid)
-        log_rank = torch.log(torch.arange(1, n + 1, dtype=torch.float32, device=W.device))
-        log_eig = torch.log(eigs_valid)
-
-        # Simple linear regression
-        x = log_rank
-        y = log_eig
-        x_mean = x.mean()
-        y_mean = y.mean()
-        slope = ((x - x_mean) * (y - y_mean)).sum() / ((x - x_mean).pow(2).sum() + 1e-10)
-
-        # Alpha is the negative slope (eigenvalues decay as rank^{-alpha})
-        # But WeightWatcher alpha is defined differently — it's the tail exponent
-        # of the empirical spectral density. For a Marchenko-Pastur + power-law
-        # tail, alpha ~ 1 + 1/|slope|. We use the simpler |slope| as our proxy.
-        alpha = -slope.item()
-
-        # Sanity check
-        if alpha < 0.1 or alpha > 20:
-            return None
-
-        return alpha
-    except Exception:
-        return None
 
 
 def _twonn_id(X: torch.Tensor) -> Optional[float]:
@@ -790,10 +1090,3 @@ def _twonn_id(X: torch.Tensor) -> Optional[float]:
         return None
 
 
-def _std(values: list[float]) -> float:
-    """Standard deviation of a list of floats."""
-    if len(values) < 2:
-        return 0.0
-    mean = sum(values) / len(values)
-    variance = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
-    return variance**0.5

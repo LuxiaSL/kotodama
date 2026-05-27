@@ -16,7 +16,7 @@ micro_batch_size: 16
 
 # Training
 total_tokens: 9_300_000_000
-lr: 0.02
+muon_lr: 0.02
 adamw_lr: 0.0006
 warmup_steps: 2000
 decay_start_pct: 0.90
@@ -29,8 +29,8 @@ muon_weight_decay: 0.01
 muon_ns_iterations: 5
 muon_ns_coefficients: gram_ns
 
-# NCA resume
-resume_nca: checkpoints/nca-seed17-flat/step_00005500.pt
+# NCA resume — co-trained NCA+AttnRes DD-v1 checkpoint (seed-17, 852M tokens)
+resume_nca: checkpoints/nca-attnres-ddv1/step_00006500.pt
 
 # Optimizations
 compile: true
@@ -54,4 +54,7 @@ geo_monitor_tier2_every: 500
 log_every: 10
 wandb: true
 wandb_project: kotodama-ddv1-openwebtext
-wandb_run_name: openwebtext-ddv1-9B
+wandb_run_name: openwebtext-ddv1-9B-cotrained
+
+# HF upload — push final checkpoint on completion
+hf_upload_repo: aethera-gp/kotodama-owt-ddv1

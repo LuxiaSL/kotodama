@@ -1,0 +1,73 @@
+# 3B Chinchilla decay — cosine cooldown from step ~30600 checkpoint
+#
+# Produces a Chinchilla-optimal 3B base (60B tokens + 6B decay = 66B total).
+# Uses resume_warm to keep optimizer momentum but reset the scheduler,
+# so cosine decay runs from full LR → 0 over 6B tokens.
+#
+# The main 384B run is unaffected — this writes to a separate checkpoint dir.
+# After this completes, resubmit the 384B job (it auto-resumes from 30600).
+#
+# Launch:
+#   scheduler submit "tools/run_train.sh --config configs/3b-chinchilla-decay.yaml" \
+#     --name 3b-chinchilla-decay --gpus 8 --node gpu-host \
+#     --env WANDB_API_KEY=... --env WANDB_ENTITY=aethera --env HF_TOKEN=...
+
+model_size: 3b
+sequence_length: 4096
+micro_batch_size: 10
+global_batch_tokens: 2097152
+
+# 6B token cooldown (10% of 60B Chinchilla budget)
+total_tokens: 6_000_000_000
+warmup_steps: 0
+decay_start_pct: 0.0
+decay_type: cosine
+
+# Optimizer — identical to main run
+muon_lr: 0.02
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+adamw_lr: 6e-4
+adamw_beta1: 0.9
+adamw_beta2: 0.95
+adamw_weight_decay: 0.1
+gradient_clip: 1.0
+
+# AttnRes DD-3B boundaries (must match main run)
+attn_res: true
+attn_res_boundaries: "0,1,3,7,15,19,24"
+
+# Warm resume from the Chinchilla-point checkpoint
+# UPDATE this path to the actual step number when ready:
+resume_warm: /models/kotodama-data/3b-chinchilla-base-step30600.pt.zst
+
+# Data — same as main run
+data_path: /models/kotodama-data/train.bin
+doc_masking: true
+seed: 42
+
+# Checkpointing — separate dir so it doesn't interfere with the main run
+checkpoint_dir: /models/kotodama-data/checkpoints/3b-chinchilla-decay
+save_every: 500
+keep_checkpoints: 10
+async_checkpoint: true
+checkpoint_shm_dir: /dev/shm/luxia-base-ckpts
+
+# Light monitoring — short run, just need basic health
+geo_monitor: true
+geo_monitor_schedule: "0:50,1000:200"
+
+# Optimization — same as main run
+compile: true
+attn_impl: auto
+fp8: true
+use_liger: true
+activation_checkpointing: true
+
+# Logging
+log_every: 10
+wandb: true
+wandb_project: luxia-base
+wandb_run_name: 3b-chinchilla-decay

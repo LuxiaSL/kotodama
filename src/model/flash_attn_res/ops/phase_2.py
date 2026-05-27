@@ -66,6 +66,7 @@ def _phase_2_online_softmax_merge_forward_with_aux_triton_op(
         intrablock_inverse_rms_norm,
         eps,
         D,
+        triton.next_power_of_2(D),
     )
 
     return merged_output, phase2_intrablock_logit, intrablock_inverse_rms_norm
@@ -171,6 +172,7 @@ def _online_softmax_merge_backward_accumulate(
         BT,
         D,
         accumulate_grad_intrablock,
+        triton.next_power_of_2(D),
     )
 
 

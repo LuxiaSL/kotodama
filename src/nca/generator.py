@@ -306,9 +306,6 @@ def tokenize_trajectory(
     frame within each timestep. For 4 channels, timestep t becomes:
     [START, ch0_patches..., END, START, ch1_patches..., END, ...]
 
-    This teaches the transformer to track parallel information streams
-    through sequential attention, matching how it processes language.
-
     Args:
         trajectory: (B, T, G, H, W) integer cell states
 
@@ -320,35 +317,31 @@ def tokenize_trajectory(
     d = d_state
     nph = H // ps
     npw = W // ps
+    n_patches = nph * npw
 
     START_TOKEN = d ** (ps * ps)
     END_TOKEN = START_TOKEN + 1
 
-    all_tokens: list[int] = []
-
     traj_np = trajectory.cpu().numpy()
 
-    for b in range(B):
-        for t in range(T):
-            # Serialize each channel as a separate frame
-            for g in range(G):
-                all_tokens.append(START_TOKEN)
+    # Reshape grid into patches: (B, T, G, nph, npw, ps, ps)
+    patches = traj_np.reshape(B, T, G, nph, ps, npw, ps)
+    patches = patches.transpose(0, 1, 2, 3, 5, 4, 6)  # (B, T, G, nph, npw, ps, ps)
+    patches = patches.reshape(B, T, G, n_patches, ps * ps)  # (B, T, G, n_patches, ps*ps)
 
-                grid = traj_np[b, t, g]
-                for ph in range(nph):
-                    for pw in range(npw):
-                        patch = grid[
-                            ph * ps : (ph + 1) * ps,
-                            pw * ps : (pw + 1) * ps,
-                        ].flatten()
-                        token = 0
-                        for i, val in enumerate(patch):
-                            token += int(val) * (d**i)
-                        all_tokens.append(token)
+    # Patch-to-token: dot product with [d^0, d^1, ..., d^(ps*ps-1)]
+    powers = d ** np.arange(ps * ps, dtype=np.int64)
+    patch_tokens = (patches.astype(np.int64) @ powers).astype(np.uint16)  # (B, T, G, n_patches)
 
-                all_tokens.append(END_TOKEN)
+    # Build frames with START/END delimiters: (B, T, G, n_patches+2)
+    tokens_per_frame = n_patches + 2
+    frames = np.empty((B, T, G, tokens_per_frame), dtype=np.uint16)
+    frames[:, :, :, 0] = START_TOKEN
+    frames[:, :, :, 1:-1] = patch_tokens
+    frames[:, :, :, -1] = END_TOKEN
 
-    return np.array(all_tokens, dtype=np.uint16)
+    # Flatten: (B, T, G, tokens_per_frame) → contiguous token stream
+    return frames.reshape(-1)
 
 
 def compute_gzip_complexity(tokens: np.ndarray) -> float:
@@ -581,7 +574,7 @@ def main() -> None:
     )
 
     p = argparse.ArgumentParser(description="Generate NCA trajectory dataset")
-    p.add_argument("--output", type=str, required=True)
+    p.add_argument("--output", type=str, default=None)
     p.add_argument("--tokens", type=int, default=300_000_000)
     p.add_argument("--num_rules", type=int, default=5000)
     p.add_argument("--sims_per_rule", type=int, default=8)
@@ -627,6 +620,9 @@ def main() -> None:
         print(f"Unique tokens: {len(np.unique(data))}")
         print(f"First 50: {data[:50].tolist()}")
         return
+
+    if not args.output:
+        p.error("--output is required when not using --verify")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)

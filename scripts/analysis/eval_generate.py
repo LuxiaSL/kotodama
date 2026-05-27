@@ -46,15 +46,28 @@ logger = logging.getLogger(__name__)
 DEFAULT_EVAL_DATA = "data/fineweb_edu_eval_5m.bin"
 
 
-def _load_prompts(prompt_set: str = "standard") -> list[str]:
-    """Load prompts from configs/prompts.yaml."""
+def _load_prompts(prompt_set: str = "standard") -> list[dict[str, str]]:
+    """Load prompts from configs/prompts.yaml.
+
+    Returns list of dicts with at least a 'text' key.
+    Plain string entries are converted to {"text": str, "domain": "general"}.
+    """
     with open("configs/prompts.yaml") as f:
         all_prompts = yaml.safe_load(f)
     if prompt_set not in all_prompts:
         raise ValueError(f"Unknown prompt set '{prompt_set}'. Available: {list(all_prompts.keys())}")
-    prompts = all_prompts[prompt_set]
-    if not isinstance(prompts, list):
+    raw = all_prompts[prompt_set]
+    if not isinstance(raw, list):
         raise ValueError(f"Prompt set '{prompt_set}' is not a list")
+
+    prompts: list[dict[str, str]] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            prompts.append({"text": entry, "domain": "general"})
+        elif isinstance(entry, dict) and "text" in entry:
+            prompts.append({"text": entry["text"], "domain": entry.get("domain", "general")})
+        else:
+            raise ValueError(f"Invalid prompt entry: {entry}")
     return prompts
 
 
@@ -212,10 +225,12 @@ def main() -> None:
         t0 = time.time()
 
         with torch.no_grad():
-            for pi, prompt in enumerate(prompts):
+            for pi, prompt_entry in enumerate(prompts):
+                prompt_text = prompt_entry["text"]
+                domain = prompt_entry.get("domain", "general")
                 for si in range(args.n_samples):
                     result = generate_text(
-                        model, tokenizer, prompt,
+                        model, tokenizer, prompt_text,
                         max_new_tokens=args.max_tokens,
                         temperature=args.temperature,
                         top_p=args.top_p,
@@ -223,6 +238,7 @@ def main() -> None:
                     samples.append({
                         "prompt_idx": pi,
                         "prompt": result["prompt"],
+                        "domain": domain,
                         "sample_idx": si,
                         "continuation": result["continuation"],
                         "n_tokens": result["n_tokens"],
@@ -232,8 +248,8 @@ def main() -> None:
                     done = pi * args.n_samples + si + 1
                     elapsed = time.time() - t0
                     logger.info(
-                        "  [%d/%d] prompt %d sample %d: %d tokens (%s, %.0fs)",
-                        done, total_gens, pi, si,
+                        "  [%d/%d] prompt %d (%s) sample %d: %d tokens (%s, %.0fs)",
+                        done, total_gens, pi, domain, si,
                         result["n_tokens"], result["stopped_by"], elapsed,
                     )
 

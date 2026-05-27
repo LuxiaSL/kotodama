@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -51,21 +52,28 @@ except ImportError:
 
 # ── Optional fused Triton AttnRes kernels ───────────────────────────────────
 _TRITON_ATTN_RES_AVAILABLE = False
-try:
-    import triton  # noqa: F401
-    from .flash_attn_res import phase_1_batched_attention_triton_op  # noqa: F401
-    _TRITON_ATTN_RES_AVAILABLE = True
-except Exception:
-    pass
+_BATCH_PHASE1 = bool(os.environ.get("KOTODAMA_BATCH_P1"))  # opt-IN: batched Phase 1 regresses throughput (register spilling)
+_P1_MAX_BATCH = 10
+if not os.environ.get("KOTODAMA_NO_TRITON_ATTNRES"):
+    try:
+        import triton  # noqa: F401
+        from .flash_attn_res import phase_1_batched_attention_triton_op  # noqa: F401
+        from .flash_attn_res import phase_2_online_softmax_merge_triton_op  # noqa: F401
+        _TRITON_ATTN_RES_AVAILABLE = True
+    except Exception:
+        pass
 
 # ── Optional Flash Attention 2 import ────────────────────────────────────────
 _FA2_AVAILABLE = False
+_FA2_VARLEN_AVAILABLE = False
 try:
-    from flash_attn import flash_attn_func
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
 
     _FA2_AVAILABLE = True
+    _FA2_VARLEN_AVAILABLE = True
 except ImportError:
     flash_attn_func = None  # type: ignore[assignment,misc]
+    flash_attn_varlen_func = None  # type: ignore[assignment,misc]
 
 # ── Optional Flash Attention 4 (CuTeDSL SM100) ────────────────────────────
 # Lazy import: FA4 patches cute.compile globally on import.
@@ -177,12 +185,16 @@ def apply_rope(
     """Apply rotary positional embeddings (SDPA layout).
 
     x: (batch, n_heads, seq_len, head_dim)
-    cos, sin: (seq_len, head_dim) — full head_dim
+    cos, sin: (seq_len, head_dim) or (batch, seq_len, head_dim) — full head_dim
     """
     half = x.shape[-1] // 2
     x_rotated = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
-    cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, S, D)
-    sin = sin.unsqueeze(0).unsqueeze(0)
+    if cos.ndim == 2:
+        cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, S, D)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+    else:
+        cos = cos.unsqueeze(1)  # (B, 1, S, D)
+        sin = sin.unsqueeze(1)
     return x * cos + x_rotated * sin
 
 
@@ -194,12 +206,16 @@ def apply_rope_fa2(
     """Apply rotary positional embeddings (FA2/FA4 layout).
 
     x: (batch, seq_len, n_heads, head_dim)
-    cos, sin: (seq_len, head_dim) — full head_dim
+    cos, sin: (seq_len, head_dim) or (batch, seq_len, head_dim) — full head_dim
     """
     half = x.shape[-1] // 2
     x_rotated = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
-    cos = cos.unsqueeze(0).unsqueeze(2)  # (1, S, 1, D)
-    sin = sin.unsqueeze(0).unsqueeze(2)
+    if cos.ndim == 2:
+        cos = cos.unsqueeze(0).unsqueeze(2)  # (1, S, 1, D)
+        sin = sin.unsqueeze(0).unsqueeze(2)
+    else:
+        cos = cos.unsqueeze(2)  # (B, S, 1, D)
+        sin = sin.unsqueeze(2)
     return x * cos + x_rotated * sin
 
 
@@ -213,6 +229,76 @@ def _select_norm_class(config: LuxiaModelConfig) -> type:
     if config.use_liger and _LIGER_AVAILABLE:
         return LigerRMSNorm
     return RMSNorm
+
+
+@torch.no_grad()
+def _compute_routing_alphas(
+    committed_stack: Optional[torch.Tensor],
+    n_committed: int,
+    partial: torch.Tensor,
+    qw: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Compute routing softmax weights for one routing point. Returns (n_src,) avg alphas."""
+    if n_committed == 0:
+        return torch.ones(1, device=partial.device)
+    all_src = torch.cat([committed_stack[:n_committed], partial.unsqueeze(0)], dim=0)
+    rsqrt = torch.rsqrt(all_src.pow(2).mean(-1) + eps)
+    logits = (all_src * qw).sum(-1) * rsqrt
+    weights = F.softmax(logits, dim=0)
+    return weights.mean(dim=(1, 2))
+
+
+@torch.no_grad()
+def _compute_attn_res_diagnostics(
+    committed: list[torch.Tensor],
+    partial: torch.Tensor,
+    final_query: torch.Tensor,
+    final_norm_weight: torch.Tensor,
+    eps: float,
+    intermediate_alphas: Optional[list[tuple[int, str, torch.Tensor]]] = None,
+) -> dict[str, float]:
+    """Compute per-block norms, final routing weights, and intermediate routing stats."""
+    diag: dict[str, float] = {}
+    for i, c in enumerate(committed):
+        diag[f"attnres/block_norm/{i}"] = c.float().norm(dim=-1).mean().item()
+    diag["attnres/partial_norm"] = partial.float().norm(dim=-1).mean().item()
+
+    # Final aggregation alphas
+    all_src = committed + [partial]
+    src = torch.stack(all_src, dim=0)
+    qw = final_query * final_norm_weight
+    rsqrt = torch.rsqrt(src.pow(2).mean(-1) + eps)
+    logits = (src * qw).sum(-1) * rsqrt
+    weights = F.softmax(logits, dim=0)
+    avg_w = weights.mean(dim=(1, 2))
+    for i in range(len(all_src)):
+        label = f"block_{i}" if i < len(committed) else "partial"
+        diag[f"attnres/final_alpha/{label}"] = avg_w[i].item()
+
+    # Intermediate routing: per-layer entropy + per-block average alpha
+    if intermediate_alphas:
+        n_blocks = len(committed)
+        block_alpha_sums = [0.0] * (n_blocks + 1)  # +1 for partial
+        block_alpha_counts = [0] * (n_blocks + 1)
+
+        for layer_idx, sublayer, alphas in intermediate_alphas:
+            n_src = alphas.shape[0]
+            entropy = -(alphas * (alphas + 1e-10).log()).sum().item()
+            max_entropy = math.log(n_src) if n_src > 1 else 1.0
+            diag[f"attnres/routing_entropy/layer_{layer_idx}/{sublayer}"] = entropy / max_entropy
+
+            for s in range(n_src):
+                bucket = s if s < n_blocks else n_blocks  # last = partial
+                block_alpha_sums[bucket] += alphas[s].item()
+                block_alpha_counts[bucket] += 1
+
+        for b in range(n_blocks + 1):
+            if block_alpha_counts[b] > 0:
+                label = f"block_{b}" if b < n_blocks else "partial"
+                diag[f"attnres/avg_alpha/{label}"] = block_alpha_sums[b] / block_alpha_counts[b]
+
+    return diag
 
 
 def _resolve_attn_impl(config: LuxiaModelConfig) -> str:
@@ -276,6 +362,7 @@ class GQAttention(nn.Module):
         x: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """FA2 path: (B, S, nheads, D) layout, no transposes."""
         bsz, seq_len, _ = x.shape
@@ -288,8 +375,14 @@ class GQAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        q = apply_rope_fa2(q, rope_cos[:seq_len], rope_sin[:seq_len])
-        k = apply_rope_fa2(k, rope_cos[:seq_len], rope_sin[:seq_len])
+        if position_ids is not None:
+            pos_cos = rope_cos[position_ids]
+            pos_sin = rope_sin[position_ids]
+        else:
+            pos_cos = rope_cos[:seq_len]
+            pos_sin = rope_sin[:seq_len]
+        q = apply_rope_fa2(q, pos_cos, pos_sin)
+        k = apply_rope_fa2(k, pos_cos, pos_sin)
 
         # FA2's custom_op doesn't participate in autocast — ensure bf16
         q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
@@ -301,6 +394,61 @@ class GQAttention(nn.Module):
         attn_output = attn_output.contiguous().view(bsz, seq_len, -1)
         return self.o_proj(attn_output)
 
+    def _forward_fa2_varlen(
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """FA2 variable-length path for document-boundary masking.
+
+        Uses flash_attn_varlen_func to prevent attention across document
+        boundaries within packed sequences. Each document is treated as an
+        independent sequence for attention computation.
+
+        Args:
+            x: (B, S, D) input hidden states
+            cu_seqlens: (total_docs+1,) int32 cumulative doc lengths (flat across batch)
+            max_seqlen: maximum document length in this batch
+            position_ids: (B, S) per-token positions (reset at doc boundaries)
+        """
+        bsz, seq_len, _ = x.shape
+
+        q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        # RoPE with document-local positions
+        pos_cos = rope_cos[position_ids]  # (B, S, D)
+        pos_sin = rope_sin[position_ids]  # (B, S, D)
+        q = apply_rope_fa2(q, pos_cos, pos_sin)
+        k = apply_rope_fa2(k, pos_cos, pos_sin)
+
+        # Flatten batch for varlen: (B, S, H, D) → (B*S, H, D)
+        q = q.reshape(-1, self.num_heads, self.head_dim).bfloat16()
+        k = k.reshape(-1, self.num_kv_heads, self.head_dim).bfloat16()
+        v = v.reshape(-1, self.num_kv_heads, self.head_dim).bfloat16()
+
+        attn_output = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=True,
+        )
+
+        # Reshape back: (B*S, H, D) → (B, S, H*D)
+        attn_output = attn_output.reshape(bsz, seq_len, -1)
+        return self.o_proj(attn_output)
+
     def _forward_sdpa(
         self,
         x: torch.Tensor,
@@ -308,6 +456,7 @@ class GQAttention(nn.Module):
         rope_sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         past_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """SDPA path: (B, nheads, S, D) layout. Returns (output, (cached_k, cached_v))."""
         bsz, seq_len, _ = x.shape
@@ -320,13 +469,18 @@ class GQAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        pos_offset = past_kv[0].shape[2] if past_kv is not None else 0
-
-        if self._use_liger_rope:
+        if position_ids is not None:
+            pos_cos = rope_cos[position_ids]
+            pos_sin = rope_sin[position_ids]
+            q = apply_rope(q, pos_cos, pos_sin)
+            k = apply_rope(k, pos_cos, pos_sin)
+        elif self._use_liger_rope:
+            pos_offset = past_kv[0].shape[2] if past_kv is not None else 0
             cos = rope_cos[pos_offset:pos_offset + seq_len].unsqueeze(0)
             sin = rope_sin[pos_offset:pos_offset + seq_len].unsqueeze(0)
             q, k = liger_rotary_pos_emb(q, k, cos, sin)
         else:
+            pos_offset = past_kv[0].shape[2] if past_kv is not None else 0
             q = apply_rope(q, rope_cos[pos_offset:pos_offset + seq_len], rope_sin[pos_offset:pos_offset + seq_len])
             k = apply_rope(k, rope_cos[pos_offset:pos_offset + seq_len], rope_sin[pos_offset:pos_offset + seq_len])
 
@@ -351,6 +505,7 @@ class GQAttention(nn.Module):
         x: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """FA4 path: (B, S, nheads, D) layout, CuTeDSL SM100 kernels."""
         bsz, seq_len, _ = x.shape
@@ -363,9 +518,14 @@ class GQAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # FA4 uses same (B, S, nheads, D) layout as FA2
-        q = apply_rope_fa2(q, rope_cos[:seq_len], rope_sin[:seq_len])
-        k = apply_rope_fa2(k, rope_cos[:seq_len], rope_sin[:seq_len])
+        if position_ids is not None:
+            pos_cos = rope_cos[position_ids]
+            pos_sin = rope_sin[position_ids]
+        else:
+            pos_cos = rope_cos[:seq_len]
+            pos_sin = rope_sin[:seq_len]
+        q = apply_rope_fa2(q, pos_cos, pos_sin)
+        k = apply_rope_fa2(k, pos_cos, pos_sin)
 
         # FA4 doesn't participate in autocast — ensure bf16
         q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
@@ -384,6 +544,9 @@ class GQAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         past_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if self.tp_group is not None:
             from src.training.tensor_parallel import copy_to_parallel_region, reduce_from_parallel_region
@@ -395,16 +558,21 @@ class GQAttention(nn.Module):
             # KV cache only implemented for SDPA; fall through
             pass
 
-        # FA4/FA2 don't accept arbitrary masks — fall back to SDPA when mask is provided
-        # KV cache forces SDPA path
+        # Priority: KV cache > varlen (doc masking) > FA4/FA2 full-causal > SDPA
         if past_kv is not None or use_cache:
-            out, new_kv = self._forward_sdpa(x, rope_cos, rope_sin, mask, past_kv)
-        elif self._attn_impl == "fa4" and mask is None:
+            out, new_kv = self._forward_sdpa(x, rope_cos, rope_sin, mask, past_kv, position_ids)
+        elif cu_seqlens is not None and _FA2_VARLEN_AVAILABLE and self._attn_impl in ("fa2", "auto") and x.is_cuda:
+            out = self._forward_fa2_varlen(x, rope_cos, rope_sin, cu_seqlens, max_seqlen, position_ids)
+        elif cu_seqlens is not None:
+            # SDPA fallback with block-causal mask built from cu_seqlens
+            out = self._forward_sdpa(x, rope_cos, rope_sin, mask, position_ids=position_ids)
+            out = out[0]
+        elif self._attn_impl == "fa4" and mask is None and position_ids is None:
             out = self._forward_fa4(x, rope_cos, rope_sin)
-        elif self._attn_impl == "fa2" and mask is None:
+        elif self._attn_impl == "fa2" and mask is None and position_ids is None:
             out = self._forward_fa2(x, rope_cos, rope_sin)
         else:
-            out = self._forward_sdpa(x, rope_cos, rope_sin, mask)
+            out = self._forward_sdpa(x, rope_cos, rope_sin, mask, position_ids=position_ids)
             out = out[0]  # discard unused cache
 
         if self.tp_group is not None:
@@ -471,12 +639,15 @@ class TransformerBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         past_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if use_cache:
-            attn_out, new_kv = self.attn(self.attn_norm(x), rope_cos, rope_sin, mask, past_kv, use_cache=True)
+            attn_out, new_kv = self.attn(self.attn_norm(x), rope_cos, rope_sin, mask, past_kv, use_cache=True, position_ids=position_ids)
             x = x + attn_out
         else:
-            x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin, mask)
+            x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin, mask, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         x = x + self.ffn(self.ffn_norm(x))
         if use_cache:
             return x, new_kv
@@ -569,6 +740,13 @@ class LuxiaBaseModel(nn.Module):
             self.register_buffer("_attn_res_masks", masks, persistent=False)
 
             self._attn_res_active_counts = [int(masks[j].sum().item()) for j in range(masks.shape[0])]
+
+            # Precompute block ranges for block-boundary activation checkpointing
+            sorted_boundaries = sorted(self._attn_res_boundary_set)
+            self._attn_res_block_ranges: list[tuple[int, int]] = []
+            for idx, b in enumerate(sorted_boundaries):
+                end = sorted_boundaries[idx + 1] if idx + 1 < len(sorted_boundaries) else config.num_layers
+                self._attn_res_block_ranges.append((b, end))
 
         # Precompute RoPE frequencies
         rope_cos, rope_sin = precompute_rope_frequencies(
@@ -663,63 +841,249 @@ class LuxiaBaseModel(nn.Module):
         active_mask[:len(sources)] = True
         return self._route_static(buf, query, norm, active_mask)
 
+    def _route_p12(
+        self,
+        committed_stack: Optional[torch.Tensor],
+        n_committed: int,
+        partial: torch.Tensor,
+        query: torch.Tensor,
+        norm: nn.Module,
+    ) -> torch.Tensor:
+        """Route using Phase 1 (inter-block attention) + Phase 2 (online merge).
+
+        Eliminates _pad_and_stack entirely. Phase 1 attends over committed blocks,
+        Phase 2 merges the result with the current partial via online softmax.
+        Falls back to PyTorch when Triton is unavailable.
+        """
+        if n_committed == 0:
+            return partial
+
+        qw = query * norm.weight
+        eps = norm.eps
+
+        if committed_stack is not None and committed_stack.is_cuda and _TRITON_ATTN_RES_AVAILABLE:
+            from .flash_attn_res import phase_1_batched_attention_triton_op
+            from .flash_attn_res import phase_2_online_softmax_merge_triton_op
+
+            p1_out, p1_lse = phase_1_batched_attention_triton_op(
+                committed_stack, qw.unsqueeze(0), eps, num_active=n_committed)
+            return phase_2_online_softmax_merge_triton_op(
+                partial, qw, p1_out[0], p1_lse[0], eps)
+
+        # PyTorch fallback
+        rsqrt_c = torch.rsqrt(committed_stack.pow(2).mean(-1) + eps)
+        logits_c = (committed_stack * qw).sum(-1) * rsqrt_c
+        rsqrt_p = torch.rsqrt(partial.pow(2).mean(-1, keepdim=True) + eps)
+        logit_p = ((partial * qw).sum(-1, keepdim=True) * rsqrt_p).squeeze(-1)
+        all_logits = torch.cat([logits_c, logit_p.unsqueeze(0)], dim=0)
+        weights = F.softmax(all_logits, dim=0)
+        all_sources = torch.cat([committed_stack, partial.unsqueeze(0)], dim=0)
+        return (weights.unsqueeze(-1) * all_sources).sum(0)
+
+    def _collect_block_queries(
+        self,
+        block_idx: int,
+        block_start: int,
+        block_end: int,
+    ) -> list[torch.Tensor]:
+        """Collect all pre-weighted queries (query * norm.weight) for one block.
+
+        Returns queries in routing order:
+          [boundary_pre_mlp, inner_pre_attn, inner_pre_mlp, ..., next_boundary_pre_attn_or_final]
+        """
+        qws: list[torch.Tensor] = []
+        lyr_b = self.layers[block_start]
+        qws.append(lyr_b.mlp_res_query * lyr_b.mlp_res_norm.weight)
+        for i in range(block_start + 1, block_end):
+            lyr = self.layers[i]
+            qws.append(lyr.attn_res_query * lyr.attn_res_norm.weight)
+            qws.append(lyr.mlp_res_query * lyr.mlp_res_norm.weight)
+        if block_idx + 1 < len(self._attn_res_block_ranges):
+            nb = self._attn_res_block_ranges[block_idx + 1][0]
+            qws.append(self.layers[nb].attn_res_query * self.layers[nb].attn_res_norm.weight)
+        else:
+            qws.append(self.final_res_query * self.final_res_norm.weight)
+        return qws
+
     def _forward_attn_res(
         self,
         embed: torch.Tensor,
         mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
-        """Forward pass with Block Attention Residuals (compile-friendly).
+        """Forward pass with Block Attention Residuals using Phase 1 + Phase 2.
 
-        Uses pad+stack to build a fixed-shape (max_S, B, T, D) buffer at each
-        routing call.  All ops are out-of-place (no autograd version issues) and
-        all tensor shapes are static (no torch.compile graph breaks).
+        When Triton is available, Phase 1 calls are batched per block — all
+        queries sharing the same committed_stack are processed in one kernel
+        launch (6 launches instead of 57).  Phase 2 (online sigmoid merge)
+        runs per routing call as the partial evolves.
 
-        Activation checkpointing is supported: each layer's computation is wrapped
-        in torch.utils.checkpoint when config.activation_checkpointing is set.
+        With AC, attention and MLP are individually checkpointed.  Routing
+        stays in the main graph (cheap, small outputs).
         """
-        committed: list[torch.Tensor] = []  # each (B, T, D), own storage
-        partial = embed
-        boundary_set = self._attn_res_boundary_set
-        max_s = self._attn_res_max_sources
-        masks = self._attn_res_masks
-        active_counts = self._attn_res_active_counts
+        use_ac = self.config.activation_checkpointing and self.training
         rope_cos = self.rope_cos
         rope_sin = self.rope_sin
-        zero = torch.zeros_like(embed)  # reusable padding tensor
+        block_ranges = self._attn_res_block_ranges
+        batch_p1 = _TRITON_ATTN_RES_AVAILABLE and _BATCH_PHASE1 and embed.is_cuda
 
-        def _pad_and_stack(committed: list[torch.Tensor], partial: torch.Tensor) -> torch.Tensor:
-            """Pad sources to max_sources with zeros and stack (out-of-place)."""
-            sources = committed + [partial]
-            while len(sources) < max_s:
-                sources.append(zero)
-            return torch.stack(sources, dim=0)  # (max_S, B, T, D)
+        committed: list[torch.Tensor] = []
+        committed_stack: Optional[torch.Tensor] = None
+        partial = embed
+        eps = self.config.norm_eps
+        capture_routing = not self.training
+        intermediate_alphas: list[tuple[int, str, torch.Tensor]] = []
 
-        for i, layer in enumerate(self.layers):
-            buf = _pad_and_stack(committed, partial)
-            h = self._route_static(buf, layer.attn_res_query, layer.attn_res_norm, masks[2 * i], int(active_counts[2 * i]))
+        prev_bnd_p1_out: Optional[torch.Tensor] = None
+        prev_bnd_p1_lse: Optional[torch.Tensor] = None
+        prev_bnd_qw: Optional[torch.Tensor] = None
 
-            if i in boundary_set:
-                committed.append(partial.clone())
-                partial = zero.clone()
+        p1_outs: Optional[torch.Tensor] = None
+        p1_lses: Optional[torch.Tensor] = None
+        qws: list[torch.Tensor] = []
+        qi = 0
 
-            attn_out = layer.attn(layer.attn_norm(h), rope_cos, rope_sin, mask)
-            partial = partial + attn_out
+        for block_idx, (block_start, block_end) in enumerate(block_ranges):
+            n_committed = len(committed)
 
-            buf = _pad_and_stack(committed, partial)
-            h = self._route_static(buf, layer.mlp_res_query, layer.mlp_res_norm, masks[2 * i + 1], int(active_counts[2 * i + 1]))
+            # ── Boundary layer pre-attention routing ──────────────────
+            # Uses the PREVIOUS block's committed state.
+            if n_committed == 0:
+                h_attn = partial
+            elif batch_p1:
+                h_attn = phase_2_online_softmax_merge_triton_op(
+                    partial, prev_bnd_qw, prev_bnd_p1_out, prev_bnd_p1_lse, eps)
+            else:
+                h_attn = self._route_p12(
+                    committed_stack, n_committed, partial,
+                    self.layers[block_start].attn_res_query,
+                    self.layers[block_start].attn_res_norm)
+            if capture_routing and n_committed > 0:
+                qw = self.layers[block_start].attn_res_query * self.layers[block_start].attn_res_norm.weight
+                intermediate_alphas.append((block_start, "pre_attn",
+                    _compute_routing_alphas(committed_stack, n_committed, partial, qw, eps)))
 
-            mlp_out = layer.ffn(layer.ffn_norm(h))
-            partial = partial + mlp_out
+            # ── Commit at boundary ────────────────────────────────────
+            committed.append(partial)
+            partial = torch.zeros_like(embed)
+            committed_stack = torch.stack(committed, dim=0)
+            n_committed = len(committed)
 
-        buf = _pad_and_stack(committed, partial)
-        x = self._route_static(buf, self.final_res_query, self.final_res_norm, masks[2 * self.config.num_layers], int(active_counts[2 * self.config.num_layers]))
-        return self.norm(x)
+            # ── Batch Phase 1 for all queries in this block ───────────
+            if batch_p1:
+                qws = self._collect_block_queries(block_idx, block_start, block_end)
+                query_stack = torch.stack(qws, dim=0)
+                nq = len(qws)
+                if nq <= _P1_MAX_BATCH:
+                    p1_outs, p1_lses = phase_1_batched_attention_triton_op(
+                        committed_stack, query_stack, eps, num_active=n_committed)
+                else:
+                    p1_out_chunks: list[torch.Tensor] = []
+                    p1_lse_chunks: list[torch.Tensor] = []
+                    for s in range(0, nq, _P1_MAX_BATCH):
+                        chunk_out, chunk_lse = phase_1_batched_attention_triton_op(
+                            committed_stack, query_stack[s:s + _P1_MAX_BATCH],
+                            eps, num_active=n_committed)
+                        p1_out_chunks.append(chunk_out)
+                        p1_lse_chunks.append(chunk_lse)
+                    p1_outs = torch.cat(p1_out_chunks, dim=0)
+                    p1_lses = torch.cat(p1_lse_chunks, dim=0)
+                qi = 0
+
+            # ── Process all layers in this block ──────────────────────
+            for i in range(block_start, block_end):
+                lyr = self.layers[i]
+
+                # Pre-attention routing (boundary layer already routed above)
+                if i != block_start:
+                    if batch_p1:
+                        h_attn = phase_2_online_softmax_merge_triton_op(
+                            partial, qws[qi], p1_outs[qi], p1_lses[qi], eps)
+                        qi += 1
+                    else:
+                        h_attn = self._route_p12(
+                            committed_stack, n_committed, partial,
+                            lyr.attn_res_query, lyr.attn_res_norm)
+                    if capture_routing:
+                        qw = lyr.attn_res_query * lyr.attn_res_norm.weight
+                        intermediate_alphas.append((i, "pre_attn",
+                            _compute_routing_alphas(committed_stack, n_committed, partial, qw, eps)))
+
+                # Attention
+                if use_ac:
+                    def _attn_fn(h_in: torch.Tensor, p_in: torch.Tensor,
+                                 _idx: int = i) -> torch.Tensor:
+                        return p_in + self.layers[_idx].attn(
+                            self.layers[_idx].attn_norm(h_in), rope_cos, rope_sin, mask,
+                            position_ids=position_ids,
+                            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                    partial = torch_checkpoint(
+                        _attn_fn, h_attn, partial,
+                        use_reentrant=False, preserve_rng_state=False)
+                else:
+                    partial = partial + lyr.attn(
+                        lyr.attn_norm(h_attn), rope_cos, rope_sin, mask,
+                        position_ids=position_ids,
+                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+
+                # Pre-MLP routing
+                if batch_p1:
+                    h_mlp = phase_2_online_softmax_merge_triton_op(
+                        partial, qws[qi], p1_outs[qi], p1_lses[qi], eps)
+                    qi += 1
+                else:
+                    h_mlp = self._route_p12(
+                        committed_stack, n_committed, partial,
+                        lyr.mlp_res_query, lyr.mlp_res_norm)
+                if capture_routing:
+                    qw = lyr.mlp_res_query * lyr.mlp_res_norm.weight
+                    intermediate_alphas.append((i, "pre_mlp",
+                        _compute_routing_alphas(committed_stack, n_committed, partial, qw, eps)))
+
+                # MLP
+                if use_ac:
+                    def _mlp_fn(h_in: torch.Tensor, p_in: torch.Tensor,
+                                _idx: int = i) -> torch.Tensor:
+                        return p_in + self.layers[_idx].ffn(
+                            self.layers[_idx].ffn_norm(h_in))
+                    partial = torch_checkpoint(
+                        _mlp_fn, h_mlp, partial,
+                        use_reentrant=False, preserve_rng_state=False)
+                else:
+                    partial = partial + lyr.ffn(lyr.ffn_norm(h_mlp))
+
+            # ── Carry Phase 1 output for next boundary's pre-attn ────
+            if batch_p1:
+                prev_bnd_p1_out = p1_outs[qi]
+                prev_bnd_p1_lse = p1_lses[qi]
+                prev_bnd_qw = qws[qi]
+
+        # ── Final routing ─────────────────────────────────────────────
+        if batch_p1:
+            h_final = phase_2_online_softmax_merge_triton_op(
+                partial, prev_bnd_qw, prev_bnd_p1_out, prev_bnd_p1_lse, eps)
+        else:
+            h_final = self._route_p12(
+                committed_stack, len(committed), partial,
+                self.final_res_query, self.final_res_norm)
+
+        if not self.training:
+            self._last_attn_res_diagnostics = _compute_attn_res_diagnostics(
+                committed, partial, self.final_res_query,
+                self.final_res_norm.weight, self.config.norm_eps,
+                intermediate_alphas=intermediate_alphas,
+            )
+
+        return self.norm(h_final)
 
     def _forward_attn_res_cached(
         self,
         embed: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         past_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """AttnRes forward with KV cache support for autoregressive decoding."""
         committed: list[torch.Tensor] = []
@@ -748,7 +1112,7 @@ class LuxiaBaseModel(nn.Module):
                 partial = zero.clone()
 
             layer_past = past_kv[i] if past_kv is not None else None
-            attn_out, layer_kv = layer.attn(layer.attn_norm(h), rope_cos, rope_sin, mask, layer_past, use_cache=True)
+            attn_out, layer_kv = layer.attn(layer.attn_norm(h), rope_cos, rope_sin, mask, layer_past, use_cache=True, position_ids=position_ids)
             new_kv_list.append(layer_kv)
             partial = partial + attn_out
 
@@ -769,21 +1133,27 @@ class LuxiaBaseModel(nn.Module):
         mask: Optional[torch.Tensor] = None,
         past_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> dict[str, torch.Tensor]:
         x = self.embed_tokens(input_ids)
         new_kv_list: list[tuple[torch.Tensor, torch.Tensor]] = []
 
+        # SDPA fallback: build block-causal mask when cu_seqlens is provided but
+        # FA2 varlen is not available (e.g. CPU testing, SDPA-only builds)
+        if cu_seqlens is not None and not _FA2_VARLEN_AVAILABLE:
+            from src.data.dataset import build_block_causal_mask
+            bsz, seq_len = input_ids.shape
+            mask = build_block_causal_mask(cu_seqlens, bsz, seq_len, input_ids.device)
+            cu_seqlens = None  # layers will use the mask instead
+            max_seqlen = None
+
         if self.config.attn_res:
-            if self.config.activation_checkpointing and self.training:
-                logger.warning_once(
-                    "activation_checkpointing has no effect with attn_res=True. "
-                    "AttnRes routing shares state across layers, making per-layer "
-                    "checkpointing unsound. Memory fits without it on B200."
-                )
             if use_cache:
-                x, new_kv_list = self._forward_attn_res_cached(x, mask, past_kv)
+                x, new_kv_list = self._forward_attn_res_cached(x, mask, past_kv, position_ids)
             else:
-                x = self._forward_attn_res(x, mask)
+                x = self._forward_attn_res(x, mask, position_ids, cu_seqlens, max_seqlen)
         else:
             for i, layer in enumerate(self.layers):
                 layer_past = past_kv[i] if past_kv is not None else None
@@ -794,10 +1164,10 @@ class LuxiaBaseModel(nn.Module):
                         preserve_rng_state=False,
                     )
                 elif use_cache:
-                    x, layer_kv = layer(x, self.rope_cos, self.rope_sin, mask, layer_past, use_cache=True)
+                    x, layer_kv = layer(x, self.rope_cos, self.rope_sin, mask, layer_past, use_cache=True, position_ids=position_ids)
                     new_kv_list.append(layer_kv)
                 else:
-                    x = layer(x, self.rope_cos, self.rope_sin, mask)
+                    x = layer(x, self.rope_cos, self.rope_sin, mask, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             x = self.norm(x)
 
         output: dict[str, Any] = {}

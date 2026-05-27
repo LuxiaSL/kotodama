@@ -44,9 +44,9 @@ warnings.filterwarnings("ignore", message="Online softmax", module=r"torch\._ind
 # Project imports — launch from the luxia-base/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from src.data.dataset import RandomTokenDataset, TokenizedDataset
+from src.data.dataset import PackedSample, RandomTokenDataset, TokenizedDataset, collate_packed
 from src.model.llama import LuxiaBaseModel, LuxiaModelConfig
-from src.monitoring.geometric import GeometricMonitor, MonitorConfig
+from src.monitoring.geometric import GeometricMonitor, MonitorConfig, MonitorSchedule
 from src.monitoring.wandb_callback import WandbLogger
 from src.training.checkpoint import (
     AsyncCheckpointManager,
@@ -82,6 +82,51 @@ def hm_log(step: int, **metrics: float) -> None:
             )
     except Exception:
         pass  # Never crash the training loop
+
+
+def _upload_checkpoint_to_hf(
+    repo_id: str,
+    checkpoint_dir: Path,
+    step: int,
+    tokens_consumed: int,
+    config_file: Optional[str] = None,
+) -> None:
+    """Upload final checkpoint to HuggingFace Hub. Best-effort — never crashes training."""
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        api.create_repo(repo_id, repo_type="model", exist_ok=True, private=True)
+
+        ckpt_name = f"step_{step:08d}"
+        candidates = [
+            checkpoint_dir / f"{ckpt_name}.pt.zst",
+            checkpoint_dir / f"{ckpt_name}.pt",
+        ]
+        ckpt_path = next((p for p in candidates if p.exists()), None)
+        if ckpt_path is None:
+            logger.warning("HF upload: final checkpoint not found at %s", checkpoint_dir)
+            return
+
+        logger.info("Uploading %s to %s ...", ckpt_path.name, repo_id)
+        api.upload_file(
+            path_or_fileobj=str(ckpt_path),
+            path_in_repo=ckpt_path.name,
+            repo_id=repo_id,
+            commit_message=f"Final checkpoint: step {step}, {tokens_consumed / 1e9:.1f}B tokens",
+        )
+
+        if config_file and Path(config_file).exists():
+            api.upload_file(
+                path_or_fileobj=config_file,
+                path_in_repo=Path(config_file).name,
+                repo_id=repo_id,
+                commit_message="Training config",
+            )
+
+        logger.info("HF upload complete: %s", repo_id)
+    except Exception:
+        logger.exception("HF upload failed (training completed successfully)")
 
 
 # =============================================================================
@@ -245,11 +290,101 @@ def train(args: argparse.Namespace) -> None:
             f"{config.param_count() / 1e6:.1f}M",
         )
 
+    # -- CPT / weight-only resume ------------------------------------------------
+    if args.resume_weights:
+        resume_path = Path(args.resume_weights)
+        if is_main:
+            logger.info("Loading weights for CPT: %s", resume_path)
+        load_path = resume_path
+        if resume_path.name.endswith(".pt.zst"):
+            import subprocess as _sp
+            load_path = resume_path.with_name(resume_path.name.replace(".pt.zst", ".pt"))
+            if is_main:
+                _sp.run(["zstd", "-d", str(resume_path), "-o", str(load_path), "-f"],
+                        check=True, capture_output=True)
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                dist.barrier()
+
+        weight_state = torch.load(load_path, map_location=device, weights_only=False)
+
+        if resume_path.name.endswith(".pt.zst") and is_main:
+            load_path.unlink(missing_ok=True)
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
+
+        model_state = weight_state.get("model", weight_state)
+        cleaned_state = {k.replace("_orig_mod.", ""): v for k, v in model_state.items()}
+        model.load_state_dict(cleaned_state, strict=True)
+        if is_main:
+            logger.info("CPT weights loaded (step %d, %.2fB tokens from prior run)",
+                        weight_state.get("step", -1),
+                        weight_state.get("tokens_consumed", 0) / 1e9)
+
+    # -- Warm resume (model + optimizer, reset step/data) -------------------------
+    if getattr(args, "resume_warm", None):
+        resume_path = Path(args.resume_warm)
+        if is_main:
+            logger.info("Warm resume (model + optimizer): %s", resume_path)
+        load_path = resume_path
+        if resume_path.name.endswith(".pt.zst"):
+            import subprocess as _sp
+            load_path = resume_path.with_name(resume_path.name.replace(".pt.zst", ".pt"))
+            if is_main:
+                _sp.run(["zstd", "-d", str(resume_path), "-o", str(load_path), "-f"],
+                        check=True, capture_output=True)
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                dist.barrier()
+
+        ckpt = torch.load(load_path, map_location=device, weights_only=False)
+
+        if resume_path.name.endswith(".pt.zst") and is_main:
+            load_path.unlink(missing_ok=True)
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
+
+        # Model weights
+        model_state = ckpt.get("model", ckpt)
+        cleaned_state = {k.replace("_orig_mod.", ""): v for k, v in model_state.items()}
+        model.load_state_dict(cleaned_state, strict=True)
+
+        # Optimizer states (preserves momentum)
+        if "muon_opt" in ckpt:
+            muon_opt.load_state_dict(ckpt["muon_opt"])
+        if "adamw_opt" in ckpt:
+            adamw_opt.load_state_dict(ckpt["adamw_opt"])
+
+        if is_main:
+            logger.info(
+                "Warm resume loaded (prior step %d, %.2fB tokens). "
+                "Step counter reset to 0, data starts from beginning.",
+                ckpt.get("step", -1),
+                ckpt.get("tokens_consumed", 0) / 1e9,
+            )
+
     # -- NCA → language transition ---------------------------------------------
-    if args.resume_nca:
+    # Skip if checkpoint dir already has saves (restart after preemption).
+    _has_existing_ckpts = any(Path(args.checkpoint_dir).glob("step_*.pt")) if args.checkpoint_dir else False
+    if args.resume_nca and not _has_existing_ckpts:
         if is_main:
             logger.info("Loading NCA checkpoint: %s", args.resume_nca)
-        nca_state = torch.load(args.resume_nca, map_location=device, weights_only=False)
+        nca_path = Path(args.resume_nca)
+        load_path = nca_path
+        if nca_path.name.endswith(".pt.zst"):
+            import subprocess as _sp
+            load_path = nca_path.with_name(nca_path.name.replace(".pt.zst", ".pt"))
+            if is_main:
+                _sp.run(["zstd", "-d", str(nca_path), "-o", str(load_path), "-f"],
+                        check=True, capture_output=True)
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                dist.barrier()
+
+        nca_state = torch.load(load_path, map_location=device, weights_only=False)
+
+        if nca_path.name.endswith(".pt.zst") and is_main:
+            load_path.unlink(missing_ok=True)
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
+
         nca_model_state = nca_state.get("model", nca_state)
 
         # Strip _orig_mod. prefix from torch.compile'd checkpoints
@@ -286,6 +421,9 @@ def train(args: argparse.Namespace) -> None:
 
         if is_main:
             logger.info("NCA → language transition complete")
+    elif args.resume_nca and _has_existing_ckpts:
+        if is_main:
+            logger.info("Skipping NCA init — existing checkpoints found (resuming from preemption)")
 
     # Enable TF32 for fp32 matmuls outside autocast (grad norm, loss compute)
     torch.set_float32_matmul_precision("high")
@@ -319,9 +457,10 @@ def train(args: argparse.Namespace) -> None:
                 "FA4 CuTeDSL kernels have no custom_op registration and will break torch.compile. "
                 "Use --attn_impl sdpa or --attn_impl fa2 with --compile, or drop --compile for FA4."
             )
+        compile_mode = getattr(args, "compile_mode", None)
         if is_main:
-            logger.info("Compiling model with torch.compile...")
-        model = torch.compile(model)
+            logger.info("Compiling model with torch.compile (mode=%s)...", compile_mode)
+        model = torch.compile(model, mode=compile_mode)
         if is_main:
             logger.info("Compilation registered (will compile on first forward)")
 
@@ -334,6 +473,7 @@ def train(args: argparse.Namespace) -> None:
             device_ids=[local_rank],
             process_group=dp_group,
             gradient_as_bucket_view=True,
+            find_unused_parameters=config.attn_res,
         )
     else:
         if is_main:
@@ -416,6 +556,7 @@ def train(args: argparse.Namespace) -> None:
     # Under TP, all ranks in a TP group must see the same data.
     # Partition by dp_rank so TP peers share batches.
     dp_rank = dist.get_rank(dp_group) if dp_group is not None else 0
+    doc_masking = getattr(args, "doc_masking", False)
 
     if args.random_data:
         dataset = RandomTokenDataset(
@@ -423,9 +564,10 @@ def train(args: argparse.Namespace) -> None:
             seq_len=seq_len,
             seed=args.seed,
             rank=dp_rank,
+            doc_masking=doc_masking,
         )
         if is_main:
-            logger.info("Using random data (vocab=%d)", config.vocab_size)
+            logger.info("Using random data (vocab=%d, doc_masking=%s)", config.vocab_size, doc_masking)
     else:
         if not args.data_path:
             raise ValueError("--data_path required when not using --random_data")
@@ -435,18 +577,56 @@ def train(args: argparse.Namespace) -> None:
             rank=dp_rank,
             world_size=dp_size,
             seed=args.seed,
+            doc_masking=doc_masking,
         )
 
     def _make_data_iter():
+        collate_fn = collate_packed if doc_masking else None
         loader = torch.utils.data.DataLoader(
             dataset,
             batch_size=micro_batch,
             num_workers=0,  # IterableDataset handles its own partitioning
             pin_memory=True,
+            collate_fn=collate_fn,
         )
         return iter(loader)
 
     data_iter = _make_data_iter()
+
+    # -- Eval data (optional held-out set) -------------------------------------
+    eval_dataset = None
+    eval_iter_fn = None
+    eval_every = getattr(args, "eval_every", 0)
+    eval_batches = getattr(args, "eval_batches", 20)
+
+    if getattr(args, "eval_data_path", None):
+        eval_dataset = TokenizedDataset(
+            path=args.eval_data_path,
+            seq_len=seq_len,
+            rank=dp_rank,
+            world_size=dp_size,
+            seed=args.seed + 7919,
+            doc_masking=doc_masking,
+        )
+        def _make_eval_iter():
+            collate_fn = collate_packed if doc_masking else None
+            loader = torch.utils.data.DataLoader(
+                eval_dataset,
+                batch_size=micro_batch,
+                num_workers=0,
+                pin_memory=True,
+                collate_fn=collate_fn,
+            )
+            return iter(loader)
+        eval_iter_fn = _make_eval_iter
+        if is_main:
+            logger.info(
+                "Eval data: %s (%.1fM tokens, eval every %d steps, %d batches)",
+                args.eval_data_path,
+                eval_dataset.total_tokens / 1e6,
+                eval_every,
+                eval_batches,
+            )
 
     # -- Checkpoint manager ----------------------------------------------------
     if getattr(args, "async_checkpoint", False):
@@ -484,26 +664,47 @@ def train(args: argparse.Namespace) -> None:
     # -- Geometric monitoring (rank 0 only) ------------------------------------
     monitor: Optional[GeometricMonitor] = None
     if is_main and args.geo_monitor:
+        geo_schedule_str = getattr(args, "geo_monitor_schedule", None)
+        if geo_schedule_str:
+            schedule = MonitorSchedule.from_string(geo_schedule_str)
+            logger.info("Geo monitor schedule: %s", schedule.phases)
+        else:
+            schedule = MonitorSchedule.fixed(args.geo_monitor_tier1_every)
+            logger.info("Geo monitor fixed cadence: every %d steps", args.geo_monitor_tier1_every)
         monitor_config = MonitorConfig(
+            schedule=schedule,
             tier1_every=args.geo_monitor_tier1_every,
             tier2_every=args.geo_monitor_tier2_every,
         )
         monitor = GeometricMonitor(model, monitor_config)
 
-        # Build a fixed probe batch for longitudinal monitoring
-        probe_batches = []
-        probe_iter = _make_data_iter()
-        probe_tokens_needed = min(
-            monitor_config.tier1_probe_size, 64
-        )  # sequences, not tokens
-        for _ in range(probe_tokens_needed):
-            try:
-                probe_batches.append(next(probe_iter))
-            except StopIteration:
-                break
-        if probe_batches:
-            probe_batch = torch.cat(probe_batches, dim=0)[:probe_tokens_needed]
-            monitor.set_probe_batch(probe_batch)
+        # Build or restore fixed probe batch for longitudinal monitoring.
+        # Restoring from checkpoint ensures metrics are comparable across
+        # stop/resume cycles (TwoNN, RankMe are sensitive to input sequences).
+        _restored_probe = False
+        if ckpt_state is not None and "probe_batch" in ckpt_state:
+            monitor.set_probe_batch(ckpt_state["probe_batch"])
+            logger.info("Probe batch restored from checkpoint")
+            _restored_probe = True
+
+        if not _restored_probe:
+            probe_ids: list[torch.Tensor] = []
+            probe_iter = _make_data_iter()
+            probe_tokens_needed = min(
+                monitor_config.tier1_probe_size, 64
+            )  # sequences, not tokens
+            for _ in range(probe_tokens_needed):
+                try:
+                    sample = next(probe_iter)
+                    if isinstance(sample, dict):
+                        probe_ids.append(sample["input_ids"])
+                    else:
+                        probe_ids.append(sample)
+                except StopIteration:
+                    break
+            if probe_ids:
+                probe_batch = torch.cat(probe_ids, dim=0)[:probe_tokens_needed]
+                monitor.set_probe_batch(probe_batch)
             logger.info("Geometric monitor ready (probe batch: %s)", tuple(probe_batch.shape))
 
     # -- Wandb logger (rank 0 only) -------------------------------------------
@@ -550,6 +751,50 @@ def train(args: argparse.Namespace) -> None:
             _profile_start, _profile_end_step, _profile_dir,
         )
 
+    # -- Eval helper -----------------------------------------------------------
+    @torch.no_grad()
+    def run_eval(step: int) -> Optional[float]:
+        if eval_iter_fn is None or eval_every <= 0:
+            return None
+        model.eval()
+        eval_it = eval_iter_fn()
+        total_loss = 0.0
+        count = 0
+        for _ in range(eval_batches):
+            try:
+                batch = next(eval_it)
+            except StopIteration:
+                break
+            if isinstance(batch, dict):
+                input_ids = batch["input_ids"].to(device)
+                cu_sq = batch.get("cu_seqlens", None)
+                if cu_sq is not None:
+                    cu_sq = cu_sq.to(device)
+                ms = batch.get("max_seqlen", None)
+                pos = batch.get("position_ids", None)
+                if pos is not None:
+                    pos = pos.to(device)
+            else:
+                input_ids = batch.to(device)
+                cu_sq = ms = pos = None
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                output = model(
+                    input_ids, labels=input_ids,
+                    cu_seqlens=cu_sq, max_seqlen=ms, position_ids=pos,
+                )
+            total_loss += output["loss"].item()
+            count += 1
+        model.train()
+        if count == 0:
+            return None
+        avg = total_loss / count
+        if is_main:
+            logger.info("  eval: loss=%.4f ppl=%.2f (%d batches)", avg, math.exp(min(avg, 20)), count)
+            if wb is not None:
+                wb.log_custom(step, {"eval/loss": avg, "eval/perplexity": math.exp(min(avg, 20))})
+            hm_log(step, **{"eval/loss": avg, "eval/perplexity": math.exp(min(avg, 20))})
+        return avg
+
     # -- Training loop ---------------------------------------------------------
     if is_main:
         logger.info("Starting training from step %d", start_step)
@@ -590,13 +835,22 @@ def train(args: argparse.Namespace) -> None:
 
         for micro_step in range(current_grad_accum):
             try:
-                input_ids = next(data_iter)
+                batch = next(data_iter)
             except StopIteration:
-                # Should not happen with infinite datasets, but handle gracefully
                 data_iter = _make_data_iter()
-                input_ids = next(data_iter)
+                batch = next(data_iter)
 
-            input_ids = input_ids.to(device, non_blocking=True)
+            # Unpack: doc_masking yields dict, legacy yields tensor
+            if doc_masking:
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                cu_seqlens = batch["cu_seqlens"].to(device, non_blocking=True)
+                position_ids = batch["position_ids"].to(device, non_blocking=True)
+                max_seqlen_batch = batch["max_seqlen"]
+            else:
+                input_ids = batch.to(device, non_blocking=True)
+                cu_seqlens = None
+                position_ids = None
+                max_seqlen_batch = None
 
             # Skip gradient sync on all but the last micro-step.
             # no_sync() only exists on DDP-wrapped models.
@@ -608,7 +862,13 @@ def train(args: argparse.Namespace) -> None:
 
             with sync_ctx:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    output = model(input_ids, labels=input_ids)
+                    output = model(
+                        input_ids,
+                        labels=input_ids,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen_batch,
+                        position_ids=position_ids,
+                    )
                     loss = output["loss"] / current_grad_accum
 
                 loss.backward()
@@ -642,6 +902,14 @@ def train(args: argparse.Namespace) -> None:
         if wb is not None and step % 50 == 0:
             grad_metrics = _per_layer_grad_norms(raw_model)
             wb.log_custom(step, grad_metrics)
+
+        # EoS sharpness (needs live gradients, must be before zero_grad)
+        if monitor is not None and monitor.should_monitor(step):
+            eos_metrics = monitor.compute_sharpness(step)
+            if eos_metrics:
+                if wb is not None:
+                    wb.log_geo(step, eos_metrics)
+                hm_log(step, **{k: v for k, v in eos_metrics.items() if isinstance(v, (int, float))})
 
         # Optimizer step
         muon_opt.step()
@@ -718,34 +986,19 @@ def train(args: argparse.Namespace) -> None:
             step_t0 = time.time()
 
         # -- Geometric monitoring (rank 0 only) --------------------------------
-        if monitor is not None:
-            if args.geo_monitor_tier1_every > 0 and step % args.geo_monitor_tier1_every == 0:
-                geo_metrics = monitor.tier1(step)
-                if geo_metrics:
-                    if wb is not None:
-                        wb.log_geo(step, geo_metrics)
-                    hm_log(step, **{k: v for k, v in geo_metrics.items() if isinstance(v, (int, float))})
-                    if step % args.log_every == 0:
-                        rankme = geo_metrics.get("geo/rankme_last", 0)
-                        logger.info("  geo: RankMe=%.1f", rankme)
-
-            if args.geo_monitor_tier2_every > 0 and step % args.geo_monitor_tier2_every == 0:
-                geo_metrics_t2 = monitor.tier2(step)
-                if geo_metrics_t2:
-                    if wb is not None:
-                        wb.log_geo(step, geo_metrics_t2)
-                    hm_log(step, **{k: v for k, v in geo_metrics_t2.items() if isinstance(v, (int, float))})
-                    ww_mean = geo_metrics_t2.get("geo/ww_alpha_mean", 0)
-                    ww_healthy = geo_metrics_t2.get("geo/ww_alpha_healthy_frac", 0)
+        if monitor is not None and monitor.should_monitor(step):
+            geo_metrics = monitor.compute_all(step)
+            if geo_metrics:
+                if wb is not None:
+                    wb.log_geo(step, geo_metrics)
+                hm_log(step, **{k: v for k, v in geo_metrics.items() if isinstance(v, (int, float))})
+                if step % args.log_every == 0:
                     logger.info(
-                        "  geo tier2: WW_alpha=%.2f, healthy=%.0f%%",
-                        ww_mean,
-                        ww_healthy * 100,
+                        "  geo: RankMe=%.1f, σ_max=%.4f, time=%.1fs",
+                        geo_metrics.get("geo/rankme_last", 0),
+                        geo_metrics.get("eoc/sigma_max", 0),
+                        geo_metrics.get("geo/compute_all_time_s", 0),
                     )
-
-        # Commit wandb step
-        if wb is not None:
-            wb.commit(step)
 
         # -- Profiler step/stop ------------------------------------------------
         if _profiler is not None:
@@ -784,6 +1037,9 @@ def train(args: argparse.Namespace) -> None:
             data_state = (
                 dataset.state_dict() if hasattr(dataset, "state_dict") else None
             )
+            _extra: dict[str, Any] = {}
+            if monitor is not None and monitor._probe_batch is not None:
+                _extra["probe_batch"] = monitor._probe_batch.cpu()
             ckpt_mgr.save(
                 step=step,
                 model=model,
@@ -792,7 +1048,16 @@ def train(args: argparse.Namespace) -> None:
                 scheduler=scheduler,
                 tokens_consumed=tokens_consumed,
                 data_state=data_state,
+                extra=_extra or None,
             )
+
+        # -- Eval on held-out data ---------------------------------------------
+        if eval_every > 0 and step > 0 and step % eval_every == 0:
+            run_eval(step)
+
+        # Commit wandb step (after all log calls including eval)
+        if wb is not None:
+            wb.commit(step)
 
         # -- SIGTERM check -----------------------------------------------------
         if sigterm.received:
@@ -807,6 +1072,9 @@ def train(args: argparse.Namespace) -> None:
                 if hasattr(ckpt_mgr, "save_blocking")
                 else ckpt_mgr.save
             )
+            _extra_sigterm: dict[str, Any] = {}
+            if monitor is not None and monitor._probe_batch is not None:
+                _extra_sigterm["probe_batch"] = monitor._probe_batch.cpu()
             save_fn(
                 step=step,
                 model=model,
@@ -815,6 +1083,7 @@ def train(args: argparse.Namespace) -> None:
                 scheduler=scheduler,
                 tokens_consumed=tokens_consumed,
                 data_state=data_state,
+                extra=_extra_sigterm or None,
             )
             break
 
@@ -830,6 +1099,9 @@ def train(args: argparse.Namespace) -> None:
         data_state = (
             dataset.state_dict() if hasattr(dataset, "state_dict") else None
         )
+        _extra_final: dict[str, Any] = {}
+        if monitor is not None and monitor._probe_batch is not None:
+            _extra_final["probe_batch"] = monitor._probe_batch.cpu()
         ckpt_mgr.save(
             step=total_steps - 1,
             model=model,
@@ -838,11 +1110,22 @@ def train(args: argparse.Namespace) -> None:
             scheduler=scheduler,
             tokens_consumed=tokens_consumed,
             data_state=data_state,
+            extra=_extra_final or None,
         )
 
     # Flush async checkpoint queue before shutting down
     if hasattr(ckpt_mgr, "shutdown"):
         ckpt_mgr.shutdown()
+
+    # Upload final checkpoint to HuggingFace
+    if is_main and not sigterm.received and getattr(args, "hf_upload_repo", None):
+        _upload_checkpoint_to_hf(
+            repo_id=args.hf_upload_repo,
+            checkpoint_dir=Path(args.checkpoint_dir),
+            step=total_steps - 1,
+            tokens_consumed=tokens_consumed,
+            config_file=getattr(args, "_config_file", None),
+        )
 
     if wb is not None:
         wb.finish()
@@ -1069,7 +1352,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use random tokens (for testing)",
     )
+    p.add_argument(
+        "--doc_masking",
+        action="store_true",
+        help="Enable document-boundary attention masking via EOS detection. "
+             "Uses flash_attn_varlen_func to prevent cross-document attention.",
+    )
     p.add_argument("--seed", type=int, default=42)
+
+    # Eval (held-out data for overfit detection)
+    p.add_argument(
+        "--eval_data_path", type=str, default=None,
+        help="Path to held-out eval binary (same format as data_path)",
+    )
+    p.add_argument(
+        "--eval_every", type=int, default=0,
+        help="Run eval every N steps (0 = disabled)",
+    )
+    p.add_argument(
+        "--eval_batches", type=int, default=20,
+        help="Number of micro-batches per eval pass",
+    )
 
     # Checkpointing
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
@@ -1119,8 +1422,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable geometric health monitoring (rank 0 only)",
     )
-    p.add_argument("--geo_monitor_tier1_every", type=int, default=500)
-    p.add_argument("--geo_monitor_tier2_every", type=int, default=5000)
+    p.add_argument("--geo_monitor_schedule", type=str, default=None,
+                   help="Decaying cadence as 'step:interval,...' e.g. "
+                        "'0:25,2000:50,10000:200,50000:500'. "
+                        "Overrides tier1/tier2/eoc cadence args.")
+    p.add_argument("--geo_monitor_tier1_every", type=int, default=500,
+                   help="Fixed cadence fallback when --geo_monitor_schedule is not set")
+    p.add_argument("--geo_monitor_tier2_every", type=int, default=5000,
+                   help="(Legacy) tier2 cadence, ignored when schedule is set")
+    p.add_argument("--geo_monitor_eoc_every", type=int, default=0,
+                   help="(Legacy) EoC cadence, ignored when schedule is set")
 
     # NCA → language transition
     p.add_argument(
@@ -1128,6 +1439,21 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to NCA checkpoint — loads weights, reinitializes embeddings",
+    )
+    # CPT / weight-only resume (no optimizer, no step, no embedding reinit)
+    p.add_argument(
+        "--resume_weights",
+        type=str,
+        default=None,
+        help="Path to checkpoint — loads model weights only for continued pretraining",
+    )
+    p.add_argument(
+        "--resume_warm",
+        type=str,
+        default=None,
+        help="Path to checkpoint — loads model + optimizer state but resets step counter, "
+             "tokens consumed, data position, and scheduler. Simulates starting a new "
+             "epoch with warm optimizer momentum.",
     )
     p.add_argument(
         "--reinit_mlps",
@@ -1172,6 +1498,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable torch.compile for throughput",
     )
+    p.add_argument(
+        "--compile_mode",
+        type=str,
+        default=None,
+        choices=[None, "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+        help="torch.compile mode (default: None = PyTorch default)",
+    )
 
     # Wandb
     p.add_argument(
@@ -1181,6 +1514,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--wandb_project", type=str, default="luxia-base")
     p.add_argument("--wandb_run_name", type=str, default=None)
+
+    # HuggingFace upload
+    p.add_argument(
+        "--hf_upload_repo", type=str, default=None,
+        help="HF repo (e.g. 'aethera-gp/model-name') — upload final checkpoint on completion",
+    )
 
     # First parse to check for --config
     args = p.parse_args()

@@ -144,8 +144,10 @@ def extract_trajectories(
 
 
 def extract_eigenspectra(model: Any) -> dict[str, np.ndarray]:
-    """SVD of all weight matrices. CPU-only. Returns {f"{wtype}_layer_{i}": sv_array}."""
-    out = {}
+    """SVD of all weight matrices on GPU, then transfer results. Returns {f"{wtype}_layer_{i}": sv_array}."""
+    keys: list[str] = []
+    weights: list[torch.Tensor] = []
+
     for i, layer in enumerate(model.layers):
         weight_map = {
             "q_proj": layer.attn.q_proj.weight,
@@ -157,8 +159,13 @@ def extract_eigenspectra(model: Any) -> dict[str, np.ndarray]:
             "down_proj": layer.ffn.down_proj.weight,
         }
         for wtype, W in weight_map.items():
-            sv = torch.linalg.svdvals(W.detach().float().cpu()).numpy()
-            out[f"{wtype}_layer_{i}"] = sv
+            keys.append(f"{wtype}_layer_{i}")
+            weights.append(W.detach().float())
+
+    # Batch SVD on GPU — avoids 196 individual GPU→CPU transfers
+    out = {}
+    for key, W in zip(keys, weights):
+        out[key] = torch.linalg.svdvals(W).cpu().numpy()
     return out
 
 

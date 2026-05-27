@@ -1,0 +1,71 @@
+# 3B NCA Phase 3: AttnRes cotrain from scratch
+# Boundaries derived from Phase 1 step 3800 geometric profile:
+#   [0, 1, 3, 7, 15, 19, 24] → blocks [1, 2, 4, 8, 4, 5, 4]
+#   L0 isolated (embedding), L7 processing cliff, L15 commitment transition,
+#   L19 deep→output, L24 output compression zone
+#
+# Train from SCRATCH (not from Phase 1 checkpoint) with AttnRes active.
+# Same NCA data, overshoot methodology — watch for geometric plateau.
+#
+# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/nca-3b-phase3-cotrain.yaml
+
+model_size: 3b
+sequence_length: 4096
+micro_batch_size: 10
+global_batch_tokens: 2097152
+
+# Training — 13.5B tokens = 1.5 epochs of 9B unique NCA data
+# Same as Phase 1 — overshoot, pick the knee from geometry
+total_tokens: 13_500_000_000
+warmup_steps: 500
+decay_start_pct: 1.0
+decay_type: cosine
+
+# Optimizer — identical to Phase 1
+muon_lr: 0.02
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+adamw_lr: 6e-4
+adamw_beta1: 0.9
+adamw_beta2: 0.95
+adamw_weight_decay: 0.1
+gradient_clip: 1.0
+
+# AttnRes DD-3B boundaries
+attn_res: true
+attn_res_boundaries: "0,1,3,7,15,19,24"
+
+# Data — same NCA dataset as Phase 1
+data_path: /models/kotodama-data/nca_3b_seed17_train.bin
+seed: 17
+
+# Eval
+eval_data_path: /models/kotodama-data/nca_3b_seed17_eval.bin
+eval_every: 50
+eval_batches: 20
+
+# Checkpointing — to /models/ (root disk is tight)
+checkpoint_dir: /models/kotodama-data/checkpoints/nca-3b-phase3
+save_every: 50
+keep_checkpoints: 80
+async_checkpoint: true
+checkpoint_shm_dir: /dev/shm/luxia-base-ckpts
+
+# Geometric monitoring — decaying schedule (dense early, sparse late)
+geo_monitor: true
+geo_monitor_schedule: "0:25,2000:50,10000:200,50000:500"
+
+# Optimization — production profile
+compile: true
+attn_impl: auto
+fp8: true
+use_liger: true
+activation_checkpointing: true
+
+# Logging
+log_every: 10
+wandb: true
+wandb_project: luxia-base
+wandb_run_name: nca-3b-phase3-attnres-cotrain

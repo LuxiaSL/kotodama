@@ -1,0 +1,62 @@
+# 3B NCA Phase 1: Raw NCA pretrain (no AttnRes)
+# Overshoot methodology: train for 1.5 epochs, pick the knee from geometry
+# 3500 rules, 20 sims/rule, seed 17 → 9B unique tokens per epoch
+#
+# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/nca-3b-phase1.yaml
+
+model_size: 3b
+sequence_length: 4096
+micro_batch_size: 10
+global_batch_tokens: 2097152
+
+# Training — 13.5B tokens = 1.5 epochs of 9B unique NCA data
+total_tokens: 13_500_000_000
+warmup_steps: 500
+decay_start_pct: 1.0
+decay_type: cosine
+
+# Optimizer — same as proxy NCA runs
+muon_lr: 0.02
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+adamw_lr: 6e-4
+adamw_beta1: 0.9
+adamw_beta2: 0.95
+adamw_weight_decay: 0.1
+gradient_clip: 1.0
+
+# Data
+data_path: /models/kotodama-data/nca_3b_seed17_train.bin
+seed: 17
+
+# Eval
+eval_data_path: /models/kotodama-data/nca_3b_seed17_eval.bin
+eval_every: 200
+eval_batches: 20
+
+# Checkpointing — frequent saves for knee selection
+checkpoint_dir: checkpoints/nca-3b-phase1
+save_every: 200
+keep_checkpoints: 100
+async_checkpoint: true
+checkpoint_shm_dir: /dev/shm/luxia-base-ckpts
+
+# Dense geometric monitoring
+geo_monitor: true
+geo_monitor_tier1_every: 25
+geo_monitor_tier2_every: 200
+
+# Optimization
+compile: true
+attn_impl: auto
+fp8: true
+use_liger: true
+activation_checkpointing: true
+
+# Logging
+log_every: 10
+wandb: true
+wandb_project: luxia-base
+wandb_run_name: nca-3b-phase1-3500rules

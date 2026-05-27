@@ -8,7 +8,7 @@ from .configs import (
 
 @triton.autotune(
     configs=forward_configs,
-    key=["NUM_SOURCE_BLOCKS", "HIDDEN_DIM", "NUM_QUERIES_PER_BLOCK", "PADDED_SRC"],
+    key=["HIDDEN_DIM"],
 )
 @triton.jit
 def phase_2_online_softmax_merge_forward_kernel(
@@ -21,20 +21,26 @@ def phase_2_online_softmax_merge_forward_kernel(
     intrablock_inverse_rms_norm_ptr,
     eps,
     HIDDEN_DIM: tl.constexpr,
+    PADDED_HIDDEN: tl.constexpr,
 ):
     batch_seq_idx = tl.program_id(0)
-    hidden_dim_range = tl.arange(0, HIDDEN_DIM)
+    hidden_dim_range = tl.arange(0, PADDED_HIDDEN)
+    valid_hidden = hidden_dim_range < HIDDEN_DIM
 
     intrablock_partial_sum = tl.load(
-        intrablock_partial_sum_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range
+        intrablock_partial_sum_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range,
+        mask=valid_hidden, other=0.0,
     ).to(tl.float32)
     pseudo_query_vector = tl.load(
-        pseudo_query_ptr + hidden_dim_range, eviction_policy="evict_last"
+        pseudo_query_ptr + hidden_dim_range,
+        mask=valid_hidden, other=0.0,
+        eviction_policy="evict_last",
     ).to(tl.float32)
 
     interblock_lse = tl.load(interblock_lse_ptr + batch_seq_idx)
     interblock_normalized_output = tl.load(
-        interblock_normalized_output_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range
+        interblock_normalized_output_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range,
+        mask=valid_hidden, other=0.0,
     ).to(tl.float32)
 
     squared_norm_sum = tl.sum(intrablock_partial_sum * intrablock_partial_sum)
@@ -54,6 +60,7 @@ def phase_2_online_softmax_merge_forward_kernel(
     tl.store(
         merged_output_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range,
         merged_output.to(tl.bfloat16),
+        mask=valid_hidden,
     )
 
 
@@ -82,15 +89,17 @@ def phase_2_online_softmax_merge_backward_kernel(
     BT: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
     ACCUMULATE_GRAD_INTRABLOCK: tl.constexpr,
+    PADDED_HIDDEN: tl.constexpr,
     BLOCK_BT: tl.constexpr,
 ):
     bt_block_idx = tl.program_id(0)
 
     bt_offsets = bt_block_idx * BLOCK_BT + tl.arange(0, BLOCK_BT)
-    hidden_offsets = tl.arange(0, HIDDEN_DIM)
+    hidden_offsets = tl.arange(0, PADDED_HIDDEN)
 
     valid_bt = bt_offsets < BT
-    mask_2d = valid_bt[:, None]
+    valid_hidden = hidden_offsets < HIDDEN_DIM
+    mask_2d = valid_bt[:, None] & valid_hidden[None, :]
 
     offsets_2d = bt_offsets[:, None] * HIDDEN_DIM + hidden_offsets[None, :]
 
@@ -102,6 +111,7 @@ def phase_2_online_softmax_merge_backward_kernel(
 
     pseudo_query = tl.load(
         pseudo_query_ptr + hidden_offsets,
+        mask=valid_hidden, other=0.0,
         eviction_policy="evict_last",
     ).to(tl.float32)
 
@@ -226,5 +236,6 @@ def phase_2_online_softmax_merge_backward_kernel(
     tl.atomic_add(
         grad_pseudo_query_accumulator_ptr + hidden_offsets,
         grad_pseudo_query_tile,
+        mask=valid_hidden,
         sem="relaxed",
     )

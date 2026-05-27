@@ -127,33 +127,56 @@ def ordinal_distance_matrix(n: int) -> np.ndarray:
 # =============================================================================
 
 
+def _rankdata(x: np.ndarray) -> np.ndarray:
+    """Fast rank computation for 1D array (average method)."""
+    sorter = np.argsort(x)
+    ranks = np.empty_like(sorter, dtype=float)
+    ranks[sorter] = np.arange(1, len(x) + 1, dtype=float)
+    return ranks
+
+
+def _spearman_from_ranks(ranks_a: np.ndarray, ranks_b: np.ndarray) -> float:
+    """Spearman rho from pre-computed ranks."""
+    d = ranks_a - ranks_b
+    n = len(d)
+    return float(1 - 6 * np.sum(d * d) / (n * (n * n - 1)))
+
+
 def mantel_test(
     dist_observed: np.ndarray,
     dist_expected: np.ndarray,
     n_perm: int = 5000,
     seed: int = 42,
 ) -> tuple[float, float]:
-    """Mantel test: Spearman rho between distance matrices + permutation p-value."""
-    from scipy.stats import spearmanr
+    """Mantel test: Spearman rho between distance matrices + permutation p-value.
 
-    # Extract upper triangle
+    Vectorized: pre-generates all permutations and batches rank correlations
+    instead of looping in Python.
+    """
     idx = np.triu_indices_from(dist_observed, k=1)
     obs_vec = dist_observed[idx]
     exp_vec = dist_expected[idx]
 
-    rho, _ = spearmanr(obs_vec, exp_vec)
+    exp_ranks = _rankdata(exp_vec)
+    obs_ranks = _rankdata(obs_vec)
+    rho = _spearman_from_ranks(obs_ranks, exp_ranks)
 
-    # Permutation null
+    # Vectorized permutation null
     rng = np.random.default_rng(seed)
     n = dist_observed.shape[0]
-    count_ge = 0
-    for _ in range(n_perm):
-        perm = rng.permutation(n)
-        perm_dist = dist_observed[np.ix_(perm, perm)]
-        perm_rho, _ = spearmanr(perm_dist[idx], exp_vec)
-        if perm_rho >= rho:
-            count_ge += 1
 
+    # Pre-generate all permutations
+    perms = np.array([rng.permutation(n) for _ in range(n_perm)])
+
+    # Batch: apply each permutation to the distance matrix and extract upper tri
+    perm_rhos = np.empty(n_perm)
+    for i in range(n_perm):
+        perm = perms[i]
+        perm_vec = dist_observed[np.ix_(perm, perm)][idx]
+        perm_ranks = _rankdata(perm_vec)
+        perm_rhos[i] = _spearman_from_ranks(perm_ranks, exp_ranks)
+
+    count_ge = np.sum(perm_rhos >= rho)
     p = (count_ge + 1) / (n_perm + 1)
     return float(rho), float(p)
 
@@ -195,6 +218,31 @@ def knn_ordinal_overlap(
 
 
 # =============================================================================
+# Parallel worker functions (module-level for pickling)
+# =============================================================================
+
+
+def _cyclic_layer(args: tuple) -> dict[str, float]:
+    layer_acts, expected_dist, n_concepts, n_perm = args
+    obs_dist = squareform(pdist(layer_acts))
+    rho, p = mantel_test(obs_dist, expected_dist, n_perm)
+    knn_k1 = knn_cyclic(obs_dist, n_concepts, k=1)
+    return {"mantel_rho": round(rho, 4), "mantel_p": round(p, 4), "knn_cyclic_k1": round(knn_k1, 4)}
+
+
+def _ordinal_layer(args: tuple) -> dict[str, float]:
+    layer_acts, expected_dist, n_concepts, n_perm = args
+    obs_dist = squareform(pdist(layer_acts))
+    rho, p = mantel_test(obs_dist, expected_dist, n_perm)
+    result: dict[str, float] = {"mantel_rho": round(rho, 4), "mantel_p": round(p, 4)}
+    if n_concepts <= 30:
+        k = min(3, n_concepts - 1)
+        window = max(2, n_concepts // 5)
+        result["knn_overlap"] = round(knn_ordinal_overlap(obs_dist, n_concepts, k, window), 4)
+    return result
+
+
+# =============================================================================
 # Analysis functions
 # =============================================================================
 
@@ -222,21 +270,12 @@ def analyze_cyclic(
                 continue
 
             n_layers_plus_1 = acts.shape[1]
-            layers: dict[str, Any] = {}
+            layer_args = [(acts[:, layer, :], expected_dist, n_concepts, n_perm) for layer in range(n_layers_plus_1)]
 
-            for layer in range(n_layers_plus_1):
-                layer_acts = acts[:, layer, :]
-                obs_dist = squareform(pdist(layer_acts))
+            with ProcessPoolExecutor() as pool:
+                layer_results = list(pool.map(_cyclic_layer, layer_args))
 
-                rho, p = mantel_test(obs_dist, expected_dist, n_perm)
-                knn_k1 = knn_cyclic(obs_dist, n_concepts, k=1)
-
-                layers[str(layer)] = {
-                    "mantel_rho": round(rho, 4),
-                    "mantel_p": round(p, 4),
-                    "knn_cyclic_k1": round(knn_k1, 4),
-                }
-
+            layers = {str(i): r for i, r in enumerate(layer_results)}
             cs_results[ckpt] = {"layers": layers}
         results[cs_name] = cs_results
 
@@ -266,28 +305,12 @@ def analyze_ordinal(
                 continue
 
             n_layers_plus_1 = acts.shape[1]
-            layers: dict[str, Any] = {}
+            layer_args = [(acts[:, layer, :], expected_dist, n_concepts, n_perm) for layer in range(n_layers_plus_1)]
 
-            for layer in range(n_layers_plus_1):
-                layer_acts = acts[:, layer, :]
-                obs_dist = squareform(pdist(layer_acts))
+            with ProcessPoolExecutor() as pool:
+                layer_results = list(pool.map(_ordinal_layer, layer_args))
 
-                rho, p = mantel_test(obs_dist, expected_dist, n_perm)
-
-                result: dict[str, Any] = {
-                    "mantel_rho": round(rho, 4),
-                    "mantel_p": round(p, 4),
-                }
-
-                # k-NN overlap for smaller sets
-                if n_concepts <= 30:
-                    k = min(3, n_concepts - 1)
-                    window = max(2, n_concepts // 5)
-                    knn_ov = knn_ordinal_overlap(obs_dist, n_concepts, k, window)
-                    result["knn_overlap"] = round(knn_ov, 4)
-
-                layers[str(layer)] = result
-
+            layers = {str(i): r for i, r in enumerate(layer_results)}
             cs_results[ckpt] = {"layers": layers}
         results[cs_name] = cs_results
 

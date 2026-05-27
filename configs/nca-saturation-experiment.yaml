@@ -1,0 +1,61 @@
+# NCA saturation experiment — proxy control
+# Question: is the NCA knee at ~721M tokens data-driven or capacity-driven?
+# Method: 800 rules (same as seed-17), but 3B unique tokens per epoch (vs 800M)
+# Train for 1.5 epochs (4.5B total) to test both saturation + consolidation
+#
+# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/nca-saturation-experiment.yaml
+
+model_size: proxy
+sequence_length: 2048
+micro_batch_size: 16
+global_batch_tokens: 131072
+
+# Training — 4.5B tokens = 1.5 epochs of 3B unique NCA data
+total_tokens: 4_500_000_000
+warmup_steps: 200
+decay_start_pct: 1.0
+decay_type: cosine
+
+# Optimizer — identical to prior NCA exploration runs
+muon_lr: 0.02
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+adamw_lr: 6e-4
+adamw_beta1: 0.9
+adamw_beta2: 0.95
+adamw_weight_decay: 0.1
+gradient_clip: 1.0
+
+# Data — NCA binary generated with seed 17, 800 rules, 30 sims/rule
+data_path: data/nca_seed17_3b_train.bin
+seed: 17
+
+# Eval — held-out 50M tokens from same generation run
+eval_data_path: data/nca_seed17_50m_eval.bin
+eval_every: 500
+eval_batches: 20
+
+# Checkpointing — frequent saves for knee analysis
+checkpoint_dir: checkpoints/nca-saturation-experiment
+save_every: 500
+keep_checkpoints: 80
+async_checkpoint: true
+
+# Dense geometric monitoring (matches prior NCA exploration runs)
+geo_monitor: true
+geo_monitor_tier1_every: 25
+geo_monitor_tier2_every: 500
+
+# Optimization
+compile: true
+attn_impl: auto
+fp8: true
+use_liger: false
+
+# Logging
+log_every: 10
+wandb: true
+wandb_project: luxia-base
+wandb_run_name: nca-saturation-3b-tokens

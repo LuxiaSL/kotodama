@@ -1,0 +1,61 @@
+# Full corpus DD-v1 108M: single-phase shuffled ~105B tokens
+# Purpose: test AttnRes geometry under extreme overtrain (~1000x tokens/param)
+# Fresh start from NCA checkpoint, cosine decay, single epoch
+
+# Model
+model_size: proxy
+
+# AttnRes DD-v1
+attn_res: true
+attn_res_boundaries: "0,3,7,12,21,25"
+
+# Data — assembled binary on NFS (mmap, bandwidth is negligible for training)
+data_path: /models/kotodama-data/assembled/train.bin
+sequence_length: 4096
+micro_batch_size: 16
+
+# Training — 170.4B tokens, single epoch (no dedup, all 13 sources)
+total_tokens: 170_400_000_000
+muon_lr: 0.02
+adamw_lr: 0.0006
+# ~81K steps total, warmup ~6% of training
+warmup_steps: 5000
+decay_start_pct: 0.90
+decay_type: cosine
+gradient_clip: 1.0
+
+# Muon
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+
+# NCA resume — co-trained NCA+AttnRes DD-v1 checkpoint (seed-17, 852M tokens)
+resume_nca: checkpoints/nca-attnres-ddv1/step_00006500.pt
+
+# Optimizations
+compile: true
+attn_impl: auto
+fp8: true
+use_liger: false
+
+# Checkpointing — save every ~5B tokens (~2400 steps), keep all for geometric analysis
+checkpoint_dir: checkpoints/fullcorpus-ddv1
+save_every: 2400
+keep_checkpoints: 80
+async_checkpoint: true
+checkpoint_shm_dir: /dev/shm/luxia-base-ckpts
+
+# Geometric monitoring
+geo_monitor: true
+geo_monitor_tier1_every: 75
+geo_monitor_tier2_every: 500
+
+# Logging
+log_every: 10
+wandb: true
+wandb_project: kotodama-ddv1-fullcorpus
+wandb_run_name: fullcorpus-ddv1-170B
+
+# HF upload — push final checkpoint on completion
+hf_upload_repo: aethera-gp/kotodama-fullcorpus-ddv1

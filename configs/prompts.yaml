@@ -1,9 +1,13 @@
 # Prompt sets for evaluation and extraction.
 #
-# Three sets:
-#   standard: 5 prompts used across all eval scripts
+# Sets:
+#   standard: 5 prompts used across all eval scripts (legacy, plain strings)
 #   trajectory: 12 prompts for layer trajectory extraction (Track 5)
 #   extended: 19 prompts for temperature matrix evaluation
+#   fullcorpus: 24 domain-tagged prompts for diverse-data evaluation
+#
+# The fullcorpus set uses {text, domain} dicts. Other sets use plain strings
+# for backward compatibility. eval_generate.py handles both formats.
 #
 # Usage:
 #   import yaml
@@ -57,3 +61,70 @@ extended:
   - "According to the latest research,"
   - "The main difference between classical and quantum computing is"
   - "One of the most underappreciated aspects of machine learning is"
+
+# Domain-tagged prompt set for fullcorpus evaluation.
+# 3 prompts per domain, 8 domains = 24 prompts.
+fullcorpus:
+  # Encyclopedic (Wikipedia)
+  - text: "The history of the Roman Empire can be divided into several distinct periods, beginning with"
+    domain: encyclopedic
+  - text: "Photosynthesis is the process by which green plants and certain other organisms transform"
+    domain: encyclopedic
+  - text: "The United Nations was established in 1945 with the primary goal of"
+    domain: encyclopedic
+
+  # Narrative (Project Gutenberg)
+  - text: "It was a dark and stormy evening when the stranger arrived at the inn. He removed his coat and"
+    domain: narrative
+  - text: "She had not expected to find the letter, but there it was, tucked between the pages of the old book. It read:"
+    domain: narrative
+  - text: "The ship had been at sea for forty days when the captain first noticed something unusual on the horizon."
+    domain: narrative
+
+  # Code (The Stack)
+  - text: "def calculate_moving_average(data: list[float], window_size: int) -> list[float]:\n    \"\"\""
+    domain: code
+  - text: "import json\nimport logging\nfrom pathlib import Path\n\nlogger = logging.getLogger(__name__)\n\n\nclass DataProcessor:\n    \"\"\"Process and validate incoming data records.\"\"\"\n\n    def __init__(self"
+    domain: code
+  - text: "# Binary search implementation with error handling\ndef binary_search(arr: list[int], target: int) -> int:\n"
+    domain: code
+
+  # Academic (peS2o)
+  - text: "Abstract: We present a novel approach to understanding the relationship between neural network depth and"
+    domain: academic
+  - text: "In this study, we investigate the effects of environmental factors on species diversity in temperate"
+    domain: academic
+  - text: "Our results demonstrate a statistically significant correlation (p < 0.001) between the observed"
+    domain: academic
+
+  # Mathematical (OpenWebMath / FineMath)
+  - text: "Theorem: Let f be a continuous function on the closed interval [a, b]. Then"
+    domain: math
+  - text: "To prove that the series converges, we apply the ratio test. Consider the limit"
+    domain: math
+  - text: "Problem: Find all integer solutions to the equation x^2 + y^2 = z^2 where"
+    domain: math
+
+  # Legal (Pile of Law)
+  - text: "OPINION OF THE COURT\n\nThe question before this court is whether the defendant's actions constitute a violation of"
+    domain: legal
+  - text: "Pursuant to Section 42 of the Civil Rights Act, the plaintiff alleges that the respondent"
+    domain: legal
+  - text: "The court finds that the evidence presented is sufficient to establish that the contract was"
+    domain: legal
+
+  # Q&A / Technical (StackExchange)
+  - text: "Question: How do I efficiently handle concurrent database connections in a Python web application?\n\nAnswer:"
+    domain: qa
+  - text: "Question: What causes segmentation faults in C programs and how can they be debugged?\n\nAnswer: A segmentation fault occurs when"
+    domain: qa
+  - text: "Question: Why does my neural network loss plateau after the first few epochs?\n\nAnswer: There are several common reasons"
+    domain: qa
+
+  # Dialogue (SODA / WildChat)
+  - text: "Alice: Hey, have you finished reading that book I lent you?\nBob: Actually, I just finished it last night. I have to say,"
+    domain: dialogue
+  - text: "User: Can you explain how transformers work in simple terms?\nAssistant: Sure! Think of it this way —"
+    domain: dialogue
+  - text: "Sarah: I've been thinking about changing careers lately.\nMark: Really? What's making you consider that?\nSarah:"
+    domain: dialogue

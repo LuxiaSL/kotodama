@@ -61,6 +61,7 @@ def _phase_1_batched_attention_forward_with_aux_triton_op(
         D,
         num_queries,
         triton.next_power_of_2(num_source_blocks),
+        triton.next_power_of_2(D),
     )
 
     return softmax_outputs, lses, inverse_rms_norms, attention_logits
@@ -188,6 +189,7 @@ def _batched_attention_backward_accumulate(
         triton.next_power_of_2(num_source_blocks),
         has_grad_lses,
         accumulate_grad_blocks,
+        triton.next_power_of_2(D),
     )
 
     wrap_triton(reduce_grad_queries_kernel)[

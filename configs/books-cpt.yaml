@@ -1,0 +1,61 @@
+# Books CPT on fullcorpus pre-decay checkpoint
+# 36.4B tokens of book text (pre_1929_books + library_of_congress + doab)
+# Resume model weights from step 72000 (151B tokens, LR still at 0.02)
+# Fresh optimizer, new LR schedule: warmup 500 steps then cosine decay
+
+# Model
+model_size: proxy
+
+# AttnRes DD-v1
+attn_res: true
+attn_res_boundaries: "0,3,7,12,21,25"
+
+# Data — books CPT binary
+data_path: /models/kotodama-data/books-cpt/assembled/books_cpt.bin
+sequence_length: 4096
+micro_batch_size: 16
+
+# Training — 36.4B tokens, ~17.3K steps, ~5.2 hours on 8xB200
+total_tokens: 36_360_000_000
+muon_lr: 0.02
+adamw_lr: 0.0006
+warmup_steps: 500
+decay_start_pct: 0.90
+decay_type: cosine
+gradient_clip: 1.0
+
+# Muon
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+
+# CPT resume — weights only from fullcorpus pre-decay checkpoint
+resume_weights: checkpoints/fullcorpus-ddv1/step_00072000.pt.zst
+
+# Optimizations
+compile: true
+attn_impl: auto
+fp8: true
+use_liger: false
+
+# Checkpoints — save every ~5B tokens, keep all for analysis
+checkpoint_dir: checkpoints/books-cpt
+save_every: 2400
+keep_checkpoints: 20
+async_checkpoint: true
+checkpoint_shm_dir: /dev/shm/luxia-base-ckpts
+
+# Geometric monitoring
+geo_monitor: true
+geo_monitor_tier1_every: 75
+geo_monitor_tier2_every: 500
+
+# Logging
+log_every: 10
+wandb: true
+wandb_project: kotodama-books-cpt
+wandb_run_name: books-cpt-36B
+
+# HF upload — push final checkpoint on completion
+hf_upload_repo: aethera-gp/kotodama-books-cpt

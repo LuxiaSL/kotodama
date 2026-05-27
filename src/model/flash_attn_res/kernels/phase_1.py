@@ -22,21 +22,25 @@ def phase_1_batched_attention_forward_kernel(
     HIDDEN_DIM: tl.constexpr,
     NUM_QUERIES_PER_BLOCK: tl.constexpr,
     PADDED_SRC: tl.constexpr,
+    PADDED_HIDDEN: tl.constexpr,
 ):
     batch_seq_idx = tl.program_id(0)
 
     source_block_range = tl.arange(0, PADDED_SRC)[:, None]
-    hidden_dim_range = tl.arange(0, HIDDEN_DIM)[None, :]
+    hidden_dim_range = tl.arange(0, PADDED_HIDDEN)[None, :]
     valid_block_mask_2d = source_block_range < num_active
+    valid_hidden_mask_2d = hidden_dim_range < HIDDEN_DIM
+    load_mask_2d = valid_block_mask_2d & valid_hidden_mask_2d
 
     valid_block_mask_1d = tl.arange(0, PADDED_SRC) < num_active
+    valid_hidden_mask_1d = tl.arange(0, PADDED_HIDDEN) < HIDDEN_DIM
 
     source_block_values = tl.load(
         block_representations_ptr
         + source_block_range * (BT * HIDDEN_DIM)
         + batch_seq_idx * HIDDEN_DIM
         + hidden_dim_range,
-        mask=valid_block_mask_2d,
+        mask=load_mask_2d,
         other=0.0,
     ).to(tl.float32)
 
@@ -54,11 +58,13 @@ def phase_1_batched_attention_forward_kernel(
         mask=valid_block_mask_1d,
     )
 
-    hidden_dim_range_1d = tl.arange(0, HIDDEN_DIM)
+    hidden_dim_range_1d = tl.arange(0, PADDED_HIDDEN)
 
     for layer_offset in tl.static_range(NUM_QUERIES_PER_BLOCK):
         pseudo_query_vector = tl.load(
             pseudo_queries_ptr + layer_offset * HIDDEN_DIM + hidden_dim_range,
+            mask=valid_hidden_mask_2d,
+            other=0.0,
             eviction_policy="evict_last",
         ).to(tl.float32)
 
@@ -94,6 +100,7 @@ def phase_1_batched_attention_forward_kernel(
             + batch_seq_idx * HIDDEN_DIM
             + hidden_dim_range_1d,
             normalized_output,
+            mask=valid_hidden_mask_1d,
         )
         tl.store(
             lse_ptr + layer_offset * BT + batch_seq_idx,
@@ -128,25 +135,29 @@ def phase_1_batched_attention_backward_kernel(
     NUM_QUERIES_PER_BLOCK: tl.constexpr,
     PADDED_SRC: tl.constexpr,
     HAS_GRAD_LSE: tl.constexpr,
-    ACCUMULATE_GRAD_BLOCKS: tl.constexpr
+    ACCUMULATE_GRAD_BLOCKS: tl.constexpr,
+    PADDED_HIDDEN: tl.constexpr,
 ):
     batch_seq_idx = tl.program_id(0)
 
     source_block_range = tl.arange(0, PADDED_SRC)[:, None]
     source_block_range_1d = tl.arange(0, PADDED_SRC)
 
-    hidden_dim_range = tl.arange(0, HIDDEN_DIM)[None, :]
-    hidden_dim_range_1d = tl.arange(0, HIDDEN_DIM)
+    hidden_dim_range = tl.arange(0, PADDED_HIDDEN)[None, :]
+    hidden_dim_range_1d = tl.arange(0, PADDED_HIDDEN)
 
     valid_block_mask_2d = source_block_range < num_active
     valid_block_mask_1d = source_block_range_1d < num_active
+    valid_hidden_mask_2d = hidden_dim_range < HIDDEN_DIM
+    valid_hidden_mask_1d = hidden_dim_range_1d < HIDDEN_DIM
+    load_mask_2d = valid_block_mask_2d & valid_hidden_mask_2d
 
     source_block_values = tl.load(
         block_representations_ptr
         + source_block_range * (BT * HIDDEN_DIM)
         + batch_seq_idx * HIDDEN_DIM
         + hidden_dim_range,
-        mask=valid_block_mask_2d,
+        mask=load_mask_2d,
         other=0.0,
     ).to(tl.float32)
 
@@ -160,11 +171,13 @@ def phase_1_batched_attention_backward_kernel(
 
     inverse_rms_norm_squared = inverse_rms_norm * inverse_rms_norm
 
-    grad_source_accumulator = tl.zeros((PADDED_SRC, HIDDEN_DIM), tl.float32)
+    grad_source_accumulator = tl.zeros((PADDED_SRC, PADDED_HIDDEN), tl.float32)
 
     for layer_offset in tl.static_range(NUM_QUERIES_PER_BLOCK):
         pseudo_query_vector = tl.load(
             pseudo_queries_ptr + layer_offset * HIDDEN_DIM + hidden_dim_range,
+            mask=valid_hidden_mask_2d,
+            other=0.0,
             eviction_policy="evict_last",
         ).to(tl.float32)
 
@@ -173,6 +186,8 @@ def phase_1_batched_attention_backward_kernel(
             + layer_offset * BT * HIDDEN_DIM
             + batch_seq_idx * HIDDEN_DIM
             + hidden_dim_range_1d,
+            mask=valid_hidden_mask_1d,
+            other=0.0,
         ).to(tl.float32)
 
         if HAS_GRAD_LSE:
@@ -236,7 +251,7 @@ def phase_1_batched_attention_backward_kernel(
         )
 
         grad_source_accumulator += tl.where(
-            valid_block_mask_2d,
+            load_mask_2d,
             grad_source_block_values,
             0.0,
         )
@@ -254,9 +269,9 @@ def phase_1_batched_attention_backward_kernel(
             + batch_seq_idx * HIDDEN_DIM
             + hidden_dim_range_1d,
             grad_pseudo_query,
+            mask=valid_hidden_mask_1d,
         )
 
-    # TODO: specialize for NUM_QUERIES_PER_BLOCK == 1.
     grad_block_ptr = (
         grad_block_representations_accumulator_ptr
         + source_block_range * (BT * HIDDEN_DIM)
@@ -267,7 +282,7 @@ def phase_1_batched_attention_backward_kernel(
     if ACCUMULATE_GRAD_BLOCKS:
         prev_grad_block = tl.load(
             grad_block_ptr,
-            mask=valid_block_mask_2d,
+            mask=load_mask_2d,
             other=0.0,
         ).to(tl.float32)
 
@@ -276,5 +291,5 @@ def phase_1_batched_attention_backward_kernel(
     tl.store(
         grad_block_ptr,
         grad_source_accumulator,
-        mask=valid_block_mask_2d,
+        mask=load_mask_2d,
     )

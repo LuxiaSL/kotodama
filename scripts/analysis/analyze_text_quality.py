@@ -257,6 +257,7 @@ class CreativityMetrics:
 class SampleResult:
     run: str = ""
     prompt: str = ""
+    domain: str = "general"
     lexical: LexicalMetrics = field(default_factory=LexicalMetrics)
     coherence: CoherenceMetrics = field(default_factory=CoherenceMetrics)
     structural: StructuralMetrics = field(default_factory=StructuralMetrics)
@@ -832,7 +833,7 @@ def analyze_creativity(
 
 def metrics_to_flat_dict(result: SampleResult) -> dict[str, Any]:
     """Flatten all nested metrics into a single dict with prefixed keys."""
-    flat: dict[str, Any] = {"run": result.run, "prompt": result.prompt}
+    flat: dict[str, Any] = {"run": result.run, "prompt": result.prompt, "domain": result.domain}
     for layer_name in ["lexical", "coherence", "structural", "repetition", "creativity"]:
         layer_obj = getattr(result, layer_name)
         for k, v in asdict(layer_obj).items():
@@ -862,6 +863,36 @@ def compute_model_profiles(
             profile[key] = float(np.mean(values))
         profiles[run] = profile
     return profiles
+
+
+def compute_domain_profiles(
+    results: list[SampleResult],
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Compute per-run, per-domain average profiles.
+
+    Returns: {run_name: {domain: {metric: mean_value}}}.
+    """
+    grouped: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for r in results:
+        grouped[r.run][r.domain].append(metrics_to_flat_dict(r))
+
+    domain_profiles: dict[str, dict[str, dict[str, float]]] = {}
+    for run, domains in grouped.items():
+        domain_profiles[run] = {}
+        for domain, flat_list in domains.items():
+            profile: dict[str, float] = {}
+            numeric_keys = [
+                k for k in flat_list[0]
+                if k not in ("run", "prompt", "domain")
+                and isinstance(flat_list[0][k], (int, float))
+            ]
+            for key in numeric_keys:
+                values = [d[key] for d in flat_list]
+                profile[key] = float(np.mean(values))
+            domain_profiles[run][domain] = profile
+    return domain_profiles
 
 
 def find_most_distinctive(
@@ -1037,7 +1068,8 @@ def run_analysis(data: list[dict[str, Any]]) -> list[SampleResult]:
             # Gather all continuations for same prompt (for unexpectedness)
             all_conts = [cont for _, cont in prompt_continuations[prompt]]
 
-            result = SampleResult(run=run_name, prompt=prompt)
+            domain = sample.get("domain", "general")
+            result = SampleResult(run=run_name, prompt=prompt, domain=domain)
             result.lexical = analyze_lexical(text)
             result.coherence = analyze_coherence(text)
             result.structural = analyze_structural(text)
@@ -1054,6 +1086,7 @@ def save_results(
     profiles: dict[str, dict[str, float]],
     distinctive: dict[str, list[tuple[str, float, float]]],
     output_path: Path,
+    domain_profiles: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> None:
     """Save all results to a JSON file."""
     output: dict[str, Any] = {
@@ -1067,6 +1100,8 @@ def save_results(
             for run, items in distinctive.items()
         },
     }
+    if domain_profiles:
+        output["domain_profiles"] = domain_profiles
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
@@ -1105,10 +1140,28 @@ def main() -> None:
 
     print("\nComputing model profiles...")
     profiles = compute_model_profiles(results)
+    domain_profiles = compute_domain_profiles(results)
     distinctive = find_most_distinctive(profiles)
 
     print_full_report(profiles, distinctive)
-    save_results(results, profiles, distinctive, args.output)
+
+    # Print domain breakdown if multiple domains present
+    domains_seen = set(r.domain for r in results)
+    if len(domains_seen) > 1:
+        print(f"\n{'=' * 60}")
+        print(f"DOMAIN BREAKDOWN ({len(domains_seen)} domains)")
+        print(f"{'=' * 60}")
+        for run, dom_prof in domain_profiles.items():
+            print(f"\n  {run}:")
+            for domain in sorted(dom_prof.keys()):
+                p = dom_prof[domain]
+                n_samples = sum(1 for r in results if r.run == run and r.domain == domain)
+                ttr = p.get("lexical.ttr_all", 0)
+                drift = p.get("coherence.topic_drift_mean", 0)
+                rep_onset = p.get("repetition.repetition_onset_ratio", 0)
+                print(f"    {domain:<15} ({n_samples} samples): ttr={ttr:.3f}  drift={drift:.3f}  rep_onset={rep_onset:.3f}")
+
+    save_results(results, profiles, distinctive, args.output, domain_profiles)
 
 
 if __name__ == "__main__":

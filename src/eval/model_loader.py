@@ -8,6 +8,8 @@ config, YAML config loading, and device placement.
 from __future__ import annotations
 
 import logging
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -106,6 +108,31 @@ def load_checkpoint_registry(
     return registry
 
 
+def decompress_checkpoint(path: Path) -> Path:
+    """Decompress a .pt.zst checkpoint, returning the decompressed path.
+
+    Returns the path unchanged if it doesn't end in .zst.
+    Decompresses to a temp directory to avoid polluting the checkpoint dir.
+    """
+    if not str(path).endswith(".zst"):
+        return path
+    decompressed = path.with_suffix("")
+    if decompressed.exists():
+        return decompressed
+    tmp_dir = Path(tempfile.gettempdir()) / "kotodama_checkpoints"
+    tmp_dir.mkdir(exist_ok=True)
+    tmp_path = tmp_dir / decompressed.name
+    if tmp_path.exists():
+        return tmp_path
+    logger.info("Decompressing %s → %s", path.name, tmp_path)
+    subprocess.run(
+        ["zstd", "-d", str(path), "-o", str(tmp_path), "-f"],
+        check=True,
+        capture_output=True,
+    )
+    return tmp_path
+
+
 def load_model(
     checkpoint_path: Path | str,
     config_path: Path | str = "configs/model.yaml",
@@ -143,6 +170,8 @@ def load_model(
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
+    checkpoint_path = decompress_checkpoint(checkpoint_path)
+
     # Load model architecture config
     cfg = load_model_config(config_path, config_section)
 
@@ -171,7 +200,10 @@ def load_model(
                 "n_blocks=7. Pass attn_res_config explicitly for reliability."
             )
 
-    # Build model
+    # Build model — filter out YAML keys that aren't LuxiaModelConfig fields
+    import dataclasses
+    valid_fields = {f.name for f in dataclasses.fields(LuxiaModelConfig)}
+    cfg = {k: v for k, v in cfg.items() if k in valid_fields}
     model = LuxiaBaseModel(LuxiaModelConfig(**cfg))
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
 

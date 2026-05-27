@@ -1,0 +1,66 @@
+# 3B NCA Consolidation: repeat pass on same data from Phase 1 checkpoint
+# Simulates "epoch 2" — model sees the same NCA trajectories again
+# Goal: drive L14 aniso consolidation, watch for reversal signals
+#
+# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/nca-3b-consolidation.yaml
+
+model_size: 3b
+sequence_length: 4096
+micro_batch_size: 10
+global_batch_tokens: 2097152
+
+# Training — 4.5B tokens = 0.5 epochs of 9B unique data
+# Enough for consolidation without over-training (proxy showed reversals at ~1.5 epochs)
+total_tokens: 4_500_000_000
+warmup_steps: 100
+decay_start_pct: 1.0
+decay_type: cosine
+
+# Optimizer — same as Phase 1
+muon_lr: 0.02
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+adamw_lr: 6e-4
+adamw_beta1: 0.9
+adamw_beta2: 0.95
+adamw_weight_decay: 0.1
+gradient_clip: 1.0
+
+# Warm resume from Phase 1 checkpoint (model + optimizer, reset step/data)
+resume_warm: /models/kotodama-data/checkpoints/nca-3b-phase1/step_00003800.pt.zst
+
+# Data — same NCA dataset as Phase 1
+data_path: /models/kotodama-data/nca_3b_seed17_train.bin
+seed: 17
+
+# Eval
+eval_data_path: /models/kotodama-data/nca_3b_seed17_eval.bin
+eval_every: 200
+eval_batches: 20
+
+# Checkpointing — save to /models/ directly
+checkpoint_dir: /models/kotodama-data/checkpoints/nca-3b-consolidation
+save_every: 200
+keep_checkpoints: 30
+async_checkpoint: true
+checkpoint_shm_dir: /dev/shm/luxia-base-ckpts
+
+# Dense geometric monitoring
+geo_monitor: true
+geo_monitor_tier1_every: 25
+geo_monitor_tier2_every: 200
+
+# Optimization — match Phase 1
+compile: true
+attn_impl: auto
+fp8: true
+use_liger: true
+activation_checkpointing: true
+
+# Logging
+log_every: 10
+wandb: true
+wandb_project: luxia-base
+wandb_run_name: nca-3b-consolidation

@@ -77,6 +77,7 @@ KNOWN_MODELS: dict[str, str] = {
 DEFAULT_CHECKPOINT = str(SERVING_DIR / KNOWN_MODELS["kotodama-108m-base-fc"])
 TOKENIZER_NAME = "HuggingFaceTB/SmolLM2-135M"
 DDV1_BOUNDARIES = [0, 3, 7, 12, 21, 25]
+DD3B_BOUNDARIES = [0, 1, 3, 7, 15, 19, 24]
 
 CHATML_TEMPLATE = (
     "{% for message in messages %}"
@@ -111,6 +112,28 @@ PROXY_CONFIG = dict(
     attn_res=True,
     attn_res_boundaries=DDV1_BOUNDARIES,
 )
+
+CONFIG_3B = dict(
+    hidden_size=3072,
+    num_layers=28,
+    num_attention_heads=24,
+    num_kv_heads=8,
+    head_dim=128,
+    intermediate_size=8192,
+    vocab_size=49152,
+    max_position_embeddings=4096,
+    rope_theta=500000.0,
+    norm_eps=1e-5,
+    qk_norm=True,
+    tie_word_embeddings=True,
+    z_loss_weight=0.0,
+    use_liger=False,
+    attn_impl="sdpa",
+    attn_res=True,
+    attn_res_boundaries=DD3B_BOUNDARIES,
+)
+
+MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "3b": CONFIG_3B}
 
 
 # ── Fast AttnRes forward ───────────────────────────────────────────────────────
@@ -288,7 +311,7 @@ def _warmup_compile(model: LuxiaBaseModel, compiled_model: torch.nn.Module) -> N
     logger.info("Compile warmup done in %.1fs", time.time() - t0)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False, mode: str = "base") -> tuple[LuxiaBaseModel, torch.nn.Module | None, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False, mode: str = "base", model_size: str = "proxy") -> tuple[LuxiaBaseModel, torch.nn.Module | None, AutoTokenizer]:
     global _device, _fast_ctx, _serve_mode, _stop_token_ids
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
@@ -298,10 +321,11 @@ def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False
         _device = torch.device("cpu")
     logger.info("Device: %s", _device)
 
-    use_fast = _FAST_ATTNRES_AVAILABLE and _device.type == "cuda"
+    model_cfg = MODEL_CONFIGS.get(model_size, PROXY_CONFIG)
+    config = LuxiaModelConfig(**model_cfg)
+    logger.info("Model config (%s): %dM params", model_size, config.param_count() // 1_000_000)
 
-    config = LuxiaModelConfig(**PROXY_CONFIG)
-    logger.info("Model config: %dM params", config.param_count() // 1_000_000)
+    use_fast = _FAST_ATTNRES_AVAILABLE and _device.type == "cuda"
 
     model = LuxiaBaseModel(config)
 
@@ -335,7 +359,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False
         _warmup_triton_kernels(model, _fast_ctx)
     else:
         _fast_ctx = None
-        if _device.type == "cuda":
+        if _device.type == "cuda" and not _FAST_ATTNRES_AVAILABLE:
             logger.info("Triton not available, using standard AttnRes forward")
 
     if _device.type == "cuda":
@@ -689,6 +713,7 @@ async def generate_stream(
 _checkpoint_path = DEFAULT_CHECKPOINT
 _compile_arg = False
 _mode_arg = "base"
+_model_size_arg = "proxy"
 
 
 @asynccontextmanager
@@ -696,6 +721,7 @@ async def lifespan(app: FastAPI):
     global _model, _compiled_model, _tokenizer
     _model, _compiled_model, _tokenizer = load_model(
         _checkpoint_path, _device_arg, compile=_compile_arg, mode=_mode_arg,
+        model_size=_model_size_arg,
     )
     yield
 
@@ -975,6 +1001,8 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["base", "chat"], default=None,
                         help="Serving mode (auto-detected from model name if omitted)")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile(dynamic=True) for faster inference")
+    parser.add_argument("--model_size", choices=list(MODEL_CONFIGS), default="proxy",
+                        help="Model architecture size (proxy=108M, 3b=2.97B)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
@@ -992,6 +1020,7 @@ if __name__ == "__main__":
     _device_arg = args.device
     _mode_arg = args.mode if args.mode is not None else inferred_mode
     _compile_arg = args.compile
+    _model_size_arg = args.model_size
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
