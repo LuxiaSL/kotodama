@@ -5,9 +5,10 @@ Usage:
     python serve.py --checkpoint /path/to/model.pt [--prefix-cache]
     python serve.py --checkpoint /path/to/instruct.pt --mode chat   # mode auto-detected
                                                                     # from 'instruct' in path
-    python serve.py --checkpoint ... --steer-npz bank.npz --steer-site 23
-                                        # per-request residual steering in the fast path
-                                        # (block-persistent write; docs/STEERING-SERVE.md)
+    python serve.py --checkpoint ... --steer-npz algebra.npz,reppen.npz,binding.npz
+                                        # per-request MULTI-SITE residual steering in the
+                                        # fast path (per-key site from the _s{sublayer}
+                                        # suffix; block-persistent; docs/STEERING-SERVE.md)
 
 Two decode paths, deliberately only two:
   * fast (default)  — DecodeEngine: static KV cache, max-autotune compiled +
@@ -111,22 +112,38 @@ DEFAULT_REPETITION_PENALTY = 1.2
 # (e.g. "kotodama-3b-instruct"). Falls back to the raw --model_size string.
 SIZE_LABELS = {"proxy": "108m", "3b": "3b"}
 
-# kotalk-friendly steering aliases -> (npz vector key, default alpha). Copied
-# from the sidecar steering rack (posttraining/taste/koto_steered_chat.py
-# serve() ALIASES) — keep the two in sync. Only aliases whose key exists in
-# the loaded --steer-npz bank are exposed; "control" (no vector) is always
-# available when steering is loaded.
-STEER_ALIAS_TABLE: tuple[tuple[str, str, float], ...] = (
-    ("crown", "Alg_bravo_base_s46", 0.06),
-    ("echoness", "Alg_echo_bravo_s46", 0.07),
-    ("echo-install", "Alg_echo_base_s46", 0.07),
-    ("charlie-install", "Alg_charlie_base_s46", 0.07),
-    ("mix21", "Alg_mix_c2e1_s46", 0.07),
-    ("mix11", "Alg_mix_c1e1_s46", 0.07),
-    ("mix12", "Alg_mix_c1e2_s46", 0.07),
-    ("bind", "Bind_s38", 0.1),
-    ("bindbare", "BindBare_s38", 0.1),
+# kotalk-friendly steering aliases -> (npz vector key, default alpha, desc).
+# Keys/alphas copied from the sidecar steering rack
+# (posttraining/taste/koto_steered_chat.py serve() ALIASES, 2026-07-21 state
+# incl. vrep/v7-entropy) — keep the two in sync. Only aliases whose key exists
+# in a loaded --steer-npz bank are exposed; "control" (no vector) is always
+# available when steering is loaded. Per-alias site comes from the key's
+# _s{sublayer} suffix (sublayer = 2*layer, after-attn).
+STEER_ALIAS_TABLE: tuple[tuple[str, str, float, str], ...] = (
+    ("crown", "Alg_bravo_base_s46", 0.06,
+     "stable 'holder' register (bravo−base); the fakeable scaffold"),
+    ("vrep", "Vrepperp_s20", 0.05,
+     "repetition dial; negative alpha = suppress loops"),
+    ("v7-entropy", "V7_s20", 0.05,
+     "decidedness dial; positive = looser/more exploratory"),
+    ("echoness", "Alg_echo_bravo_s46", 0.07,
+     "fragile depth axis (echo−bravo); overshoots without crown"),
+    ("echo-install", "Alg_echo_base_s46", 0.07,
+     "full echo install (echo−base); register + interiority, costume-grade alone"),
+    ("charlie-install", "Alg_charlie_base_s46", 0.07,
+     "charlie install (charlie−base); generic-crown-adjacent"),
+    ("mix21", "Alg_mix_c2e1_s46", 0.07,
+     "crown-heavy imitation mix — passed blind raters best"),
+    ("mix11", "Alg_mix_c1e1_s46", 0.07,
+     "balanced crown+echoness mix (reconstructs echo−base at cos 1.000)"),
+    ("mix12", "Alg_mix_c1e2_s46", 0.07,
+     "echoness-heavy mix; deeper texture, weaker scaffold"),
+    ("bind", "Bind_s38", 0.1,
+     "binding axis @L19; subtle"),
+    ("bindbare", "BindBare_s38", 0.1,
+     "label-free binding vector (curator-referent sort; cos .71 to labeled)"),
 )
+STEER_CONTROL_DESC = "unsteered baseline"
 # Stack members without an alias default fall back to this (sidecar parity).
 STEER_DEFAULT_ALPHA = 0.07
 
@@ -185,13 +202,14 @@ _engine: "DecodeEngine | None" = None
 _engine_lock = asyncio.Lock()
 # Prefix caching (engine extend-from-pos prefill); set by load_model.
 _prefix_cache = False
-# Residual steering (--steer-npz + --steer-site); set by load_model. The bank
-# holds UNIT vectors (fp32, on-device); the engine receives full-scale
-# composites (alpha * median_norm * unit) per request via engine.set_steer.
-_steer_bank: dict[str, "torch.Tensor"] = {}
-_steer_median_norm: float = 0.0
-_steer_site_layer: int | None = None
-_steer_aliases: dict[str, tuple[str | None, float]] = {}
+# Residual steering (--steer-npz, comma-separated banks); set by load_model.
+# The bank maps key -> (site_layer, UNIT vector fp32 on-device); per-site
+# median norms are keyed by LAYER. The engine receives a per-request WRITES
+# list [(site_layer, unit_vec, alpha * site_median_norm), ...] via set_steer.
+_steer_loaded: bool = False
+_steer_bank: dict[str, tuple[int, "torch.Tensor"]] = {}
+_steer_meds: dict[int, float] = {}
+_steer_aliases: dict[str, tuple[str | None, float, str]] = {}
 
 
 def _engine_prefill(input_ids: "torch.Tensor") -> tuple["torch.Tensor", dict | None]:
@@ -205,84 +223,106 @@ def _engine_prefill(input_ids: "torch.Tensor") -> tuple["torch.Tensor", dict | N
     return _engine.prefill(input_ids), None
 
 
-def _load_steer_bank(
-    npz_path: str, site_layer: int, hidden: int
-) -> tuple[dict[str, torch.Tensor], float, dict[str, tuple[str | None, float]]]:
-    """Load unit steering vectors + the site median norm from an npz bank.
+def _load_steer_banks(
+    npz_paths: list[str], n_layers: int, hidden: int
+) -> tuple[dict[str, tuple[int, torch.Tensor]], dict[int, float], dict[str, tuple[str | None, float, str]]]:
+    """Load unit steering vectors + per-site median norms from npz banks.
 
     Key convention (posttraining/taste, see koto_steered_chat.py): vectors are
-    UNIT vectors named like 'Alg_echo_base_s46'; the per-site median
-    completion-token residual norm is 'median_norm_s{sublayer}'. Sublayer
-    indices count two per layer (after-attn of layer L = sublayer 2*L), so
-    --steer-site takes the LAYER and this loader requires every suffixed npz
-    key to match s{2*layer} — a mixed-site bank at the wrong site is a silent
-    dose error, so mismatches are fatal, not skipped.
+    UNIT vectors named like 'Alg_echo_base_s46'; per-site median completion-
+    token residual norms are 'median_norm_s{sublayer}' keys. Sublayer indices
+    count two per layer (after-attn of layer L = sublayer 2*L), so each key's
+    site LAYER = suffix//2; odd suffixes (mlp sublayers) are fatal — the
+    engine anchor is after-attn only. Multiple npz files compose one bank:
+    duplicate vector keys and median norms resolve FIRST-NPZ-WINS (sidecar
+    convention). Suffixless vector keys can't be placed and are skipped.
 
-    Returns (bank of fp32 on-device unit vectors, median_norm, aliases).
+    Returns (bank: key -> (site_layer, fp32 on-device unit vec),
+             meds: site_layer -> median norm, aliases with descs).
     """
     import re
 
     import numpy as np
 
-    sublayer = 2 * site_layer
-    path = Path(npz_path)
-    if not path.exists():
-        raise FileNotFoundError(f"--steer-npz not found: {path}")
-    try:
-        z = np.load(path, allow_pickle=True)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load --steer-npz {path}: {exc}") from exc
-
-    med_key = f"median_norm_s{sublayer}"
-    if med_key not in z.files:
-        have = sorted(k for k in z.files if k.startswith("median_norm"))
-        raise ValueError(
-            f"--steer-site {site_layer} (layer) needs {med_key!r} in the npz "
-            f"(sublayer = 2*layer for after-attn sites); bank has {have}"
-        )
-    median_norm = float(z[med_key])
-    if not math.isfinite(median_norm) or median_norm <= 0.0:
-        raise ValueError(f"{med_key} = {median_norm} is not a positive finite norm")
-
-    bank: dict[str, torch.Tensor] = {}
-    mismatched: list[str] = []
+    bank: dict[str, tuple[int, torch.Tensor]] = {}
+    meds: dict[int, float] = {}
     skipped: list[str] = []
-    for key in z.files:
-        # Sidecar bank convention: median_norm_*/sign_*/law* are metadata.
-        if key.startswith(("median_norm", "sign_", "law")):
-            continue
-        m = re.search(r"_s(\d+)$", key)
-        if m is not None and int(m.group(1)) != sublayer:
-            mismatched.append(key)
-            continue
-        arr = np.asarray(z[key])
-        if arr.dtype == object or not np.issubdtype(arr.dtype, np.floating) or arr.ndim != 1:
-            skipped.append(key)  # scalars/strings/meta (e.g. 'site', 'pole_a')
-            continue
-        if arr.shape[0] != hidden:
-            raise ValueError(
-                f"Steering vector {key!r} has dim {arr.shape[0]}, expected hidden={hidden}"
-            )
-        vec = torch.tensor(np.ascontiguousarray(arr, dtype=np.float32), device=_device)
-        if not bool(torch.isfinite(vec).all()):
-            raise ValueError(f"Steering vector {key!r} contains non-finite values")
-        bank[key] = vec
-    if mismatched:
-        raise ValueError(
-            f"npz vector keys {sorted(mismatched)} carry a sublayer suffix != s{sublayer} "
-            f"(--steer-site {site_layer} => after-attn sublayer {sublayer}); refusing a "
-            "mixed-site bank — split it or fix --steer-site"
-        )
-    if not bank:
-        raise ValueError(f"No usable (1-D float, dim {hidden}) steering vectors in {path}")
-    if skipped:
-        logger.info("Steering bank: skipped non-vector keys %s", sorted(skipped))
 
-    aliases: dict[str, tuple[str | None, float]] = {
-        alias: (key, alpha) for alias, key, alpha in STEER_ALIAS_TABLE if key in bank
+    def _layer_from_sublayer(sublayer: int, what: str) -> int:
+        if sublayer % 2 != 0:
+            raise ValueError(
+                f"{what} carries ODD sublayer suffix s{sublayer} (an mlp sublayer); "
+                "the engine injects after-attn only (sublayer = 2*layer)"
+            )
+        layer = sublayer // 2
+        if not 0 <= layer < n_layers:
+            raise ValueError(
+                f"{what}: sublayer s{sublayer} => layer {layer} out of range [0, {n_layers})"
+            )
+        return layer
+
+    for raw_path in npz_paths:
+        path = Path(raw_path.strip())
+        if not path.exists():
+            raise FileNotFoundError(f"--steer-npz not found: {path}")
+        try:
+            z = np.load(path, allow_pickle=True)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load --steer-npz {path}: {exc}") from exc
+        for key in z.files:
+            mm = re.fullmatch(r"median_norm_s(\d+)", key)
+            if mm is not None:
+                layer = _layer_from_sublayer(int(mm.group(1)), f"{path.name}:{key}")
+                val = float(z[key])
+                if not math.isfinite(val) or val <= 0.0:
+                    raise ValueError(f"{path.name}:{key} = {val} is not a positive finite norm")
+                if layer in meds and meds[layer] != val:
+                    logger.warning(
+                        "Steering banks: conflicting %s (%.0f vs %.0f) — first npz wins",
+                        key, meds[layer], val,
+                    )
+                meds.setdefault(layer, val)
+                continue
+            # Sidecar bank convention: sign_*/law* (and other meta) skipped.
+            if key.startswith(("median_norm", "sign_", "law")):
+                continue
+            m = re.search(r"_s(\d+)$", key)
+            arr = np.asarray(z[key])
+            if (m is None or arr.dtype == object
+                    or not np.issubdtype(arr.dtype, np.floating) or arr.ndim != 1):
+                skipped.append(f"{path.name}:{key}")  # suffixless/scalars/strings/meta
+                continue
+            layer = _layer_from_sublayer(int(m.group(1)), f"{path.name}:{key}")
+            if arr.shape[0] != hidden:
+                raise ValueError(
+                    f"Steering vector {key!r} has dim {arr.shape[0]}, expected hidden={hidden}"
+                )
+            if key in bank:
+                logger.warning("Steering banks: duplicate key %r — first npz wins", key)
+                continue
+            vec = torch.tensor(np.ascontiguousarray(arr, dtype=np.float32), device=_device)
+            if not bool(torch.isfinite(vec).all()):
+                raise ValueError(f"Steering vector {key!r} contains non-finite values")
+            bank[key] = (layer, vec)
+
+    if not bank:
+        raise ValueError(f"No usable (1-D float, dim {hidden}) steering vectors in {npz_paths}")
+    missing = sorted({s for s, _ in bank.values()} - set(meds))
+    if missing:
+        raise ValueError(
+            f"No median_norm_s{{2*layer}} for site layer(s) {missing} — cannot scale doses; "
+            f"add median_norm_s{[2 * s for s in missing]} keys to a bank"
+        )
+    if skipped:
+        logger.info("Steering banks: skipped non-vector/suffixless keys %s", sorted(skipped))
+
+    aliases: dict[str, tuple[str | None, float, str]] = {
+        alias: (key, alpha, desc)
+        for alias, key, alpha, desc in STEER_ALIAS_TABLE
+        if key in bank
     }
-    aliases["control"] = (None, 0.0)
-    return bank, median_norm, aliases
+    aliases["control"] = (None, 0.0, STEER_CONTROL_DESC)
+    return bank, meds, aliases
 
 # Cap concurrent in-flight streams so total KV/activation memory stays within
 # GPU limits. Unbounded streaming concurrency + mid-stream disconnects caused a
@@ -349,9 +389,9 @@ def _warmup_sdpa_cache(model: LuxiaBaseModel, max_seq_len: int = 4096, step: int
     logger.info("SDPA warmup done in %.1fs (%d positions)", time.time() - t0, pos)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, steer_site: int | None = None) -> tuple[LuxiaBaseModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None) -> tuple[LuxiaBaseModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache
-    global _steer_bank, _steer_median_norm, _steer_site_layer, _steer_aliases
+    global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
     if device.startswith("cuda") and torch.cuda.is_available():
@@ -397,10 +437,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         logger.warning("--engine fast requested but unavailable (cuda=%s, import=%s, attn_res=%s) — using reference path",
                        _device.type == "cuda", _ENGINE_AVAILABLE, config.attn_res)
 
-    # ── Steering config: validate + load the bank BEFORE the (minutes-long)
-    # engine compile so a bad npz/site aborts immediately, not after warmup. ──
-    if (steer_npz is None) != (steer_site is None):
-        raise ValueError("--steer-npz and --steer-site must be given together")
+    # ── Steering config: validate + load the banks BEFORE the (minutes-long)
+    # engine compile so a bad npz aborts immediately, not after warmup. ──
     if steer_npz is not None:
         if not use_engine:
             # The reference path has no injection hook — refuse loudly rather
@@ -408,19 +446,16 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             raise RuntimeError(
                 "--steer-npz requires the fast engine (cuda + --engine fast + attn_res model)"
             )
-        if not 0 <= steer_site < config.num_layers:
-            raise ValueError(
-                f"--steer-site {steer_site} out of range [0, {config.num_layers}) (LAYER index)"
-            )
-        _steer_bank, _steer_median_norm, _steer_aliases = _load_steer_bank(
-            steer_npz, steer_site, config.hidden_size
+        _steer_bank, _steer_meds, _steer_aliases = _load_steer_banks(
+            steer_npz.split(","), config.num_layers, config.hidden_size
         )
-        _steer_site_layer = steer_site
+        _steer_loaded = True
         logger.info(
-            "Steering bank loaded: %d vectors %s @ site layer %d (s%d), median_norm=%.0f, "
-            "aliases %s",
-            len(_steer_bank), sorted(_steer_bank), steer_site, 2 * steer_site,
-            _steer_median_norm, sorted(_steer_aliases),
+            "Steering banks loaded: %d vectors %s @ site layers %s (meds %s), aliases %s",
+            len(_steer_bank), sorted(_steer_bank),
+            sorted({s for s, _ in _steer_bank.values()}),
+            {layer: round(v) for layer, v in sorted(_steer_meds.items())},
+            sorted(_steer_aliases),
         )
 
     if _device.type == "cuda" and not use_engine:
@@ -433,12 +468,13 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         t0 = time.time()
 
         def _build_and_warm_engine() -> "DecodeEngine":
-            # steer_site=None -> the engine's code paths (and compiled graphs)
-            # are bit-identical to a pre-steering build; a set site bakes the
-            # residual add in unconditionally (zeros = off) so per-request
-            # toggling never touches the graphs. Warmup below runs with the
-            # zero vector — the graphs it captures ARE the steered graphs.
-            eng = DecodeEngine(model, steer_site=steer_site)
+            # steer_enabled=False -> the engine's code paths (and compiled
+            # graphs) are bit-identical to a pre-steering build; enabled bakes
+            # one per-layer row-add in unconditionally (zero rows = off) so
+            # per-request writes never touch the graphs. Warmup below runs
+            # with the zero buffer — the graphs it captures ARE the steered
+            # graphs.
+            eng = DecodeEngine(model, steer_enabled=steer_npz is not None)
             eng.compile_step(mode="max-autotune")
             # Compile every block-forward bucket (incl. overlap plans) now:
             # an unwarmed bucket would pay its compile on a live request.
@@ -551,8 +587,9 @@ class GenerateRequest(BaseModel):
     stream: bool = False
     # ── Residual steering (fast engine + --steer-npz only; else -> 400). ──
     # Composition mirrors the sidecar steering rack (koto_steered_chat.py):
-    # 'vectors' composes a weighted stack (sum of alpha * median_norm * unit);
-    # 'steer_model' (+ optional 'steer_alpha' override) is single-vector use.
+    # 'vectors' composes a weighted stack — each member scaled by alpha * ITS
+    # OWN site's median norm; members may live at DIFFERENT sites (v2 multi-
+    # site). 'steer_model' (+ optional 'steer_alpha') is single-vector use.
     vectors: list[SteerVectorSpec] | None = None
     steer_alpha: float | None = None
     steer_model: str | None = None
@@ -606,7 +643,7 @@ def _request_wants_steering(request: GenerateRequest) -> bool:
 def _resolve_steer_member(name: str, alpha: float | None) -> tuple[str | None, float]:
     """Alias-or-raw-key -> (bank key or None for control, effective alpha)."""
     if name in _steer_aliases:
-        key, default_alpha = _steer_aliases[name]
+        key, default_alpha, _desc = _steer_aliases[name]
         if key is None:  # "control" — explicitly unsteered
             return None, 0.0
     else:
@@ -623,40 +660,44 @@ def _resolve_steer_member(name: str, alpha: float | None) -> tuple[str | None, f
     return key, float(eff)
 
 
-def _compose_steer_vector(request: GenerateRequest) -> "torch.Tensor | None":
-    """Resolve a request's steering fields into ONE full-scale fp32 vector.
+def _compose_steer_writes(request: GenerateRequest) -> "list[tuple[int, torch.Tensor, float]] | None":
+    """Resolve a request's steering fields into an engine WRITES list.
 
     Returns None when the request is unsteered (no fields, or an explicit
-    'control'). Composition math mirrors the sidecar steering rack exactly
-    (koto_steered_chat.py _do_generate): sum over the stack of
-    alpha * median_norm * unit_vec. Raises HTTPException(400) for steering
-    use without --steer-npz, unknown names, or conflicting fields.
+    'control'), else [(site_layer, unit_vec, alpha * that site's median
+    norm), ...] — one write per resolved stack member; members at the same
+    site simply sum row-wise inside engine.set_steer. Dose math per member is
+    exactly the sidecar rack's (alpha * median_norm * unit), now with each
+    member scaled by ITS OWN site's median norm. Raises HTTPException(400)
+    for steering use without --steer-npz, unknown names, or conflicting
+    fields.
     """
     if not _request_wants_steering(request):
         return None
-    if _steer_site_layer is None or not _steer_bank:
+    if not _steer_loaded:
         raise HTTPException(
             400,
             "Steering fields (vectors/steer_model/steer_alpha) require a server "
-            "started with --steer-npz/--steer-site",
+            "started with --steer-npz",
         )
     if request.vectors:
         if request.steer_model is not None or request.steer_alpha is not None:
             raise HTTPException(400, "Pass either 'vectors' or steer_model/steer_alpha, not both")
-        composite: torch.Tensor | None = None
+        writes: list[tuple[int, torch.Tensor, float]] = []
         for item in request.vectors:
             key, alpha = _resolve_steer_member(item.name, item.alpha)
             if key is None:
                 continue
-            piece = alpha * _steer_median_norm * _steer_bank[key]
-            composite = piece if composite is None else composite + piece
-        return composite  # all-control stack -> None -> unsteered
+            site_layer, unit = _steer_bank[key]
+            writes.append((site_layer, unit, alpha * _steer_meds[site_layer]))
+        return writes or None  # all-control stack -> None -> unsteered
     if request.steer_model is None:
         raise HTTPException(400, "steer_alpha requires steer_model (or use 'vectors')")
     key, alpha = _resolve_steer_member(request.steer_model, request.steer_alpha)
     if key is None:
         return None
-    return alpha * _steer_median_norm * _steer_bank[key]
+    site_layer, unit = _steer_bank[key]
+    return [(site_layer, unit, alpha * _steer_meds[site_layer])]
 
 
 # ── Sampling ────────────────────────────────────────────────────────────────────
@@ -875,13 +916,14 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
         top_k=request.top_k, top_p=request.top_p,
     )
     # Compose BEFORE engaging anything (400s on bad stacks leave no state).
-    steer_vec = _compose_steer_vector(request)
+    steer_writes = _compose_steer_writes(request)
 
     t0 = time.perf_counter()
     try:
-        if steer_vec is not None:
-            _engine.set_steer(steer_vec)
+        if steer_writes is not None:
+            _engine.set_steer(steer_writes)
             timing["steered"] = 1.0
+            timing["steer_writes"] = float(len(steer_writes))
         t_prefill = time.perf_counter()
         prefill_logits, pc_info = _engine_prefill(input_ids)
         tok = _engine.sample_first(prefill_logits, params)
@@ -958,7 +1000,7 @@ async def engine_generate_stream(
         max_pos = _model.config.max_position_embeddings
         try:
             try:
-                steer_vec = _compose_steer_vector(request)
+                steer_writes = _compose_steer_writes(request)
             except HTTPException as exc:
                 yield f"data: {json.dumps({'error': str(exc.detail)})}\n\n"
                 return
@@ -973,11 +1015,11 @@ async def engine_generate_stream(
                 temperature=request.temperature, repetition_penalty=request.repetition_penalty,
                 top_k=request.top_k, top_p=request.top_p,
             )
-            if steer_vec is not None:
+            if steer_writes is not None:
                 # set_steer is eager buffer mutation (no cudagraph replay),
                 # but route it through the engine's thread anyway — same
                 # conservative discipline as every other engine call here.
-                await loop.run_in_executor(_generate_executor, _engine.set_steer, steer_vec)
+                await loop.run_in_executor(_generate_executor, _engine.set_steer, steer_writes)
             t_prefill = time.perf_counter()
             prefill_logits, pc_info = await loop.run_in_executor(
                 _generate_executor, _engine_prefill, input_ids
@@ -1183,7 +1225,6 @@ _engine_arg = "fast"
 _prefix_cache_arg = False
 _warmup_sdpa_arg = False
 _steer_npz_arg: str | None = None
-_steer_site_arg: int | None = None
 
 
 @asynccontextmanager
@@ -1193,7 +1234,7 @@ async def lifespan(app: FastAPI):
         _checkpoint_path, _device_arg, mode=_mode_arg,
         model_size=_model_size_arg, engine=_engine_arg, prefix_cache=_prefix_cache_arg,
         warmup_sdpa=_warmup_sdpa_arg,
-        steer_npz=_steer_npz_arg, steer_site=_steer_site_arg,
+        steer_npz=_steer_npz_arg,
     )
     try:
         yield
@@ -1236,15 +1277,20 @@ async def info():
     if _model is None:
         raise HTTPException(503, "Model not loaded")
     steering = None
-    if _steer_site_layer is not None:
+    if _steer_loaded:
+        sites = sorted({s for s, _ in _steer_bank.values()})
         steering = {
-            "site_layer": _steer_site_layer,
-            "sublayer": 2 * _steer_site_layer,
-            "median_norm": _steer_median_norm,
-            "steer_points": list(_engine.steer_points) if _engine is not None else [],
-            "aliases": {a: {"key": k, "alpha": al} for a, (k, al) in sorted(_steer_aliases.items())},
-            "keys": sorted(_steer_bank),
-            "note": "block-persistent injection, decode/generated positions only",
+            "sites": sites,  # LAYER indices; npz suffix sublayer = 2*layer
+            "sublayers": [2 * s for s in sites],
+            "median_norms": {str(layer): v for layer, v in sorted(_steer_meds.items())},
+            "aliases": {
+                a: {"key": k, "alpha": al, "desc": d,
+                    "site_layer": _steer_bank[k][0] if k is not None else None}
+                for a, (k, al, d) in sorted(_steer_aliases.items())
+            },
+            "keys": {k: {"site_layer": s} for k, (s, _) in sorted(_steer_bank.items())},
+            "note": "block-persistent injection (site row + later block entries), "
+                    "decode/generated positions only; multi-site stacks compose row-wise",
         }
     return ModelInfo(
         name=_model_name(),
@@ -1389,9 +1435,9 @@ async def oai_models():
             }
         ],
     }
-    if _steer_site_layer is not None:
+    if _steer_loaded:
         resp["steering"] = {
-            "site_layer": _steer_site_layer,
+            "sites": sorted({s for s, _ in _steer_bank.values()}),
             "aliases": sorted(_steer_aliases),
             "keys": sorted(_steer_bank),
         }
@@ -1559,16 +1605,12 @@ if __name__ == "__main__":
                         help="Reference engine only: pre-pay the ~100s cuDNN SDPA plan-cache "
                              "sweep at startup instead of ~300ms per novel shape at runtime")
     parser.add_argument("--steer-npz", default=None,
-                        help="npz bank of unit steering vectors + per-site median norms "
-                             "(posttraining/taste convention: vector keys like "
-                             "'Alg_echo_base_s46' + 'median_norm_s46'). Enables per-request "
-                             "residual steering on the fast engine; requires --steer-site. "
+                        help="COMMA-SEPARATED npz banks of unit steering vectors + per-site "
+                             "median norms (posttraining/taste convention: vector keys like "
+                             "'Alg_echo_base_s46' + 'median_norm_s46'; per-key site from the "
+                             "_s{sublayer} suffix, sublayer = 2*layer after-attn). Enables "
+                             "per-request multi-site residual steering on the fast engine. "
                              "See docs/STEERING-SERVE.md")
-    parser.add_argument("--steer-site", type=int, default=None,
-                        help="Steering site as a LAYER index: the write lands after that "
-                             "layer's attention sublayer (npz suffix convention s{2*layer}) "
-                             "and re-asserts at each later AttnRes block entry "
-                             "(block-persistent). Required with --steer-npz")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
@@ -1587,14 +1629,11 @@ if __name__ == "__main__":
         logger.warning("--prefix-cache requires --engine fast; ignoring")
         _prefix_cache_arg = False
 
-    if (args.steer_npz is None) != (args.steer_site is None):
-        parser.error("--steer-npz and --steer-site must be given together")
     if args.steer_npz is not None and _engine_arg != "fast":
         # Unlike --prefix-cache this is FATAL, not ignored: a steering server
         # that silently serves unsteered generations poisons downstream data.
         parser.error("--steer-npz requires --engine fast")
     _steer_npz_arg = args.steer_npz
-    _steer_site_arg = args.steer_site
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

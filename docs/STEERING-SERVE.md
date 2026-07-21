@@ -1,7 +1,9 @@
-# STEERING-SERVE — residual steering in the production fast path
+# STEERING-SERVE — residual steering in the production fast path (v2, multi-site)
 
-> STATUS: LIVE (implementation 2026-07-21; GPU gates PENDING — see §5, nothing is
-> production-legal until they pass). Companion docs: the pilot record
+> STATUS: LIVE (v2 multi-site implementation 2026-07-21; v1 single-site passed its
+> first GPU gates — identity-off 5/5 token-exact vs HEAD, throughput −0.5%. The v2
+> generalization re-runs the SAME gates before production — see §5).
+> Companion docs: the pilot record
 > `research/planning/{PLAN,RESULTS}-steering-pilot-2026-07-21.md` (repo root), the
 > reference semantics `posttraining/taste/steer_inject.py::forward_inject`, and the
 > sidecar server this API mirrors `posttraining/taste/koto_steered_chat.py`.
@@ -21,10 +23,10 @@ the first after-attn position of every block AFTER the site's block (KL 0.78 at
 α=0.1 — the real lever).
 
 **Layer/sublayer convention.** The pilot indexes SUBLAYERS (two per layer); the
-after-attn sublayer of layer L is `s = 2*L`. The engine and `--steer-site` take
-the **LAYER** index; npz banks keep the sublayer suffix. So `--steer-site 23`
-⇔ pilot site `s46` ⇔ the write lands after layer 23's
-`partial = partial + attn_out`.
+after-attn sublayer of layer L is `s = 2*L`. The engine takes **LAYER** indices;
+npz banks keep the sublayer suffix, and in v2 **each key carries its own site**:
+`Alg_echo_base_s46` ⇔ layer 23, `Vrepperp_s20` ⇔ layer 10, `Bind_s38` ⇔ layer 19.
+Odd suffixes (mlp sublayers) are rejected — the engine anchor is after-attn only.
 
 **Write points** (`src/model/decode_engine.py::compute_steer_points`):
 `{site} + {boundary b : b > site}`. Example — site layer 23, DD-3B boundaries
@@ -44,48 +46,58 @@ slightly slower, semantics exact). Vector off → path unchanged.
 ## 2. Engine API (`src/model/decode_engine.py`)
 
 ```python
-engine = DecodeEngine(model, steer_site=23)   # LAYER index; None (default) = feature absent
-engine.steer_site      # 23
-engine.steer_points    # (23, 24) — introspection
-engine.set_steer(vec)  # engage: FULL-SCALE composite (see §3), any dtype/shape (hidden,)
-engine.set_steer(None) # clear (also: all-zero vector). No-op on a disabled engine.
+engine = DecodeEngine(model, steer_enabled=True)  # False (default) = feature absent
+engine.steer_buf          # (n_layers, hidden) buffer; zero rows = off
+engine.set_steer([        # engage: list of (site_layer, vec, scale) writes
+    (23, unit_a, 0.05 * med23),   # scale = alpha * that site's median norm
+    (10, unit_b, -0.1 * med10),
+])
+engine.set_steer(None)    # clear (also: []). No-op on a disabled engine.
+compute_steer_points(23, boundaries, n_layers)  # (23, 24) — row placement rule
 ```
 
-* The site is **fixed at construction** (it's baked into the compiled graphs).
-  Different site ⇒ rebuild the engine.
-* `set_steer` casts to engine dtype (bf16 in prod — koto residual scales ~1e5 are
-  safe in bf16; it was fp16 that clipped) and rejects wrong sizes / non-finite
-  values. Callers own scaling: pass `sum(alpha * median_norm * unit_vec)`.
-* `reset()` deliberately does NOT clear the vector — it is per-request state owned
-  by the caller (serve.py clears in a `finally` after every request).
+* v2: sites are **per-write, at request time** — the compiled graphs contain one
+  per-layer row-add (`partial + steer_buf[layer]`) regardless of which rows are
+  populated, so no rebuild is needed to change sites. `set_steer` stages rows in
+  fp32 then copies into the buffer in-place: each write lands `scale*vec` in the
+  site row AND every later block-entry row (`compute_steer_points`, now applied
+  at content-time); overlapping rows SUM.
+* Buffer dtype = engine dtype (bf16 in prod — koto residual scales ~1e5 are safe
+  in bf16; it was fp16 that clipped). `set_steer` rejects wrong sizes,
+  non-finite vectors/scales, malformed items, out-of-range sites.
+* `reset()` deliberately does NOT clear the buffer — it is per-request state
+  owned by the caller (serve.py clears in a `finally` after every request).
 
 ## 3. serve.py API
 
 ```bash
 python serve.py --checkpoint /models/.../base.pt \
-    --steer-npz /models/kotodama-data/steering_pilot/smoke/algebra_vectors.npz \
-    --steer-site 23        # layer; npz must carry median_norm_s46 + *_s46 keys
+    --steer-npz algebra_vectors.npz,reppen_formula.npz,binding.npz
+    # comma-separated banks; per-key site from the _s{sublayer} suffix
 ```
 
-* `--steer-npz` — bank of UNIT vectors + per-site median norms, the
-  posttraining/taste convention: vector keys like `Alg_echo_base_s46`, median key
-  `median_norm_s{2*layer}`. Keys suffixed with a DIFFERENT sublayer are **fatal**
-  (mixed-site bank = silent dose error); metadata keys
-  (`median_norm*`/`sign_*`/`law*`, scalars, strings) are skipped. Requires
+* `--steer-npz` — COMMA-SEPARATED banks of UNIT vectors + per-site median norms,
+  the posttraining/taste convention: vector keys like `Alg_echo_base_s46`
+  (site = suffix//2), median keys `median_norm_s{2*layer}` per site. Duplicate
+  keys / conflicting medians across files resolve FIRST-NPZ-WINS (sidecar
+  convention). Every vector's site MUST have a median norm (else fatal — doses
+  can't be scaled); odd sublayer suffixes are fatal (after-attn only);
+  suffixless vector keys are skipped (can't be placed); metadata
+  (`median_norm*`/`sign_*`/`law*`, scalars, strings) is skipped. Requires
   `--engine fast` — a steering flag on the reference engine is a startup error,
   never a silent unsteered server.
-* Aliases: `STEER_ALIAS_TABLE` in serve.py is a verbatim copy of the sidecar's
-  `ALIASES` (crown/echoness/echo-install/…/bind/bindbare + `control`); only
-  aliases whose key is present in the bank are exposed. Keep the two tables in
-  sync by hand.
+* Aliases: `STEER_ALIAS_TABLE` in serve.py copies the sidecar's `ALIASES`
+  (crown/vrep/v7-entropy/echoness/…/bind/bindbare + `control`) and adds a
+  human-readable `desc` per alias (surfaced in `/info`); only aliases whose key
+  is present in a loaded bank are exposed. Keep the two tables in sync by hand.
 
 Per-request (`POST /generate`, streaming included — same fields):
 
 ```jsonc
 { "messages": [...],
-  "vectors": [ {"name": "crown", "alpha": 0.05},      // alias or raw npz key
-               {"name": "echoness", "alpha": 0.03} ]  // composed: sum of alpha*med*unit
-}
+  "vectors": [ {"name": "crown", "alpha": 0.05},   // alias or raw npz key
+               {"name": "vrep", "alpha": -0.1},    // DIFFERENT site — fine in v2
+               {"name": "bind"} ] }                // per-member: alpha * ITS site's med * unit
 // or single-vector:
 { "prompt": "...", "steer_model": "echo-install", "steer_alpha": 0.07 }
 ```
@@ -93,37 +105,44 @@ Per-request (`POST /generate`, streaming included — same fields):
 * Omitted `alpha` → alias default (raw keys: 0.07, the sidecar fallback).
   `"control"` (or an all-control stack) → unsteered. `vectors` and
   `steer_model/steer_alpha` are mutually exclusive (400).
-* Composition math is exactly the sidecar's: `Σ alphaᵢ · median_norm · unitᵢ`,
-  fp32, then `engine.set_steer(composite)`; **`engine.set_steer(None)` runs in a
-  `finally` after every request** (streaming: including disconnect paths), so
+* Composition: each member becomes one engine write
+  `(site_layer, unit, alpha · that site's median_norm)` — same-site members sum
+  row-wise in the engine, cross-site members land in their own rows (dose math
+  per member identical to the sidecar rack). **`engine.set_steer(None)` runs in
+  a `finally` after every request** (streaming: including disconnect paths), so
   state can never leak across requests.
 * No `--steer-npz` → the request fields exist but any use of them is a clear 400;
   behavior is otherwise byte-identical to a pre-steering server. The OpenAI
   endpoints (`/v1/completions`, `/v1/chat/completions`) do not expose steering.
-* Discovery: `/info` gains a `steering` block (site_layer, sublayer, median_norm,
-  steer_points, aliases with defaults, raw keys); `/v1/models` gains a top-level
-  `"steering"` key (aliases/keys). Aliases are deliberately NOT injected into
-  `data[]` as fake model ids — the gateway routes on the model field.
+* Discovery: `/info` gains a `steering` block (sites/sublayers, per-site
+  median_norms, aliases with defaults + per-alias `desc` + site_layer, raw keys
+  with sites); `/v1/models` gains a top-level `"steering"` key
+  (sites/aliases/keys). Aliases are deliberately NOT injected into `data[]` as
+  fake model ids — the gateway routes on the model field.
 
 ## 4. Compile-safety rules (load-bearing — do not "simplify" these away)
 
-1. `steer_vec` is a registered buffer created ONCE in `__init__` and only ever
-   mutated **in-place** (`copy_`/`zero_`). Never reassign it —
-   `torch.compile(mode="max-autotune")`/cudagraph trees specialize on tensor
-   identity; a reassignment silently detaches the live graphs from the vector.
-2. The add is **unconditional in the compiled graph** of a steering-enabled
-   engine (zeros = off). Toggling via `set_steer` therefore never changes graph
-   structure — no recompiles, no guard churn, no capture invalidation.
-3. A steering-**disabled** engine (`steer_site=None`) traces an EMPTY point set:
-   zero new ops, code paths bit-identical to HEAD. The membership test
-   `ls.layer_idx in self._steer_point_set` resolves at trace time.
+1. `steer_buf` (n_layers, hidden) is a registered buffer created ONCE in
+   `__init__` and only ever mutated **in-place** (`copy_`/`zero_`). Never
+   reassign it — `torch.compile(mode="max-autotune")`/cudagraph trees specialize
+   on tensor identity; a reassignment silently detaches the live graphs from the
+   buffer.
+2. The per-layer row-add (`partial + steer_buf[layer]`, static index per
+   unrolled layer) is **unconditional in the compiled graph** of a
+   steering-enabled engine (zero rows = off). set_steer changes CONTENT only —
+   no recompiles, no guard churn, no capture invalidation, regardless of which
+   sites a request uses.
+3. A steering-**disabled** engine (`steer_enabled=False`, a trace-time constant)
+   traces zero new ops, code paths bit-identical to HEAD — the off-gate is
+   bitwise by construction, never by an "adding zeros is identity" argument.
 4. All three compiled decode variants (`_compiled_forward`,
    `_compiled_step_sampled`, `_compiled_step_truncated`) trace through the same
    `_forward_step`, so one injection site covers every decode graph. The compiled
    block forward (`_compiled_block`, prefill/extend) intentionally has NO
    injection. There are no other captured graphs.
-5. `set_steer` costs two host syncs (finiteness + nonzero check) at request
-   granularity — never call it inside the token loop.
+5. `set_steer` costs one host sync per write (vector finiteness validation) at
+   request granularity — never call it inside the token loop. The activity flag
+   is derived host-side from the writes (no device sync).
 6. serve.py threading: in the non-stream path `set_steer` runs on the dedicated
    generation thread (inside `engine_generate`); in the stream path it is routed
    through `_generate_executor` like every other engine call (it is eager buffer
@@ -158,12 +177,15 @@ behavior and throughput are only provable on a B200. Gate battery, in order:
 ## 6. Tests (CPU, run anywhere)
 
 ```bash
-python scripts/benchmark/test_steering_engine.py    # 33 checks, ~2 s, CPU
+python scripts/benchmark/test_steering_engine.py    # 46 checks, ~3 s, CPU
 ```
 
 Proves: steer-point computation == `forward_inject` persist semantics for all 28
-production sites; zeros/absent bitwise identity; prefill untouched; steered step
-bitwise-equal to an independent injected reference (sites in first/middle/last
-block); exact-vector shift of the running partial at the site; `set_steer(None)`
-bitwise restore; error surface; the prefix-cache regenerate guard (tip token not
-injected, counterfactual visibly would be).
+production sites; zero-buffer/absent bitwise identity; prefill untouched under
+multi-site writes; steered step bitwise-equal to an independent injected
+reference (sites in first/middle/last block); exact-write shift of the running
+partial at the site; multi-site writes populate exactly the expected rows
+(site + later block entries; overlaps sum; duplicate same-site writes sum) and
+compose bitwise; `set_steer(None)`/`[]` bitwise restore; error surface (incl.
+malformed writes and bad scales); the prefix-cache regenerate guard under
+multi-site writes (tip token not injected, counterfactual visibly would be).

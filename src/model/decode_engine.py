@@ -22,18 +22,20 @@ The decode step is written to be torch.compile + CUDA-graph friendly:
   * Sampling: on-GPU, matching serve.py semantics — presence-based
     repetition penalty over GENERATED tokens only, pure temperature
     (top_k/top_p intentionally unsupported: prod runs 0/0).
-  * Steering (optional, site fixed at construction): a registered steer_vec
-    buffer added to the running `partial` after attention at the site layer
-    and at every later block entry (block-persistent write, the koto
-    primitive — single-site writes die at DD-3B boundaries). Decode steps
-    only; prefill/extend never inject. Zeros = off; the add is baked into
-    an enabled engine's graphs so set_steer() never changes graph structure.
-    docs/STEERING-SERVE.md has the API + the GPU gates.
+  * Steering (optional, enabled at construction): a registered per-layer
+    steer_buf (n_layers, hidden) added row-wise to the running `partial`
+    after attention at EVERY layer of an enabled engine (zero rows = off).
+    set_steer() populates rows per write: the site row + every later block
+    entry (block-persistent, the koto primitive — single-site writes die at
+    DD-3B boundaries); multiple sites just populate different rows. Decode
+    steps only; prefill/extend never inject. A disabled engine traces zero
+    new ops. docs/STEERING-SERVE.md has the API + the GPU gates.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -132,7 +134,7 @@ class DecodeEngine(nn.Module):
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.bfloat16,
         prefill_backends: Optional[list[SDPBackend]] = None,
-        steer_site: Optional[int] = None,
+        steer_enabled: bool = False,
     ) -> None:
         super().__init__()
         if not model.config.attn_res:
@@ -197,34 +199,37 @@ class DecodeEngine(nn.Module):
         boundary_set = model._attn_res_boundary_set
         self.schedule = [LayerSchedule(i, i in boundary_set) for i in range(self.n_layers)]
 
-        # ── Steering (block-persistent residual write; fixed at construction) ──
-        # steer_site is a LAYER index: the write lands after that layer's
-        # `partial = partial + attn_out`, then re-asserts at each later block
-        # entry (see compute_steer_points). DECODE STEPS ONLY — prefill/extend
-        # paths never inject, which gives the pilot's generated-positions-only
-        # semantics for free (re-prefilled prior turns are acceptably
-        # unsteered, the documented pilot choice).
+        # ── Steering v2 (block-persistent residual write; enabled at construction) ──
+        # PER-LAYER buffer (n_layers, hidden). Rows are populated at request
+        # time by set_steer(): each write (site_layer, vec, scale) lands
+        # scale*vec in the site row AND in every later block-entry row
+        # (compute_steer_points — now applied at CONTENT time, not trace
+        # time), so multi-site stacks are just multiple populated rows.
+        # DECODE STEPS ONLY — prefill/extend paths never inject, which gives
+        # the pilot's generated-positions-only semantics for free
+        # (re-prefilled prior turns are acceptably unsteered, the documented
+        # pilot choice).
         #
         # COMPILE SAFETY: the buffer is created ONCE and only ever mutated
         # in-place (copy_/zero_) — torch.compile(max-autotune)/cudagraph trees
         # specialize on tensor identity, so reassignment would silently detach
-        # the graphs from the live vector. A steering-enabled engine bakes the
-        # add into its graphs UNCONDITIONALLY (zeros = off), so set_steer()
-        # never changes graph structure; a steering-disabled engine
-        # (steer_site=None) traces an empty point set -> literally zero new
-        # ops, bit-identical to a pre-steering engine.
-        self.steer_site = steer_site
+        # the graphs from the live buffer. A steering-enabled engine bakes ONE
+        # row-add per layer into its graphs UNCONDITIONALLY (zero rows = off),
+        # so set_steer() never changes graph structure; a steering-disabled
+        # engine (steer_enabled=False, a trace-time constant) traces ZERO new
+        # ops — the off-gate stays bitwise by construction, never by an
+        # "adding zeros is identity" argument.
+        self.steer_enabled = bool(steer_enabled)
         self._steer_active = False
-        if steer_site is not None:
-            self.steer_points = compute_steer_points(steer_site, boundary_set, self.n_layers)
-            self._steer_point_set = frozenset(self.steer_points)
+        self._boundaries = tuple(sorted(boundary_set))
+        if self.steer_enabled:
             self.register_buffer(
-                "steer_vec", torch.zeros((self.hidden,), device=self.device, dtype=dtype), persistent=False
+                "steer_buf",
+                torch.zeros((self.n_layers, self.hidden), device=self.device, dtype=dtype),
+                persistent=False,
             )
         else:
-            self.steer_points = ()
-            self._steer_point_set = frozenset()
-            self.steer_vec = None
+            self.steer_buf = None
 
         # ── Fused projection weights (decode-only) ──────────────────────────
         # QKV and gate/up merges: fewer, larger GEMVs. Output rows are
@@ -315,11 +320,12 @@ class DecodeEngine(nn.Module):
             sum(b.numel() for b in self.k_caches) * 2 * 2 / 1e6,
             custom_sites or "off",
         )
-        if self.steer_site is not None:
+        if self.steer_enabled:
             logger.info(
-                "DecodeEngine steering: site layer %d (after-attn sublayer s%d), "
-                "block-persistent write points %s (decode steps only, zeros = off)",
-                self.steer_site, 2 * self.steer_site, list(self.steer_points),
+                "DecodeEngine steering ENABLED: per-layer buffer (%d, %d), "
+                "block-persistent rows written by set_steer (decode steps only, "
+                "zero rows = off)",
+                self.n_layers, self.hidden,
             )
 
     # ── Linear dispatch: custom Triton GEMV for tuned shapes ────────────────
@@ -526,12 +532,13 @@ class DecodeEngine(nn.Module):
             partial = partial + attn_out
 
             # Block-persistent steering write (decode/generated tokens only).
-            # Membership is a trace-time constant: a steer-disabled engine
-            # traces NO new ops here; an enabled one bakes the add in
-            # unconditionally (steer_vec zeros = off), so toggling via
-            # set_steer never changes the compiled graph.
-            if ls.layer_idx in self._steer_point_set:
-                partial = partial + self.steer_vec
+            # steer_enabled is a trace-time constant: a disabled engine traces
+            # NO new ops here; an enabled one bakes ONE row-add per layer in
+            # unconditionally (zero rows = off; set_steer populates the site
+            # row + later block-entry rows per write), so toggling content
+            # never changes the compiled graph.
+            if self.steer_enabled:
+                partial = partial + self.steer_buf[ls.layer_idx]
 
             # Pre-MLP routing.
             h_mlp = self._route(committed + [partial], layer.mlp_res_query, layer.mlp_res_norm.weight)
@@ -662,46 +669,70 @@ class DecodeEngine(nn.Module):
         for li in range(self.n_layers):
             self.k_caches[li].zero_()
             self.v_caches[li].zero_()
-        # NOTE: steer_vec is deliberately NOT cleared here — it is per-request
+        # NOTE: steer_buf is deliberately NOT cleared here — it is per-request
         # state owned by the caller (serve.py engages it before prefill and
         # clears it in a finally after every request).
 
     @torch.inference_mode()
-    def set_steer(self, vec: Optional[torch.Tensor]) -> None:
-        """Install (or clear) the steering vector for subsequent decode steps.
+    def set_steer(self, writes: Optional[list[tuple[int, torch.Tensor, float]]]) -> None:
+        """Install (or clear) steering writes for subsequent decode steps.
 
-        None (or an all-zero vector) turns steering off. The vector is copied
-        IN-PLACE into the persistent buffer (cast to engine dtype) — compiled
-        graphs hold the buffer by identity, so this never recompiles or swaps
-        a graph. The caller owns scaling: pass the FULL-SCALE composite
-        (sum of alpha * site_median_norm * unit_vec), not a unit vector.
+        `writes` is None (or an empty list) to clear, else a list of
+        (site_layer, vec, scale) triples: scale*vec is added into the
+        per-layer buffer at row site_layer AND at every block-entry row
+        after site_layer's block (compute_steer_points — the block-persistent
+        primitive, applied per write). Writes at different sites populate
+        different rows; overlapping rows SUM. The buffer is mutated IN-PLACE
+        (staged in fp32, cast to engine dtype) — compiled graphs hold it by
+        identity, so this never recompiles or swaps a graph. Callers own
+        scaling: pass scale = alpha * that site's median residual norm.
 
         Raises on a steering-disabled engine (except set_steer(None), which is
         a no-op there so callers can clear unconditionally in a finally).
         """
-        if self.steer_site is None:
-            if vec is None:
+        if not self.steer_enabled:
+            if writes is None:
                 return
             raise RuntimeError(
-                "Engine was built without steering (steer_site=None); "
-                "rebuild with steer_site=<layer> to enable set_steer()."
+                "Engine was built without steering (steer_enabled=False); "
+                "rebuild with steer_enabled=True to enable set_steer()."
             )
-        if vec is None:
-            self.steer_vec.zero_()
+        if not writes:  # None or []
+            self.steer_buf.zero_()
             self._steer_active = False
             return
-        if not isinstance(vec, torch.Tensor):
-            raise TypeError(f"set_steer expects a torch.Tensor or None, got {type(vec).__name__}")
-        if vec.numel() != self.hidden:
-            raise ValueError(f"Steer vector has {vec.numel()} elements, expected hidden={self.hidden}")
-        v = vec.detach().reshape(self.hidden).to(device=self.device, dtype=torch.float32)
-        if not bool(torch.isfinite(v).all().item()):
-            raise ValueError("Steer vector contains non-finite values")
-        self.steer_vec.copy_(v.to(self.dtype))
-        # CPU-side activity flag (one host sync, request granularity): gates
-        # the prefix-cache suffix==1 shortcut, which must not run the
-        # injecting compiled step on a prompt position while a vector is live.
-        self._steer_active = bool((v != 0).any().item())
+        staged = torch.zeros((self.n_layers, self.hidden), device=self.device, dtype=torch.float32)
+        active = False
+        for i, item in enumerate(writes):
+            try:
+                site_layer, vec, scale = item
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"writes[{i}] must be a (site_layer, vec, scale) triple, got {item!r}"
+                ) from exc
+            if not isinstance(vec, torch.Tensor):
+                raise TypeError(f"writes[{i}]: vec must be a torch.Tensor, got {type(vec).__name__}")
+            if vec.numel() != self.hidden:
+                raise ValueError(
+                    f"writes[{i}]: vec has {vec.numel()} elements, expected hidden={self.hidden}"
+                )
+            scale = float(scale)
+            if not math.isfinite(scale):
+                raise ValueError(f"writes[{i}]: non-finite scale {scale}")
+            v = vec.detach().reshape(self.hidden).to(device=self.device, dtype=torch.float32)
+            if not bool(torch.isfinite(v).all().item()):
+                raise ValueError(f"writes[{i}]: vec contains non-finite values")
+            for row in compute_steer_points(int(site_layer), self._boundaries, self.n_layers):
+                staged[row] += scale * v
+            if scale != 0.0:
+                active = True
+        self.steer_buf.copy_(staged.to(self.dtype))
+        # Host-side activity flag (NO device sync — derived from the writes
+        # themselves): gates the prefix-cache suffix==1 shortcut, which must
+        # not run the injecting compiled step on a prompt position while any
+        # row is live. Conservative: a nonzero-scale write of an all-zero
+        # vector still reads active (harmless — only skips the shortcut).
+        self._steer_active = active
 
     def _chunk_plan(self, start: int, end: int) -> list[tuple[int, int]] | None:
         """Decompose [start, end) into block-bucket chunks.
@@ -860,7 +891,7 @@ class DecodeEngine(nn.Module):
         if suffix_len == 1 and not self._steer_active:
             # A 1-token extend IS a decode step (regenerate / undo-to-tip):
             # run it through the compiled step — no mask machinery, ~2.5ms.
-            # Steering caveat: the compiled step injects steer_vec, but this
+            # Steering caveat: the compiled step injects steer_buf rows, but this
             # token is a PROMPT position — with a nonzero vector engaged we
             # skip this shortcut (falls through to the block/eager extend,
             # which never injects) to preserve generated-positions-only
