@@ -139,9 +139,12 @@ STEER_ALIAS_TABLE: tuple[tuple[str, str, float, str], ...] = (
     ("mix12", "Alg_mix_c1e2_s46", 0.07,
      "Strangeness-heavy blend: more character and depth, less stability. Expect occasional beautiful weirdness and occasional nonsense."),
     ("bind", "Bind_s38", 0.1,
-     "binding axis @L19; subtle"),
+     "Sticks-to-the-conversation dial: nudges the model to actually use what "
+     "was said earlier instead of dodging or changing the subject. Subtle — "
+     "safe at any dose, expect small effects. Try 0.1."),
     ("bindbare", "BindBare_s38", 0.1,
-     "label-free binding vector (curator-referent sort; cos .71 to labeled)"),
+     "Same sticks-to-the-conversation dial, but built fully automatically (no "
+     "human labels). Nearly the same direction as bind; here for comparison."),
 )
 STEER_CONTROL_DESC = "unsteered baseline"
 # Stack members without an alias default fall back to this (sidecar parity).
