@@ -41,22 +41,22 @@ torchrun --nproc_per_node=8 -m src.training.train \
 
 The canary is designed for a multi-GPU CUDA environment and performs no useful checkpoint save. For other experiments, start from a config in `configs/` and provide a tokenized data path or use its `random_data` mode.
 
-Serve a compatible checkpoint:
+Serve the public 3B base checkpoint:
 
 ```bash
-python serve.py \
-  --checkpoint /path/to/checkpoint.pt \
-  --model_size 3b \
-  --mode chat \
-  --prefix-cache
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements-serve.txt
+tools/serve_3b_base.sh
 ```
+
+The launcher downloads [the public 3B base checkpoint](https://huggingface.co/aethera-gp/kotodama-3b-base-final) once, supports its `.pt.zst` full-checkpoint format, and starts the fast engine by default. For the complete CUDA/PyTorch setup, conservative VRAM and host sizing, engine tradeoffs, and runtime controls, see [docs/serving-3b-base.md](docs/serving-3b-base.md).
 
 The server listens on port 2222 by default. It exposes `POST /v1/chat/completions`, `POST /v1/completions`, `POST /generate`, `GET /v1/models`, `GET /info`, and `GET /health`.
 
 Start a gateway fleet after adapting a gateway YAML file to local checkpoint paths and runtime settings:
 
 ```bash
-python gateway.py --config configs/gateway-minitest.yaml --gpus 0
+python gateway.py --config configs/gateway.example.yaml --gpus 0
 ```
 
 Gateway configs use `python: python` and `workdir: .` as portable defaults. Checkpoint locations, caches, GPU placement, and any scheduler integration are operator configuration.

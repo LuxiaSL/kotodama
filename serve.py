@@ -32,11 +32,12 @@ import asyncio
 import functools
 import gc
 import html
-import io
 import json
 import logging
 import math
 import os
+import shutil
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
@@ -200,6 +201,7 @@ _tokenizer: AutoTokenizer | None = None
 _device: torch.device = torch.device("cpu")
 _serve_mode: str = "base"
 _stop_token_ids: frozenset[int] = BASE_STOP_TOKEN_IDS
+_max_seq_len = CONFIG_3B["max_position_embeddings"]
 # Fast decode engine (single-stream): guarded by _engine_lock.
 _engine: "DecodeEngine | None" = None
 _engine_lock = asyncio.Lock()
@@ -392,8 +394,33 @@ def _warmup_sdpa_cache(model: LuxiaBaseModel, max_seq_len: int = 4096, step: int
     logger.info("SDPA warmup done in %.1fs (%d positions)", time.time() - t0, pos)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None) -> tuple[LuxiaBaseModel, AutoTokenizer]:
-    global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache
+def _load_checkpoint(checkpoint_path: Path) -> Any:
+    """Load a PyTorch checkpoint, streaming a .zst payload through a temp file.
+
+    Full training checkpoints can include optimizer state. Keeping the compressed
+    bytes, decompressed bytes, and deserialized checkpoint in RAM at once makes
+    an otherwise usable host needlessly memory-hungry.
+    """
+    if checkpoint_path.suffix != ".zst":
+        return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    import zstandard as zstd
+
+    logger.info("Streaming zstd checkpoint to a temporary file...")
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+            with checkpoint_path.open("rb") as source, zstd.ZstdDecompressor().stream_reader(source) as reader:
+                shutil.copyfileobj(reader, temp_file, length=16 * 1024 * 1024)
+        return torch.load(temp_path, map_location="cpu", weights_only=False)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None) -> tuple[LuxiaBaseModel, AutoTokenizer]:
+    global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
@@ -407,7 +434,13 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     if model_cfg is None:
         raise ValueError(f"Unknown model_size {model_size!r}; choose from {sorted(MODEL_CONFIGS)}")
     config = LuxiaModelConfig(**model_cfg)
+    _max_seq_len = config.max_position_embeddings if max_seq_len is None else max_seq_len
+    if not 16 <= _max_seq_len <= config.max_position_embeddings:
+        raise ValueError(
+            f"max_seq_len must be between 16 and {config.max_position_embeddings}, got {_max_seq_len}"
+        )
     logger.info("Model config (%s): %dM params", model_size, config.param_count() // 1_000_000)
+    logger.info("Serving context limit: %d tokens", _max_seq_len)
 
     model = LuxiaBaseModel(config)
 
@@ -416,20 +449,14 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     logger.info("Loading checkpoint: %s", ckpt_path)
-    if ckpt_path.suffix == ".zst":
-        import zstandard as zstd
-        logger.info("Decompressing zstd checkpoint...")
-        dctx = zstd.ZstdDecompressor()
-        with open(ckpt_path, "rb") as f_in:
-            decompressed = dctx.decompress(f_in.read())
-        ckpt = torch.load(io.BytesIO(decompressed), map_location="cpu", weights_only=False)
-        del decompressed
-    else:
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt = _load_checkpoint(ckpt_path)
 
     state_dict = ckpt.get("model", ckpt)
     model.load_state_dict(state_dict, strict=True)
     logger.info("Checkpoint loaded (step %s, %s tokens)", ckpt.get("step", "?"), ckpt.get("tokens_consumed", "?"))
+    del state_dict
+    del ckpt
+    gc.collect()
 
     model = model.to(_device).eval()
     if _device.type == "cuda":
@@ -477,7 +504,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             # per-request writes never touch the graphs. Warmup below runs
             # with the zero buffer — the graphs it captures ARE the steered
             # graphs.
-            eng = DecodeEngine(model, steer_enabled=steer_npz is not None)
+            eng = DecodeEngine(model, max_seq_len=_max_seq_len, steer_enabled=steer_npz is not None)
             eng.compile_step(mode="max-autotune")
             # Compile every block-forward bucket (incl. overlap plans) now:
             # an unwarmed bucket would pay its compile on a live request.
@@ -485,7 +512,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             with torch.inference_mode():
                 warm_params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2)
                 trunc_params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2, top_p=0.9)
-                for plen in [16, 256]:
+                warm_lengths = sorted({min(plen, _max_seq_len - 1) for plen in [16, 256]})
+                for plen in warm_lengths:
                     dummy = torch.randint(4, config.vocab_size, (1, plen), device=_device)
                     logits = eng.prefill(dummy)
                     tok = eng.sample_first(logits, warm_params)
@@ -497,7 +525,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
                         # stall long enough to flap gateway health.
                         tok = eng.step(tok, trunc_params)
                     eng.step_logits(tok)  # warm the greedy/forward variant too
-                if prefix_cache:
+                if prefix_cache and _max_seq_len > 112:
                     # Warm the extend path (MATH-SDPA suffix forward + match logic):
                     # the first real extend otherwise pays ~0.6s of lazy dispatch.
                     base_ids = torch.randint(4, config.vocab_size, (1, 64), device=_device)
@@ -509,6 +537,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
                     # And the suffix==1 (regenerate) variant, which routes through
                     # the compiled step.
                     eng.prefill_cached(ext)
+                elif prefix_cache:
+                    logger.warning("Prefix-cache warmup skipped: max_seq_len=%d is too small", _max_seq_len)
                 torch.cuda.synchronize(_device)
             eng.reset()
             return eng
@@ -534,13 +564,13 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     elif _device.type == "cuda" and warmup_sdpa:
         # Reference path only: prime cuDNN plan cache so per-shape ~300ms
         # stalls don't land on live requests. ~100s; opt-in for debug use.
-        _warmup_sdpa_cache(model, config.max_position_embeddings, step=64)
+        _warmup_sdpa_cache(model, _max_seq_len, step=64)
 
     # Run a few prefills at different lengths to warm any remaining caches
     if _device.type == "cuda":
         logger.info("Warming up prefill path...")
         with torch.inference_mode():
-            for plen in [1, 16, 128, 512]:
+            for plen in sorted({min(plen, _max_seq_len - 1) for plen in [1, 16, 128, 512]}):
                 dummy = torch.zeros(1, plen, dtype=torch.long, device=_device)
                 model(dummy, use_cache=True)
             torch.cuda.synchronize(_device)
@@ -618,6 +648,7 @@ class ModelInfo(BaseModel):
     config: dict
     device: str
     checkpoint: str
+    max_seq_len: int
     fast_engine: bool
     prefix_cache: bool = False
     steering: dict | None = None
@@ -777,8 +808,8 @@ def generate(
     prompt_len = input_ids.shape[1]
     timing["tokenize_ms"] = (time.perf_counter() - t_tok) * 1000
 
-    if prompt_len >= model.config.max_position_embeddings:
-        raise HTTPException(400, f"Prompt too long: {prompt_len} tokens (max {model.config.max_position_embeddings})")
+    if prompt_len >= _max_seq_len:
+        raise HTTPException(400, f"Prompt too long: {prompt_len} tokens (max {_max_seq_len})")
 
     generated_ids: list[int] = []
     t0 = time.perf_counter()
@@ -823,7 +854,7 @@ def generate(
     decode_text_ms = 0.0
 
     for _ in range(request.max_new_tokens - 1):
-        if prompt_len + len(generated_ids) >= model.config.max_position_embeddings:
+        if prompt_len + len(generated_ids) >= _max_seq_len:
             break
 
         if _device.type == "cuda":
@@ -904,7 +935,7 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
     """Non-streaming generation on the fast engine. Caller must hold _engine_lock."""
     assert _engine is not None and _tokenizer is not None and _model is not None
     timing: dict[str, float] = {}
-    max_pos = _model.config.max_position_embeddings
+    max_pos = _max_seq_len
 
     t_tok = time.perf_counter()
     prompt_text = _resolve_prompt(request, _tokenizer)
@@ -1000,7 +1031,7 @@ async def engine_generate_stream(
     assert _engine is not None and _tokenizer is not None and _model is not None
     async with _engine_lock:
         loop = asyncio.get_running_loop()
-        max_pos = _model.config.max_position_embeddings
+        max_pos = _max_seq_len
         try:
             try:
                 steer_writes = _compose_steer_writes(request)
@@ -1132,7 +1163,7 @@ async def generate_stream(
             input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
             prompt_len = input_ids.shape[1]
 
-            if prompt_len >= model.config.max_position_embeddings:
+            if prompt_len >= _max_seq_len:
                 yield f'data: {{"error": "Prompt too long: {prompt_len} tokens"}}\n\n'
                 return
 
@@ -1166,7 +1197,7 @@ async def generate_stream(
 
             # Decode with KV cache (compiled if available)
             for _ in range(request.max_new_tokens - 1):
-                if prompt_len + len(generated_ids) >= model.config.max_position_embeddings:
+                if prompt_len + len(generated_ids) >= _max_seq_len:
                     break
 
                 # Stop early for clients that have disconnected. This keeps us off
@@ -1225,6 +1256,7 @@ _mode_arg = "base"
 _model_size_arg = "3b"
 _served_name_override: str | None = None
 _engine_arg = "fast"
+_max_seq_len_arg: int | None = None
 _prefix_cache_arg = False
 _warmup_sdpa_arg = False
 _steer_npz_arg: str | None = None
@@ -1238,6 +1270,7 @@ async def lifespan(app: FastAPI):
         model_size=_model_size_arg, engine=_engine_arg, prefix_cache=_prefix_cache_arg,
         warmup_sdpa=_warmup_sdpa_arg,
         steer_npz=_steer_npz_arg,
+        max_seq_len=_max_seq_len_arg,
     )
     try:
         yield
@@ -1302,6 +1335,7 @@ async def info():
         config=asdict(_model.config),
         device=str(_device),
         checkpoint=_checkpoint_path,
+        max_seq_len=_max_seq_len,
         fast_engine=_engine is not None,
         prefix_cache=_prefix_cache,
         steering=steering,
@@ -1595,6 +1629,9 @@ if __name__ == "__main__":
                         help="'fast' (default) = static-cache CUDA-graph DecodeEngine, all "
                              "sampling laws incl. top-k/top-p; 'reference' = eager debug/"
                              "parity path (~10x slower decode)")
+    parser.add_argument("--max-seq-len", type=int, default=None,
+                        help="Serving context limit (16-4096 for the 3B model). Lower values "
+                             "reduce the fast engine's static KV-cache memory; default is 4096")
     parser.add_argument("--prefix-cache", action="store_true",
                         help="Reuse the engine KV cache across requests sharing a token-exact "
                              "prompt prefix (multi-turn TTFT win; requires --engine fast and "
@@ -1626,6 +1663,7 @@ if __name__ == "__main__":
     _mode_arg = args.mode if args.mode is not None else inferred_mode
     _model_size_arg = args.model_size
     _engine_arg = args.engine
+    _max_seq_len_arg = args.max_seq_len
     _prefix_cache_arg = args.prefix_cache
     _warmup_sdpa_arg = args.warmup_sdpa
     if _prefix_cache_arg and _engine_arg != "fast":

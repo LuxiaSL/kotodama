@@ -1,0 +1,25 @@
+# Example only. Substitute a local checkpoint path and choose ports/GPUs that
+# match the host. This starts one base-model replica behind the optional gateway.
+models:
+  - key: base
+    checkpoint: /absolute/path/to/checkpoint.pt.zst
+    mode: base
+    served_model_name: kotodama-3b-base
+    model_size: 3b
+
+gpus: [0]
+replica_base_port: 2300
+gateway_host: 0.0.0.0
+gateway_port: 8080
+
+python: python
+workdir: .
+serve_script: serve.py
+hf_home: .cache/huggingface
+log_dir: logs/gateway
+serve_args: ["--engine", "fast"]
+
+completion_pool: base
+max_inflight_global: 8
+request_timeout_s: 900.0
+warmup_grace_s: 900.0

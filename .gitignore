@@ -3,6 +3,7 @@
 # the dataset module out of version control (found 2026-07-03).
 /data/
 checkpoints/
+models/
 outputs/
 wandb/
 /analysis/
