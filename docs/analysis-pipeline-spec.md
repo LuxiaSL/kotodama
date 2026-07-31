@@ -339,7 +339,7 @@ scheduler submit 'tools/run_eval.sh serve.py --checkpoint <path> --device cuda -
 
 # 2. Hit it from local with the eval client
 python scripts/analysis/eval_via_server.py \
-    --url http://<scheduler-url>:2222 \
+    --url http://<server-host>:2222 \
     --name <run-name> \
     --prompt-set extended --n-samples 3 --temperature 0.7 --max-tokens 512
 

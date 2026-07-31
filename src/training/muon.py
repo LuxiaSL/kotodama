@@ -216,6 +216,7 @@ class Muon(Optimizer):
         weight_decay: float = 0.01,
         ns_iterations: int = 5,
         ns_coefficients: Optional[str] = None,
+        distributed: bool = False,
     ) -> None:
         defaults = dict(
             lr=lr,
@@ -226,6 +227,15 @@ class Muon(Optimizer):
         )
         super().__init__(params, defaults)
         self._ns_coefficients = ns_coefficients
+        # Distributed NS: under DDP every rank holds identical grads, so
+        # orthogonalizing every matrix on every rank is world_size-times
+        # redundant work. When enabled, matrices are partitioned across ranks
+        # (greedy by numel), each rank runs NS on its subset, and results are
+        # broadcast — mathematically identical to local compute (same input
+        # bytes, same kernel, one owner). Incompatible with TP-sharded params
+        # (falls back to local compute with a one-time warning).
+        self._distributed = distributed
+        self._warned_tp_fallback = False
         _resolve_ns_coefficients(ns_coefficients, ns_iterations)  # validate early
 
     def state_dict(self) -> dict[str, Any]:
@@ -303,12 +313,46 @@ class Muon(Optimizer):
             if not params_with_grads:
                 continue
 
+            # Decide whether this step runs distributed NS (see __init__ note).
+            use_dist_ns = False
+            if self._distributed:
+                import torch.distributed as dist
+                if any(info is not None for info in tp_infos):
+                    if not self._warned_tp_fallback:
+                        logger.warning(
+                            "Muon distributed NS disabled: TP-sharded params present"
+                        )
+                        self._warned_tp_fallback = True
+                elif dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                    use_dist_ns = True
+
+            owned: Optional[set[int]] = None
+            if use_dist_ns:
+                # Greedy numel-balanced ownership — deterministic (same param
+                # order and sizes on every rank), so all ranks agree without
+                # communication.
+                world_size = dist.get_world_size()
+                my_rank = dist.get_rank()
+                loads = [0] * world_size
+                owner_of: list[int] = [0] * len(updates_to_orthogonalize)
+                order = sorted(
+                    range(len(updates_to_orthogonalize)),
+                    key=lambda i: (-updates_to_orthogonalize[i].numel(), i),
+                )
+                for i in order:
+                    r = loads.index(min(loads))
+                    owner_of[i] = r
+                    loads[r] += updates_to_orthogonalize[i].numel()
+                owned = {i for i in range(len(owner_of)) if owner_of[i] == my_rank}
+
             # Batch NS by shape: group matrices with same shape
             # and orthogonalize them as a single batched operation.
             # Under TP, updates are already gathered to full shape,
             # so batching groups match the non-TP case.
             shape_groups: dict[tuple[int, int], list[int]] = {}
             for i, M in enumerate(updates_to_orthogonalize):
+                if owned is not None and i not in owned:
+                    continue
                 shape = (M.shape[0], M.shape[1])
                 if shape not in shape_groups:
                     shape_groups[shape] = []
@@ -335,6 +379,21 @@ class Muon(Optimizer):
                     for j, idx in enumerate(indices):
                         orthogonalized[idx] = result[j]
 
+            if use_dist_ns:
+                # Non-owners receive; owners send. contiguous() — NS may
+                # return transposed views, and broadcast requires dense.
+                handles = []
+                for i in range(len(updates_to_orthogonalize)):
+                    if orthogonalized[i] is None:
+                        orthogonalized[i] = torch.empty_like(updates_to_orthogonalize[i])
+                    else:
+                        orthogonalized[i] = orthogonalized[i].contiguous()
+                    handles.append(
+                        dist.broadcast(orthogonalized[i], src=owner_of[i], async_op=True)
+                    )
+                for h in handles:
+                    h.wait()
+
             # Apply updates — slice TP params back to local shard
             for i, p in enumerate(params_with_grads):
                 orth = orthogonalized[i]
@@ -360,6 +419,7 @@ def build_hybrid_optimizer(
     muon_weight_decay: float = 0.01,
     muon_ns_iterations: int = 5,
     muon_ns_coefficients: Optional[str] = None,
+    muon_distributed: bool = False,
     adamw_lr: float = 6e-4,
     adamw_betas: tuple[float, float] = (0.9, 0.95),
     adamw_weight_decay: float = 0.1,
@@ -406,6 +466,7 @@ def build_hybrid_optimizer(
         weight_decay=muon_weight_decay,
         ns_iterations=muon_ns_iterations,
         ns_coefficients=muon_ns_coefficients,
+        distributed=muon_distributed,
     )
 
     adamw_opt = AdamW(

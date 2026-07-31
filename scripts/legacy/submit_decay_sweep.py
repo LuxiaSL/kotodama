@@ -29,9 +29,10 @@ import sys
 import urllib.request
 import urllib.error
 
-SCHEDULER_URL = "http://<scheduler-url>:7000"
+SCHEDULER_URL = os.environ.get("KOTODAMA_SCHEDULER_URL", "")
+SCHEDULER_NODE = os.environ.get("KOTODAMA_SCHEDULER_NODE", "")
 DATA_PATH = "data/fineweb_edu_6b.bin"
-WORKING_DIR = "/home/cluster-user/projects/luxia-base"
+WORKING_DIR = os.environ.get("KOTODAMA_WORKDIR", ".")
 VENV_PYTHON = ".venv/bin/torchrun"
 
 # Runs to test (source checkpoint → decay variants)
@@ -97,6 +98,8 @@ def build_command(source: dict, decay_pct: float) -> str:
 
 def submit(dry_run: bool = False) -> None:
     """Submit all decay sweep jobs."""
+    if not SCHEDULER_URL or not SCHEDULER_NODE:
+        raise SystemExit("Set KOTODAMA_SCHEDULER_URL and KOTODAMA_SCHEDULER_NODE before submitting.")
     jobs = []
     prev_job_id = None
 
@@ -119,7 +122,7 @@ def submit(dry_run: bool = False) -> None:
                 "job_type": "custom",
                 "name": job_name,
                 "command": f"bash -c '{setup_cmd}'",
-                "node": "gpu-host",
+                "node": SCHEDULER_NODE,
                 "gpus": 8,
                 "working_dir": WORKING_DIR,
                 "env": {"PYTHONUNBUFFERED": "1"},

@@ -1,29 +1,39 @@
 """
-Inference server for kotodama 108M models.
+Inference server for kotodama models (3B-first; one replica = one model on one GPU).
 
 Usage:
-    python serve.py --model kotodama-108m-base-fc [--compile]
-    python serve.py --model kotodama-108m-instruct-fc [--compile]
-    python serve.py --checkpoint /path/to/custom.pt --mode chat
+    python serve.py --checkpoint /path/to/model.pt [--prefix-cache]
+    python serve.py --checkpoint /path/to/instruct.pt --mode chat   # mode auto-detected
+                                                                    # from 'instruct' in path
 
-Models (resolved from checkpoints/serving/):
-    kotodama-108m-base-fc       — fullcorpus pretrained (text completion)
-    kotodama-108m-base-bcpt     — books CPT pretrained (text completion)
-    kotodama-108m-instruct-fc   — fullcorpus SFT (chat, auto-detected)
-    kotodama-108m-instruct-bcpt — books CPT SFT (chat, auto-detected)
+Two decode paths, deliberately only two:
+  * fast (default)  — DecodeEngine: static KV cache, max-autotune compiled +
+    CUDA-graphed step, all sampling laws in-graph (temperature, repetition
+    penalty, top-k/top-p), compiled block prefill/extend, optional token-exact
+    prefix cache. ~400 tok/s decode on B200. Startup pays a one-time compile
+    (~1 min warm inductor cache, minutes cold) — see gateway warmup timeouts.
+  * reference       — plain eager llama.py loop. The parity oracle and debug
+    path (~10x slower); NOT for production traffic.
+
+The fleet story (gateway.py) runs many single-GPU replicas of this server;
+concurrency comes from the fleet, not from batching within a replica.
 
 Requires: fastapi, uvicorn, transformers (tokenizer only), torch
-Optional: triton (enables fused AttnRes kernels, ~2x routing speedup)
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import functools
+import gc
+import html
 import io
 import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -37,11 +47,15 @@ _SERVE_THREADS = int(os.environ.get("LUXIA_SERVE_THREADS", "2"))
 os.environ.setdefault("OMP_NUM_THREADS", str(_SERVE_THREADS))
 os.environ.setdefault("MKL_NUM_THREADS", str(_SERVE_THREADS))
 
+# expandable_segments cuts allocator fragmentation under variable-length decode
+# and bursty concurrency (reserved-but-unallocated headroom). Set before the
+# torch import so it applies regardless of how the server is launched.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
-import torch.nn.functional as F
 
 torch.set_num_threads(_SERVE_THREADS)
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -49,32 +63,20 @@ from transformers import AutoTokenizer
 
 from src.model.llama import LuxiaBaseModel, LuxiaModelConfig
 
+# Fast decode engine (static cache + compiled/CUDA-graphed step). Optional.
+try:
+    from src.model.decode_engine import DecodeEngine, SamplingParams as EngineSamplingParams
+    _ENGINE_AVAILABLE = True
+except Exception as _engine_exc:
+    DecodeEngine = None  # type: ignore[assignment,misc]
+    EngineSamplingParams = None  # type: ignore[assignment,misc]
+    _ENGINE_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── Fast AttnRes kernels (optional, requires triton) ───────────────────────────
-
-_FAST_ATTNRES_AVAILABLE = False
-try:
-    from src.model.flash_attn_res.ops.phase_1 import phase_1_batched_attention_triton_op as phase_1_forward
-    from src.model.flash_attn_res.ops.phase_2 import phase_2_online_softmax_merge_triton_op as phase_2_merge
-
-    _FAST_ATTNRES_AVAILABLE = True
-except Exception:
-    phase_1_forward = None  # type: ignore[assignment]
-    phase_2_merge = None  # type: ignore[assignment]
-
-
 # ── Defaults ────────────────────────────────────────────────────────────────────
 
-SERVING_DIR = Path("checkpoints/serving")
-KNOWN_MODELS: dict[str, str] = {
-    "kotodama-108m-base-fc": "kotodama-108m-base-fc.pt.zst",
-    "kotodama-108m-base-bcpt": "kotodama-108m-base-bcpt.pt.zst",
-    "kotodama-108m-instruct-fc": "kotodama-108m-instruct-fc.pt",
-    "kotodama-108m-instruct-bcpt": "kotodama-108m-instruct-bcpt.pt",
-}
-DEFAULT_CHECKPOINT = str(SERVING_DIR / KNOWN_MODELS["kotodama-108m-base-fc"])
 TOKENIZER_NAME = "HuggingFaceTB/SmolLM2-135M"
 DDV1_BOUNDARIES = [0, 3, 7, 12, 21, 25]
 DD3B_BOUNDARIES = [0, 1, 3, 7, 15, 19, 24]
@@ -92,6 +94,18 @@ IM_END_TOKEN_ID = 2
 
 BASE_STOP_TOKEN_IDS = frozenset({0})
 CHAT_STOP_TOKEN_IDS = frozenset({0, 2})
+
+# Sampling defaults — shared by the native /generate and the OpenAI-compatible
+# endpoints so every entrypoint agrees on the server's default behavior.
+DEFAULT_MAX_NEW_TOKENS = 256
+DEFAULT_TEMPERATURE = 0.9
+DEFAULT_TOP_K = 0
+DEFAULT_TOP_P = 0.0
+DEFAULT_REPETITION_PENALTY = 1.2
+
+# Architecture-size label used to build the served model id
+# (e.g. "kotodama-3b-instruct"). Falls back to the raw --model_size string.
+SIZE_LABELS = {"proxy": "108m", "3b": "3b"}
 
 PROXY_CONFIG = dict(
     hidden_size=512,
@@ -136,118 +150,64 @@ CONFIG_3B = dict(
 MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "3b": CONFIG_3B}
 
 
-# ── Fast AttnRes forward ───────────────────────────────────────────────────────
-
-
-class FastAttnResContext:
-    """Pre-computed state for Triton-accelerated AttnRes forward."""
-
-    def __init__(self, model: LuxiaBaseModel) -> None:
-        config = model.config
-        self.eps = config.norm_eps
-
-        # Fold norm weights into queries: effective_q = query * norm.weight
-        # Layout: [attn_q_0, mlp_q_0, attn_q_1, mlp_q_1, ..., final_q]
-        effective_queries: list[torch.Tensor] = []
-        for layer in model.layers:
-            effective_queries.append(layer.attn_res_query * layer.attn_res_norm.weight)
-            effective_queries.append(layer.mlp_res_query * layer.mlp_res_norm.weight)
-        effective_queries.append(model.final_res_query * model.final_res_norm.weight)
-        self.pseudo_queries = torch.stack(effective_queries, dim=0)  # [57, D]
-
-        # DD-v1 layer boundaries → sublayer boundaries (2 sublayers per layer)
-        layer_boundaries = sorted(model._attn_res_boundary_set)
-        self.sublayer_boundaries = [2 * b for b in layer_boundaries]
-
-        # Build sublayer callables: each returns the RESIDUAL UPDATE
-        rope_cos = model.rope_cos
-        rope_sin = model.rope_sin
-        self.sublayers: list[Callable] = []
-        for layer in model.layers:
-            self.sublayers.append(
-                lambda x, ly=layer: ly.attn(ly.attn_norm(x), rope_cos, rope_sin)
-            )
-            self.sublayers.append(
-                lambda x, ly=layer: ly.ffn(ly.ffn_norm(x))
-            )
-
-        self.final_norm = model.norm
-
-
-def fast_forward_attn_res(ctx: FastAttnResContext, embed: torch.Tensor) -> torch.Tensor:
-    """AttnRes forward using Triton-fused phase 1/2 kernels with variable block sizes."""
-    blocks = [embed]
-    sublayers = ctx.sublayers
-    pq = ctx.pseudo_queries
-    eps = ctx.eps
-    num_sublayers = len(sublayers)
-
-    # Compute block ranges from sublayer boundaries
-    boundaries = ctx.sublayer_boundaries
-    block_ranges: list[tuple[int, int]] = []
-    for i, start in enumerate(boundaries):
-        end = boundaries[i + 1] if i + 1 < len(boundaries) else num_sublayers
-        block_ranges.append((start, end))
-
-    for block_start, block_end in block_ranges:
-        num_queries = block_end - block_start
-        values = torch.stack(blocks, dim=0)
-
-        phase1_out, phase1_lse = phase_1_forward(
-            values,
-            pq[block_start: block_start + num_queries],
-            eps,
-        )
-
-        curr_block = None
-        for query_offset in range(num_queries):
-            sublayer_idx = block_start + query_offset
-
-            if query_offset == 0:
-                layer_input = phase1_out[0]
-                curr_block = sublayers[sublayer_idx](layer_input)
-            else:
-                layer_input = phase_2_merge(
-                    curr_block,
-                    pq[sublayer_idx],
-                    phase1_out[query_offset],
-                    phase1_lse[query_offset],
-                    eps,
-                )
-                curr_block = curr_block + sublayers[sublayer_idx](layer_input)
-
-        blocks.append(curr_block)
-
-    # Final aggregation over all committed blocks
-    final_out, _ = phase_1_forward(
-        torch.stack(blocks, dim=0),
-        pq[-1:],
-        eps,
-    )
-
-    return ctx.final_norm(final_out[0].to(embed.dtype))
-
-
 # ── Global state ────────────────────────────────────────────────────────────────
 
 _model: LuxiaBaseModel | None = None
-_compiled_model: torch.nn.Module | None = None
 _tokenizer: AutoTokenizer | None = None
 _device: torch.device = torch.device("cpu")
-_fast_ctx: FastAttnResContext | None = None
 _serve_mode: str = "base"
 _stop_token_ids: frozenset[int] = BASE_STOP_TOKEN_IDS
+# Fast decode engine (single-stream): guarded by _engine_lock.
+_engine: "DecodeEngine | None" = None
+_engine_lock = asyncio.Lock()
+# Prefix caching (engine extend-from-pos prefill); set by load_model.
+_prefix_cache = False
 
 
-@torch.inference_mode()
-def _warmup_triton_kernels(model: LuxiaBaseModel, ctx: FastAttnResContext) -> None:
-    """Run a dummy forward pass to trigger Triton JIT compilation for all kernel variants."""
-    logger.info("Warming up Triton kernels (compiling %d block variants)...", len(ctx.sublayer_boundaries))
-    t0 = time.time()
-    dummy = torch.randn(1, 8, model.config.hidden_size, device=_device, dtype=torch.bfloat16)
-    fast_forward_attn_res(ctx, dummy)
-    torch.cuda.synchronize()
-    logger.info("Triton warmup done in %.1fs", time.time() - t0)
+def _engine_prefill(input_ids: "torch.Tensor") -> tuple["torch.Tensor", dict | None]:
+    """Engine prefill, via the prefix cache when enabled.
+
+    Returns (last-position logits, prefix-cache info dict or None).
+    """
+    assert _engine is not None
+    if _prefix_cache:
+        return _engine.prefill_cached(input_ids)
+    return _engine.prefill(input_ids), None
+
+# Cap concurrent in-flight streams so total KV/activation memory stays within
+# GPU limits. Unbounded streaming concurrency + mid-stream disconnects caused a
+# full-GPU OOM wedge. Override via LUXIA_MAX_CONCURRENT_STREAMS.
+_MAX_CONCURRENT_STREAMS = int(os.environ.get("LUXIA_MAX_CONCURRENT_STREAMS", "4"))
+_stream_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_STREAMS)
+
+# Non-streaming generation is a fully synchronous CUDA decode loop; run directly
+# on the event loop thread it starves /health + /memory for the whole generation
+# (2026-07-04 incident: under saturation the gateway's health checker saw >15s
+# probe silence and restarted busy replicas). Offload it to ONE dedicated worker
+# thread: the loop stays responsive, while max_workers=1 preserves the exact
+# serialization the loop-thread execution used to provide (the engine's static
+# KV cache and the compiled decode path are stateful — never run two generations
+# concurrently in this process; each replica owns a single GPU anyway).
+#
+# HARD INVARIANT (2026-07-04 follow-up regression): with --engine fast, ALL
+# fast-engine activity — compile/cudagraph capture at startup warmup, replay,
+# and every prefill/sample/step (streaming included) — must run on THIS thread.
+# Inductor's cudagraph_trees keeps its tree-manager containers in THREAD-LOCAL
+# storage; capture on one thread + replay on another dies with
+# `assert torch._C._is_key_in_tls(attr_name)` in cudagraph_trees.get_obj.
+# If you add a new engine call site, route it through _run_generation /
+# run_in_executor(_generate_executor, ...). Never widen max_workers past 1.
+_generate_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="koto-generate")
+
+
+async def _run_generation(fn: Callable[..., "GenerateResponse"], /, *args: Any, **kwargs: Any) -> "GenerateResponse":
+    """Run a blocking generation function on the dedicated generation thread.
+
+    Exceptions (including HTTPException, e.g. prompt-too-long 400s) propagate
+    unchanged to the awaiting handler.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_generate_executor, functools.partial(fn, *args, **kwargs))
 
 
 @torch.inference_mode()
@@ -279,40 +239,8 @@ def _warmup_sdpa_cache(model: LuxiaBaseModel, max_seq_len: int = 4096, step: int
     logger.info("SDPA warmup done in %.1fs (%d positions)", time.time() - t0, pos)
 
 
-@torch.inference_mode()
-def _warmup_compile(model: LuxiaBaseModel, compiled_model: torch.nn.Module) -> None:
-    """Trigger torch.compile specialization for the decode path.
-
-    Warms compiled decode after prefills at multiple prompt lengths to cover
-    the shape specializations that real requests will hit. The first 2-3
-    compiled decode steps trigger inductor compilation (~30-45s total on cold
-    cache, faster with inductor cache). After that, decode is stable.
-    """
-    logger.info("Warming up torch.compile decode path...")
-    t0 = time.time()
-
-    for plen in [16, 128, 1024]:
-        dummy_ids = torch.zeros(1, plen, dtype=torch.long, device=_device)
-        out = model(dummy_ids, use_cache=True)
-        torch.cuda.synchronize(_device)
-        past_kv = out["past_kv"]
-        tok = out["logits"][0, -1].argmax().unsqueeze(0).unsqueeze(0)
-
-        for i in range(4):
-            t_step = time.time()
-            out = compiled_model(tok, use_cache=True, past_kv=past_kv)
-            torch.cuda.synchronize(_device)
-            elapsed = time.time() - t_step
-            past_kv = out["past_kv"]
-            tok = out["logits"][0, -1].argmax().unsqueeze(0).unsqueeze(0)
-            if elapsed > 1.0:
-                logger.info("  Compile warmup plen=%d step %d: %.1fs (compilation)", plen, i, elapsed)
-
-    logger.info("Compile warmup done in %.1fs", time.time() - t0)
-
-
-def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False, mode: str = "base", model_size: str = "proxy") -> tuple[LuxiaBaseModel, torch.nn.Module | None, AutoTokenizer]:
-    global _device, _fast_ctx, _serve_mode, _stop_token_ids
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False) -> tuple[LuxiaBaseModel, AutoTokenizer]:
+    global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
     if device.startswith("cuda") and torch.cuda.is_available():
@@ -321,11 +249,11 @@ def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False
         _device = torch.device("cpu")
     logger.info("Device: %s", _device)
 
-    model_cfg = MODEL_CONFIGS.get(model_size, PROXY_CONFIG)
+    model_cfg = MODEL_CONFIGS.get(model_size)
+    if model_cfg is None:
+        raise ValueError(f"Unknown model_size {model_size!r}; choose from {sorted(MODEL_CONFIGS)}")
     config = LuxiaModelConfig(**model_cfg)
     logger.info("Model config (%s): %dM params", model_size, config.param_count() // 1_000_000)
-
-    use_fast = _FAST_ATTNRES_AVAILABLE and _device.type == "cuda"
 
     model = LuxiaBaseModel(config)
 
@@ -353,25 +281,78 @@ def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False
     if _device.type == "cuda":
         model = model.bfloat16()
 
-    if use_fast:
-        _fast_ctx = FastAttnResContext(model)
-        logger.info("Fast AttnRes kernels enabled (Triton-fused phase 1/2)")
-        _warmup_triton_kernels(model, _fast_ctx)
-    else:
-        _fast_ctx = None
-        if _device.type == "cuda" and not _FAST_ATTNRES_AVAILABLE:
-            logger.info("Triton not available, using standard AttnRes forward")
+    use_engine = engine == "fast" and _device.type == "cuda" and _ENGINE_AVAILABLE and config.attn_res
+    if engine == "fast" and not use_engine:
+        logger.warning("--engine fast requested but unavailable (cuda=%s, import=%s, attn_res=%s) — using reference path",
+                       _device.type == "cuda", _ENGINE_AVAILABLE, config.attn_res)
 
-    if _device.type == "cuda":
+    if _device.type == "cuda" and not use_engine:
+        # Reference path only: the engine's masked SDPA relies on cuDNN flash.
         torch.backends.cuda.enable_cudnn_sdp(False)
         logger.info("cuDNN SDP disabled (using flash/math backend)")
 
-    compiled_model: torch.nn.Module | None = None
-    if compile and _device.type == "cuda":
-        logger.info("Creating torch.compile(dynamic=True) decode model...")
-        compiled_model = torch.compile(model, dynamic=True)
-        _warmup_compile(model, compiled_model)
-    else:
+    if use_engine:
+        logger.info("Building fast decode engine (compile may take minutes on cold inductor cache)...")
+        t0 = time.time()
+
+        def _build_and_warm_engine() -> "DecodeEngine":
+            eng = DecodeEngine(model)
+            eng.compile_step(mode="max-autotune")
+            # Compile every block-forward bucket (incl. overlap plans) now:
+            # an unwarmed bucket would pay its compile on a live request.
+            eng.warm_blocks()
+            with torch.inference_mode():
+                warm_params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2)
+                trunc_params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2, top_p=0.9)
+                for plen in [16, 256]:
+                    dummy = torch.randint(4, config.vocab_size, (1, plen), device=_device)
+                    logits = eng.prefill(dummy)
+                    tok = eng.sample_first(logits, warm_params)
+                    for _ in range(4):
+                        tok = eng.step(tok, warm_params)
+                    for _ in range(2):
+                        # Warm the truncated (top-k/top-p) sampler graph too —
+                        # a cold compile on the first truncated request would
+                        # stall long enough to flap gateway health.
+                        tok = eng.step(tok, trunc_params)
+                    eng.step_logits(tok)  # warm the greedy/forward variant too
+                if prefix_cache:
+                    # Warm the extend path (MATH-SDPA suffix forward + match logic):
+                    # the first real extend otherwise pays ~0.6s of lazy dispatch.
+                    base_ids = torch.randint(4, config.vocab_size, (1, 64), device=_device)
+                    eng.prefill(base_ids)
+                    ext = torch.cat(
+                        [base_ids, torch.randint(4, config.vocab_size, (1, 48), device=_device)], dim=1
+                    )
+                    eng.prefill_cached(ext)
+                    # And the suffix==1 (regenerate) variant, which routes through
+                    # the compiled step.
+                    eng.prefill_cached(ext)
+                torch.cuda.synchronize(_device)
+            eng.reset()
+            return eng
+
+        # Build/compile/capture on the SAME single worker thread that serves all
+        # generation (_generate_executor). max-autotune uses inductor's
+        # cudagraph_trees, whose tree-manager containers live in THREAD-LOCAL
+        # storage: a graph captured here on the main thread asserts
+        # (torch._C._is_key_in_tls) the moment the worker thread replays it
+        # (2026-07-04 production regression — 28ms 500s on every non-stream
+        # request of warmed-at-startup replicas). load_model is sync (called
+        # from lifespan before serving starts), so block on the future.
+        _engine = _generate_executor.submit(_build_and_warm_engine).result()
+        # Disable cuDNN SDPA only AFTER the engine compiled: the captured
+        # decode graph keeps its baked cuDNN flash kernels, while the eager
+        # FALLBACK path (non-engine requests) avoids cuDNN's ~300ms per-shape
+        # plan-selection stalls by dispatching to pytorch flash instead.
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        _prefix_cache = prefix_cache
+        if _prefix_cache:
+            logger.info("Prefix caching ENABLED (engine extend-from-pos prefill)")
+        logger.info("Fast decode engine ready in %.1fs", time.time() - t0)
+    elif _device.type == "cuda" and warmup_sdpa:
+        # Reference path only: prime cuDNN plan cache so per-shape ~300ms
+        # stalls don't land on live requests. ~100s; opt-in for debug use.
         _warmup_sdpa_cache(model, config.max_position_embeddings, step=64)
 
     # Run a few prefills at different lengths to warm any remaining caches
@@ -397,7 +378,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", compile: bool = False
         tokenizer.chat_template = CHATML_TEMPLATE
     logger.info("Tokenizer loaded: %s (vocab %d, mode=%s)", TOKENIZER_NAME, len(tokenizer), mode)
 
-    return model, compiled_model, tokenizer
+    return model, tokenizer
 
 
 # ── Request/response schemas ────────────────────────────────────────────────────
@@ -410,11 +391,11 @@ class ChatMessage(BaseModel):
 class GenerateRequest(BaseModel):
     prompt: str | None = None
     messages: list[ChatMessage] | None = None
-    max_new_tokens: int = Field(default=256, ge=1, le=2048)
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    top_k: int = Field(default=50, ge=0)
-    top_p: float = Field(default=0.0, ge=0.0, le=1.0)
-    repetition_penalty: float = Field(default=1.0, ge=1.0, le=2.0)
+    max_new_tokens: int = Field(default=DEFAULT_MAX_NEW_TOKENS, ge=1, le=2048)
+    temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=0.0, le=2.0)
+    top_k: int = Field(default=DEFAULT_TOP_K, ge=0)
+    top_p: float = Field(default=DEFAULT_TOP_P, ge=0.0, le=1.0)
+    repetition_penalty: float = Field(default=DEFAULT_REPETITION_PENALTY, ge=1.0, le=2.0)
     stop_strings: list[str] = Field(default_factory=list)
     stream: bool = False
 
@@ -425,6 +406,11 @@ class GenerateResponse(BaseModel):
     completion_tokens: int
     tokens_per_second: float
     timing: dict[str, float] | None = None
+    # exact token IDs for offline replay (anamnesis taste discriminator) —
+    # always populated (cheap, already in hand); surfaced in the OAI response
+    # only when the request sets return_token_ids
+    prompt_ids: list[int] | None = None
+    completion_ids: list[int] | None = None
 
 
 class ModelInfo(BaseModel):
@@ -434,8 +420,8 @@ class ModelInfo(BaseModel):
     config: dict
     device: str
     checkpoint: str
-    triton_attn_res: bool
-    compiled_decode: bool
+    fast_engine: bool
+    prefix_cache: bool = False
 
 
 def _resolve_prompt(request: GenerateRequest, tokenizer: AutoTokenizer) -> str:
@@ -499,12 +485,7 @@ def sample_next_token(
 
 @torch.inference_mode()
 def model_forward(model: LuxiaBaseModel, input_ids: torch.Tensor) -> torch.Tensor:
-    """Run model forward, returning logits. Uses fast AttnRes kernels when available."""
-    if _fast_ctx is not None:
-        embed = model.embed_tokens(input_ids)
-        hidden = fast_forward_attn_res(_fast_ctx, embed)
-        return F.linear(hidden, model.get_lm_head_weight())
-
+    """Plain eager forward, returning logits (reference/debug path)."""
     return model(input_ids)["logits"]
 
 
@@ -531,8 +512,7 @@ def generate(
     generated_ids: list[int] = []
     t0 = time.perf_counter()
 
-    # Use compiled model for decode if available, eager for prefill
-    decode_model = _compiled_model if _compiled_model is not None else model
+    decode_model = model
 
     # Prefill: process entire prompt, cache KV (always eager — variable prompt shapes)
     if _device.type == "cuda":
@@ -558,7 +538,9 @@ def generate(
         elapsed = time.perf_counter() - t0
         return GenerateResponse(text="", prompt_tokens=prompt_len,
                                 completion_tokens=0, tokens_per_second=0.0,
-                                timing=timing)
+                                timing=timing,
+                                prompt_ids=input_ids[0].tolist(),
+                                completion_ids=[])
 
     generated_ids.append(token_id)
     next_input = torch.tensor([[token_id]], device=_device)
@@ -629,7 +611,198 @@ def generate(
         completion_tokens=len(generated_ids),
         tokens_per_second=round(tps, 1),
         timing=timing,
+        prompt_ids=input_ids[0].tolist(),
+        completion_ids=list(generated_ids),
     )
+
+
+# ── Fast-engine generation ──────────────────────────────────────────────────
+
+def _engine_compatible(request: GenerateRequest) -> bool:
+    """Engine handles the full law surface: temperature + rep penalty + top-k/top-p.
+
+    Truncated laws (top_k > 0 or 0 < top_p < 1) run the engine's dedicated
+    compiled sampler variant (2026-07-05) — they used to fall back to the
+    reference path at a ~10x decode penalty (the SERVING-LAWS p90/k100 cliff).
+    """
+    return _engine is not None
+
+
+@torch.inference_mode()
+def engine_generate(request: GenerateRequest) -> GenerateResponse:
+    """Non-streaming generation on the fast engine. Caller must hold _engine_lock."""
+    assert _engine is not None and _tokenizer is not None and _model is not None
+    timing: dict[str, float] = {}
+    max_pos = _model.config.max_position_embeddings
+
+    t_tok = time.perf_counter()
+    prompt_text = _resolve_prompt(request, _tokenizer)
+    input_ids = _tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
+    prompt_len = input_ids.shape[1]
+    timing["tokenize_ms"] = (time.perf_counter() - t_tok) * 1000
+    if prompt_len >= max_pos:
+        raise HTTPException(400, f"Prompt too long: {prompt_len} tokens (max {max_pos})")
+
+    params = EngineSamplingParams(
+        temperature=request.temperature, repetition_penalty=request.repetition_penalty,
+        top_k=request.top_k, top_p=request.top_p,
+    )
+
+    t0 = time.perf_counter()
+    t_prefill = time.perf_counter()
+    prefill_logits, pc_info = _engine_prefill(input_ids)
+    tok = _engine.sample_first(prefill_logits, params)
+    token_id = int(tok.item())
+    timing["prefill_ms"] = (time.perf_counter() - t_prefill) * 1000
+    if pc_info is not None:
+        timing["prefix_cache_hit"] = pc_info["prefix_hit"]
+        timing["prefix_common_tokens"] = pc_info["common_prefix"]
+        timing["prefill_suffix_tokens"] = pc_info["suffix_len"]
+
+    generated_ids: list[int] = []
+    if token_id not in _stop_token_ids:
+        generated_ids.append(token_id)
+        for _ in range(request.max_new_tokens - 1):
+            if prompt_len + len(generated_ids) >= max_pos:
+                break
+            tok = _engine.step(tok, params)
+            token_id = int(tok.item())
+            if token_id in _stop_token_ids:
+                break
+            generated_ids.append(token_id)
+            if request.stop_strings:
+                decoded_so_far = _tokenizer.decode(generated_ids, skip_special_tokens=True)
+                if any(s in decoded_so_far for s in request.stop_strings):
+                    break
+
+    elapsed = time.perf_counter() - t0
+    completion_text = _tokenizer.decode(generated_ids, skip_special_tokens=True)
+    timing["total_ms"] = round(elapsed * 1000, 2)
+    n_decode = max(len(generated_ids) - 1, 0)
+    if n_decode > 0:
+        timing["decode_per_token_ms"] = round((elapsed - timing["prefill_ms"] / 1000) * 1000 / n_decode, 3)
+    tps = len(generated_ids) / elapsed if elapsed > 0 else 0.0
+
+    return GenerateResponse(
+        text=completion_text,
+        prompt_tokens=prompt_len,
+        completion_tokens=len(generated_ids),
+        tokens_per_second=round(tps, 1),
+        timing=timing,
+        prompt_ids=input_ids[0].tolist(),
+        completion_ids=list(generated_ids),
+    )
+
+
+@torch.inference_mode()
+async def engine_generate_stream(
+    request: GenerateRequest,
+    http_request: Request | None = None,
+):
+    """Streaming generation on the fast engine.
+
+    Emits text via windowed incremental detokenization: pending token ids are
+    decoded together and flushed once the text no longer ends in an incomplete
+    UTF-8 sequence (U+FFFD) — O(window) per step instead of O(n) full redecode.
+
+    THREADING: every engine call below is dispatched to _generate_executor —
+    the single thread the engine compiled/captured on. _engine.step (T > 0)
+    replays the cudagraph-captured fused step, and _engine_prefill can replay
+    it too (--prefix-cache suffix==1 regenerate path); cudagraph_trees keeps
+    its tree managers in THREAD-LOCAL storage, so touching either from the
+    event loop thread asserts (torch._C._is_key_in_tls). sample_first/prefill
+    are eager but mutate shared engine buffers, so they take the same thread.
+    Cost: one ~50-100us executor hop per token. _engine_lock is held across
+    the whole stream, so worker-thread engine ops never interleave requests.
+    """
+    assert _engine is not None and _tokenizer is not None and _model is not None
+    async with _engine_lock:
+        loop = asyncio.get_running_loop()
+        max_pos = _model.config.max_position_embeddings
+        try:
+            prompt_text = _resolve_prompt(request, _tokenizer)
+            input_ids = _tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
+            prompt_len = input_ids.shape[1]
+            if prompt_len >= max_pos:
+                yield f'data: {{"error": "Prompt too long: {prompt_len} tokens"}}\n\n'
+                return
+
+            params = EngineSamplingParams(
+                temperature=request.temperature, repetition_penalty=request.repetition_penalty,
+                top_k=request.top_k, top_p=request.top_p,
+            )
+            t_prefill = time.perf_counter()
+            prefill_logits, pc_info = await loop.run_in_executor(
+                _generate_executor, _engine_prefill, input_ids
+            )
+            if pc_info is not None:
+                logger.debug(
+                    "stream prefill: hit=%s common=%d suffix=%d in %.1fms",
+                    pc_info["prefix_hit"], pc_info["common_prefix"],
+                    pc_info["suffix_len"], (time.perf_counter() - t_prefill) * 1000,
+                )
+            tok = await loop.run_in_executor(
+                _generate_executor, _engine.sample_first, prefill_logits, params
+            )
+            token_id = int(tok.item())
+
+            if token_id in _stop_token_ids:
+                yield f"data: {json.dumps({'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': 0})}\n\n"
+                return
+
+            generated_count = 0
+            emitted_text = ""
+            pending: list[int] = []
+
+            def _flush() -> str:
+                nonlocal emitted_text
+                text = _tokenizer.decode(pending, skip_special_tokens=True)
+                if text and not text.endswith("�"):
+                    emitted_text += text
+                    pending.clear()
+                    return text
+                return ""
+
+            generated_count = 1
+            pending.append(token_id)
+            delta = _flush()
+            if delta:
+                yield f"data: {json.dumps({'token': delta})}\n\n"
+
+            stopped = False
+            interrupted = False
+            for _ in range(request.max_new_tokens - 1):
+                if prompt_len + generated_count >= max_pos:
+                    break
+                if http_request is not None and await http_request.is_disconnected():
+                    interrupted = True
+                    break
+
+                tok = await loop.run_in_executor(
+                    _generate_executor, _engine.step, tok, params
+                )
+                token_id = int(tok.item())
+                if token_id in _stop_token_ids:
+                    break
+                generated_count += 1
+                pending.append(token_id)
+                delta = _flush()
+                if delta:
+                    yield f"data: {json.dumps({'token': delta})}\n\n"
+                if request.stop_strings and any(s in emitted_text for s in request.stop_strings):
+                    stopped = True
+                    break
+
+            if not interrupted:
+                # Flush any pending tail (possibly with incomplete bytes dropped
+                # by skip_special decode semantics).
+                if pending and not stopped:
+                    tail = _tokenizer.decode(pending, skip_special_tokens=True)
+                    if tail:
+                        yield f"data: {json.dumps({'token': tail})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': generated_count})}\n\n"
+        finally:
+            pass
 
 
 @torch.inference_mode()
@@ -637,102 +810,146 @@ async def generate_stream(
     model: LuxiaBaseModel,
     tokenizer: AutoTokenizer,
     request: GenerateRequest,
+    http_request: Request | None = None,
 ):
-    prompt_text = _resolve_prompt(request, tokenizer)
-    input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
-    prompt_len = input_ids.shape[1]
+    # THREADING: this reference streaming path is safe on the event loop
+    # thread — it never touches the fast engine (fully eager decode, no
+    # cudagraph_trees thread-local state).
+    # Hold a slot for the whole stream so concurrent streams stay bounded.
+    async with _stream_semaphore:
+        past_kv = None
+        output = None
+        interrupted = False
+        try:
+            prompt_text = _resolve_prompt(request, tokenizer)
+            input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
+            prompt_len = input_ids.shape[1]
 
-    if prompt_len >= model.config.max_position_embeddings:
-        yield f'data: {{"error": "Prompt too long: {prompt_len} tokens"}}\n\n'
-        return
+            if prompt_len >= model.config.max_position_embeddings:
+                yield f'data: {{"error": "Prompt too long: {prompt_len} tokens"}}\n\n'
+                return
 
-    generated_ids: list[int] = []
-    prev_text = ""
+            generated_ids: list[int] = []
+            prev_text = ""
 
-    decode_model = _compiled_model if _compiled_model is not None else model
+            decode_model = model
 
-    # Prefill (always eager)
-    output = model(input_ids, use_cache=True)
-    past_kv = output.get("past_kv")
-    next_logits = output["logits"][0, -1]
+            # Prefill (always eager)
+            output = model(input_ids, use_cache=True)
+            past_kv = output.get("past_kv")
+            next_logits = output["logits"][0, -1]
 
-    token_id = sample_next_token(
-        next_logits, request.temperature, request.top_k, request.top_p,
-        request.repetition_penalty, generated_ids,
-    )
+            token_id = sample_next_token(
+                next_logits, request.temperature, request.top_k, request.top_p,
+                request.repetition_penalty, generated_ids,
+            )
 
-    if token_id in _stop_token_ids:
-        yield f"data: {json.dumps({'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': 0})}\n\n"
-        return
+            if token_id in _stop_token_ids:
+                yield f"data: {json.dumps({'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': 0})}\n\n"
+                return
 
-    generated_ids.append(token_id)
-    next_input = torch.tensor([[token_id]], device=_device)
+            generated_ids.append(token_id)
+            next_input = torch.tensor([[token_id]], device=_device)
 
-    current_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    delta = current_text
-    prev_text = current_text
-    if delta:
-        yield f"data: {json.dumps({'token': delta})}\n\n"
+            current_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            delta = current_text
+            prev_text = current_text
+            if delta:
+                yield f"data: {json.dumps({'token': delta})}\n\n"
 
-    # Decode with KV cache (compiled if available)
-    for _ in range(request.max_new_tokens - 1):
-        if prompt_len + len(generated_ids) >= model.config.max_position_embeddings:
-            break
+            # Decode with KV cache (compiled if available)
+            for _ in range(request.max_new_tokens - 1):
+                if prompt_len + len(generated_ids) >= model.config.max_position_embeddings:
+                    break
 
-        output = decode_model(next_input, use_cache=True, past_kv=past_kv)
-        past_kv = output.get("past_kv")
-        next_logits = output["logits"][0, -1]
+                # Stop early for clients that have disconnected. This keeps us off
+                # the mid-stream exception path, which would otherwise pin this
+                # request's CUDA tensors via the traceback reference cycle.
+                if http_request is not None and await http_request.is_disconnected():
+                    interrupted = True
+                    break
 
-        token_id = sample_next_token(
-            next_logits, request.temperature, request.top_k, request.top_p,
-            request.repetition_penalty, generated_ids,
-        )
+                output = decode_model(next_input, use_cache=True, past_kv=past_kv)
+                past_kv = output.get("past_kv")
+                next_logits = output["logits"][0, -1]
 
-        if token_id in _stop_token_ids:
-            break
+                token_id = sample_next_token(
+                    next_logits, request.temperature, request.top_k, request.top_p,
+                    request.repetition_penalty, generated_ids,
+                )
 
-        generated_ids.append(token_id)
-        next_input = torch.tensor([[token_id]], device=_device)
+                if token_id in _stop_token_ids:
+                    break
 
-        current_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        delta = current_text[len(prev_text):]
-        prev_text = current_text
+                generated_ids.append(token_id)
+                next_input = torch.tensor([[token_id]], device=_device)
 
-        if delta:
-            yield f"data: {json.dumps({'token': delta})}\n\n"
+                current_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                delta = current_text[len(prev_text):]
+                prev_text = current_text
 
-        if request.stop_strings:
-            if any(s in current_text for s in request.stop_strings):
-                break
+                if delta:
+                    yield f"data: {json.dumps({'token': delta})}\n\n"
 
-    yield f"data: {json.dumps({'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': len(generated_ids)})}\n\n"
+                if request.stop_strings:
+                    if any(s in current_text for s in request.stop_strings):
+                        break
+
+            if not interrupted:
+                yield f"data: {json.dumps({'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': len(generated_ids)})}\n\n"
+        except BaseException:
+            # GeneratorExit / CancelledError on client disconnect arrive here.
+            interrupted = True
+            raise
+        finally:
+            # Drop refs to this request's CUDA tensors; on the interrupted path
+            # force a cyclic GC so traceback-pinned tensors are reclaimed now
+            # instead of accumulating across disconnects into a full-GPU OOM.
+            past_kv = None
+            output = None
+            if interrupted:
+                gc.collect()
 
 
 # ── App ─────────────────────────────────────────────────────────────────────────
 
-_checkpoint_path = DEFAULT_CHECKPOINT
-_compile_arg = False
+_checkpoint_path = ""
 _mode_arg = "base"
-_model_size_arg = "proxy"
+_model_size_arg = "3b"
+_served_name_override: str | None = None
+_engine_arg = "fast"
+_prefix_cache_arg = False
+_warmup_sdpa_arg = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model, _compiled_model, _tokenizer
-    _model, _compiled_model, _tokenizer = load_model(
-        _checkpoint_path, _device_arg, compile=_compile_arg, mode=_mode_arg,
-        model_size=_model_size_arg,
+    global _model, _tokenizer
+    _model, _tokenizer = load_model(
+        _checkpoint_path, _device_arg, mode=_mode_arg,
+        model_size=_model_size_arg, engine=_engine_arg, prefix_cache=_prefix_cache_arg,
+        warmup_sdpa=_warmup_sdpa_arg,
     )
-    yield
+    try:
+        yield
+    finally:
+        # Uvicorn's graceful shutdown has already drained in-flight requests by
+        # the time we get here; drop anything still queued (its awaiting request
+        # was cancelled) so the non-daemon worker thread can't stall exit.
+        _generate_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _model_name() -> str:
-    ckpt_stem = Path(_checkpoint_path).stem.removesuffix(".pt")
-    for name in KNOWN_MODELS:
-        if ckpt_stem.startswith(name):
-            return name
-    suffix = "instruct" if _serve_mode == "chat" else "base"
-    return f"kotodama-108m-{suffix}-unknown"
+    """Canonical served model id, e.g. 'kotodama-3b-instruct'.
+
+    Priority: explicit --served_model_name > derived from architecture size
+    (--model_size) + serving mode.
+    """
+    if _served_name_override:
+        return _served_name_override
+    size_label = SIZE_LABELS.get(_model_size_arg, _model_size_arg)
+    mode_label = "instruct" if _serve_mode == "chat" else "base"
+    return f"kotodama-{size_label}-{mode_label}"
 
 
 app = FastAPI(title="luxia DD-v1", lifespan=lifespan)
@@ -760,8 +977,8 @@ async def info():
         config=asdict(_model.config),
         device=str(_device),
         checkpoint=_checkpoint_path,
-        triton_attn_res=_FAST_ATTNRES_AVAILABLE and _device.type == "cuda",
-        compiled_decode=_compiled_model is not None,
+        fast_engine=_engine is not None,
+        prefix_cache=_prefix_cache,
     )
 
 
@@ -778,17 +995,25 @@ async def memory():
 
 
 @app.post("/generate", response_model=GenerateResponse)
-async def generate_endpoint(request: GenerateRequest):
+async def generate_endpoint(request: GenerateRequest, http_request: Request):
     if _model is None or _tokenizer is None:
         raise HTTPException(503, "Model not loaded")
 
     if request.stream:
+        if _engine_compatible(request):
+            return StreamingResponse(
+                engine_generate_stream(request, http_request),
+                media_type="text/event-stream",
+            )
         return StreamingResponse(
-            generate_stream(_model, _tokenizer, request),
+            generate_stream(_model, _tokenizer, request, http_request),
             media_type="text/event-stream",
         )
 
-    return generate(request=request, model=_model, tokenizer=_tokenizer)
+    if _engine_compatible(request):
+        async with _engine_lock:
+            return await _run_generation(engine_generate, request)
+    return await _run_generation(generate, request=request, model=_model, tokenizer=_tokenizer)
 
 
 # ── OpenAI-compatible /v1/completions (for Loom/Loomsidian) ─────────────────────
@@ -796,14 +1021,15 @@ async def generate_endpoint(request: GenerateRequest):
 class OAICompletionRequest(BaseModel):
     prompt: str
     model: str = ""
-    max_tokens: int = Field(default=256, ge=1, le=2048)
+    max_tokens: int = Field(default=DEFAULT_MAX_NEW_TOKENS, ge=1, le=2048)
     n: int = Field(default=1, ge=1, le=8)
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    top_p: float = Field(default=0.0, ge=0.0, le=1.0)
-    frequency_penalty: float = Field(default=0.0, ge=0.0, le=2.0)
+    temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=0.0, le=2.0)
+    top_p: float = Field(default=DEFAULT_TOP_P, ge=0.0, le=1.0)
+    frequency_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
     presence_penalty: float = Field(default=0.0, ge=0.0, le=2.0)
     best_of: int | None = None
     stop: list[str] | str | None = None
+    return_token_ids: bool = False
 
 
 @app.post("/v1/completions")
@@ -817,6 +1043,12 @@ async def oai_completions(request: OAICompletionRequest):
     elif isinstance(request.stop, list):
         stop_strings = request.stop
 
+    repetition_penalty = (
+        1.0 + request.frequency_penalty
+        if request.frequency_penalty is not None
+        else DEFAULT_REPETITION_PENALTY
+    )
+
     choices = []
     for i in range(request.n):
         gen_req = GenerateRequest(
@@ -824,16 +1056,24 @@ async def oai_completions(request: OAICompletionRequest):
             max_new_tokens=request.max_tokens,
             temperature=request.temperature,
             top_p=request.top_p,
-            repetition_penalty=1.0 + request.frequency_penalty,
+            repetition_penalty=repetition_penalty,
             stop_strings=stop_strings,
         )
-        result = generate(model=_model, tokenizer=_tokenizer, request=gen_req)
-        choices.append({
-            "text": result.text,
+        if _engine_compatible(gen_req):
+            async with _engine_lock:
+                result = await _run_generation(engine_generate, gen_req)
+        else:
+            result = await _run_generation(generate, model=_model, tokenizer=_tokenizer, request=gen_req)
+        choice = {
+            "text": html.unescape(result.text),
             "index": i,
             "logprobs": None,
             "finish_reason": "length" if result.completion_tokens >= request.max_tokens else "stop",
-        })
+        }
+        if request.return_token_ids:
+            choice["token_ids"] = {"prompt": result.prompt_ids,
+                                   "completion": result.completion_ids}
+        choices.append(choice)
 
     prompt_tokens = _tokenizer.encode(request.prompt, return_tensors="pt").shape[1]
     completion_tokens = sum(
@@ -856,17 +1096,17 @@ async def oai_completions(request: OAICompletionRequest):
 
 @app.get("/v1/models")
 async def oai_models():
+    # One model is loaded per process; report the one actually being served.
     active = _model_name()
     return {
         "object": "list",
         "data": [
             {
-                "id": name,
+                "id": active,
                 "object": "model",
                 "owned_by": "aethera-gp",
-                "active": name == active,
+                "active": True,
             }
-            for name in KNOWN_MODELS
         ],
     }
 
@@ -877,18 +1117,19 @@ async def oai_models():
 class OAIChatRequest(BaseModel):
     messages: list[ChatMessage]
     model: str = ""
-    max_tokens: int = Field(default=256, ge=1, le=2048)
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    top_p: float = Field(default=0.0, ge=0.0, le=1.0)
-    frequency_penalty: float = Field(default=0.0, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=DEFAULT_MAX_NEW_TOKENS, ge=1, le=2048)
+    temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=0.0, le=2.0)
+    top_p: float = Field(default=DEFAULT_TOP_P, ge=0.0, le=1.0)
+    frequency_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
     presence_penalty: float = Field(default=0.0, ge=0.0, le=2.0)
     stop: list[str] | str | None = None
     stream: bool = False
     n: int = Field(default=1, ge=1, le=8)
+    return_token_ids: bool = False
 
 
 @app.post("/v1/chat/completions")
-async def oai_chat_completions(request: OAIChatRequest):
+async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
     if _model is None or _tokenizer is None:
         raise HTTPException(503, detail="Model not loaded")
     if _serve_mode != "chat":
@@ -905,19 +1146,30 @@ async def oai_chat_completions(request: OAIChatRequest):
     elif isinstance(request.stop, list):
         stop_strings = request.stop
 
+    repetition_penalty = (
+        1.0 + request.frequency_penalty
+        if request.frequency_penalty is not None
+        else DEFAULT_REPETITION_PENALTY
+    )
+
     if request.stream:
         gen_req = GenerateRequest(
             prompt=prompt_text,
             max_new_tokens=request.max_tokens,
             temperature=request.temperature,
             top_p=request.top_p,
-            repetition_penalty=1.0 + request.frequency_penalty,
+            repetition_penalty=repetition_penalty,
             stop_strings=stop_strings,
             stream=True,
         )
 
+        if _engine_compatible(gen_req):
+            source_stream = engine_generate_stream(gen_req, http_request)
+        else:
+            source_stream = generate_stream(_model, _tokenizer, gen_req, http_request)
+
         async def chat_stream():
-            async for chunk in generate_stream(_model, _tokenizer, gen_req):
+            async for chunk in source_stream:
                 data = json.loads(chunk.removeprefix("data: ").strip())
                 if "token" in data:
                     oai_chunk = {
@@ -957,16 +1209,24 @@ async def oai_chat_completions(request: OAIChatRequest):
             max_new_tokens=request.max_tokens,
             temperature=request.temperature,
             top_p=request.top_p,
-            repetition_penalty=1.0 + request.frequency_penalty,
+            repetition_penalty=repetition_penalty,
             stop_strings=stop_strings,
         )
-        result = generate(model=_model, tokenizer=_tokenizer, request=gen_req)
+        if _engine_compatible(gen_req):
+            async with _engine_lock:
+                result = await _run_generation(engine_generate, gen_req)
+        else:
+            result = await _run_generation(generate, model=_model, tokenizer=_tokenizer, request=gen_req)
         total_completion_tokens += result.completion_tokens
-        choices.append({
+        choice = {
             "index": i,
-            "message": {"role": "assistant", "content": result.text},
+            "message": {"role": "assistant", "content": html.unescape(result.text)},
             "finish_reason": "length" if result.completion_tokens >= request.max_tokens else "stop",
-        })
+        }
+        if request.return_token_ids:
+            choice["token_ids"] = {"prompt": result.prompt_ids,
+                                   "completion": result.completion_ids}
+        choices.append(choice)
 
     prompt_tokens = _tokenizer.encode(prompt_text, add_special_tokens=False, return_tensors="pt").shape[1]
 
@@ -989,38 +1249,45 @@ async def oai_chat_completions(request: OAIChatRequest):
 _device_arg = "cuda"
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="kotodama inference server",
-        epilog="Available models: " + ", ".join(KNOWN_MODELS),
-    )
-    ckpt_group = parser.add_mutually_exclusive_group()
-    ckpt_group.add_argument("--model", choices=list(KNOWN_MODELS), metavar="NAME",
-                            help="Model name (resolves to checkpoints/serving/)")
-    ckpt_group.add_argument("--checkpoint", help="Direct path to checkpoint .pt/.pt.zst file")
+    parser = argparse.ArgumentParser(description="kotodama inference server")
+    parser.add_argument("--checkpoint", required=True,
+                        help="Path to checkpoint .pt/.pt.zst file")
     parser.add_argument("--device", default="cuda", help="Device: cuda, cuda:N, or cpu")
     parser.add_argument("--mode", choices=["base", "chat"], default=None,
-                        help="Serving mode (auto-detected from model name if omitted)")
-    parser.add_argument("--compile", action="store_true", help="Enable torch.compile(dynamic=True) for faster inference")
-    parser.add_argument("--model_size", choices=list(MODEL_CONFIGS), default="proxy",
-                        help="Model architecture size (proxy=108M, 3b=2.97B)")
+                        help="Serving mode (auto-detected from checkpoint path if omitted)")
+    parser.add_argument("--engine", choices=["fast", "reference"], default="fast",
+                        help="'fast' (default) = static-cache CUDA-graph DecodeEngine, all "
+                             "sampling laws incl. top-k/top-p; 'reference' = eager debug/"
+                             "parity path (~10x slower decode)")
+    parser.add_argument("--prefix-cache", action="store_true",
+                        help="Reuse the engine KV cache across requests sharing a token-exact "
+                             "prompt prefix (multi-turn TTFT win; requires --engine fast and "
+                             "per-conversation replica pinning)")
+    parser.add_argument("--model_size", choices=list(MODEL_CONFIGS), default="3b",
+                        help="Model architecture size (3b=2.97B, proxy=108M legacy)")
+    parser.add_argument("--served_model_name", default=None,
+                        help="Override the model id reported by /info and /v1/models "
+                             "(default: kotodama-<size>-<base|instruct>)")
+    parser.add_argument("--warmup-sdpa", action="store_true",
+                        help="Reference engine only: pre-pay the ~100s cuDNN SDPA plan-cache "
+                             "sweep at startup instead of ~300ms per novel shape at runtime")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
 
-    if args.model:
-        _checkpoint_path = str(SERVING_DIR / KNOWN_MODELS[args.model])
-        inferred_mode = "chat" if "instruct" in args.model else "base"
-    elif args.checkpoint:
-        _checkpoint_path = args.checkpoint
-        inferred_mode = "chat" if "instruct" in args.checkpoint else "base"
-    else:
-        _checkpoint_path = DEFAULT_CHECKPOINT
-        inferred_mode = "base"
+    _checkpoint_path = args.checkpoint
+    inferred_mode = "chat" if "instruct" in args.checkpoint else "base"
 
+    _served_name_override = args.served_model_name
     _device_arg = args.device
     _mode_arg = args.mode if args.mode is not None else inferred_mode
-    _compile_arg = args.compile
     _model_size_arg = args.model_size
+    _engine_arg = args.engine
+    _prefix_cache_arg = args.prefix_cache
+    _warmup_sdpa_arg = args.warmup_sdpa
+    if _prefix_cache_arg and _engine_arg != "fast":
+        logger.warning("--prefix-cache requires --engine fast; ignoring")
+        _prefix_cache_arg = False
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

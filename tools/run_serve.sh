@@ -3,17 +3,14 @@
 # Activates shared venv, sets env, runs serve.py.
 #
 # Usage:
-#   tools/run_serve.sh --model kotodama-108m-instruct-fc [--compile] [--port 2224]
-#   tools/run_serve.sh --checkpoint /path/to/custom.pt --mode chat
+#   tools/run_serve.sh --checkpoint /path/to/model.pt [--prefix-cache] [--port 2224]
+#   tools/run_serve.sh --checkpoint /path/to/instruct.pt --mode chat
 #
-# Scheduler:
-#   scheduler submit "tools/run_serve.sh --model kotodama-108m-instruct-fc --compile" \
-#     --name kotodama-serve --gpus 1 --node gpu-host --always-on \
-#     --workdir ~/workspace/kotodama --port 2224
 set -e
-cd ~/workspace/kotodama
+ROOT="${KOTODAMA_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$ROOT"
 
-VENV=~/workspace/.venv-shared
+VENV="${KOTODAMA_VENV:-$ROOT/.venv}"
 export PATH="$VENV/bin:$PATH"
 export VIRTUAL_ENV="$VENV"
 export PYTHONUNBUFFERED=1
@@ -22,4 +19,8 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=2
 export MKL_NUM_THREADS=2
 
-exec python3 serve.py "$@"
+# Reduce CUDA allocator fragmentation under variable-length decode.
+# (serve.py also setdefault()s this, so direct launches get it too.)
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
+exec "${KOTODAMA_PYTHON:-python}" serve.py "$@"

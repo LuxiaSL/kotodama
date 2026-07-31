@@ -3,6 +3,7 @@ import triton.language as tl
 from .configs import (
     forward_configs,
     phase2_backward_configs,
+    phase2_backward_v2_configs,
 )
 
 
@@ -239,3 +240,180 @@ def phase_2_online_softmax_merge_backward_kernel(
         mask=valid_hidden,
         sem="relaxed",
     )
+
+
+@triton.autotune(
+    configs=phase2_backward_v2_configs,
+    key=["HIDDEN_DIM"],
+    # Autotune trials with different BLOCK_BT write different row counts into
+    # the partials buffer; restore between trials so stale rows from a wider
+    # grid don't survive into the final reduce.
+    restore_value=["grad_pseudo_query_partials_ptr"],
+)
+@triton.jit
+def phase_2_online_softmax_merge_backward_v2_kernel(
+    intrablock_partial_sum_ptr,
+    pseudo_query_ptr,
+    phase1_interblock_normalized_output_ptr,
+    phase1_interblock_logsumexp_ptr,
+    phase2_intrablock_logit_ptr,
+    intrablock_inverse_rms_norm_ptr,
+    grad_merged_attention_output_ptr,
+    grad_intrablock_partial_sum_ptr,
+    grad_pseudo_query_partials_ptr,
+    grad_phase1_interblock_normalized_output_ptr,
+    grad_phase1_interblock_logsumexp_ptr,
+    eps,
+    BT,
+    HIDDEN_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_BT: tl.constexpr,
+):
+    # Same math as v1, restructured:
+    #   - Hidden dim processed in BLOCK_D chunks, two passes: pass 1
+    #     accumulates the per-row dot sum(gm * (p1norm - ps)); pass 2 emits
+    #     grads chunk-by-chunk. Live registers drop from (BLOCK_BT, 4096) x6
+    #     tensors (v1: guaranteed spill to local memory) to (BLOCK_BT,
+    #     BLOCK_D) x3 — the kernel becomes bandwidth-bound at the cost of
+    #     re-reading gm/ps once.
+    #   - grad_intrablock / grad_p1_normalized stored in the output buffer's
+    #     dtype (bf16 in training): identical rounding to v1's fp32-store +
+    #     separate .to() pass, half the store traffic, no follow-up kernels.
+    #   - grad_pseudo_query: per-program partial rows + deterministic torch
+    #     reduce instead of tl.atomic_add contention (which was also
+    #     order-nondeterministic).
+    #   - BT is a runtime arg, not constexpr (no per-shape recompiles); no
+    #     ACCUMULATE path (unused by the wrapper).
+    bt_block_idx = tl.program_id(0)
+
+    bt_offsets = bt_block_idx * BLOCK_BT + tl.arange(0, BLOCK_BT)
+    valid_bt = bt_offsets < BT
+
+    phase1_interblock_logsumexp = tl.load(
+        phase1_interblock_logsumexp_ptr + bt_offsets,
+        mask=valid_bt,
+        other=float("-inf"),
+    ).to(tl.float32)
+
+    phase2_intrablock_logit = tl.load(
+        phase2_intrablock_logit_ptr + bt_offsets,
+        mask=valid_bt,
+        other=0.0,
+    ).to(tl.float32)
+
+    intrablock_inverse_rms_norm = tl.load(
+        intrablock_inverse_rms_norm_ptr + bt_offsets,
+        mask=valid_bt,
+        other=0.0,
+    ).to(tl.float32)
+
+    phase2_merge_probability = tl.sigmoid(
+        phase2_intrablock_logit - phase1_interblock_logsumexp
+    )
+    phase1_merge_probability = 1.0 - phase2_merge_probability
+
+    # ── Pass 1: per-row dot of grad with (p1norm - ps), chunked over D ──
+    grad_output_dot_interblock_minus_intrablock = tl.zeros(
+        (BLOCK_BT,), dtype=tl.float32
+    )
+    for d_start in range(0, HIDDEN_DIM, BLOCK_D):
+        d_offsets = d_start + tl.arange(0, BLOCK_D)
+        valid_d = d_offsets < HIDDEN_DIM
+        mask_2d = valid_bt[:, None] & valid_d[None, :]
+        offsets_2d = bt_offsets[:, None] * HIDDEN_DIM + d_offsets[None, :]
+
+        grad_merged_chunk = tl.load(
+            grad_merged_attention_output_ptr + offsets_2d,
+            mask=mask_2d, other=0.0,
+        ).to(tl.float32)
+        p1norm_chunk = tl.load(
+            phase1_interblock_normalized_output_ptr + offsets_2d,
+            mask=mask_2d, other=0.0,
+        ).to(tl.float32)
+        ps_chunk = tl.load(
+            intrablock_partial_sum_ptr + offsets_2d,
+            mask=mask_2d, other=0.0,
+        ).to(tl.float32)
+
+        grad_output_dot_interblock_minus_intrablock += tl.sum(
+            grad_merged_chunk * (p1norm_chunk - ps_chunk), axis=1
+        )
+
+    merge_probability_product = phase1_merge_probability * phase2_merge_probability
+
+    grad_phase1_interblock_logsumexp = (
+        merge_probability_product * grad_output_dot_interblock_minus_intrablock
+    )
+    grad_phase2_intrablock_logit = (
+        -merge_probability_product * grad_output_dot_interblock_minus_intrablock
+    )
+
+    tl.store(
+        grad_phase1_interblock_logsumexp_ptr + bt_offsets,
+        grad_phase1_interblock_logsumexp,
+        mask=valid_bt,
+    )
+
+    # Per-row coefficients for pass 2 (v1's logit-path term regrouped):
+    #   grad_ps_logit_path = coef_query * q  +  coef_ps * ps
+    #   grad_pseudo_query_per_row = coef_query * ps
+    coef_query = grad_phase2_intrablock_logit * intrablock_inverse_rms_norm
+    coef_ps = (
+        -grad_phase2_intrablock_logit
+        * phase2_intrablock_logit
+        * intrablock_inverse_rms_norm
+        * intrablock_inverse_rms_norm
+        / float(HIDDEN_DIM)
+    )
+
+    # ── Pass 2: emit grads chunk-by-chunk ──
+    for d_start in range(0, HIDDEN_DIM, BLOCK_D):
+        d_offsets = d_start + tl.arange(0, BLOCK_D)
+        valid_d = d_offsets < HIDDEN_DIM
+        mask_2d = valid_bt[:, None] & valid_d[None, :]
+        offsets_2d = bt_offsets[:, None] * HIDDEN_DIM + d_offsets[None, :]
+
+        grad_merged_chunk = tl.load(
+            grad_merged_attention_output_ptr + offsets_2d,
+            mask=mask_2d, other=0.0,
+        ).to(tl.float32)
+        ps_chunk = tl.load(
+            intrablock_partial_sum_ptr + offsets_2d,
+            mask=mask_2d, other=0.0,
+        ).to(tl.float32)
+        query_chunk = tl.load(
+            pseudo_query_ptr + d_offsets,
+            mask=valid_d, other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+
+        tl.store(
+            grad_phase1_interblock_normalized_output_ptr + offsets_2d,
+            (phase1_merge_probability[:, None] * grad_merged_chunk).to(
+                grad_phase1_interblock_normalized_output_ptr.dtype.element_ty
+            ),
+            mask=mask_2d,
+        )
+
+        grad_ps_chunk = (
+            phase2_merge_probability[:, None] * grad_merged_chunk
+            + coef_query[:, None] * query_chunk[None, :]
+            + coef_ps[:, None] * ps_chunk
+        )
+        tl.store(
+            grad_intrablock_partial_sum_ptr + offsets_2d,
+            grad_ps_chunk.to(grad_intrablock_partial_sum_ptr.dtype.element_ty),
+            mask=mask_2d,
+        )
+
+        grad_pseudo_query_chunk = tl.sum(
+            tl.where(mask_2d, coef_query[:, None] * ps_chunk, 0.0),
+            axis=0,
+        )
+        tl.store(
+            grad_pseudo_query_partials_ptr
+            + bt_block_idx * HIDDEN_DIM
+            + d_offsets,
+            grad_pseudo_query_chunk,
+            mask=valid_d,
+        )

@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_TASKS = "hellaswag,piqa,arc_easy,boolq,lambada_openai,winogrande,wikitext,copa,sciq"
+DEFAULT_TASKS = "hellaswag,piqa,arc_easy,arc_challenge,boolq,lambada_openai,winogrande,wikitext,copa,sciq"
 
 DEFAULT_ATTN_RES_CONFIG = {
     "attn_res": True,
@@ -49,7 +49,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TASKS,
         help=f"Comma-separated task names (default: {DEFAULT_TASKS})",
     )
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--batch-size", type=int, default=32,
+        help="Rows per forward pass (batched loglikelihood; 32 is a good "
+             "B200 default for the 3B)",
+    )
+    parser.add_argument(
+        "--max-batch-tokens", type=int, default=32768,
+        help="Cap on rows x padded-width per forward pass; bounds memory "
+             "for long-sequence batches (wikitext rolling windows)",
+    )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument(
         "--output-dir",
@@ -114,6 +123,7 @@ def run_eval(args: argparse.Namespace) -> None:
         ckpt_name = Path(ckpt_path).stem
         logger.info("Evaluating checkpoint: %s", ckpt_name)
 
+        lm = None
         try:
             lm = LuxiaEvalLM(
                 checkpoint_path=ckpt_path,
@@ -123,6 +133,7 @@ def run_eval(args: argparse.Namespace) -> None:
                 device=args.device,
                 batch_size=args.batch_size,
                 compile=getattr(args, "compile", False),
+                max_batch_tokens=args.max_batch_tokens,
             )
 
             eval_kwargs: dict = {

@@ -15,19 +15,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.request
 import urllib.error
 
-SCHEDULER_URL = "http://<scheduler-url>:7000"
+SCHEDULER_URL = os.environ.get("KOTODAMA_SCHEDULER_URL", "")
+SCHEDULER_NODE = os.environ.get("KOTODAMA_SCHEDULER_NODE", "")
 DATA_PATH = "data/fineweb_edu_6b.bin"
-WORKING_DIR = "/home/cluster-user/workspace/luxia-base"
+WORKING_DIR = os.environ.get("KOTODAMA_WORKDIR", ".")
 VENV_TORCHRUN = ".venv/bin/python -m torch.distributed.run"
 
 # NCA phase checkpoint for the NCA+AttnRes run
 NCA_PHASE_CKPT = "checkpoints/nca_proxy/nca-phase-muon-002/step_00002287.pt"
 
-WANDB_API_KEY = "[REDACTED]"
+WANDB_API_KEY = os.environ.get("WANDB_API_KEY")
 
 # Common training args (matching proxy sweep exactly, plus --attn_res)
 COMMON_ARGS = (
@@ -98,6 +100,8 @@ def build_command(run: dict, data_path: str = DATA_PATH) -> str:
 
 def submit_sweep(dry_run: bool = False) -> list[dict[str, str]]:
     """Submit all AttnRes runs as chained Scheduler jobs."""
+    if not SCHEDULER_URL or not SCHEDULER_NODE:
+        raise SystemExit("Set KOTODAMA_SCHEDULER_URL and KOTODAMA_SCHEDULER_NODE before submitting.")
     submitted: list[dict[str, str]] = []
     prev_job_id: str | None = None
 
@@ -120,13 +124,10 @@ def submit_sweep(dry_run: bool = False) -> list[dict[str, str]]:
             "job_type": "custom",
             "name": f"luxia-attnres-{run['name']}",
             "command": command,
-            "node": "gpu-host",
+            "node": SCHEDULER_NODE,
             "gpus": 8,
             "working_dir": WORKING_DIR,
-            "env": {
-                "PYTHONUNBUFFERED": "1",
-                "WANDB_API_KEY": WANDB_API_KEY,
-            },
+            "env": {"PYTHONUNBUFFERED": "1", **({"WANDB_API_KEY": WANDB_API_KEY} if WANDB_API_KEY else {})},
             "estimated_minutes": 120,  # ~90 min each, 120 for safety
             "max_retries": 1,
             "priority": 80,

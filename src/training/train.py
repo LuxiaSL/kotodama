@@ -26,12 +26,14 @@ import argparse
 import logging
 import math
 import os
+import queue
 import sys
+import threading
 import time
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import torch
 import torch.distributed as dist
@@ -154,6 +156,18 @@ MODEL_CONFIGS: dict[str, dict[str, Any]] = {
         vocab_size=49152,
         max_position_embeddings=4096,
     ),
+    # ~7.18B params at vocab 49,152 — Llama-3-8B skeleton; its extra ~1B is
+    # purely the 128K vocab. "8b" kept as an alias for older configs.
+    "7b": dict(
+        hidden_size=4096,
+        num_layers=32,
+        num_attention_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        intermediate_size=14336,
+        vocab_size=49152,
+        max_position_embeddings=4096,
+    ),
     "8b": dict(
         hidden_size=4096,
         num_layers=32,
@@ -197,9 +211,165 @@ MODEL_CONFIGS: dict[str, dict[str, Any]] = {
 }
 
 
+def _model_flops_per_token(
+    param_count: int,
+    config: LuxiaModelConfig,
+    seq_len: int,
+) -> float:
+    """Analytic model FLOPs per token, forward + backward (PaLM-style 6N).
+
+    6 × matmul params (embedding lookup is free; the tied lm_head matmul IS
+    the embedding matrix, so tied models count param_count as-is) plus the
+    attention score/value term at causal average context seq_len/2.
+    Doc masking shortens real attention context, so the attention term is a
+    mild overestimate (~10% of the total) — reported MFU is comparable across
+    runs, which is what matters.
+    """
+    embed_params = config.vocab_size * config.hidden_size
+    if config.tie_word_embeddings:
+        n_matmul = param_count  # embed excluded, lm_head included — same matrix
+    else:
+        n_matmul = param_count - embed_params
+    attn_flops = (
+        6.0
+        * seq_len
+        * config.num_layers
+        * config.num_attention_heads
+        * config.head_dim
+    )
+    return 6.0 * n_matmul + attn_flops
+
+
+class _PrefetchIterator:
+    """Background-thread batch prefetcher with exact dataset-state tracking.
+
+    Pulls (batch, dataset_state) pairs ahead of the training loop so memmap
+    page faults, EOS scanning, and collation overlap GPU compute instead of
+    running in the gaps between kernel launches. ``consumed_state`` always
+    reflects only batches actually handed to the training loop, so a
+    checkpoint saved mid-run resumes with zero skipped / replayed sequences
+    — identical semantics to the unprefetched loader.
+    """
+
+    def __init__(
+        self,
+        make_iter: Callable[[], Iterator[Any]],
+        dataset: Any,
+        depth: int = 2,
+    ) -> None:
+        self._make_iter = make_iter
+        self._dataset = dataset
+        self._queue: queue.Queue[Optional[tuple[Any, Optional[dict[str, int]]]]] = (
+            queue.Queue(maxsize=max(1, depth))
+        )
+        self._stop = threading.Event()
+        self._exc: Optional[BaseException] = None
+        self.consumed_state: Optional[dict[str, int]] = (
+            dataset.state_dict() if hasattr(dataset, "state_dict") else None
+        )
+        self._thread = threading.Thread(
+            target=self._worker, daemon=True, name="data-prefetch"
+        )
+        self._thread.start()
+
+    def _worker(self) -> None:
+        try:
+            it = self._make_iter()
+            while not self._stop.is_set():
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    it = self._make_iter()
+                    continue
+                state = (
+                    self._dataset.state_dict()
+                    if hasattr(self._dataset, "state_dict")
+                    else None
+                )
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put((batch, state), timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+        except BaseException as e:  # surface to consumer, never die silently
+            self._exc = e
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def __iter__(self) -> "_PrefetchIterator":
+        return self
+
+    def __next__(self) -> Any:
+        while True:
+            try:
+                item = self._queue.get(timeout=5.0)
+            except queue.Empty:
+                if self._exc is not None:
+                    raise RuntimeError("data prefetch worker failed") from self._exc
+                if not self._thread.is_alive():
+                    raise RuntimeError("data prefetch worker died without an exception")
+                continue
+            if item is None:
+                raise RuntimeError("data prefetch worker failed") from self._exc
+            batch, state = item
+            if state is not None:
+                self.consumed_state = state
+            return batch
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._thread.join(timeout=5.0)
+
+
 # =============================================================================
 # Distributed setup
 # =============================================================================
+
+
+class _FlexBlockMaskBuilder:
+    """Builds the per-step FlexAttention BlockMask (causal-within-document).
+
+    Built OUTSIDE the compiled model (BlockMask is a graph input, not traced
+    construction). Doc ids come from position_ids resets (position 0 = doc
+    start — the same signal cu_seqlens encodes). The doc-id tensor is a
+    persistent buffer updated with copy_ so the mask_mod closure always sees
+    the same tensor object: a fresh closure/tensor identity per step would
+    force dynamo to recompile create_block_mask every step.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        self._create = create_block_mask
+        self._device = device
+        self._doc_ids: Optional[torch.Tensor] = None
+
+        def _doc_causal(b, h, q_idx, kv_idx):  # noqa: ANN001
+            return (
+                self._doc_ids[b, q_idx] == self._doc_ids[b, kv_idx]
+            ) & (q_idx >= kv_idx)
+
+        self._mask_mod = _doc_causal
+
+    def build(self, position_ids: torch.Tensor):
+        bsz, seq_len = position_ids.shape
+        doc_ids = (position_ids == 0).cumsum(dim=1, dtype=torch.int32)
+        if self._doc_ids is None or self._doc_ids.shape != doc_ids.shape:
+            self._doc_ids = doc_ids.contiguous()
+        else:
+            self._doc_ids.copy_(doc_ids)
+        return self._create(
+            self._mask_mod, bsz, None, seq_len, seq_len,
+            device=self._device, _compile=True,
+        )
 
 
 def setup_distributed() -> tuple[int, int, int]:
@@ -275,6 +445,7 @@ def train(args: argparse.Namespace) -> None:
     model_kwargs["attn_impl"] = getattr(args, "attn_impl", "auto")
     model_kwargs["attn_res"] = args.attn_res
     model_kwargs["attn_res_n_blocks"] = args.attn_res_n_blocks
+    model_kwargs["attn_res_freeze_unused"] = getattr(args, "attn_res_freeze_unused", True)
     if args.attn_res_boundaries:
         model_kwargs["attn_res_boundaries"] = [int(x) for x in args.attn_res_boundaries.split(",")]
     config = LuxiaModelConfig(**model_kwargs)
@@ -438,26 +609,66 @@ def train(args: argparse.Namespace) -> None:
 
     # FP8 training: convert Linear layers to Float8Linear (before compile)
     if getattr(args, "fp8", False):
-        try:
-            from torchao.float8 import convert_to_float8_training, Float8LinearConfig
-            fp8_config = Float8LinearConfig()
-            convert_to_float8_training(model, config=fp8_config)
+        fp8_recipe = getattr(args, "fp8_recipe", "tensorwise")
+        if fp8_recipe == "mxfp8":
+            # Tier-C lever (SPEC-7B C2): per-32-element block scales, native
+            # B200 format. Gated by the SPEC §5 validation protocol.
+            from ..model.mxfp8 import convert_to_mxfp8_training
+
+            convert_to_mxfp8_training(model)
             if is_main:
-                logger.info("FP8 training enabled via torchao (Float8Linear)")
-        except ImportError:
-            raise ImportError(
-                "--fp8 requires torchao. Install with: uv pip install torchao"
-            )
+                logger.info("FP8 training enabled via torchao (MXFP8Linear)")
+        else:
+            try:
+                from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+                fp8_config = Float8LinearConfig()
+                convert_to_float8_training(model, config=fp8_config)
+                if is_main:
+                    logger.info("FP8 training enabled via torchao (Float8Linear)")
+            except ImportError:
+                raise ImportError(
+                    "--fp8 requires torchao. Install with: uv pip install torchao"
+                )
 
     # torch.compile for throughput (compile before DDP)
     if args.compile:
-        if args.attn_impl == "fa4":
+        if args.attn_impl == "fa4" and not getattr(args, "doc_masking", False):
+            # With doc masking, attention runs through the kotodama::fa4_varlen
+            # custom op (opaque to dynamo — compile-safe). The full-causal
+            # path still calls raw CuTe kernels, which break tracing.
             raise ValueError(
-                "--compile and --attn_impl fa4 are incompatible. "
-                "FA4 CuTeDSL kernels have no custom_op registration and will break torch.compile. "
-                "Use --attn_impl sdpa or --attn_impl fa2 with --compile, or drop --compile for FA4."
+                "--compile and --attn_impl fa4 are incompatible without --doc_masking. "
+                "The raw CuTeDSL full-causal path has no custom_op registration and "
+                "breaks torch.compile; the varlen doc-masking path is wrapped and safe. "
+                "Use --doc_masking, or --attn_impl fa2/sdpa, or drop --compile."
             )
         compile_mode = getattr(args, "compile_mode", None)
+        if getattr(args, "capture_scalar_outputs", False):
+            # Lets dynamo trace through the Liger FLCE .item() call — the one
+            # remaining graph-break site (Phase-1 diag, 2026-07-04).
+            torch._dynamo.config.capture_scalar_outputs = True
+            if is_main:
+                logger.info("dynamo capture_scalar_outputs=True (FLCE tail-break fix)")
+        ac_budget = getattr(args, "ac_budget", 0.0)
+        if ac_budget and ac_budget > 0.0:
+            # Inductor min-cut partitioner with a memory budget: recompute is
+            # chosen optimally per-graph instead of the manual every-sublayer
+            # AC policy. Math-identical (recompute-schedule-only, SPEC Tier B).
+            # Use with --no_activation_checkpointing — combining both would
+            # nest recompute regions.
+            if config.activation_checkpointing:
+                raise ValueError(
+                    "--ac_budget requires manual AC off "
+                    "(--no_activation_checkpointing): nesting both recompute "
+                    "policies double-recomputes."
+                )
+            import torch._functorch.config as functorch_config
+
+            functorch_config.activation_memory_budget = ac_budget
+            if is_main:
+                logger.info(
+                    "Inductor activation_memory_budget=%.2f (partitioner-driven "
+                    "selective recompute; manual AC off)", ac_budget)
         if is_main:
             logger.info("Compiling model with torch.compile (mode=%s)...", compile_mode)
         model = torch.compile(model, mode=compile_mode)
@@ -468,12 +679,16 @@ def train(args: argparse.Namespace) -> None:
     # Pure TP (tp_size == world_size): no DDP — all ranks are in the same
     # TP group with identical replicated-param gradients.
     if dp_size > 1:
+        # With attn_res_freeze_unused, the only never-used params (first
+        # boundary layer's pre-attn routing) have requires_grad=False, so DDP
+        # can skip the per-iteration unused-param graph traversal entirely.
+        ddp_find_unused = config.attn_res and not config.attn_res_freeze_unused
         model = DDP(
             model,
             device_ids=[local_rank],
             process_group=dp_group,
             gradient_as_bucket_view=True,
-            find_unused_parameters=config.attn_res,
+            find_unused_parameters=ddp_find_unused,
         )
     else:
         if is_main:
@@ -506,6 +721,7 @@ def train(args: argparse.Namespace) -> None:
             muon_weight_decay=args.muon_weight_decay,
             muon_ns_iterations=args.muon_ns_iterations,
             muon_ns_coefficients=args.muon_ns_coefficients,
+            muon_distributed=getattr(args, "muon_distributed", False),
             adamw_lr=args.adamw_lr,
             adamw_betas=(args.adamw_beta1, args.adamw_beta2),
             adamw_weight_decay=args.adamw_weight_decay,
@@ -795,6 +1011,40 @@ def train(args: argparse.Namespace) -> None:
             hm_log(step, **{"eval/loss": avg, "eval/perplexity": math.exp(min(avg, 20))})
         return avg
 
+    # -- Data prefetcher ---------------------------------------------------------
+    # Started AFTER resume + probe-batch setup: both iterate the same dataset
+    # object, and the prefetch thread must not race their position advances.
+    prefetcher: Optional[_PrefetchIterator] = None
+    prefetch_depth = getattr(args, "prefetch_batches", 2)
+    if prefetch_depth > 0:
+        prefetcher = _PrefetchIterator(_make_data_iter, dataset, depth=prefetch_depth)
+        data_iter = prefetcher
+        if is_main:
+            logger.info("Data prefetcher enabled (depth=%d)", prefetch_depth)
+
+    def _current_data_state() -> Optional[dict[str, int]]:
+        """Dataset state for checkpointing — from the prefetcher when active,
+        so prefetched-but-unconsumed batches are not skipped on resume."""
+        if prefetcher is not None:
+            return prefetcher.consumed_state
+        return dataset.state_dict() if hasattr(dataset, "state_dict") else None
+
+    # -- FlexAttention doc-mask builder (C1) --------------------------------------
+    flex_mask_builder: Optional[_FlexBlockMaskBuilder] = None
+    if getattr(args, "attn_impl", "auto") == "flex" and doc_masking:
+        flex_mask_builder = _FlexBlockMaskBuilder(device)
+        if is_main:
+            logger.info("FlexAttention BlockMask builder enabled (doc masking)")
+
+    # -- MFU accounting ----------------------------------------------------------
+    flops_per_token = _model_flops_per_token(param_count, config, seq_len)
+    peak_flops_total = world_size * getattr(args, "peak_tflops_per_gpu", 2250.0) * 1e12
+    if is_main:
+        logger.info(
+            "MFU accounting: %.2e model FLOPs/token, peak %.1f TFLOPs/GPU x %d GPUs",
+            flops_per_token, getattr(args, "peak_tflops_per_gpu", 2250.0), world_size,
+        )
+
     # -- Training loop ---------------------------------------------------------
     if is_main:
         logger.info("Starting training from step %d", start_step)
@@ -804,6 +1054,7 @@ def train(args: argparse.Namespace) -> None:
     log_loss_accum = 0.0
     log_z_loss_accum = 0.0
     log_steps = 0
+    log_data_wait = 0.0
 
     # Pre-allocate loss accumulators on GPU to avoid .item() sync per micro-step
     _loss_accum = torch.zeros(1, device=device)
@@ -834,11 +1085,13 @@ def train(args: argparse.Namespace) -> None:
         )
 
         for micro_step in range(current_grad_accum):
+            _t_data = time.perf_counter()
             try:
                 batch = next(data_iter)
             except StopIteration:
                 data_iter = _make_data_iter()
                 batch = next(data_iter)
+            log_data_wait += time.perf_counter() - _t_data
 
             # Unpack: doc_masking yields dict, legacy yields tensor
             if doc_masking:
@@ -851,6 +1104,12 @@ def train(args: argparse.Namespace) -> None:
                 cu_seqlens = None
                 position_ids = None
                 max_seqlen_batch = None
+
+            block_mask = (
+                flex_mask_builder.build(position_ids)
+                if flex_mask_builder is not None and position_ids is not None
+                else None
+            )
 
             # Skip gradient sync on all but the last micro-step.
             # no_sync() only exists on DDP-wrapped models.
@@ -868,6 +1127,7 @@ def train(args: argparse.Namespace) -> None:
                         cu_seqlens=cu_seqlens,
                         max_seqlen=max_seqlen_batch,
                         position_ids=position_ids,
+                        block_mask=block_mask,
                     )
                     loss = output["loss"] / current_grad_accum
 
@@ -938,11 +1198,13 @@ def train(args: argparse.Namespace) -> None:
             lrs = scheduler.get_last_lr()
             gpu_mem = torch.cuda.max_memory_allocated(device) / 1e9
             _grad_norm_scalar = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            mfu = flops_per_token * tokens_per_sec / peak_flops_total
+            data_wait_per_step = log_data_wait / max(log_steps, 1)
 
             logger.info(
                 "step=%d/%d | loss=%.4f | z_loss=%.6f | grad_norm=%.3f | "
                 "muon_lr=%.6f | adamw_lr=%.6f | tok/s=%.0f | it/s=%.2f | "
-                "tokens=%.3fB | gpu_mem=%.1fGB",
+                "mfu=%.1f%% | data_wait=%.3fs | tokens=%.3fB | gpu_mem=%.1fGB",
                 step,
                 total_steps,
                 avg_loss,
@@ -952,6 +1214,8 @@ def train(args: argparse.Namespace) -> None:
                 lrs["adamw_lr"],
                 tokens_per_sec,
                 iters_per_sec,
+                mfu * 100.0,
+                data_wait_per_step,
                 tokens_consumed / 1e9,
                 gpu_mem,
             )
@@ -970,19 +1234,25 @@ def train(args: argparse.Namespace) -> None:
                     gpu_mem_gb=gpu_mem,
                     step_time_s=elapsed / max(log_steps, 1),
                 )
+                wb.log_custom(step, {
+                    "perf/mfu": mfu,
+                    "perf/data_wait_s_per_step": data_wait_per_step,
+                })
 
             if is_main:
                 hm_log(
                     step,
                     **{"train/loss": avg_loss, "train/grad_norm": _grad_norm_scalar,
                        "train/perplexity": math.exp(min(avg_loss, 20)),
-                       "perf/tokens_per_sec": tokens_per_sec},
+                       "perf/tokens_per_sec": tokens_per_sec,
+                       "perf/mfu": mfu},
                 )
 
             # Reset accumulators
             log_loss_accum = 0.0
             log_z_loss_accum = 0.0
             log_steps = 0
+            log_data_wait = 0.0
             step_t0 = time.time()
 
         # -- Geometric monitoring (rank 0 only) --------------------------------
@@ -1034,9 +1304,7 @@ def train(args: argparse.Namespace) -> None:
         )
 
         if should_save:
-            data_state = (
-                dataset.state_dict() if hasattr(dataset, "state_dict") else None
-            )
+            data_state = _current_data_state()
             _extra: dict[str, Any] = {}
             if monitor is not None and monitor._probe_batch is not None:
                 _extra["probe_batch"] = monitor._probe_batch.cpu()
@@ -1061,11 +1329,13 @@ def train(args: argparse.Namespace) -> None:
 
         # -- SIGTERM check -----------------------------------------------------
         if sigterm.received:
+            if args.save_every <= 0:
+                if is_main:
+                    logger.info("SIGTERM exit — checkpoint skipped (save_every<=0)")
+                break
             if is_main:
                 logger.info("SIGTERM exit — saving checkpoint at step %d", step)
-            data_state = (
-                dataset.state_dict() if hasattr(dataset, "state_dict") else None
-            )
+            data_state = _current_data_state()
             # Use blocking save for SIGTERM (async may not finish before SIGKILL)
             save_fn = (
                 ckpt_mgr.save_blocking
@@ -1088,17 +1358,24 @@ def train(args: argparse.Namespace) -> None:
             break
 
     # -- Final -----------------------------------------------------------------
-    # All ranks must participate in save (it contains a barrier)
-    if not sigterm.received:
+    # All ranks must participate in save (it contains a barrier).
+    # save_every <= 0 disables ALL saves (benchmark/canary runs): a 7B final
+    # checkpoint is ~30GB+ and gpu-host's / has ~16GB free — writing it there
+    # ENOSPC-crashed a completed run (2026-07-04).
+    if not sigterm.received and args.save_every <= 0:
+        if is_main:
+            logger.info(
+                "Training complete: %d steps, %.2fB tokens (no checkpoint — save_every<=0)",
+                total_steps, tokens_consumed / 1e9,
+            )
+    elif not sigterm.received:
         if is_main:
             logger.info(
                 "Training complete: %d steps, %.2fB tokens",
                 total_steps,
                 tokens_consumed / 1e9,
             )
-        data_state = (
-            dataset.state_dict() if hasattr(dataset, "state_dict") else None
-        )
+        data_state = _current_data_state()
         _extra_final: dict[str, Any] = {}
         if monitor is not None and monitor._probe_batch is not None:
             _extra_final["probe_batch"] = monitor._probe_batch.cpu()
@@ -1112,6 +1389,10 @@ def train(args: argparse.Namespace) -> None:
             data_state=data_state,
             extra=_extra_final or None,
         )
+
+    # Stop the prefetch thread before teardown
+    if prefetcher is not None:
+        prefetcher.shutdown()
 
     # Flush async checkpoint queue before shutting down
     if hasattr(ckpt_mgr, "shutdown"):
@@ -1261,6 +1542,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable activation checkpointing (saves memory, required for full 3B)",
     )
+    p.add_argument(
+        "--no_activation_checkpointing", dest="activation_checkpointing",
+        action="store_false",
+        help="Disable activation checkpointing even when the YAML enables it "
+             "(needed for --ac_budget arms)",
+    )
 
     # Block Attention Residuals (Moonshot, 2026)
     p.add_argument(
@@ -1279,6 +1566,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Explicit block boundary layers as comma-separated ints (e.g. '0,3,7,12,21,25'). Overrides --attn_res_n_blocks.",
+    )
+    p.add_argument(
+        "--attn_res_freeze_unused", action="store_true", default=True,
+        help="Freeze the first boundary layer's never-used pre-attn routing params "
+             "so DDP can run with find_unused_parameters=False (default: on)",
+    )
+    p.add_argument(
+        "--no_attn_res_freeze_unused", dest="attn_res_freeze_unused", action="store_false",
+        help="Disable routing-param freeze — required when resuming pre-2026-07 "
+             "checkpoints WITH optimizer state (AdamW param-count mismatch otherwise)",
     )
 
     # Training scale
@@ -1332,6 +1629,12 @@ def parse_args() -> argparse.Namespace:
              "'gram_ns': per-iteration optimized (Dao-AILab Gram-Newton-Schulz). "
              "'polar_express': conservative per-iteration (Dao-AILab). "
              "Default: original.",
+    )
+    p.add_argument(
+        "--muon_distributed", action="store_true",
+        help="Partition Newton-Schulz across DDP ranks and broadcast results "
+             "(exact same math, ~1/world_size the NS compute). No effect on "
+             "single GPU or with TP.",
     )
 
     # AdamW optimizer
@@ -1395,8 +1698,21 @@ def parse_args() -> argparse.Namespace:
         help="Disable zstd compression for async checkpoints",
     )
 
+    # Data prefetch
+    p.add_argument(
+        "--prefetch_batches", type=int, default=2,
+        help="Background-thread batch prefetch depth (0 = disabled). "
+             "Overlaps memmap reads / EOS scans / collation with GPU compute; "
+             "checkpoint data-state tracks consumed batches exactly.",
+    )
+
     # Logging
     p.add_argument("--log_every", type=int, default=10)
+    p.add_argument(
+        "--peak_tflops_per_gpu", type=float, default=2250.0,
+        help="Per-GPU peak TFLOPs for MFU reporting (default: 2250 = B200 dense BF16). "
+             "Reported MFU is on the BF16 basis regardless of FP8 use — comparable across runs.",
+    )
 
     # Profiling
     p.add_argument(
@@ -1467,6 +1783,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable FP8 training via torchao (Linear layers only, Muon NS stays fp16)",
     )
+    p.add_argument(
+        "--fp8_recipe",
+        type=str,
+        default="tensorwise",
+        choices=["tensorwise", "mxfp8"],
+        help="FP8 scaling recipe: tensorwise (Float8Linear, production) or "
+        "mxfp8 (per-32-block scales, B200-native; Tier-C validation gate)",
+    )
 
     # Liger fused kernels
     p.add_argument(
@@ -1478,9 +1802,10 @@ def parse_args() -> argparse.Namespace:
     # Attention implementation
     p.add_argument(
         "--attn_impl", type=str, default="auto",
-        choices=["auto", "fa2", "fa4", "sdpa"],
+        choices=["auto", "fa2", "fa4", "flex", "sdpa"],
         help="Attention backend. 'auto': FA2 if available, else SDPA. "
              "'fa2': Flash Attention 2. 'fa4': CuTeDSL SM100 (lazy import, breaks compile). "
+             "'flex': FlexAttention + BlockMask doc masking (Inductor-fused). "
              "'sdpa': PyTorch SDPA.",
     )
 
@@ -1504,6 +1829,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=[None, "default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
         help="torch.compile mode (default: None = PyTorch default)",
+    )
+    p.add_argument(
+        "--capture_scalar_outputs",
+        action="store_true",
+        help="Set torch._dynamo.config.capture_scalar_outputs=True (kills the "
+             "Liger FLCE .item() tail graph-break; bench arm)",
+    )
+    p.add_argument(
+        "--ac_budget",
+        type=float,
+        default=0.0,
+        help=(
+            "Inductor activation_memory_budget in (0,1]: partitioner-driven "
+            "selective recompute (SPEC B1a). Requires --compile and manual AC "
+            "off. 0 = disabled (default). 1.0 = save everything eligible; "
+            "lower = recompute more."
+        ),
     )
 
     # Wandb

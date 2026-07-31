@@ -5,13 +5,14 @@ Usage: python tools/extract_benchmark_results.py <job_id1> <job_id2> ...
        python tools/extract_benchmark_results.py --prefix bench-
 """
 import json
+import os
 import re
 import subprocess
 import sys
 from typing import Optional
 
 
-SCHEDULER_URL = "http://<scheduler-url>:7000"
+SCHEDULER_URL = os.environ.get("KOTODAMA_SCHEDULER_URL", "")
 
 
 def get_job(job_id: str) -> dict:
@@ -65,6 +66,8 @@ def get_full_log(job_id: str) -> str:
 
 
 def main():
+    if not SCHEDULER_URL:
+        raise SystemExit("Set KOTODAMA_SCHEDULER_URL before retrieving scheduler logs.")
     if "--prefix" in sys.argv:
         idx = sys.argv.index("--prefix")
         prefix = sys.argv[idx + 1]

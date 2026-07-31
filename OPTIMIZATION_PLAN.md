@@ -1,7 +1,7 @@
 # luxia-base Pretraining Optimization Plan
 
 **Source**: Audit of 4p-sc (SFT/LoRA codebase) vs luxia-base, 2026-03-31.
-**Full risk assessment**: `<local-user-home>/projects/CROSS_POLLINATION_RISK_ASSESSMENT.md`
+**Full risk assessment**: `<local-projects-dir>/CROSS_POLLINATION_RISK_ASSESSMENT.md`
 **Scope**: Kernel and infrastructure optimizations ported from 4p-sc. No architectural changes.
 
 ---

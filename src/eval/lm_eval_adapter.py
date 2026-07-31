@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 import torch.nn.functional as F
@@ -41,6 +41,7 @@ class LuxiaEvalLM(TemplateLM):
         batch_size: int = 4,
         max_length: int = 4096,
         compile: bool = False,
+        max_batch_tokens: int = 32768,
     ) -> None:
         super().__init__()
 
@@ -69,6 +70,7 @@ class LuxiaEvalLM(TemplateLM):
         self._device = torch.device(device)
         self._batch_size = batch_size
         self._max_length = max_length
+        self._max_batch_tokens = max_batch_tokens
         self._checkpoint_name = Path(checkpoint_path).stem
 
         param_count = sum(p.numel() for p in self.model.parameters())
@@ -112,91 +114,137 @@ class LuxiaEvalLM(TemplateLM):
     def tok_decode(self, tokens: list[int], **kwargs: Any) -> str:
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
 
+    def _iter_padded_batches(
+        self, items: list[tuple[int, list[int]]]
+    ) -> "Iterator[tuple[list[tuple[int, list[int]]], torch.Tensor]]":
+        """Yield (batch, input_ids) with right-padded, length-sorted batching.
+
+        Right-padding is exact under causal attention: content positions
+        never attend to trailing pads, and RoPE positions start at 0 for
+        every row. (Left-padding would shift RoPE positions — never do that.)
+        Batches respect both `batch_size` (rows) and `max_batch_tokens`
+        (rows × padded width) so long-sequence batches can't OOM.
+        """
+        items = sorted(items, key=lambda t: len(t[1]), reverse=True)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+
+        bs = max(1, self._batch_size)
+        pos = 0
+        while pos < len(items):
+            # Pad width to a multiple of 64: fewer distinct shapes for the
+            # kernel/compile caches; extra trailing pads don't affect content
+            # logits under causal attention.
+            width = max(64, ((len(items[pos][1]) + 63) // 64) * 64)
+            rows = 1
+            while (
+                pos + rows < len(items)
+                and rows < bs
+                and (rows + 1) * width <= max(self._max_batch_tokens, width)
+            ):
+                rows += 1
+            batch = items[pos : pos + rows]
+            pos += rows
+
+            input_ids = torch.full(
+                (rows, width), pad_id, dtype=torch.long, device=self._device
+            )
+            for r, (_key, toks) in enumerate(batch):
+                input_ids[r, : len(toks)] = torch.tensor(
+                    toks, dtype=torch.long, device=self._device
+                )
+            yield batch, input_ids
+
     def _loglikelihood_tokens(
         self,
         requests: list[tuple[tuple[str, str], list[int], list[int]]],
         **kwargs: Any,
     ) -> list[tuple[float, bool]]:
-        results: list[tuple[float, bool]] = []
+        n = len(requests)
+        results: list[tuple[float, bool] | None] = [None] * n
 
-        # Process one at a time — RoPE assigns positions from index 0, so
-        # left-padding would give content tokens wrong positional encodings.
-        # At 108M params, unbatched GPU inference is fast enough.
-        for orig_idx, (_strings, ctx_toks, cont_toks) in enumerate(requests):
+        prepped: list[tuple[int, list[int]]] = []
+        cont_lens: dict[int, int] = {}
+        for idx, (_strings, ctx_toks, cont_toks) in enumerate(requests):
             full = ctx_toks + cont_toks
             if len(full) > self._max_length:
                 full = full[-self._max_length :]
-            cont_len = len(cont_toks)
-            seq_len = len(full)
+            prepped.append((idx, full))
+            cont_lens[idx] = len(cont_toks)
 
-            input_ids = torch.tensor(
-                [full], dtype=torch.long, device=self._device
-            )
-
+        done = 0
+        for batch, input_ids in self._iter_padded_batches(prepped):
             with torch.no_grad():
-                output = self.model(input_ids)
-                logits = output["logits"].float()
+                logits = self.model(input_ids)["logits"]
 
-            log_probs = F.log_softmax(logits, dim=-1)
+            for r, (idx, toks) in enumerate(batch):
+                seq_len = len(toks)
+                cont_len = cont_lens[idx]
 
-            # Logits at position t predict token t+1
-            # Continuation spans positions [seq_len - cont_len, seq_len)
-            # So we need logits at [seq_len - cont_len - 1, seq_len - 1)
-            start = seq_len - cont_len - 1
-            end = seq_len - 1
+                # Logits at position t predict token t+1.
+                # Continuation spans positions [seq_len - cont_len, seq_len),
+                # so we need logits at [seq_len - cont_len - 1, seq_len - 1).
+                start = seq_len - cont_len - 1
+                end = seq_len - 1
 
-            cont_ids = input_ids[0, start + 1 : end + 1]
-            token_log_probs = log_probs[0, start:end, :]
-            gathered = torch.gather(
-                token_log_probs, 1, cont_ids.unsqueeze(-1)
-            ).squeeze(-1)
+                token_log_probs = F.log_softmax(
+                    logits[r, start:end, :].float(), dim=-1
+                )
+                cont_ids = input_ids[r, start + 1 : end + 1]
+                gathered = torch.gather(
+                    token_log_probs, 1, cont_ids.unsqueeze(-1)
+                ).squeeze(-1)
 
-            total_ll = gathered.sum().item()
-            greedy = (token_log_probs.argmax(-1) == cont_ids).all().item()
+                total_ll = gathered.sum().item()
+                greedy = bool(
+                    (token_log_probs.argmax(-1) == cont_ids).all().item()
+                )
+                results[idx] = (total_ll, greedy)
 
-            results.append((total_ll, greedy))
+            done += len(batch)
+            if done % 2048 < len(batch):
+                logger.info("loglikelihood: %d/%d requests", done, n)
 
-        return results
+        assert all(r is not None for r in results)
+        return results  # type: ignore[return-value]
 
     def loglikelihood_rolling(
         self, requests: list[Instance], disable_tqdm: bool = False
     ) -> list[float]:
-        results: list[float] = []
+        totals = [0.0] * len(requests)
 
-        for request in requests:
-            text = request.args[0]
-            token_ids = self.tok_encode(text)
-
-            total_ll = 0.0
-
-            # Process in windows of max_length
+        # Split every request into windows of max_length (stride
+        # max_length - 1: token 0 of each window is "free"/context-only),
+        # then batch windows across requests — each window is scored
+        # independently, so this is exactly the sequential computation.
+        windows: list[tuple[int, list[int]]] = []
+        for ridx, request in enumerate(requests):
+            token_ids = self.tok_encode(request.args[0])
             for start in range(0, len(token_ids), self._max_length - 1):
                 window = token_ids[start : start + self._max_length]
                 if len(window) < 2:
                     continue
+                windows.append((ridx, window))
 
-                input_ids = torch.tensor(
-                    [window], dtype=torch.long, device=self._device
-                )
-                with torch.no_grad():
-                    output = self.model(input_ids)
-                    logits = output["logits"].float()
+        for batch, input_ids in self._iter_padded_batches(windows):
+            with torch.no_grad():
+                logits = self.model(input_ids)["logits"]
 
-                log_probs = F.log_softmax(logits, dim=-1)
-
+            for r, (ridx, toks) in enumerate(batch):
+                seq_len = len(toks)
                 # Logits at position t predict token t+1.
                 # Score tokens [1, N-1] using logits at [0, N-2].
-                # Token 0 in each window is "free" (context-only).
-                target_ids = input_ids[0, 1:]
-                token_lps = log_probs[0, :-1, :]
+                token_lps = F.log_softmax(
+                    logits[r, : seq_len - 1, :].float(), dim=-1
+                )
+                target_ids = input_ids[r, 1:seq_len]
                 gathered = torch.gather(
                     token_lps, 1, target_ids.unsqueeze(-1)
                 ).squeeze(-1)
-                total_ll += gathered.sum().item()
+                totals[ridx] += gathered.sum().item()
 
-            results.append(total_ll)
-
-        return results
+        return totals
 
     def generate_until(
         self, requests: list[Instance], disable_tqdm: bool = False

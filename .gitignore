@@ -1,5 +1,7 @@
 # Artifacts — large binary data, checkpoints, outputs
-data/
+# Anchored: the unanchored `data/` also matched src/data/, silently keeping
+# the dataset module out of version control (found 2026-07-03).
+/data/
 checkpoints/
 outputs/
 wandb/
@@ -17,6 +19,13 @@ build/
 # Virtual environments
 .venv*/
 venv/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
 
 # IDE / editor
 .vscode/

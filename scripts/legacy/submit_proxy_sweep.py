@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from typing import Any, Optional
@@ -54,9 +55,10 @@ except ImportError:
     httpx = None  # type: ignore
 
 
-SCHEDULER_URL = "http://<scheduler-url>:7000"
+SCHEDULER_URL = os.environ.get("KOTODAMA_SCHEDULER_URL", "")
+SCHEDULER_NODE = os.environ.get("KOTODAMA_SCHEDULER_NODE", "")
 DATA_PATH = "data/fineweb_edu_6b.bin"
-WORKING_DIR = "/home/cluster-user/workspace/luxia-base"
+WORKING_DIR = os.environ.get("KOTODAMA_WORKDIR", ".")
 VENV_PYTHON = ".venv/bin/torchrun"
 
 # Common training args for all runs
@@ -134,6 +136,8 @@ def submit_sweep(
 ) -> list[dict[str, str]]:
     """Submit all sweep runs as chained Scheduler jobs."""
 
+    if not SCHEDULER_URL or not SCHEDULER_NODE:
+        raise SystemExit("Set KOTODAMA_SCHEDULER_URL and KOTODAMA_SCHEDULER_NODE before submitting.")
     if httpx is not None:
         client = httpx.Client(base_url=SCHEDULER_URL, timeout=30.0)
     else:
@@ -159,7 +163,7 @@ def submit_sweep(
             "job_type": "custom",
             "name": f"luxia-proxy-{run['name']}",
             "command": command,
-            "node": "gpu-host",
+            "node": SCHEDULER_NODE,
             "gpus": 8,
             "working_dir": WORKING_DIR,
             "env": {
@@ -213,7 +217,6 @@ def submit_sweep(
         for s in submitted:
             print(f"  {s['name']}: {s['job_id']}")
         print(f"\nMonitor: curl {SCHEDULER_URL}/api/v1/jobs/{{job_id}}")
-        print(f"Logs: ssh gpu-host 'tail -f /tmp/scheduler_{{job_id}}.log'")
         print(f"Wandb: https://wandb.ai/g-stratiy-personal-/luxia-base")
 
     return submitted
@@ -221,6 +224,8 @@ def submit_sweep(
 
 def check_status() -> None:
     """Check status of any running luxia-base jobs."""
+    if not SCHEDULER_URL:
+        raise SystemExit("Set KOTODAMA_SCHEDULER_URL before checking status.")
     if httpx is not None:
         client = httpx.Client(base_url=SCHEDULER_URL, timeout=30.0)
     else:

@@ -54,14 +54,15 @@ except ImportError:
 _TRITON_ATTN_RES_AVAILABLE = False
 _BATCH_PHASE1 = bool(os.environ.get("KOTODAMA_BATCH_P1"))  # opt-IN: batched Phase 1 regresses throughput (register spilling)
 _P1_MAX_BATCH = 10
+_TRITON_ATTN_RES_IMPORT_ERROR: Optional[str] = None
 if not os.environ.get("KOTODAMA_NO_TRITON_ATTNRES"):
     try:
         import triton  # noqa: F401
         from .flash_attn_res import phase_1_batched_attention_triton_op  # noqa: F401
         from .flash_attn_res import phase_2_online_softmax_merge_triton_op  # noqa: F401
         _TRITON_ATTN_RES_AVAILABLE = True
-    except Exception:
-        pass
+    except Exception as _triton_exc:  # keep the reason inspectable, not silent
+        _TRITON_ATTN_RES_IMPORT_ERROR = repr(_triton_exc)
 
 # ── Optional Flash Attention 2 import ────────────────────────────────────────
 _FA2_AVAILABLE = False
@@ -74,6 +75,20 @@ try:
 except ImportError:
     flash_attn_func = None  # type: ignore[assignment,misc]
     flash_attn_varlen_func = None  # type: ignore[assignment,misc]
+
+# ── Optional FlexAttention (torch-native, Inductor-fused) ────────────────────
+# C1 candidate (SPEC-7B): doc masking via BlockMask instead of FA2 varlen.
+# Unlike FA2's opaque custom op, flex lowers through Inductor — the AC-budget
+# partitioner can see and schedule around attention. Same math as SDPA up to
+# fp reassociation. The BlockMask is built once per step in the train loop
+# (outside compile) and threaded down as `block_mask`.
+_FLEX_AVAILABLE = False
+try:
+    from torch.nn.attention.flex_attention import flex_attention
+
+    _FLEX_AVAILABLE = True
+except ImportError:
+    flex_attention = None  # type: ignore[assignment,misc]
 
 # ── Optional Flash Attention 4 (CuTeDSL SM100) ────────────────────────────
 # Lazy import: FA4 patches cute.compile globally on import.
@@ -91,6 +106,25 @@ def _init_fa4() -> bool:
 
         _fa4_func = _f
         _FA4_AVAILABLE = True
+        return True
+    except ImportError:
+        return False
+
+
+_fa4_varlen_op = None
+
+
+def _init_fa4_varlen() -> bool:
+    """FA4 varlen custom op (compile-safe, doc masking). Lazy — see _init_fa4."""
+    global _fa4_varlen_op
+    if _fa4_varlen_op is not None:
+        return True
+    try:
+        from .fa4_varlen import fa4_varlen_available, fa4_varlen_op
+
+        if not fa4_varlen_available():
+            return False
+        _fa4_varlen_op = fa4_varlen_op
         return True
     except ImportError:
         return False
@@ -116,12 +150,18 @@ class LuxiaModelConfig:
     activation_checkpointing: bool = False
     # Liger fused kernels (RMSNorm, SwiGLU, CrossEntropy)
     use_liger: bool = False
-    # Attention implementation: "auto" (FA2 if available, else SDPA), "fa2", "fa4", "sdpa"
+    # Attention implementation: "auto" (FA2 if available, else SDPA), "fa2",
+    # "fa4", "flex" (FlexAttention + BlockMask doc masking), "sdpa"
     attn_impl: str = "auto"
     # Block Attention Residuals (Moonshot, 2026)
     attn_res: bool = False
     attn_res_n_blocks: int = 7  # N=7 divides 28 layers cleanly into blocks of 4
     attn_res_boundaries: Optional[list[int]] = None  # explicit boundary layers (overrides n_blocks)
+    # Freeze the first boundary layer's pre-attn routing params (never used:
+    # routing is skipped when no blocks are committed). Lets DDP run with
+    # find_unused_parameters=False. Disable only when resuming a checkpoint
+    # saved with optimizer state from before 2026-07 (AdamW param-count mismatch).
+    attn_res_freeze_unused: bool = True
 
     @property
     def num_kv_groups(self) -> int:
@@ -310,6 +350,7 @@ def _resolve_attn_impl(config: LuxiaModelConfig) -> str:
                 "attn_impl='fa4' requested but flash_attn.cute is not available. "
                 "Requires flash-attn with CuTeDSL SM100 support."
             )
+        _init_fa4_varlen()  # optional: enables the compile-safe varlen path
         return "fa4"
     if impl == "auto":
         # Don't auto-select FA4 (heavy import, JIT compile overhead)
@@ -318,6 +359,11 @@ def _resolve_attn_impl(config: LuxiaModelConfig) -> str:
         raise ImportError(
             "attn_impl='fa2' requested but flash-attn is not installed. "
             "Install with: pip install flash-attn"
+        )
+    if impl == "flex" and not _FLEX_AVAILABLE:
+        raise ImportError(
+            "attn_impl='flex' requested but torch.nn.attention.flex_attention "
+            "is not available in this torch build."
         )
     return impl
 
@@ -375,7 +421,10 @@ class GQAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        if position_ids is not None:
+        if rope_cos.ndim == 3:
+            # Pre-gathered (B, S, D) tables from model.forward — no per-layer gather
+            pos_cos, pos_sin = rope_cos, rope_sin
+        elif position_ids is not None:
             pos_cos = rope_cos[position_ids]
             pos_sin = rope_sin[position_ids]
         else:
@@ -426,8 +475,12 @@ class GQAttention(nn.Module):
             k = self.k_norm(k)
 
         # RoPE with document-local positions
-        pos_cos = rope_cos[position_ids]  # (B, S, D)
-        pos_sin = rope_sin[position_ids]  # (B, S, D)
+        if rope_cos.ndim == 3:
+            # Pre-gathered (B, S, D) tables from model.forward — no per-layer gather
+            pos_cos, pos_sin = rope_cos, rope_sin
+        else:
+            pos_cos = rope_cos[position_ids]  # (B, S, D)
+            pos_sin = rope_sin[position_ids]  # (B, S, D)
         q = apply_rope_fa2(q, pos_cos, pos_sin)
         k = apply_rope_fa2(k, pos_cos, pos_sin)
 
@@ -469,7 +522,11 @@ class GQAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        if position_ids is not None:
+        if rope_cos.ndim == 3:
+            # Pre-gathered (B, S, D) tables from model.forward — no per-layer gather
+            q = apply_rope(q, rope_cos, rope_sin)
+            k = apply_rope(k, rope_cos, rope_sin)
+        elif position_ids is not None:
             pos_cos = rope_cos[position_ids]
             pos_sin = rope_sin[position_ids]
             q = apply_rope(q, pos_cos, pos_sin)
@@ -518,7 +575,10 @@ class GQAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        if position_ids is not None:
+        if rope_cos.ndim == 3:
+            # Pre-gathered (B, S, D) tables from model.forward — no per-layer gather
+            pos_cos, pos_sin = rope_cos, rope_sin
+        elif position_ids is not None:
             pos_cos = rope_cos[position_ids]
             pos_sin = rope_sin[position_ids]
         else:
@@ -536,6 +596,90 @@ class GQAttention(nn.Module):
         attn_output = attn_output.contiguous().view(bsz, seq_len, -1)
         return self.o_proj(attn_output)
 
+    def _forward_fa4_varlen(
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """FA4 varlen path via the kotodama::fa4_varlen custom op.
+
+        Identical structure to _forward_fa2_varlen; the custom-op wrapper
+        makes the CuTe kernels opaque to torch.compile instead of a hard
+        incompatibility.
+        """
+        bsz, seq_len, _ = x.shape
+
+        q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        if rope_cos.ndim == 3:
+            pos_cos, pos_sin = rope_cos, rope_sin
+        else:
+            pos_cos = rope_cos[position_ids]
+            pos_sin = rope_sin[position_ids]
+        q = apply_rope_fa2(q, pos_cos, pos_sin)
+        k = apply_rope_fa2(k, pos_cos, pos_sin)
+
+        q = q.reshape(-1, self.num_heads, self.head_dim).bfloat16()
+        k = k.reshape(-1, self.num_kv_heads, self.head_dim).bfloat16()
+        v = v.reshape(-1, self.num_kv_heads, self.head_dim).bfloat16()
+
+        attn_output, _lse = _fa4_varlen_op(q, k, v, cu_seqlens, max_seqlen)
+
+        attn_output = attn_output.reshape(bsz, seq_len, -1)
+        return self.o_proj(attn_output)
+
+    def _forward_flex(
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        block_mask,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """FlexAttention path: (B, nheads, S, D) layout, BlockMask doc masking.
+
+        The BlockMask (causal-within-document) is built once per step in the
+        train loop and shared by all layers. Inside the compiled model, flex
+        lowers to a fused Inductor template — no opaque custom op.
+        """
+        bsz, seq_len, _ = x.shape
+
+        q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        if rope_cos.ndim == 3:
+            # Pre-gathered (B, S, D) tables from model.forward
+            q = apply_rope(q, rope_cos, rope_sin)
+            k = apply_rope(k, rope_cos, rope_sin)
+        elif position_ids is not None:
+            q = apply_rope(q, rope_cos[position_ids], rope_sin[position_ids])
+            k = apply_rope(k, rope_cos[position_ids], rope_sin[position_ids])
+        else:
+            q = apply_rope(q, rope_cos[:seq_len], rope_sin[:seq_len])
+            k = apply_rope(k, rope_cos[:seq_len], rope_sin[:seq_len])
+
+        attn_output = flex_attention(
+            q, k, v, block_mask=block_mask, enable_gqa=True
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        return self.o_proj(attn_output)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -547,6 +691,7 @@ class GQAttention(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        block_mask=None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if self.tp_group is not None:
             from src.training.tensor_parallel import copy_to_parallel_region, reduce_from_parallel_region
@@ -558,10 +703,15 @@ class GQAttention(nn.Module):
             # KV cache only implemented for SDPA; fall through
             pass
 
-        # Priority: KV cache > varlen (doc masking) > FA4/FA2 full-causal > SDPA
+        # Priority: KV cache > flex (BlockMask doc masking) > varlen (doc
+        # masking) > FA4/FA2 full-causal > SDPA
         if past_kv is not None or use_cache:
             out, new_kv = self._forward_sdpa(x, rope_cos, rope_sin, mask, past_kv, position_ids)
-        elif cu_seqlens is not None and _FA2_VARLEN_AVAILABLE and self._attn_impl in ("fa2", "auto") and x.is_cuda:
+        elif block_mask is not None and self._attn_impl == "flex" and x.is_cuda:
+            out = self._forward_flex(x, rope_cos, rope_sin, block_mask, position_ids)
+        elif cu_seqlens is not None and self._attn_impl == "fa4" and _fa4_varlen_op is not None and x.is_cuda:
+            out = self._forward_fa4_varlen(x, rope_cos, rope_sin, cu_seqlens, max_seqlen, position_ids)
+        elif cu_seqlens is not None and _FA2_VARLEN_AVAILABLE and self._attn_impl in ("fa2", "auto", "flex") and x.is_cuda:
             out = self._forward_fa2_varlen(x, rope_cos, rope_sin, cu_seqlens, max_seqlen, position_ids)
         elif cu_seqlens is not None:
             # SDPA fallback with block-causal mask built from cu_seqlens
@@ -642,12 +792,13 @@ class TransformerBlock(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        block_mask=None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if use_cache:
             attn_out, new_kv = self.attn(self.attn_norm(x), rope_cos, rope_sin, mask, past_kv, use_cache=True, position_ids=position_ids)
             x = x + attn_out
         else:
-            x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin, mask, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin, mask, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, block_mask=block_mask)
         x = x + self.ffn(self.ffn_norm(x))
         if use_cache:
             return x, new_kv
@@ -747,6 +898,16 @@ class LuxiaBaseModel(nn.Module):
             for idx, b in enumerate(sorted_boundaries):
                 end = sorted_boundaries[idx + 1] if idx + 1 < len(sorted_boundaries) else config.num_layers
                 self._attn_res_block_ranges.append((b, end))
+
+            # The first boundary layer's pre-attn routing params are never used:
+            # routing is skipped when n_committed == 0 (training path), and in
+            # the cached path the single-source softmax is constant 1 regardless
+            # of the query. Freezing them lets DDP run without
+            # find_unused_parameters=True (per-step graph traversal).
+            if config.attn_res_freeze_unused:
+                first_boundary_layer = self.layers[sorted_boundaries[0]]
+                first_boundary_layer.attn_res_query.requires_grad_(False)
+                first_boundary_layer.attn_res_norm.weight.requires_grad_(False)
 
         # Precompute RoPE frequencies
         rope_cos, rope_sin = precompute_rope_frequencies(
@@ -862,9 +1023,10 @@ class LuxiaBaseModel(nn.Module):
         eps = norm.eps
 
         if committed_stack is not None and committed_stack.is_cuda and _TRITON_ATTN_RES_AVAILABLE:
-            from .flash_attn_res import phase_1_batched_attention_triton_op
-            from .flash_attn_res import phase_2_online_softmax_merge_triton_op
-
+            # NOTE: use the module-level op bindings (imported at line ~60).
+            # A runtime relative re-import here resolves through sys.modules
+            # and breaks when an embedding process (e.g. posttraining's
+            # _import_from_pretraining) has purged/replaced the src package.
             p1_out, p1_lse = phase_1_batched_attention_triton_op(
                 committed_stack, qw.unsqueeze(0), eps, num_active=n_committed)
             return phase_2_online_softmax_merge_triton_op(
@@ -912,6 +1074,7 @@ class LuxiaBaseModel(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        block_mask=None,
     ) -> torch.Tensor:
         """Forward pass with Block Attention Residuals using Phase 1 + Phase 2.
 
@@ -926,6 +1089,13 @@ class LuxiaBaseModel(nn.Module):
         use_ac = self.config.activation_checkpointing and self.training
         rope_cos = self.rope_cos
         rope_sin = self.rope_sin
+        if position_ids is not None:
+            # Gather per-token RoPE tables ONCE per forward. Attention paths
+            # detect the pre-gathered (B, S, D) shape and skip their own gather
+            # — previously this ran per layer AND re-ran inside every AC
+            # region's recompute during backward.
+            rope_cos = rope_cos[position_ids]
+            rope_sin = rope_sin[position_ids]
         block_ranges = self._attn_res_block_ranges
         batch_p1 = _TRITON_ATTN_RES_AVAILABLE and _BATCH_PHASE1 and embed.is_cuda
 
@@ -1018,7 +1188,8 @@ class LuxiaBaseModel(nn.Module):
                         return p_in + self.layers[_idx].attn(
                             self.layers[_idx].attn_norm(h_in), rope_cos, rope_sin, mask,
                             position_ids=position_ids,
-                            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                            block_mask=block_mask)
                     partial = torch_checkpoint(
                         _attn_fn, h_attn, partial,
                         use_reentrant=False, preserve_rng_state=False)
@@ -1026,7 +1197,8 @@ class LuxiaBaseModel(nn.Module):
                     partial = partial + lyr.attn(
                         lyr.attn_norm(h_attn), rope_cos, rope_sin, mask,
                         position_ids=position_ids,
-                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                        block_mask=block_mask)
 
                 # Pre-MLP routing
                 if batch_p1:
@@ -1136,6 +1308,7 @@ class LuxiaBaseModel(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        block_mask=None,
     ) -> dict[str, torch.Tensor]:
         x = self.embed_tokens(input_ids)
         new_kv_list: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -1153,21 +1326,32 @@ class LuxiaBaseModel(nn.Module):
             if use_cache:
                 x, new_kv_list = self._forward_attn_res_cached(x, mask, past_kv, position_ids)
             else:
-                x = self._forward_attn_res(x, mask, position_ids, cu_seqlens, max_seqlen)
+                x = self._forward_attn_res(x, mask, position_ids, cu_seqlens, max_seqlen, block_mask)
         else:
+            rope_cos = self.rope_cos
+            rope_sin = self.rope_sin
+            if position_ids is not None and not use_cache:
+                # Gather per-token RoPE tables once (see _forward_attn_res note)
+                rope_cos = rope_cos[position_ids]
+                rope_sin = rope_sin[position_ids]
             for i, layer in enumerate(self.layers):
                 layer_past = past_kv[i] if past_kv is not None else None
                 if self.config.activation_checkpointing and self.training:
+                    # Positional args match TransformerBlock.forward — earlier
+                    # version dropped position_ids/cu_seqlens here, silently
+                    # disabling doc masking under non-AttnRes AC.
                     x = torch_checkpoint(
-                        layer, x, self.rope_cos, self.rope_sin, mask,
+                        layer, x, rope_cos, rope_sin, mask,
+                        None, False, position_ids, cu_seqlens, max_seqlen,
+                        block_mask,
                         use_reentrant=False,
                         preserve_rng_state=False,
                     )
                 elif use_cache:
-                    x, layer_kv = layer(x, self.rope_cos, self.rope_sin, mask, layer_past, use_cache=True, position_ids=position_ids)
+                    x, layer_kv = layer(x, rope_cos, rope_sin, mask, layer_past, use_cache=True, position_ids=position_ids)
                     new_kv_list.append(layer_kv)
                 else:
-                    x = layer(x, self.rope_cos, self.rope_sin, mask, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                    x = layer(x, rope_cos, rope_sin, mask, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, block_mask=block_mask)
             x = self.norm(x)
 
         output: dict[str, Any] = {}

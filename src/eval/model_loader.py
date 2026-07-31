@@ -8,6 +8,7 @@ config, YAML config loading, and device placement.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -124,12 +125,20 @@ def decompress_checkpoint(path: Path) -> Path:
     tmp_path = tmp_dir / decompressed.name
     if tmp_path.exists():
         return tmp_path
+    # Decompress to a process-unique path, then atomically rename: parallel
+    # eval shards may race on the same checkpoint, and a bare `zstd -o
+    # tmp_path` would let a second process load a half-written file.
+    partial = tmp_path.with_name(f"{tmp_path.name}.partial.{os.getpid()}")
     logger.info("Decompressing %s → %s", path.name, tmp_path)
-    subprocess.run(
-        ["zstd", "-d", str(path), "-o", str(tmp_path), "-f"],
-        check=True,
-        capture_output=True,
-    )
+    try:
+        subprocess.run(
+            ["zstd", "-d", str(path), "-o", str(partial), "-f"],
+            check=True,
+            capture_output=True,
+        )
+        os.replace(partial, tmp_path)
+    finally:
+        partial.unlink(missing_ok=True)
     return tmp_path
 
 
