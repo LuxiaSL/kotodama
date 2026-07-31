@@ -2,7 +2,7 @@
 
 From-scratch transformer language model. NCA pre-pretraining + Block Attention Residuals + Muon optimizer.
 
-Research model targeting rich geometric structure formation and conversational quality at the 3B–8B scale. Full writeup at [aetherawi.red/kotodama](https://aetherawi.red/kotodama).
+Research model targeting rich geometric structure formation and conversational quality at the 3B–8B scale.
 
 ## Kotodama-108m
 
