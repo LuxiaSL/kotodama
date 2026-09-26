@@ -14,8 +14,8 @@ no error anywhere. Three parts:
                   divergent-swap) repeating part-2 gates per turn
 
 Usage:
-    python scripts/benchmark/test_prefix_cache.py --unit-only          # anywhere
-    CUDA_VISIBLE_DEVICES=0 python scripts/benchmark/test_prefix_cache.py \
+    python scripts/benchmark/check_prefix_cache.py --unit-only          # anywhere
+    CUDA_VISIBLE_DEVICES=0 python scripts/benchmark/check_prefix_cache.py \
         --checkpoint /models/.../3b-language-FINAL-step195311.pt [--compile] [--seeds 5]
 """
 

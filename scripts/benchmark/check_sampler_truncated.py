@@ -16,7 +16,7 @@ Model-free, seconds to run. Two gates:
      and the composed k100+p90 law.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 python scripts/benchmark/test_sampler_truncated.py
+    CUDA_VISIBLE_DEVICES=0 python scripts/benchmark/check_sampler_truncated.py
 """
 
 from __future__ import annotations

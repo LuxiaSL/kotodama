@@ -9,7 +9,7 @@ Model-free, seconds to run. Two gates:
      (symmetric KL + max abs probability gap on union of top-100 tokens).
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0 python scripts/benchmark/test_sampler_dist.py
+    CUDA_VISIBLE_DEVICES=0 python scripts/benchmark/check_sampler_dist.py
 """
 
 from __future__ import annotations

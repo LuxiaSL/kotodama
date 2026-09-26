@@ -2,7 +2,7 @@
 """Steering v2 (per-layer block-persistent residual write) unit battery.
 
 CPU-only, tiny fp32 random-weight model — no checkpoint, no GPU, exact
-comparisons (fp32 + MATH SDPA, same trick as test_prefix_cache part 1).
+comparisons (fp32 + MATH SDPA, same trick as check_prefix_cache part 1).
 What it proves, per docs/STEERING-SERVE.md:
 
   0. steer-points — compute_steer_points matches the reference persist
@@ -33,7 +33,7 @@ the compiled/cudagraph gates (bitwise-off vs HEAD, steered-serve vs mirror,
 throughput) are a GPU battery — see docs/STEERING-SERVE.md.
 
 Usage:
-    python scripts/benchmark/test_steering_engine.py            # CPU, anywhere
+    python scripts/benchmark/check_steering_engine.py            # CPU, anywhere
 """
 
 from __future__ import annotations
@@ -442,7 +442,7 @@ def run_prefix_regen_guard(device: torch.device) -> None:
           f"regenerate hit with suffix==1 (got {info})")
     d = float((logits - ref).abs().max())
     # Extend path: KV from the same reference batch path, only mask/backend
-    # form differs -> near-exact class (test_prefix_cache GATE_MAX_DELTA_SMALL).
+    # form differs -> near-exact class (check_prefix_cache GATE_MAX_DELTA_SMALL).
     check(d < 1e-3, f"tip token NOT injected: regenerate ~= unsteered prefill (maxD={d:.2e})")
 
     # Counterfactual: the same tip token through the decode STEP path IS
