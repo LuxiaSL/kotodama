@@ -146,6 +146,12 @@ STEER_ALIAS_TABLE: tuple[tuple[str, str, float, str], ...] = (
     ("bindbare", "BindBare_s38", 0.1,
      "Same sticks-to-the-conversation dial, but built fully automatically (no "
      "human labels). Nearly the same direction as bind; here for comparison."),
+    ("bindport", "bind_proc_s46", 0.1,
+     "Leg-C conjugation-transport vector: koto's own binding-FAILURE axis, carried "
+     "into Llama-3.2-3B, purified there (echo/sycophancy/register stripped), and "
+     "ported home to koto's L46 via the fitted reverse map g-inverse. + = toward "
+     "failure (pro-binding would be its negation). Behaviorally sign-undetermined "
+     "with no reliable binding effect (P1-S box game + 2 conversation rounds, n=8)."),
 )
 STEER_CONTROL_DESC = "unsteered baseline"
 # Stack members without an alias default fall back to this (sidecar parity).
@@ -198,6 +204,8 @@ MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "3b": CONFIG_3B}
 
 _model: LuxiaBaseModel | None = None
 _tokenizer: AutoTokenizer | None = None
+_attn_res_override: str = "config"   # config | on | off (CLI --attn_res)
+_attn_res_boundaries_override: str | None = None
 _device: torch.device = torch.device("cpu")
 _serve_mode: str = "base"
 _stop_token_ids: frozenset[int] = BASE_STOP_TOKEN_IDS
@@ -433,6 +441,17 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     model_cfg = MODEL_CONFIGS.get(model_size)
     if model_cfg is None:
         raise ValueError(f"Unknown model_size {model_size!r}; choose from {sorted(MODEL_CONFIGS)}")
+    # P0.6/2x2 battery support: serve non-AttnRes checkpoints (proxy matrix
+    # arms) without editing MODEL_CONFIGS — override via --attn_res off /
+    # --attn_res_boundaries "0,3,7,12,21,25".
+    model_cfg = dict(model_cfg)
+    if _attn_res_override == "off":
+        model_cfg["attn_res"] = False
+    elif _attn_res_override == "on":
+        model_cfg["attn_res"] = True
+    if _attn_res_boundaries_override:
+        model_cfg["attn_res_boundaries"] = [
+            int(x) for x in _attn_res_boundaries_override.split(",")]
     config = LuxiaModelConfig(**model_cfg)
     _max_seq_len = config.max_position_embeddings if max_seq_len is None else max_seq_len
     if not 16 <= _max_seq_len <= config.max_position_embeddings:
@@ -652,6 +671,71 @@ class ModelInfo(BaseModel):
     fast_engine: bool
     prefix_cache: bool = False
     steering: dict | None = None
+
+
+# ── /logprobs: batched prefill-only scoring (P0.6 four-register battery) ────────
+# One forward per BATCH, no decode loop: prompts are right-padded and logits are
+# gathered at each sequence's last REAL position — exactly correct under causal
+# attention (pad tokens sit after the read position and can never attend into
+# it), so no attention mask is needed. This is the fast path for logprob evals;
+# the decode engine is irrelevant here because nothing is generated.
+
+LOGPROB_MAX_BATCH = 64
+LOGPROB_MAX_TOTAL_TOKENS = 96_000  # sum over the batch; logits are B x T x 49152 bf16
+
+
+class LogprobItem(BaseModel):
+    id: str
+    prompt: str
+    candidates: list[str] = Field(..., min_length=1, max_length=64)
+
+
+class LogprobRequest(BaseModel):
+    items: list[LogprobItem] = Field(..., min_length=1, max_length=LOGPROB_MAX_BATCH)
+    top_n: int = Field(default=5, ge=0, le=50)
+
+
+@torch.inference_mode()
+def _score_logprobs(req: LogprobRequest) -> dict[str, Any]:
+    tok = _tokenizer
+    enc = [tok.encode(it.prompt) for it in req.items]
+    lens = [len(e) for e in enc]
+    if max(lens) >= _max_seq_len:
+        raise HTTPException(400, f"prompt too long ({max(lens)} tokens, max {_max_seq_len})")
+    if sum(lens) > LOGPROB_MAX_TOTAL_TOKENS:
+        raise HTTPException(400, f"batch too large ({sum(lens)} total tokens, "
+                                 f"max {LOGPROB_MAX_TOTAL_TOKENS})")
+    batch = torch.zeros((len(enc), max(lens)), dtype=torch.long)
+    for r, e in enumerate(enc):
+        batch[r, : len(e)] = torch.tensor(e, dtype=torch.long)
+    batch = batch.to(_device)
+    logits = _model(batch)["logits"]
+
+    results: list[dict[str, Any]] = []
+    for r, it in enumerate(req.items):
+        last = logits[r, lens[r] - 1].float()
+        logsm = torch.log_softmax(last, dim=-1)
+        probs = logsm.exp()
+        entropy = float(-(probs * logsm).sum())
+        cands = []
+        for c in it.candidates:
+            cids = tok.encode(c, add_special_tokens=False)
+            first = cids[0]
+            cands.append({
+                "text": c,
+                "id": int(first),
+                "n_tokens": len(cids),  # runner treats >1 as a verification failure
+                "logprob": float(logsm[first]),
+                "rank_full": int((logsm > logsm[first]).sum()) + 1,
+            })
+        top = []
+        if req.top_n:
+            tv, ti = logsm.topk(req.top_n)
+            top = [{"token": tok.decode([int(i)]), "id": int(i), "logprob": float(v)}
+                   for v, i in zip(tv, ti)]
+        results.append({"id": it.id, "prompt_tokens": lens[r],
+                        "entropy": entropy, "candidates": cands, "top": top})
+    return {"results": results, "model": _model_name()}
 
 
 def _resolve_prompt(request: GenerateRequest, tokenizer: AutoTokenizer) -> str:
@@ -1354,6 +1438,15 @@ async def memory():
     }
 
 
+@app.post("/logprobs")
+async def logprobs_endpoint(request: LogprobRequest):
+    if _model is None or _tokenizer is None:
+        raise HTTPException(503, "Model not loaded")
+    # Same dedicated thread as generation: the GPU is single-tenant per replica
+    # and eager batch prefill must not interleave with engine activity.
+    return await _run_generation(_score_logprobs, request)
+
+
 @app.post("/generate", response_model=GenerateResponse)
 async def generate_endpoint(request: GenerateRequest, http_request: Request):
     if _model is None or _tokenizer is None:
@@ -1651,6 +1744,11 @@ if __name__ == "__main__":
                              "_s{sublayer} suffix, sublayer = 2*layer after-attn). Enables "
                              "per-request multi-site residual steering on the fast engine. "
                              "See docs/STEERING-SERVE.md")
+    parser.add_argument("--attn_res", choices=["config", "on", "off"], default="config",
+                        help="Override the size-config's attn_res (proxy 2x2 arms: "
+                             "baseline/NCA-only checkpoints have no AttnRes params)")
+    parser.add_argument("--attn_res_boundaries", default=None,
+                        help="Override boundaries, comma ints (proxy DD-v1: 0,3,7,12,21,25)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
@@ -1662,6 +1760,8 @@ if __name__ == "__main__":
     _device_arg = args.device
     _mode_arg = args.mode if args.mode is not None else inferred_mode
     _model_size_arg = args.model_size
+    _attn_res_override = args.attn_res
+    _attn_res_boundaries_override = args.attn_res_boundaries
     _engine_arg = args.engine
     _max_seq_len_arg = args.max_seq_len
     _prefix_cache_arg = args.prefix_cache
