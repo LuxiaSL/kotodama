@@ -1,0 +1,21 @@
+# Shared by the shipped 3B lineage (nca-3b-phase1 -> nca-3b-phase3-cotrain ->
+# 3b-language, + 3b-chinchilla-decay): 3B shape, 4096 ctx, 2M-token global
+# batch, production optimizer + runtime, async checkpoints via /dev/shm,
+# geometric monitoring, wandb logging. Run-specific values live in the child.
+
+extends: [optim-muon.yaml, runtime-production.yaml]
+
+model_size: 3b
+sequence_length: 4096
+micro_batch_size: 10
+global_batch_tokens: 2097152
+decay_type: cosine
+
+async_checkpoint: true
+checkpoint_shm_dir: /dev/shm/luxia-base-ckpts
+
+geo_monitor: true
+
+log_every: 10
+wandb: true
+wandb_project: luxia-base

@@ -1,0 +1,9 @@
+# Production runtime profile (the 303K tok/s 3B stack): torch.compile,
+# FA auto-select, FP8, Liger kernels, per-sublayer activation checkpointing.
+# Override activation_checkpointing in the child for AC-off / selective-AC runs.
+
+compile: true
+attn_impl: auto
+fp8: true
+use_liger: true
+activation_checkpointing: true

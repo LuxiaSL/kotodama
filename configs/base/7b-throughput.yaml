@@ -1,0 +1,30 @@
+# Shared by the 7B throughput program configs (canary-7b, canary-7b-noac,
+# bench-7b-profile, soak-7b; SPEC-7B-THROUGHPUT-2026-07-03): 7B shape (8b dims
+# @ 49K vocab), 4096 ctx, 2M-token global batch, short warmup + late cosine
+# decay, production optimizer + runtime, no wandb.
+# AttnRes: 8 uniform blocks as a THROUGHPUT PLACEHOLDER only — production
+# boundaries will be re-derived from 7B geometry (DD-3B pattern).
+
+extends: [optim-muon.yaml, runtime-production.yaml]
+
+model_size: 7b
+sequence_length: 4096
+micro_batch_size: 4
+global_batch_tokens: 2097152
+
+warmup_steps: 30
+decay_start_pct: 0.95
+decay_type: cosine
+
+attn_res: true
+attn_res_n_blocks: 8
+
+# Doc masking so the varlen FA2 path (production) is exercised
+doc_masking: true
+seed: 42
+
+keep_checkpoints: 1
+prefetch_batches: 2
+
+log_every: 10
+wandb: false
