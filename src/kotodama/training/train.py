@@ -1440,15 +1440,78 @@ def _per_layer_grad_norms(model: torch.nn.Module) -> dict[str, float]:
 # =============================================================================
 
 
-def _load_yaml_config(path: str) -> dict[str, Any]:
-    """Load a YAML config file and normalize keys (hyphens → underscores)."""
+class ConfigError(ValueError):
+    """A training YAML config (or its `extends` chain) is malformed."""
+
+
+_EXTENDS_KEY = "extends"
+
+
+def _load_yaml_config(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Load a YAML config file into a flat dict of argparse defaults.
+
+    Keys are normalized (hyphens → underscores). A config may declare
+    ``extends: <path>`` or ``extends: [<path>, ...]``; parents are resolved
+    relative to the child file's directory and loaded recursively. Configs
+    are flat, so merging is a plain key override: parents apply in list
+    order (later parents override earlier ones), then the child's own keys
+    override all parents. The ``extends`` key is consumed here and never
+    reaches argparse. Raises ConfigError on cycles, missing parents, or a
+    malformed file.
+    """
+    return _resolve_yaml_config(Path(path).resolve(), chain=())
+
+
+def _resolve_yaml_config(path: Path, chain: tuple[Path, ...]) -> dict[str, Any]:
     try:
         import yaml
     except ImportError:
         raise ImportError("PyYAML required for --config. Install: pip install pyyaml")
-    with open(path) as f:
-        raw = yaml.safe_load(f) or {}
-    return {k.replace("-", "_"): v for k, v in raw.items()}
+
+    if path in chain:
+        cycle = " -> ".join(str(p) for p in (*chain, path))
+        raise ConfigError(f"Config inheritance cycle: {cycle}")
+    if not path.is_file():
+        if chain:
+            raise ConfigError(f"Parent config not found: {path} (extended by {chain[-1]})")
+        raise ConfigError(f"Config file not found: {path}")
+
+    try:
+        with open(path) as f:
+            raw = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Invalid YAML in {path}: {e}") from e
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"Config {path} must be a mapping of key: value, got {type(raw).__name__}"
+        )
+    for k in raw:
+        if not isinstance(k, str):
+            raise ConfigError(f"Config {path}: non-string key {k!r}")
+
+    own = {k.replace("-", "_"): v for k, v in raw.items()}
+    extends = own.pop(_EXTENDS_KEY, None)
+    if extends is None:
+        parents: list[str] = []
+    elif isinstance(extends, str):
+        parents = [extends]
+    elif isinstance(extends, list) and all(isinstance(p, str) for p in extends):
+        parents = list(extends)
+    else:
+        raise ConfigError(
+            f"Config {path}: `extends` must be a path or a list of paths, got {extends!r}"
+        )
+
+    merged: dict[str, Any] = {}
+    for parent in parents:
+        parent_path = Path(parent)
+        if not parent_path.is_absolute():
+            parent_path = path.parent / parent_path
+        merged.update(_resolve_yaml_config(parent_path.resolve(), (*chain, path)))
+    merged.update(own)
+    return merged
 
 
 def parse_args() -> argparse.Namespace:
