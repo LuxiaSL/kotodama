@@ -86,19 +86,11 @@ TOKENIZER_NAME = presets.TOKENIZER_NAME
 DDV1_BOUNDARIES = list(presets.DDV1)
 DD3B_BOUNDARIES = list(presets.DD3B)
 
-CHATML_TEMPLATE = (
-    "{% for message in messages %}"
-    "<|im_start|>{{ message['role'] }}\n"
-    "{{ message['content'] }}<|im_end|>\n"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}"
-    "<|im_start|>assistant\n"
-    "{% endif %}"
+from kotodama.serve.chatml import (  # noqa: E402
+    BASE_STOP_TOKEN_IDS,
+    CHAT_STOP_TOKEN_IDS,
+    CHATML_TEMPLATE,
 )
-IM_END_TOKEN_ID = 2
-
-BASE_STOP_TOKEN_IDS = frozenset({0})
-CHAT_STOP_TOKEN_IDS = frozenset({0, 2})
 
 # Sampling defaults — shared by the native /generate and the OpenAI-compatible
 # endpoints so every entrypoint agrees on the server's default behavior.
