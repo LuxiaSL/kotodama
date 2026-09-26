@@ -7,7 +7,7 @@
 # Usage (see SPEC Window-3):
 #   baseline:  tools/run_train.sh --config configs/soak-7b.yaml \
 #                --checkpoint_dir /models/kotodama-data/soak-7b/baseline
-#   candidate: KOTODAMA_VENV=/models/kotodama-data/venv-mxfp8 \
+#   candidate: KOTODAMA_VENV=<venv with torchao cu128 build> \
 #              KOTODAMA_P1_BWD_TORCH=1 tools/run_train.sh \
 #                --config configs/soak-7b.yaml --attn_impl fa4 \
 #                --fp8_recipe mxfp8 \

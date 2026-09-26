@@ -8,8 +8,8 @@ The real gates are the canary loss overlay and the proxy soak — this
 script only proves the kernels run, differentiate, compile, and are in
 the right numerical ballpark on B200.
 
-Run on gpu-host (throwaway venv!):
-  KOTODAMA_VENV=/models/kotodama-data/venv-mxfp8 tools/run_py.sh \
+Run in a throwaway venv (never modify the shared one):
+  KOTODAMA_VENV=<venv with torchao cu128 build> tools/run_py.sh \
       scripts/utils/mxfp8_smoke.py
 """
 
