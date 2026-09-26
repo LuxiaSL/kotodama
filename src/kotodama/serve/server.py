@@ -36,8 +36,6 @@ import json
 import logging
 import math
 import os
-import shutil
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
@@ -67,6 +65,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import AutoTokenizer
 
+from kotodama import ckpt, presets
 from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
 
 # Fast decode engine (static cache + compiled/CUDA-graphed step). Optional.
@@ -83,9 +82,9 @@ logger = logging.getLogger(__name__)
 
 # ── Defaults ────────────────────────────────────────────────────────────────────
 
-TOKENIZER_NAME = "HuggingFaceTB/SmolLM2-135M"
-DDV1_BOUNDARIES = [0, 3, 7, 12, 21, 25]
-DD3B_BOUNDARIES = [0, 1, 3, 7, 15, 19, 24]
+TOKENIZER_NAME = presets.TOKENIZER_NAME
+DDV1_BOUNDARIES = list(presets.DDV1)
+DD3B_BOUNDARIES = list(presets.DD3B)
 
 CHATML_TEMPLATE = (
     "{% for message in messages %}"
@@ -158,14 +157,7 @@ STEER_CONTROL_DESC = "unsteered baseline"
 STEER_DEFAULT_ALPHA = 0.07
 
 PROXY_CONFIG = dict(
-    hidden_size=512,
-    num_layers=28,
-    num_attention_heads=4,
-    num_kv_heads=2,
-    head_dim=128,
-    intermediate_size=1408,
-    vocab_size=49152,
-    max_position_embeddings=4096,
+    **presets.shape("proxy"),
     rope_theta=500000.0,
     norm_eps=1e-5,
     qk_norm=True,
@@ -178,14 +170,7 @@ PROXY_CONFIG = dict(
 )
 
 CONFIG_3B = dict(
-    hidden_size=3072,
-    num_layers=28,
-    num_attention_heads=24,
-    num_kv_heads=8,
-    head_dim=128,
-    intermediate_size=8192,
-    vocab_size=49152,
-    max_position_embeddings=4096,
+    **presets.shape("3b"),
     rope_theta=500000.0,
     norm_eps=1e-5,
     qk_norm=True,
@@ -403,28 +388,8 @@ def _warmup_sdpa_cache(model: LuxiaBaseModel, max_seq_len: int = 4096, step: int
 
 
 def _load_checkpoint(checkpoint_path: Path) -> Any:
-    """Load a PyTorch checkpoint, streaming a .zst payload through a temp file.
-
-    Full training checkpoints can include optimizer state. Keeping the compressed
-    bytes, decompressed bytes, and deserialized checkpoint in RAM at once makes
-    an otherwise usable host needlessly memory-hungry.
-    """
-    if checkpoint_path.suffix != ".zst":
-        return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-
-    import zstandard as zstd
-
-    logger.info("Streaming zstd checkpoint to a temporary file...")
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
-            temp_path = Path(temp_file.name)
-            with checkpoint_path.open("rb") as source, zstd.ZstdDecompressor().stream_reader(source) as reader:
-                shutil.copyfileobj(reader, temp_file, length=16 * 1024 * 1024)
-        return torch.load(temp_path, map_location="cpu", weights_only=False)
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+    """Load a checkpoint dict (.pt or streamed .pt.zst) — see kotodama.ckpt.load."""
+    return ckpt.load(checkpoint_path)
 
 
 def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None) -> tuple[LuxiaBaseModel, AutoTokenizer]:

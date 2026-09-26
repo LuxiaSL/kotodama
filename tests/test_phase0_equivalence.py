@@ -13,7 +13,6 @@ Run: python tests/test_phase0_equivalence.py   (from pretraining/)
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 
@@ -38,6 +37,7 @@ def _smoke_config(**overrides) -> LuxiaModelConfig:
         max_position_embeddings=128,
         attn_res=True,
         attn_res_boundaries=[0, 1, 2],
+        attn_impl="sdpa",  # "auto" picks flash-attn when installed, which has no CPU kernel
     )
     base.update(overrides)
     return LuxiaModelConfig(**base)

@@ -8,49 +8,34 @@ config, YAML config loading, and device placement.
 from __future__ import annotations
 
 import logging
-import os
-import subprocess
-import tempfile
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 import yaml
 
+from kotodama import ckpt, presets
 from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class CheckpointInfo:
-    """Registry entry for a named checkpoint."""
-
-    name: str
-    path: Path
-    attn_res_config: dict[str, Any] | None = None
-    group: str | None = None
-    tags: list[str] = field(default_factory=list)
-
-
 def load_model_config(
-    config_path: Path | str = "configs/model.yaml",
+    config_path: Path | str | None = None,
     section: str = "proxy",
 ) -> dict[str, Any]:
-    """Load model architecture config from YAML.
+    """Model architecture kwargs for LuxiaModelConfig.
 
-    Args:
-        config_path: Path to the model config YAML.
-        section: Which config section to load (proxy, intermediate, model).
-
-    Returns:
-        Dict of model config kwargs suitable for LuxiaModelConfig.
+    With no ``config_path``, ``section`` names a shape in ``kotodama.presets``
+    (aliases like "model" -> "3b" accepted). A YAML path is still honoured for
+    one-off shapes that are not presets.
 
     Raises:
-        FileNotFoundError: If config file doesn't exist.
-        KeyError: If section is missing from config.
+        FileNotFoundError: If a given config file doesn't exist.
+        KeyError: If the section / preset is unknown.
     """
+    if config_path is None:
+        return presets.shape(section)
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Model config not found: {config_path}")
@@ -68,83 +53,9 @@ def load_model_config(
     return dict(full_config[section])
 
 
-def load_checkpoint_registry(
-    config_path: Path | str = "configs/checkpoints.yaml",
-) -> dict[str, CheckpointInfo]:
-    """Load the checkpoint registry from YAML.
-
-    The registry maps checkpoint names to paths and optional AttnRes config.
-
-    Returns:
-        Dict mapping checkpoint name → CheckpointInfo.
-
-    Raises:
-        FileNotFoundError: If config file doesn't exist.
-    """
-    config_path = Path(config_path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Checkpoint registry not found: {config_path}")
-
-    with open(config_path) as f:
-        raw = yaml.safe_load(f)
-
-    registry: dict[str, CheckpointInfo] = {}
-    for group_name, group_data in raw.items():
-        checkpoints = group_data.get("checkpoints", {})
-        for ckpt_name, ckpt_data in checkpoints.items():
-            attn_res_config = None
-            ar_keys = {"attn_res", "attn_res_n_blocks", "attn_res_boundaries"}
-            ar_subset = {k: v for k, v in ckpt_data.items() if k in ar_keys}
-            if ar_subset:
-                attn_res_config = ar_subset
-
-            registry[ckpt_name] = CheckpointInfo(
-                name=ckpt_name,
-                path=Path(ckpt_data["path"]),
-                attn_res_config=attn_res_config,
-                group=group_name,
-                tags=ckpt_data.get("tags", []),
-            )
-
-    return registry
-
-
-def decompress_checkpoint(path: Path) -> Path:
-    """Decompress a .pt.zst checkpoint, returning the decompressed path.
-
-    Returns the path unchanged if it doesn't end in .zst.
-    Decompresses to a temp directory to avoid polluting the checkpoint dir.
-    """
-    if not str(path).endswith(".zst"):
-        return path
-    decompressed = path.with_suffix("")
-    if decompressed.exists():
-        return decompressed
-    tmp_dir = Path(tempfile.gettempdir()) / "kotodama_checkpoints"
-    tmp_dir.mkdir(exist_ok=True)
-    tmp_path = tmp_dir / decompressed.name
-    if tmp_path.exists():
-        return tmp_path
-    # Decompress to a process-unique path, then atomically rename: parallel
-    # eval shards may race on the same checkpoint, and a bare `zstd -o
-    # tmp_path` would let a second process load a half-written file.
-    partial = tmp_path.with_name(f"{tmp_path.name}.partial.{os.getpid()}")
-    logger.info("Decompressing %s → %s", path.name, tmp_path)
-    try:
-        subprocess.run(
-            ["zstd", "-d", str(path), "-o", str(partial), "-f"],
-            check=True,
-            capture_output=True,
-        )
-        os.replace(partial, tmp_path)
-    finally:
-        partial.unlink(missing_ok=True)
-    return tmp_path
-
-
 def load_model(
     checkpoint_path: Path | str,
-    config_path: Path | str = "configs/model.yaml",
+    config_path: Path | str | None = None,
     config_section: str = "proxy",
     attn_res_config: dict[str, Any] | None = None,
     device: str = "cuda:0",
@@ -162,9 +73,9 @@ def load_model(
     2. Otherwise, auto-detect from state dict keys (fallback, assumes n_blocks=7).
 
     Args:
-        checkpoint_path: Path to the .pt checkpoint file.
-        config_path: Path to model YAML config.
-        config_section: Section name in YAML (proxy, intermediate, model).
+        checkpoint_path: A .pt/.pt.zst path or a kotodama.ckpt registry name.
+        config_path: Optional model YAML; default = kotodama.presets.
+        config_section: Preset name (3b, proxy, ...) or YAML section.
         attn_res_config: Explicit AttnRes kwargs (attn_res, attn_res_n_blocks,
             attn_res_boundaries). Preferred over auto-detection.
         device: Target device for the model.
@@ -175,25 +86,14 @@ def load_model(
     Raises:
         FileNotFoundError: If checkpoint or config doesn't exist.
     """
-    checkpoint_path = Path(checkpoint_path)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    checkpoint_path = decompress_checkpoint(checkpoint_path)
+    checkpoint_path = ckpt.decompress_cached(ckpt.resolve(checkpoint_path))
 
     # Load model architecture config
     cfg = load_model_config(config_path, config_section)
 
     # Load checkpoint state dict
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    model_state = state.get("model", state)
-
-    # Strip torch.compile and DDP prefixes
-    cleaned: dict[str, torch.Tensor] = {}
-    for k, v in model_state.items():
-        k = k.replace("_orig_mod.", "")
-        k = k.replace("module.", "")
-        cleaned[k] = v
+    cleaned = ckpt.model_state(state)
 
     # Configure AttnRes
     if attn_res_config is not None:

@@ -34,7 +34,7 @@ class LuxiaEvalLM(TemplateLM):
     def __init__(
         self,
         checkpoint_path: str | Path,
-        config_path: str | Path = "configs/model.yaml",
+        config_path: str | Path | None = None,
         config_section: str = "proxy",
         attn_res_config: dict[str, Any] | None = None,
         device: str = "cuda:0",

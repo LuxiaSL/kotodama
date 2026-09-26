@@ -12,7 +12,6 @@ import argparse
 import gc
 import json
 import logging
-import sys
 from pathlib import Path
 
 import torch
@@ -72,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         "--num-fewshot", type=int, default=None, help="Override few-shot count"
     )
     parser.add_argument(
-        "--config", type=str, default="configs/model.yaml",
+        "--config", type=str, default=None,
     )
     parser.add_argument(
         "--config-section", type=str, default="proxy",

@@ -46,7 +46,8 @@ warnings.filterwarnings("ignore", message="Online softmax", module=r"torch\._ind
 # Project imports — launch from the luxia-base/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from kotodama.data.dataset import PackedSample, RandomTokenDataset, TokenizedDataset, collate_packed
+from kotodama.data.dataset import RandomTokenDataset, TokenizedDataset, collate_packed
+from kotodama import presets
 from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
 from kotodama.monitoring.geometric import GeometricMonitor, MonitorConfig, MonitorSchedule
 from kotodama.monitoring.wandb_callback import WandbLogger
@@ -138,80 +139,7 @@ def _upload_checkpoint_to_hf(
 # Model configs — matches configs/model.yaml
 # =============================================================================
 
-MODEL_CONFIGS: dict[str, dict[str, Any]] = {
-    "full": dict(
-        hidden_size=3072,
-        num_layers=28,
-        num_attention_heads=24,
-        num_kv_heads=8,
-        head_dim=128,
-        intermediate_size=8192,
-        vocab_size=49152,
-        max_position_embeddings=4096,
-    ),
-    "3b": dict(
-        hidden_size=3072,
-        num_layers=28,
-        num_attention_heads=24,
-        num_kv_heads=8,
-        head_dim=128,
-        intermediate_size=8192,
-        vocab_size=49152,
-        max_position_embeddings=4096,
-    ),
-    # ~7.18B params at vocab 49,152 — Llama-3-8B skeleton; its extra ~1B is
-    # purely the 128K vocab. "8b" kept as an alias for older configs.
-    "7b": dict(
-        hidden_size=4096,
-        num_layers=32,
-        num_attention_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        intermediate_size=14336,
-        vocab_size=49152,
-        max_position_embeddings=4096,
-    ),
-    "8b": dict(
-        hidden_size=4096,
-        num_layers=32,
-        num_attention_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        intermediate_size=14336,
-        vocab_size=49152,
-        max_position_embeddings=4096,
-    ),
-    "intermediate": dict(
-        hidden_size=1024,
-        num_layers=28,
-        num_attention_heads=8,
-        num_kv_heads=4,
-        head_dim=128,
-        intermediate_size=2816,
-        vocab_size=49152,
-        max_position_embeddings=4096,
-    ),
-    "proxy": dict(
-        hidden_size=512,
-        num_layers=28,
-        num_attention_heads=4,
-        num_kv_heads=2,
-        head_dim=128,
-        intermediate_size=1408,
-        vocab_size=49152,
-        max_position_embeddings=4096,
-    ),
-    "smoke": dict(
-        hidden_size=256,
-        num_layers=4,
-        num_attention_heads=4,
-        num_kv_heads=2,
-        head_dim=64,
-        intermediate_size=512,
-        vocab_size=1024,
-        max_position_embeddings=2048,
-    ),
-}
+MODEL_CONFIGS: dict[str, dict[str, Any]] = {name: presets.shape(name) for name in presets.names()}
 
 
 def _model_flops_per_token(
@@ -521,11 +449,8 @@ def train(args: argparse.Namespace) -> None:
         cleaned_state = {k.replace("_orig_mod.", ""): v for k, v in model_state.items()}
         model.load_state_dict(cleaned_state, strict=True)
 
-        # Optimizer states (preserves momentum)
-        if "muon_opt" in ckpt:
-            muon_opt.load_state_dict(ckpt["muon_opt"])
-        if "adamw_opt" in ckpt:
-            adamw_opt.load_state_dict(ckpt["adamw_opt"])
+        # Weights only: optimizer state is NOT restored on a warm resume (fresh
+        # Muon/AdamW moments; the schedule restarts from step 0).
 
         if is_main:
             logger.info(
