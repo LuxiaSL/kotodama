@@ -1,0 +1,42 @@
+# ARM-D-lite dyadic-NCA phase, DENSE boundaries (28 blocks; feeds the
+# boundary-distillation methodology — DRAFT-SPEC-dyadic-nca §5b)
+model_size: proxy
+sequence_length: 4096
+micro_batch_size: 4
+global_batch_tokens: 131072
+
+total_tokens: 750_000_000
+warmup_steps: 200
+decay_start_pct: 0.90
+decay_type: cosine
+
+muon_lr: 0.02
+muon_momentum: 0.95
+muon_weight_decay: 0.01
+muon_ns_iterations: 5
+muon_ns_coefficients: gram_ns
+adamw_lr: 6e-4
+adamw_beta1: 0.9
+adamw_beta2: 0.95
+adamw_weight_decay: 0.1
+gradient_clip: 1.0
+
+data_path: /models/kotodama-data/p5-dyadic/p5_dyadic.bin
+seed: 42
+
+compile: true
+attn_impl: auto
+fp8: false
+use_liger: false
+activation_checkpointing: false
+
+save_every: 2800
+keep_checkpoints: 4
+async_checkpoint: true
+checkpoint_shm_dir: /dev/shm/luxia-base-ckpts
+geo_monitor: false
+log_every: 100
+wandb: false
+attn_res: true
+attn_res_boundaries: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27"
+checkpoint_dir: /models/kotodama-data/p5-dyadic/ckpt-dense
