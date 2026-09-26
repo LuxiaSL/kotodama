@@ -3,6 +3,8 @@ tables on a synthetic grid, and /logprobs payloads against a mocked server."""
 
 from __future__ import annotations
 
+import os
+
 import importlib.util
 import json
 import random
@@ -18,8 +20,11 @@ from kotodama.eval.riders import aggregate as agg
 from kotodama.eval.riders import grid, items, smoothing
 from kotodama.eval.riders.__main__ import main as cli_main
 
-FROZEN_DIR = Path.home() / "projects/kotodama-frozen/posttraining/taste/probes/p06"
-BANKED_DIR = Path.home() / "projects/kotodama-frozen/_node1-snapshot-2026-09-26/kotodama/probes/p06"
+# Golden checks against the original instrument + banked artifacts run only where
+# a frozen snapshot is available: KOTODAMA_FROZEN_DIR=<snapshot root>.
+_FROZEN_ROOT = Path(os.environ.get("KOTODAMA_FROZEN_DIR", "/nonexistent"))
+FROZEN_DIR = _FROZEN_ROOT / "posttraining/taste/probes/p06"
+BANKED_DIR = _FROZEN_ROOT / "_node1-snapshot-2026-09-26/kotodama/probes/p06"
 
 
 def _frozen_gen_items() -> ModuleType:
