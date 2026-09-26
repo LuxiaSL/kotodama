@@ -1,97 +1,74 @@
 # Kotodama
 
-Kotodama is an experimental PyTorch codebase for training and serving decoder-only language models. It contains the current 3B and 7B training paths, Attention Residuals, optional Neural Cellular Automata (NCA) pre-training, distributed Muon, evaluation tooling, and an OpenAI-compatible inference server.
+A from-scratch language-model pretraining stack: Llama-style decoders with
+**Block Attention Residuals** (AttnRes), **NCA pre-pretraining** (training on
+neural-cellular-automata trajectories before language), and **Muon** for matrix
+parameters. The shipped model is
+[kotodama-3b-base](https://huggingface.co/aethera-gp/kotodama-3b-base-final)
+(384B tokens, DD-3B AttnRes boundaries).
 
-This repository contains source code, configurations, and small benchmark artifacts. It does not include training data, checkpoints, credentials, or deployment-specific infrastructure.
+Architecture: GQA, RoPE (θ=500K), RMSNorm + QK-norm, SwiGLU, tied embeddings,
+SmolLM2 vocabulary (49,152), z-loss. Shapes live in one table:
+`src/kotodama/presets.py`.
 
-## Current Capabilities
-
-- 3B and 7B Llama-style decoder models with grouped-query attention, RoPE, RMSNorm, SwiGLU, and tied embeddings.
-- Block Attention Residuals with Triton and PyTorch implementations.
-- DDP training with Muon for matrix parameters and AdamW for the remaining parameters.
-- Optional FP8 and MXFP8 paths, activation checkpointing, FlashAttention/SDPA/flex attention backends, and `torch.compile`.
-- NCA trajectory generation and NCA-to-language initialization experiments.
-- Checkpoint loading, generation, lm-eval integration, parity checks, and profiling utilities.
-- FastAPI inference server and a multi-replica gateway with health checks and prefix-cache affinity.
-
-The 108M proxy experiments and their reports remain in the tree as historical research artifacts. The actively maintained configs are the 3B and 7B training, serving, and benchmark paths.
-
-## Requirements
-
-- Python 3.12+
-- PyTorch with a CUDA build for GPU training or fast inference
-- CUDA-compatible NVIDIA hardware for the optional compiled, FlashAttention, and FP8 paths
-
-Install the base package and the extras appropriate to your workflow:
+## Setup
 
 ```bash
-uv sync --extra training --extra eval
+uv venv .venv && uv pip install --python .venv/bin/python -e ".[training,eval]"
+cp site.env.example site.env   # optional: data root, venv, caches for this machine
 ```
 
-`flash-attn`, `liger-kernel`, `torchao`, and `lm-eval` are optional and feature-dependent. Consult `pyproject.toml` and the selected config before running a GPU workflow.
+Every launcher in `tools/` sources `tools/_env.sh`, which loads `site.env`,
+activates the venv, and sets the package path and compile caches.
 
-## Quick Start
+## Golden paths
 
-Run a short 7B canary using synthetic data:
+| task | command |
+|---|---|
+| NCA data | `tools/nca_gen.sh` (defaults = the 3B recipe: 3500 rules × 20 sims, seed 17) |
+| pretrain (NCA → language, CPT) | `tools/run_train.sh --config configs/<run>.yaml [--flag value ...]` |
+| lm-eval anchors | `tools/launch_lmeval_sharded.sh <ckpt> 0,1,2` · single GPU: `tools/run_py.sh -m scripts.eval.run_lm_eval --checkpoint <ckpt> --config-section 3b` |
+| binding rider grid | `python -m kotodama.eval.riders {gen,run,aggregate}` (logprob battery against a server) |
+| checkpoints | `python -m kotodama.ckpt {info,strip,list}` — names from `configs/checkpoints.yaml` |
+| capture / readout | `kotodama.model.capture` (instrumented AttnRes forward, parity-tested) |
+| serve one model | `tools/run_serve.sh --checkpoint <ckpt> [--mode chat]` · public base: `tools/serve_3b_base.sh` |
+| serve a fleet | `tools/run_gateway.sh --config configs/gateway.example.yaml` |
+| chat | `python -m kotodama.serve.chat [complete]` (sampling laws: `kotodama.serve.laws`) |
+| any script | `tools/run_py.sh <script.py or -m module> ...` |
 
-```bash
-torchrun --nproc_per_node=8 -m kotodama.training.train \
-  --config configs/canary-7b.yaml
-```
+Configs are flat YAML (keys = `train.py` flags) with `extends:` inheritance;
+shared blocks live in `configs/base/`. The 3B lineage configs
+(`nca-3b-phase1` → `nca-3b-phase3-cotrain` → `3b-language`, plus
+`3b-chinchilla-decay`) are the record of the shipped run.
 
-The canary is designed for a multi-GPU CUDA environment and performs no useful checkpoint save. For other experiments, start from a config in `configs/` and provide a tokenized data path or use its `random_data` mode.
+The server exposes `/v1/chat/completions`, `/v1/completions`, `/generate`
+(full sampling control, streaming), `/logprobs` (batched prefill scoring),
+`/v1/models`, `/info`, `/health`.
 
-Serve the public 3B base checkpoint:
-
-```bash
-python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
-python -m pip install -r requirements-serve.txt
-tools/serve_3b_base.sh
-```
-
-The launcher downloads [the public 3B base checkpoint](https://huggingface.co/aethera-gp/kotodama-3b-base-final) once, supports its `.pt.zst` full-checkpoint format, and starts the fast engine by default. For the complete CUDA/PyTorch setup, conservative VRAM and host sizing, engine tradeoffs, and runtime controls, see [docs/serving-3b-base.md](docs/serving-3b-base.md).
-
-The server listens on port 2222 by default. It exposes `POST /v1/chat/completions`, `POST /v1/completions`, `POST /generate`, `GET /v1/models`, `GET /info`, and `GET /health`.
-
-Start a gateway fleet after adapting a gateway YAML file to local checkpoint paths and runtime settings:
-
-```bash
-python gateway.py --config configs/gateway.example.yaml --gpus 0
-```
-
-Gateway configs use `python: python` and `workdir: .` as portable defaults. Checkpoint locations, caches, GPU placement, and any scheduler integration are operator configuration.
-
-## Evaluation And Validation
-
-The repository includes focused parity, smoke, and benchmark tools:
-
-```bash
-python scripts/utils/phase1_bwd_parity.py
-python scripts/utils/phase2_bwd_parity.py
-python scripts/utils/fa4_varlen_parity.py
-python scripts/benchmark/validate_engine.py --checkpoint /path/to/checkpoint.pt
-python -m scripts.eval.run_lm_eval --help
-```
-
-Most scripts are hardware- and checkpoint-dependent. Run `--help` before invoking a tool and treat configurations in `scripts/legacy/` as archived experiment launchers, not production defaults.
-
-## Repository Layout
+## Layout
 
 ```text
-configs/       Training, serving, and benchmark configurations
-docs/          Research notes and handoff documents
-scripts/       Analysis, evaluation, benchmark, utility, and legacy scripts
-src/data/      Dataset loading
-src/eval/      Evaluation, generation, and model-loading utilities
-src/model/     Model, decode engine, and Attention Residual implementations
-src/nca/       NCA data generation
-src/training/  Distributed training, Muon, and checkpoint handling
-tests/         CPU-focused equivalence tests
-tools/         Portable runner and convenience scripts
+src/kotodama/
+  model/      llama.py (model + AttnRes), flash_attn_res/ (Triton), decode_engine, capture
+  nca/        NCA trajectory generator (+ dyadic variant)
+  training/   train.py, Muon, checkpointing
+  data/       uint16 token-stream dataset
+  eval/       model loading, lm-eval adapter, riders/ (binding battery)
+  serve/      server, gateway, chatml, laws, chat client
+  presets.py  shapes + AttnRes boundaries + tokenizer
+  ckpt.py     checkpoint load/strip/info/registry
+configs/      training runs (+ base/), gateway example, checkpoint registry
+scripts/      eval/ (lm-eval), benchmark/ (serving perf + parity batteries), utils/ (kernel parity, data, smoke)
+tools/        launchers (all via _env.sh)
+tests/        CPU suite: pytest
 ```
 
-## Configuration And Security
+## Tests
 
-Do not commit checkpoints, datasets, scheduler URLs, private hostnames, local paths, or API keys. The launcher wrappers accept `KOTODAMA_WORKDIR`, `KOTODAMA_VENV`, `KOTODAMA_CACHE_ROOT`, and `KOTODAMA_SCHEDULER_URL` for environment-specific setup. Telemetry credentials such as `WANDB_API_KEY` must be supplied through the environment or a secret manager.
+```bash
+.venv/bin/python -m pytest
+```
 
-For prior experimental context, see `PROXY-REPORT.md` and the documents in `docs/`; they should be read as dated research notes rather than a deployment guide.
+CPU-only; GPU batteries skip without CUDA. Kernel parity checks
+(`scripts/utils/*_parity.py`) and serving batteries (`scripts/benchmark/check_*.py`)
+run standalone on a GPU.

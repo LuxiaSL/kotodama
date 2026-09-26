@@ -29,7 +29,7 @@ The decode step is written to be torch.compile + CUDA-graph friendly:
     entry (block-persistent, the koto primitive — single-site writes die at
     DD-3B boundaries); multiple sites just populate different rows. Decode
     steps only; prefill/extend never inject. A disabled engine traces zero
-    new ops. docs/STEERING-SERVE.md has the API + the GPU gates.
+    new ops. kotodama/serve/steering.py has the API + the GPU gates.
 """
 
 from __future__ import annotations

@@ -3,7 +3,7 @@
 
 CPU-only, tiny fp32 random-weight model — no checkpoint, no GPU, exact
 comparisons (fp32 + MATH SDPA, same trick as check_prefix_cache part 1).
-What it proves, per docs/STEERING-SERVE.md:
+What it proves, per kotodama/serve/steering.py:
 
   0. steer-points — compute_steer_points matches the reference persist
      semantics of posttraining/taste/steer_inject.forward_inject (sublayer
@@ -30,7 +30,7 @@ What it proves, per docs/STEERING-SERVE.md:
 
 GPU/compiled variants share the exact traced code these eager paths run, but
 the compiled/cudagraph gates (bitwise-off vs HEAD, steered-serve vs mirror,
-throughput) are a GPU battery — see docs/STEERING-SERVE.md.
+throughput) are a GPU battery — see kotodama/serve/steering.py.
 
 Usage:
     python scripts/benchmark/check_steering_engine.py            # CPU, anywhere

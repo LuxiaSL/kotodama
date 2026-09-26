@@ -1,5 +1,5 @@
 # Minimal runtime dependencies for serve.py. Install a CUDA-enabled PyTorch build
-# for your driver separately; see docs/serving-3b-base.md.
+# for your driver separately; see README.md.
 fastapi>=0.115,<1
 huggingface-hub>=0.24,<2
 numpy>=1.26,<3

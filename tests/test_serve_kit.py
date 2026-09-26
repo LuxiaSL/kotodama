@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from kotodama import presets
 from kotodama.serve import chatml, laws
@@ -57,3 +58,21 @@ def test_chat_client_defaults_follow_the_chat_law(monkeypatch):
     from kotodama.serve import chat
     assert chat.Sampling().temperature == laws.LAWS["chat"]["temperature"]
     assert chat.Sampling().rep_penalty == laws.LAWS["chat"]["repetition_penalty"]
+
+
+def test_steer_bank_loader(tmp_path):
+    import numpy as np
+    from kotodama.serve import steering
+
+    vec = np.zeros(8, dtype=np.float32)
+    vec[0] = 1.0
+    good = tmp_path / "bank.npz"
+    np.savez(good, Bind_s38=vec, median_norm_s38=np.float32(12.5), sign_meta=np.array("x"))
+    bank, meds, aliases = steering.load_steer_banks([str(good)], n_layers=28, hidden=8,
+                                                     device=torch.device("cpu"))
+    assert bank["Bind_s38"][0] == 19 and meds == {19: 12.5}
+    assert set(aliases) == {"bind", "control"}
+    odd = tmp_path / "odd.npz"
+    np.savez(odd, X_s39=vec, median_norm_s39=np.float32(1.0))
+    with pytest.raises(ValueError, match="ODD sublayer"):
+        steering.load_steer_banks([str(odd)], n_layers=28, hidden=8, device=torch.device("cpu"))
