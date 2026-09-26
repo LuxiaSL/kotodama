@@ -24,9 +24,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.profiler import profile, record_function, ProfilerActivity
 
-sys.path.insert(0, ".")
-from src.model.llama import LuxiaBaseModel, LuxiaModelConfig
-from src.training.muon import Muon, build_hybrid_optimizer
+sys.path.insert(0, "src")
+from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.training.muon import Muon, build_hybrid_optimizer
 
 
 def main():

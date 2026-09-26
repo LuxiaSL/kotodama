@@ -7,7 +7,7 @@
 #   attn_res_boundaries: [list of boundary layer indices] (explicit, overrides n_blocks)
 #
 # Usage:
-#   from src.eval.model_loader import load_checkpoint_registry
+#   from kotodama.eval.model_loader import load_checkpoint_registry
 #   registry = load_checkpoint_registry()
 
 proxy_sweep:

@@ -20,11 +20,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.data.dataset import TokenizedDataset, collate_packed, compute_doc_boundaries
-from src.model.llama import LuxiaBaseModel, LuxiaModelConfig
-from src.training.muon import Muon
+from kotodama.data.dataset import TokenizedDataset, collate_packed, compute_doc_boundaries
+from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.training.muon import Muon
 
 
 def _smoke_config(**overrides) -> LuxiaModelConfig:
@@ -167,7 +166,7 @@ def test_muon_distributed_noop_without_dist() -> None:
 def test_prefetcher_stream_and_resume() -> None:
     """Prefetcher must yield the identical batch stream and produce resume
     states that continue with zero skipped/replayed sequences."""
-    from src.training.train import _PrefetchIterator
+    from kotodama.training.train import _PrefetchIterator
 
     with tempfile.TemporaryDirectory() as td:
         rng = np.random.RandomState(3)
@@ -234,7 +233,7 @@ def test_doc_masked_forward_smoke() -> None:
     toks[:, 20] = 0
     toks[:, 45] = 0
     samples = []
-    from src.data.dataset import PackedSample
+    from kotodama.data.dataset import PackedSample
     for b in range(B):
         cu, pos, ms = compute_doc_boundaries(toks[b].numpy().astype(np.uint16))
         samples.append(PackedSample(

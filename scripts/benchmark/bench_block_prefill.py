@@ -36,9 +36,9 @@ import torch
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from scripts.benchmark.decode_parity import load_model  # noqa: E402
-from src.model.decode_engine import DecodeEngine  # noqa: E402
+from kotodama.model.decode_engine import DecodeEngine  # noqa: E402
 
 NOISE_CEILING = 0.72     # round-1 parity gate (cross-kernel logit noise)
 # KV gate is SELF-CALIBRATING against a same-run control, because this trunk
@@ -121,7 +121,7 @@ def reference_control(engine: DecodeEngine, ids: torch.Tensor) -> float:
     This is the noise floor the trunk itself produces between two correct
     paths; the block gate is calibrated against it.
     """
-    import src.model.llama as llama_mod
+    import kotodama.model.llama as llama_mod
     n = ids.shape[1]
     engine.prefill_reference(ids)
     r1 = snapshot_kv(engine, n)

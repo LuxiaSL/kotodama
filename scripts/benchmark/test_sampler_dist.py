@@ -23,7 +23,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "2")
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 VOCAB = 49152
 N_DRAWS = 400_000

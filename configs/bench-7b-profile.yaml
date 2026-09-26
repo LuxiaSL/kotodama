@@ -1,6 +1,6 @@
 # 7B profiling run — chrome trace + kernel summary for the throughput program.
 # Same config as canary-7b but with torch.profiler enabled at steady state.
-# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/bench-7b-profile.yaml
+# Usage: torchrun --nproc_per_node=8 -m kotodama.training.train --config configs/bench-7b-profile.yaml
 
 model_size: 7b
 sequence_length: 4096

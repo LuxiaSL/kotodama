@@ -7,7 +7,7 @@
 # Train from SCRATCH (not from Phase 1 checkpoint) with AttnRes active.
 # Same NCA data, overshoot methodology — watch for geometric plateau.
 #
-# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/nca-3b-phase3-cotrain.yaml
+# Usage: torchrun --nproc_per_node=8 -m kotodama.training.train --config configs/nca-3b-phase3-cotrain.yaml
 
 model_size: 3b
 sequence_length: 4096

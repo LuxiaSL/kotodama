@@ -4,9 +4,8 @@ from pathlib import Path
 import torch
 import zstandard as zstd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from serve import _load_checkpoint
+from kotodama.serve.server import _load_checkpoint
 
 
 def test_load_checkpoint_supports_plain_and_zstd_payloads(tmp_path):

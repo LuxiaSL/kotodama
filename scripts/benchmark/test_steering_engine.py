@@ -56,9 +56,9 @@ torch.set_num_threads(2)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.model.decode_engine import DecodeEngine, compute_steer_points  # noqa: E402
-from src.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from kotodama.model.decode_engine import DecodeEngine, compute_steer_points  # noqa: E402
+from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
 
 _FAILURES: list[str] = []
 

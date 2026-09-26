@@ -25,7 +25,7 @@ import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 torch.set_num_threads(2)
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from scripts.benchmark.decode_parity import compare_steps, load_model, reference_forced, reference_greedy
 

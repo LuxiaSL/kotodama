@@ -37,8 +37,8 @@ from transformers import AutoTokenizer
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.model.llama import LuxiaBaseModel, LuxiaModelConfig
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
 
 TOKENIZER_NAME = "HuggingFaceTB/SmolLM2-135M"
 DDV1_BOUNDARIES = [0, 3, 7, 12, 21, 25]

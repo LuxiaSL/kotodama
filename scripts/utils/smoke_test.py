@@ -10,9 +10,9 @@ import time
 
 import torch
 
-sys.path.insert(0, ".")
-from src.model.llama import LuxiaBaseModel, LuxiaModelConfig
-from src.training.muon import build_hybrid_optimizer, HybridScheduler
+sys.path.insert(0, "src")
+from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.training.muon import build_hybrid_optimizer, HybridScheduler
 
 
 def main() -> None:

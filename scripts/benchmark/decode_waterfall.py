@@ -59,9 +59,9 @@ torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.model import llama as llama_mod
-from src.model.llama import LuxiaBaseModel, LuxiaModelConfig
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from kotodama.model import llama as llama_mod
+from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
 
 DDV1_BOUNDARIES = [0, 3, 7, 12, 21, 25]
 DD3B_BOUNDARIES = [0, 1, 3, 7, 15, 19, 24]
@@ -325,8 +325,8 @@ def profile_decode_window(
 
 def sample_next_token_cost(vocab_size: int, device: torch.device) -> dict[str, float]:
     """Microbench serve.py's sample_next_token at several generated-ids lengths."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from serve import sample_next_token  # noqa: PLC0415
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+    from kotodama.serve.server import sample_next_token  # noqa: PLC0415
 
     logits = torch.randn(vocab_size, device=device, dtype=torch.bfloat16)
     results: dict[str, float] = {}

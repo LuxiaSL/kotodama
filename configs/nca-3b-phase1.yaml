@@ -2,7 +2,7 @@
 # Overshoot methodology: train for 1.5 epochs, pick the knee from geometry
 # 3500 rules, 20 sims/rule, seed 17 → 9B unique tokens per epoch
 #
-# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/nca-3b-phase1.yaml
+# Usage: torchrun --nproc_per_node=8 -m kotodama.training.train --config configs/nca-3b-phase1.yaml
 
 model_size: 3b
 sequence_length: 4096

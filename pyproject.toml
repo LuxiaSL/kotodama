@@ -1,7 +1,7 @@
 [project]
-name = "luxia-base"
-version = "0.2.0"
-description = "Pretraining, fine-tuning, and RL for conversational research models"
+name = "kotodama"
+version = "0.3.0"
+description = "From-scratch LLM pretraining with NCA pre-pretraining, Block Attention Residuals, and Muon"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -47,8 +47,18 @@ nca = [
 
 # Everything
 all = [
-    "luxia-base[training,eval,nca]",
+    "kotodama[training,eval,nca]",
 ]
 
 [tool.uv]
 find-links = ["https://download.pytorch.org/whl/cu128"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

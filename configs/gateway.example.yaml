@@ -14,7 +14,6 @@ gateway_port: 8080
 
 python: python
 workdir: .
-serve_script: serve.py
 hf_home: .cache/huggingface
 log_dir: logs/gateway
 serve_args: ["--engine", "fast"]

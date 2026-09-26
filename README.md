@@ -35,7 +35,7 @@ uv sync --extra training --extra eval
 Run a short 7B canary using synthetic data:
 
 ```bash
-torchrun --nproc_per_node=8 -m src.training.train \
+torchrun --nproc_per_node=8 -m kotodama.training.train \
   --config configs/canary-7b.yaml
 ```
 

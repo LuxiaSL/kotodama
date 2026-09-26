@@ -40,10 +40,10 @@ torch.set_num_threads(2)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.model import llama as llama_mod
-from src.model.decode_engine import DecodeEngine
-from src.model.llama import LuxiaBaseModel, LuxiaModelConfig
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from kotodama.model import llama as llama_mod
+from kotodama.model.decode_engine import DecodeEngine
+from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
 
 DD3B_BOUNDARIES = [0, 1, 3, 7, 15, 19, 24]
 CONFIG_3B = dict(

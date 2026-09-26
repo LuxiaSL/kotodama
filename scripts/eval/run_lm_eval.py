@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
 def run_eval(args: argparse.Namespace) -> None:
     import lm_eval
 
-    from src.eval.lm_eval_adapter import LuxiaEvalLM
+    from kotodama.eval.lm_eval_adapter import LuxiaEvalLM
 
     checkpoints = [p.strip() for p in args.checkpoint.split(",")]
     task_list = [t.strip() for t in args.tasks.split(",")]

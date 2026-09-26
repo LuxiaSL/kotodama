@@ -1,30 +1,18 @@
 #!/bin/bash
-# Canary throughput benchmark: measures steady-state tok/s for 3B and 8B models.
+# Canary throughput benchmark: steady-state tok/s for a model config
+# (configs/canary-<name>.yaml; 7b and 7b-noac exist).
 # Usage:
-#   tools/run_canary.sh              # run both 3B and 8B
-#   tools/run_canary.sh 3b           # run 3B only
-#   tools/run_canary.sh 8b           # run 8B only
-#   tools/run_canary.sh 8b 1         # run 8B on 1 GPU (for testing)
+#   tools/run_canary.sh 7b          # 8 GPUs
+#   tools/run_canary.sh 7b-noac 1   # 1 GPU (testing)
 set -euo pipefail
 
-MODEL="${1:-both}"
+MODEL="${1:-7b}"
 NUM_GPUS="${2:-8}"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 CANARY_DIR="outputs/canary-${TIMESTAMP}"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BASE_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$BASE_DIR"
-
-# Activate venv — adjust path for your node
-if [ -f ~/workspace/.venv-shared/bin/activate ]; then
-    source ~/workspace/.venv-shared/bin/activate
-elif [ -f .venv-train/bin/activate ]; then
-    source .venv-train/bin/activate
-fi
-
-export OMP_NUM_THREADS=16
-export PYTHONUNBUFFERED=1
+source "$(dirname -- "${BASH_SOURCE[0]}")/_env.sh"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
 
 mkdir -p "$CANARY_DIR"
 
@@ -58,7 +46,7 @@ run_canary() {
     start_time=$(date +%s.%N)
 
     set +e
-    torchrun --nproc_per_node="$NUM_GPUS" -m src.training.train \
+    torchrun --nproc_per_node="$NUM_GPUS" -m kotodama.training.train \
         --config "$config" \
         --checkpoint_dir "$ckpt_dir" \
         2>&1 | tee "$log_file"
@@ -126,22 +114,8 @@ echo "  $(date)"
 echo "  Output: $CANARY_DIR"
 echo "============================================"
 
-case "$MODEL" in
-    3b)
-        run_canary "3b"
-        ;;
-    8b)
-        run_canary "8b"
-        ;;
-    both)
-        run_canary "3b"
-        run_canary "8b"
-        ;;
-    *)
-        echo "Usage: $0 [3b|8b|both] [num_gpus]"
-        exit 1
-        ;;
-esac
+[ -f "configs/canary-${MODEL}.yaml" ] || { echo "Usage: $0 <name> [num_gpus]  (configs/canary-<name>.yaml)"; exit 1; }
+run_canary "$MODEL"
 
 echo ""
 echo "============================================"

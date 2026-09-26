@@ -15,12 +15,12 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from src.model.flash_attn_res.kernels import phase_1 as p1k  # noqa: E402
-from src.model.flash_attn_res.kernels import phase_2 as p2k  # noqa: E402
-from src.model.flash_attn_res.ops import phase_1 as p1ops  # noqa: E402
-from src.model.flash_attn_res.ops import phase_2 as p2ops  # noqa: E402
+from kotodama.model.flash_attn_res.kernels import phase_1 as p1k  # noqa: E402
+from kotodama.model.flash_attn_res.kernels import phase_2 as p2k  # noqa: E402
+from kotodama.model.flash_attn_res.ops import phase_1 as p1ops  # noqa: E402
+from kotodama.model.flash_attn_res.ops import phase_2 as p2ops  # noqa: E402
 
 DEVICE = "cuda"
 D = 4096

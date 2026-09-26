@@ -40,10 +40,10 @@ torch.set_num_threads(2)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from scripts.benchmark.decode_parity import CONFIG_3B, load_model  # noqa: E402
-from src.model.decode_engine import DecodeEngine  # noqa: E402
-from src.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
+from kotodama.model.decode_engine import DecodeEngine  # noqa: E402
+from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
 
 # Gates for the real-checkpoint soak. What distillation samples is the HEAD
 # of the distribution, so the noise-floor-class bound applies to the top-K

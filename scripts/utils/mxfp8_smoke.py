@@ -21,9 +21,9 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from src.model.mxfp8 import MXFP8_AVAILABLE, MXFP8Linear, convert_to_mxfp8_training  # noqa: E402
+from kotodama.model.mxfp8 import MXFP8_AVAILABLE, MXFP8Linear, convert_to_mxfp8_training  # noqa: E402
 
 DEVICE = "cuda"
 # Production 7B GEMM shapes: attn qkv/o (4096x4096-class) and MLP (4096<->14336)

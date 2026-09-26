@@ -16,10 +16,10 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from src.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
-from src.training.train import _FlexBlockMaskBuilder  # noqa: E402
+from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
+from kotodama.training.train import _FlexBlockMaskBuilder  # noqa: E402
 
 DEVICE = "cuda"
 B, T = 2, 512

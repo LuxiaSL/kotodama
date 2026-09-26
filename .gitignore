@@ -48,3 +48,10 @@ Thumbs.db
 
 # Compiled HTML reports
 *.html
+
+# site profile (machine-specific)
+site.env
+.venv/
+.cache/
+models/
+logs/

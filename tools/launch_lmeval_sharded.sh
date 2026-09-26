@@ -6,7 +6,7 @@
 # then merges the shard results into the standard analysis/lm_eval/<ckpt>/
 # results.json layout.
 #
-# Usage (on gpu-host, from ~/workspace/kotodama):
+# Usage:
 #   tools/launch_lmeval_sharded.sh <checkpoint.pt[.zst]> [gpus] [batch_size]
 #   tools/launch_lmeval_sharded.sh /models/kotodama-data/ckpt.pt.zst 4,5,6 32
 #
@@ -20,8 +20,7 @@ CKPT="${1:?usage: launch_lmeval_sharded.sh <ckpt> [gpus=4,5,6] [batch_size=32]}"
 GPUS="${2:-4,5,6}"
 BS="${3:-32}"
 
-ROOT=~/workspace/kotodama
-VENV=~/workspace/.venv-shared/bin/activate
+source "$(dirname -- "${BASH_SOURCE[0]}")/_env.sh"
 STEM="$(basename "$CKPT")"; STEM="${STEM%.zst}"; STEM="${STEM%.pt}.pt"
 SHARD_ROOT="$ROOT/analysis/lm_eval_shards/$STEM"
 
@@ -43,8 +42,7 @@ mkdir -p "$ROOT/logs" "$SHARD_ROOT"
 # Pre-decompress .zst once so the three shards don't race on it (the loader
 # also handles this atomically now, but doing it here avoids 3x the work).
 if [[ "$CKPT" == *.zst ]]; then
-  TMPDIR=/models/kotodama-data/tmp
-  export TMPDIR
+  export TMPDIR="${TMPDIR:-$KOTODAMA_DATA_ROOT/tmp}"
   DECOMP_DIR="$TMPDIR/kotodama_checkpoints"
   DECOMP="$DECOMP_DIR/$(basename "${CKPT%.zst}")"
   if [ ! -f "$DECOMP" ] && [ ! -f "${CKPT%.zst}" ]; then
@@ -61,9 +59,9 @@ for i in "${!SHARD_TASKS[@]}"; do
   N=$((i + 1))
   echo "shard$N gpu=$GPU tasks=${SHARD_TASKS[$i]}"
   (
-    cd "$ROOT" && source "$VENV" &&
+    cd "$ROOT" &&
     CUDA_VISIBLE_DEVICES="$GPU" KOTODAMA_NO_TRITON_ATTNRES=1 \
-    HF_HOME=/models/huggingface TMPDIR=/models/kotodama-data/tmp \
+    TMPDIR="${TMPDIR:-$KOTODAMA_DATA_ROOT/tmp}" \
     python -m scripts.eval.run_lm_eval \
       --checkpoint "$CKPT" --tasks "${SHARD_TASKS[$i]}" \
       --config-section model --attn-res-boundaries 0,1,3,7,15,19,24 \
@@ -84,7 +82,7 @@ for i in "${!PIDS[@]}"; do
 done
 [ "$FAIL" -eq 0 ] || exit 1
 
-cd "$ROOT" && source "$VENV"
+cd "$ROOT"
 MERGED="$ROOT/analysis/lm_eval/$STEM/results.json"
 if [ -f "$MERGED" ]; then
   # Never silently clobber banked numbers — divert and let the operator

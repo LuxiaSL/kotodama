@@ -154,8 +154,8 @@ def visualize_from_generator(
 ) -> None:
     """Generate a few NCA rules and visualize their trajectories."""
     import torch
-    sys.path.insert(0, ".")
-    from src.nca.generator import (
+    sys.path.insert(0, "src")
+    from kotodama.nca.generator import (
         NCAConfig, NCARule, sample_rule_config,
         simulate_trajectory, evaluate_rule_complexity,
     )

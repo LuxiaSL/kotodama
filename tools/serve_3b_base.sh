@@ -2,8 +2,7 @@
 # Download (once) and serve the public Kotodama 3B base checkpoint.
 set -euo pipefail
 
-ROOT="${KOTODAMA_WORKDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
-cd "$ROOT"
+source "$(dirname -- "${BASH_SOURCE[0]}")/_env.sh"
 
 MODEL_ID="${KOTODAMA_MODEL_ID:-aethera-gp/kotodama-3b-base-final}"
 CHECKPOINT_NAME="${KOTODAMA_CHECKPOINT_NAME:-step_00195311.pt.zst}"
@@ -26,7 +25,7 @@ if [[ ! -f "$CHECKPOINT_PATH" ]]; then
   hf download "$MODEL_ID" "$CHECKPOINT_NAME" --local-dir "$MODEL_DIR"
 fi
 
-exec "${KOTODAMA_PYTHON:-python}" serve.py \
+exec python -m kotodama.serve.server \
   --checkpoint "$CHECKPOINT_PATH" \
   --model_size 3b \
   --mode base \

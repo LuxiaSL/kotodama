@@ -16,9 +16,9 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from src.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
+from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
 
 DEVICE = "cuda"
 B, T = 2, 512
@@ -71,7 +71,7 @@ def main() -> int:
 
     # ── op-level parity at 7B attention shapes ────────────────────────────
     from flash_attn import flash_attn_varlen_func
-    from src.model.fa4_varlen import fa4_varlen_op
+    from kotodama.model.fa4_varlen import fa4_varlen_op
 
     g = torch.Generator(device=DEVICE).manual_seed(0)
     total, nq, nkv, hd = 16384, 32, 8, 128

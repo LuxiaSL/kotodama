@@ -2,7 +2,7 @@
 # Phase-1 baseline for the 7B throughput program (SPEC-7B-THROUGHPUT-2026-07-03).
 # AttnRes boundaries: 8 uniform blocks as a THROUGHPUT PLACEHOLDER only —
 # production boundaries will be re-derived from 7B geometry (DD-3B pattern).
-# Usage: torchrun --nproc_per_node=8 -m src.training.train --config configs/canary-7b.yaml
+# Usage: torchrun --nproc_per_node=8 -m kotodama.training.train --config configs/canary-7b.yaml
 
 model_size: 7b
 sequence_length: 4096
