@@ -1699,9 +1699,9 @@ def parse_args() -> argparse.Namespace:
         "--resume_warm",
         type=str,
         default=None,
-        help="Path to checkpoint — loads model + optimizer state but resets step counter, "
-             "tokens consumed, data position, and scheduler. Simulates starting a new "
-             "epoch with warm optimizer momentum.",
+        help="Path to checkpoint — loads model weights and resets step counter, tokens "
+             "consumed, data position, and scheduler. Optimizer moments start FRESH (this "
+             "has always been so; the old help promised warm momentum it never loaded).",
     )
     p.add_argument(
         "--reinit_mlps",
