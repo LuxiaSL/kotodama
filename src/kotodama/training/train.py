@@ -381,6 +381,10 @@ def train(args: argparse.Namespace) -> None:
         model_kwargs["attn_res_boundaries"] = [int(x) for x in args.attn_res_boundaries.split(",")]
     config = LuxiaModelConfig(**model_kwargs)
 
+    # Seed the init: without this every run of the same config draws different
+    # initial weights (data order is already seeded in the dataset). DDP then
+    # broadcasts rank 0's params, so ranks agree either way.
+    torch.manual_seed(args.seed)
     model = LuxiaBaseModel(config).to(device=device, dtype=torch.bfloat16)
     param_count = sum(p.numel() for p in model.parameters())
 
