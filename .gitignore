@@ -55,3 +55,4 @@ site.env
 .cache/
 models/
 logs/
+.claude/
