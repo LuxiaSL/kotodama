@@ -720,7 +720,7 @@ def replay_extract_cached_koto(
     kotodama-native AttnRes fields.
 
     The contract, mirrored from `anamnesis.extraction.replay_cached` at
-    source (sha 4282447d... state_extractor / bfb27e09... pipeline, node1
+    source (sha 4282447d... state_extractor / bfb27e09... pipeline, cluster
     deploy): T = n-1 steps for n continuation tokens; `logits[i]` is the
     distribution produced AT continuation index i (abs position offset+i);
     `chosen_token_ids = cont[1:n]`; attention row i keeps columns

@@ -11,7 +11,7 @@ fit a window at that scale — this is a deliberate design split.)
 Eval items (held-out rule pairs, never in training): ledger items + smoothing
 pairs per src/nca/dyadic.py emitters.
 
-Usage (node1, sharded across GPUs):
+Usage (sharded across GPUs):
   for s in 0..5: CUDA_VISIBLE_DEVICES=$s python -m kotodama.nca.gen_dyadic_data \
       --shard $s --n-shards 6 --target-tokens 125_000_000 \
       --out /models/kotodama-data/p5-dyadic &
