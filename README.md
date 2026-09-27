@@ -26,6 +26,7 @@ activates the venv, and sets the package path and compile caches.
 | task | command |
 |---|---|
 | NCA data | `tools/nca_gen.sh` (defaults = the 3B recipe: 3500 rules × 20 sims, seed 17) |
+| NCA v3 data + gates | `python -m kotodama.nca.gen_dyadic_data --out <dir> ...` (token-level mix, banded rules, sidecar; `--finalize` emits eval sets) · score: `python -m kotodama.eval.nca_gates --checkpoint <ckpt> --eval-dir <dir> --tag <t>` |
 | pretrain (NCA → language, CPT) | `tools/run_train.sh --config configs/<run>.yaml [--flag value ...]` |
 | lm-eval anchors | `tools/launch_lmeval_sharded.sh <ckpt> 0,1,2` · single GPU: `tools/run_py.sh -m scripts.eval.run_lm_eval --checkpoint <ckpt> --config-section 3b` |
 | binding rider grid | `python -m kotodama.eval.riders {gen,run,aggregate}` (logprob battery against a server) |
