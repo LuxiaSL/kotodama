@@ -182,6 +182,45 @@ def _print_ledger(tag: str, name: str, agg: dict[str, Any]) -> None:
             print(f"[{tag}]   {label}: {fmt(agg[key])}")
 
 
+def score_eval_dir(model: ModelFn, eval_dir: Path | str, tag: str,
+                   device: str = "cpu",
+                   reserve_eos: str = "auto") -> dict[str, Any]:
+    """Every gate present under ``eval_dir`` for one model: ``{"ledger":
+    {file: {"aggregate", "rows"}}, "smoothing": {...} | None}``. Prints the
+    per-split summary lines. Raises FileNotFoundError if no eval set exists."""
+    ev = Path(eval_dir)
+    tm = resolve_token_map(ev, reserve_eos)
+    result: dict[str, Any] = {"ledger": {}, "smoothing": None}
+    found = False
+    for name in LEDGER_FILES:
+        path = ev / name
+        if not path.exists():
+            continue
+        found = True
+        rows = score_ledger(model, _read_jsonl(path), tm, device=device)
+        agg = aggregate_ledger(rows)
+        result["ledger"][name] = {"aggregate": agg, "rows": rows}
+        _print_ledger(tag, name.removeprefix("eval_ledger")
+                      .removeprefix("_").removesuffix(".jsonl") or "legacy",
+                      agg)
+
+    smo_path = ev / "eval_smoothing.jsonl"
+    if smo_path.exists():
+        found = True
+        rows = score_smoothing(model, _read_jsonl(smo_path), device=device)
+        agg = aggregate_smoothing(rows)
+        result["smoothing"] = {"aggregate": agg, "rows": rows}
+        if agg:
+            print(f"[{tag}] SMOOTHING SI_nca: {agg['si_mean']:.3f} "
+                  f"± {agg['si_se']:.3f} (n={agg['n']}; 0.5 = indifferent, "
+                  f"high = rides over the event)")
+
+    if not found:
+        raise FileNotFoundError(
+            f"no eval_ledger*.jsonl / eval_smoothing.jsonl under {ev}")
+    return result
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     ap = argparse.ArgumentParser(description="NCA in-domain gates")
@@ -219,37 +258,10 @@ def main() -> None:
                        attn_res_config=attn_res_config, device=device)
 
     ev = Path(args.eval_dir)
-    tm = resolve_token_map(ev, args.reserve_eos)
     result: dict[str, Any] = {"tag": args.tag,
                               "checkpoint": str(args.checkpoint),
-                              "ledger": {}, "smoothing": None}
-
-    found = False
-    for name in LEDGER_FILES:
-        path = ev / name
-        if not path.exists():
-            continue
-        found = True
-        rows = score_ledger(model, _read_jsonl(path), tm, device=device)
-        agg = aggregate_ledger(rows)
-        result["ledger"][name] = {"aggregate": agg, "rows": rows}
-        _print_ledger(args.tag, name.removeprefix("eval_ledger")
-                      .removeprefix("_").removesuffix(".jsonl") or "legacy",
-                      agg)
-
-    smo_path = ev / "eval_smoothing.jsonl"
-    if smo_path.exists():
-        found = True
-        rows = score_smoothing(model, _read_jsonl(smo_path), device=device)
-        agg = aggregate_smoothing(rows)
-        result["smoothing"] = {"aggregate": agg, "rows": rows}
-        print(f"[{args.tag}] SMOOTHING SI_nca: {agg['si_mean']:.3f} "
-              f"± {agg['si_se']:.3f} (n={agg['n']}; 0.5 = indifferent, "
-              f"high = rides over the event)")
-
-    if not found:
-        raise FileNotFoundError(
-            f"no eval_ledger*.jsonl / eval_smoothing.jsonl under {ev}")
+                              **score_eval_dir(model, ev, args.tag, device,
+                                               args.reserve_eos)}
 
     out = Path(args.out) if args.out else ev / f"gates_{args.tag}.json"
     out.write_text(json.dumps(result))
