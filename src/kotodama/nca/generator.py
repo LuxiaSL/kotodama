@@ -94,6 +94,11 @@ class NCAConfig:
     # Mixed complexity — if True, sample rule architecture per rule
     mixed_complexity: bool = True
 
+    # v3 alphabet (SPEC-1B-FORMATION-LADDER §5 R3): shift every token id +1 so
+    # id 0 is a reserved EOS episode separator, matching the EOS=0 doc-masking
+    # contract in kotodama.data.dataset. False = the v1/3B layout, unchanged.
+    reserve_eos: bool = False
+
     @property
     def vocab_size(self) -> int:
         """NCA token vocabulary size (per single-channel frame)."""
@@ -193,12 +198,17 @@ class NCARule(nn.Module):
         return self.output(x)
 
 
-def sample_rule_config(config: NCAConfig) -> dict:
+def sample_rule_config(config: NCAConfig, rng: random.Random | None = None) -> dict:
     """
     Sample a random rule architecture from the design space.
 
     Returns kwargs for NCARule plus dynamics parameters.
     When mixed_complexity is False, returns fixed config values.
+
+    ``rng``: optional dedicated stream (v3 writers pass one so architecture
+    sampling is reproducible independent of filter/global RNG consumption —
+    SPEC §5 R4). Default None = the module-global stream, byte-identical to
+    the v1/3B path.
     """
     if not config.mixed_complexity:
         return {
@@ -209,12 +219,13 @@ def sample_rule_config(config: NCAConfig) -> dict:
             "temperature": config.temperature,
         }
 
+    r = rng if rng is not None else random
     return {
-        "kernel_size": random.choice([3, 5]),
-        "hidden_dim": random.choice([16, 32, 48]),
-        "num_hidden_layers": random.choice([1, 2, 3]),
-        "identity_bias": random.uniform(0.5, 2.0),
-        "temperature": random.uniform(0.3, 1.0),
+        "kernel_size": r.choice([3, 5]),
+        "hidden_dim": r.choice([16, 32, 48]),
+        "num_hidden_layers": r.choice([1, 2, 3]),
+        "identity_bias": r.uniform(0.5, 2.0),
+        "temperature": r.uniform(0.3, 1.0),
     }
 
 
@@ -297,6 +308,7 @@ def tokenize_trajectory(
     trajectory: torch.Tensor,
     d_state: int,
     patch_size: int,
+    offset: int = 0,
 ) -> np.ndarray:
     """
     Convert multi-channel grid trajectories to token sequences.
@@ -307,6 +319,8 @@ def tokenize_trajectory(
 
     Args:
         trajectory: (B, T, G, H, W) integer cell states
+        offset: added to every token id (v3 passes 1 so id 0 stays free as
+            the reserved EOS separator; default 0 = the v1/3B layout)
 
     Returns:
         tokens: flat uint16 array
@@ -318,7 +332,7 @@ def tokenize_trajectory(
     npw = W // ps
     n_patches = nph * npw
 
-    START_TOKEN = d ** (ps * ps)
+    START_TOKEN = d ** (ps * ps) + offset
     END_TOKEN = START_TOKEN + 1
 
     traj_np = trajectory.cpu().numpy()
@@ -330,7 +344,7 @@ def tokenize_trajectory(
 
     # Patch-to-token: dot product with [d^0, d^1, ..., d^(ps*ps-1)]
     powers = d ** np.arange(ps * ps, dtype=np.int64)
-    patch_tokens = (patches.astype(np.int64) @ powers).astype(np.uint16)  # (B, T, G, n_patches)
+    patch_tokens = (patches.astype(np.int64) @ powers + offset).astype(np.uint16)  # (B, T, G, n_patches)
 
     # Build frames with START/END delimiters: (B, T, G, n_patches+2)
     tokens_per_frame = n_patches + 2
