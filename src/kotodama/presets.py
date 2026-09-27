@@ -27,6 +27,10 @@ SHAPES: dict[str, dict[str, Any]] = {
     # purely the 128K vocab.
     "7b": dict(hidden_size=4096, num_layers=32, num_attention_heads=32,
                num_kv_heads=8, head_dim=128, intermediate_size=14336, **_COMMON),
+    # The formation-ladder rung (D1, 2026-09-27): ~1.42B, benched 590K tok/s
+    # at mb8 on 8xB200 (14.1h per 30B-token arm). DD-3B boundaries verbatim.
+    "1b": dict(hidden_size=2048, num_layers=28, num_attention_heads=16,
+               num_kv_heads=8, head_dim=128, intermediate_size=5632, **_COMMON),
     # d1024 x 28 (~0.38B with tied embeddings) — the April "intermediate".
     "intermediate": dict(hidden_size=1024, num_layers=28, num_attention_heads=8,
                          num_kv_heads=4, head_dim=128, intermediate_size=2816, **_COMMON),
@@ -41,8 +45,10 @@ SHAPES: dict[str, dict[str, Any]] = {
 # Older names still found in configs and scripts.
 ALIASES: dict[str, str] = {"full": "3b", "model": "3b", "8b": "7b"}
 
-# The boundaries each shape was trained with, where there is a shipped model.
-DEFAULT_BOUNDARIES: dict[str, tuple[int, ...]] = {"3b": DD3B, "proxy": DDV1}
+# The boundaries each shape was trained with, where there is a shipped model
+# (the 1b ladder runs DD-3B verbatim by design — same 28-layer block geometry).
+DEFAULT_BOUNDARIES: dict[str, tuple[int, ...]] = {"3b": DD3B, "proxy": DDV1,
+                                                  "1b": DD3B}
 
 
 def resolve(name: str) -> str:
