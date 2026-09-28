@@ -240,34 +240,37 @@ class GeometricMonitor:
         self.model.eval()
 
         metrics: dict[str, float] = {}
-        # Track perturbation state for safe recovery: 0=original, 1=+ε, -1=-ε
-        perturbation_state = 0
+        # Exact snapshot (CPU, so 7B rank 0 does not need 2x weight memory). The old
+        # in-place +e / -2e / +e adds on bf16 weights did not restore exactly and
+        # left a residual on rank 0 only -> DDP ranks silently diverged (2026-09-28).
+        snapshot = [p.detach().to("cpu", copy=True) for p in params_with_grad]
+        inv_norm = 1.0 / grad_norm
+
+        def _set_perturbed(sign: float) -> float:
+            """Weights := original + sign*eps*g_hat (computed in fp32, one rounding).
+            Returns the norm of the displacement that actually landed."""
+            landed_sq = torch.zeros((), device=device, dtype=torch.float32)
+            for p, orig in zip(params_with_grad, snapshot):
+                o = orig.to(device, non_blocking=True).float()
+                new = (o + p.grad.float() * (sign * epsilon * inv_norm)).to(p.dtype)
+                landed_sq += (new.float() - o).pow(2).sum()
+                p.data.copy_(new)
+            return landed_sq.sqrt().item()
+
+        def _restore() -> None:
+            for p, orig in zip(params_with_grad, snapshot):
+                p.data.copy_(orig.to(device, non_blocking=True))
 
         try:
             with torch.no_grad():
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     L0 = self.model(batch, labels=batch)["loss"].float().item()
-
-                # Perturb +ε along gradient direction
-                for p in params_with_grad:
-                    p.data.add_(p.grad.float() / grad_norm, alpha=epsilon)
-                perturbation_state = 1
-
+                landed_plus = _set_perturbed(+1.0)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     L_plus = self.model(batch, labels=batch)["loss"].float().item()
-
-                # Perturb to -ε (subtract 2ε from current +ε position)
-                for p in params_with_grad:
-                    p.data.add_(p.grad.float() / grad_norm, alpha=-2.0 * epsilon)
-                perturbation_state = -1
-
+                _set_perturbed(-1.0)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     L_minus = self.model(batch, labels=batch)["loss"].float().item()
-
-                # Restore original weights
-                for p in params_with_grad:
-                    p.data.add_(p.grad.float() / grad_norm, alpha=epsilon)
-                perturbation_state = 0
 
             sharpness = (L_plus - 2.0 * L0 + L_minus) / (epsilon ** 2)
             metrics["eos/sharpness"] = sharpness
@@ -276,26 +279,26 @@ class GeometricMonitor:
             metrics["eos/L_minus"] = L_minus
             metrics["eos/grad_norm"] = grad_norm.item()
             metrics["eos/embed_grad_frac"] = embed_grad_frac
+            # < 1 means bf16 rounding swallowed part of the probe step: sharpness
+            # is then measured along a truncated direction (read it with that in mind).
+            metrics["eos/eps_landed_frac"] = landed_plus / epsilon
             metrics["eos/time_s"] = time.time() - t0
 
             logger.info(
-                "EoS [step %d]: sharpness=%.4f, L0=%.4f, embed_grad=%.1f%%, time=%.2fs",
-                step, sharpness, L0, embed_grad_frac * 100, time.time() - t0,
+                "EoS [step %d]: sharpness=%.4f, L0=%.4f, embed_grad=%.1f%%, landed=%.2f, time=%.2fs",
+                step, sharpness, L0, embed_grad_frac * 100, landed_plus / epsilon,
+                time.time() - t0,
             )
 
         except Exception as e:
             logger.warning("Sharpness computation failed: %s", e)
-            # Restore weights from current perturbation state
-            if perturbation_state != 0:
-                try:
-                    for p in params_with_grad:
-                        p.data.add_(
-                            p.grad.float() / grad_norm,
-                            alpha=-perturbation_state * epsilon,
-                        )
-                except Exception:
-                    logger.error("CRITICAL: failed to restore weights after sharpness error")
-                    pass
+        finally:
+            try:
+                with torch.no_grad():
+                    _restore()
+            except Exception:
+                logger.error("CRITICAL: failed to restore weights after sharpness probe")
+                raise
 
         if was_training:
             self.model.train()

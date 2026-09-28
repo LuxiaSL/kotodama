@@ -122,7 +122,7 @@ def newton_schulz_orthogonalize(
             "polar_express"). None defaults to "original".
 
     Optimizations from reference implementation (KellerJordan/Muon):
-    - BF16 computation for ~2x speedup on modern GPUs
+    - fp16 iterations (after fp32 normalization) for ~2x speedup
     - Tall-matrix transpose for faster convergence (NS converges
       faster when ncols >= nrows)
     """
@@ -130,16 +130,16 @@ def newton_schulz_orthogonalize(
 
     coeffs = _resolve_ns_coefficients(ns_coefficients, num_iterations)
     orig_dtype = M.dtype
-    X = M.half()
+    # Normalize in fp32 BEFORE the fp16 cast: momentum entries (~1e-7..1e-5) are
+    # fp16 subnormals, and up to ~12% flush to zero if cast first (2026-09-28).
+    X = M.float()
+    X = (X / X.norm().clamp_min(1e-30)).half()
 
     # Transpose tall matrices: NS converges faster when ncols >= nrows
     transposed = False
     if X.shape[0] > X.shape[1]:
         X = X.T
         transposed = True
-
-    # Normalize to unit Frobenius norm for numerical stability
-    X = X / (X.norm() + 1e-7)
 
     for a, b, c in coeffs:
         A = X @ X.T
@@ -165,17 +165,17 @@ def _batched_newton_schulz(
     """
     coeffs = _resolve_ns_coefficients(ns_coefficients, num_iterations)
     orig_dtype = M.dtype
-    X = M.half()
+    # Per-matrix normalization in fp32 before the fp16 cast (see
+    # newton_schulz_orthogonalize).
+    X = M.float()
+    norms = X.flatten(start_dim=-2).norm(dim=-1, keepdim=True).unsqueeze(-1)
+    X = (X / norms.clamp_min(1e-30)).half()
 
     # Transpose if tall
     transposed = False
     if X.shape[-2] > X.shape[-1]:
         X = X.transpose(-2, -1)
         transposed = True
-
-    # Normalize each matrix
-    norms = X.flatten(start_dim=-2).norm(dim=-1, keepdim=True).unsqueeze(-1)
-    X = X / (norms + 1e-7)
 
     for a, b, c in coeffs:
         A = X @ X.transpose(-2, -1)  # batched matmul

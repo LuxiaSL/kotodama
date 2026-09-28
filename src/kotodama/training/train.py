@@ -1130,14 +1130,16 @@ def train(args: argparse.Namespace) -> None:
                     wb.log_geo(step, eos_metrics)
                 hm_log(step, **{k: v for k, v in eos_metrics.items() if isinstance(v, (int, float))})
 
+        # LR for THIS step, set before the optimizer uses it: stepping the
+        # scheduler afterwards ran step 0 at the full base LR (an unwarmed step
+        # on random init) and every later step one multiplier behind.
+        scheduler.step(step)
+
         # Optimizer step
         muon_opt.step()
         adamw_opt.step()
         muon_opt.zero_grad(set_to_none=True)
         adamw_opt.zero_grad(set_to_none=True)
-
-        # Scheduler step
-        scheduler.step(step)
 
         # Track tokens (use current_grad_accum for accurate counting)
         current_tokens_per_step = current_grad_accum * tokens_per_global_micro
