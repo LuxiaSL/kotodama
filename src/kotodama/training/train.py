@@ -27,6 +27,7 @@ import logging
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -55,6 +56,10 @@ from kotodama.training.checkpoint import (
     AsyncCheckpointManager,
     CheckpointManager,
     SIGTERMHandler,
+    TokenThresholds,
+    parse_save_schedule,
+    parse_token_count,
+    save_weights_only,
 )
 from kotodama.training.muon import HybridScheduler, build_hybrid_optimizer
 
@@ -659,6 +664,7 @@ def train(args: argparse.Namespace) -> None:
             adamw_lr=args.adamw_lr,
             adamw_betas=(args.adamw_beta1, args.adamw_beta2),
             adamw_weight_decay=args.adamw_weight_decay,
+            adamw_no_decay_norms=getattr(args, "adamw_no_decay_norms", False),
         )
 
     # -- Compute training geometry ---------------------------------------------
@@ -808,6 +814,23 @@ def train(args: argparse.Namespace) -> None:
         # Restore scheduler position
         scheduler.step(start_step)
 
+    # -- Formation-ladder cadence: weights-only saves + protected full anchors --
+    weight_saves: Optional[TokenThresholds] = None
+    anchor_saves: Optional[TokenThresholds] = None
+    anchor_mgr: Optional[CheckpointManager] = None
+    if getattr(args, "save_schedule", None):
+        weight_saves = TokenThresholds(parse_save_schedule(args.save_schedule, total_tokens))
+        weight_saves.skip_through(tokens_consumed)
+        if is_main:
+            logger.info("Weights-only save schedule %r: %d thresholds -> %s/weights",
+                        args.save_schedule, len(weight_saves), args.checkpoint_dir)
+    if getattr(args, "anchor_tokens", None):
+        anchor_saves = TokenThresholds(
+            [parse_token_count(t) for t in args.anchor_tokens.split(",") if t.strip()])
+        anchor_saves.skip_through(tokens_consumed)
+        anchor_mgr = CheckpointManager(
+            checkpoint_dir=Path(args.checkpoint_dir) / "anchors", rank=rank, keep_last_n=0)
+
     # -- SIGTERM handler -------------------------------------------------------
     sigterm = SIGTERMHandler()
 
@@ -839,6 +862,10 @@ def train(args: argparse.Namespace) -> None:
 
         if not _restored_probe:
             probe_ids: list[torch.Tensor] = []
+            # The probe must not advance the training stream: rank 0 would skip
+            # ahead of the other ranks, and the saved (rank-0) data position
+            # would then shift every rank on resume.
+            _pre_probe_state = dataset.state_dict() if hasattr(dataset, "state_dict") else None
             probe_iter = _make_data_iter()
             probe_tokens_needed = min(
                 monitor_config.tier1_probe_size, 64
@@ -852,6 +879,10 @@ def train(args: argparse.Namespace) -> None:
                         probe_ids.append(sample)
                 except StopIteration:
                     break
+            del probe_iter
+            if _pre_probe_state is not None:
+                dataset.load_state_dict(_pre_probe_state)
+                data_iter = _make_data_iter()
             if probe_ids:
                 probe_batch = torch.cat(probe_ids, dim=0)[:probe_tokens_needed]
                 monitor.set_probe_batch(probe_batch)
@@ -1182,6 +1213,10 @@ def train(args: argparse.Namespace) -> None:
                        "perf/mfu": mfu},
                 )
 
+            _ng_every = getattr(args, "norm_gain_every", 0)
+            if _ng_every > 0 and (step % _ng_every == 0 or step == total_steps - 1):
+                hm_log(step, **_norm_gain_metrics(raw_model))
+
             # Reset accumulators
             log_loss_accum = 0.0
             log_z_loss_accum = 0.0
@@ -1251,6 +1286,19 @@ def train(args: argparse.Namespace) -> None:
                 tokens_consumed=tokens_consumed,
                 data_state=data_state,
                 extra=_extra or None,
+            )
+
+        if weight_saves is not None and weight_saves.due(tokens_consumed):
+            save_weights_only(Path(args.checkpoint_dir) / "weights", step, model,
+                              tokens_consumed, rank=rank)
+        if anchor_saves is not None and anchor_mgr is not None and anchor_saves.due(tokens_consumed):
+            _extra_anchor: dict[str, Any] = {}
+            if monitor is not None and monitor._probe_batch is not None:
+                _extra_anchor["probe_batch"] = monitor._probe_batch.cpu()
+            anchor_mgr.save(
+                step=step, model=model, muon_opt=muon_opt, adamw_opt=adamw_opt,
+                scheduler=scheduler, tokens_consumed=tokens_consumed,
+                data_state=_current_data_state(), extra=_extra_anchor or None,
             )
 
         # -- Eval on held-out data ---------------------------------------------
@@ -1401,6 +1449,29 @@ def _compute_grad_norm(params: Any) -> torch.Tensor:
     if not norms:
         return torch.tensor(0.0)
     return torch.stack(norms).square().sum().sqrt()
+
+
+_LAYER_RE = re.compile(r"layers\.(\d+)\.")
+
+
+def _norm_gain_metrics(model: torch.nn.Module) -> dict[str, float]:
+    """Mean/std of every RMSNorm/QK-norm gain, as heimdall layer families:
+    ``norm_gain/layer_{i}/{kind}`` (mean) and ``norm_gain_std/layer_{i}/{kind}``.
+    Non-layer norms land under ``norm_gain/{kind}``. One host sync."""
+    keys: list[str] = []
+    stats: list[torch.Tensor] = []
+    for name, p in model.named_parameters():
+        if p.ndim != 1 or not name.endswith("norm.weight"):
+            continue
+        kind = name.split(".")[-2]
+        m = _LAYER_RE.search(name)
+        where = f"layer_{m.group(1)}/{kind}" if m else ("final_norm" if kind == "norm" else kind)
+        g = p.detach().float()
+        keys += [f"norm_gain/{where}", f"norm_gain_std/{where}"]
+        stats += [g.mean(), g.std() if g.numel() > 1 else g.new_zeros(())]
+    if not stats:
+        return {}
+    return dict(zip(keys, torch.stack(stats).tolist()))
 
 
 def _per_layer_grad_norms(model: torch.nn.Module) -> dict[str, float]:
@@ -1639,6 +1710,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--adamw_beta1", type=float, default=0.9)
     p.add_argument("--adamw_beta2", type=float, default=0.95)
     p.add_argument("--adamw_weight_decay", type=float, default=0.1)
+    p.add_argument(
+        "--norm_gain_every", type=int, default=0,
+        help="Log RMSNorm/QK-norm gain mean/std per layer to heimdall every N "
+             "steps (checked on log steps; 0 = off).",
+    )
+    p.add_argument(
+        "--adamw_no_decay_norms", action="store_true",
+        help="Exclude RMSNorm/QK-norm gains from AdamW weight decay (second "
+             "param group, wd=0). Cannot resume a checkpoint made without it.",
+    )
 
     # Schedule
     p.add_argument("--warmup_steps", type=int, default=2000)
@@ -1678,6 +1759,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--keep_checkpoints", type=int, default=5)
+    p.add_argument(
+        "--save_schedule", type=str, default=None,
+        help="Weights-only saves on a piecewise token cadence, e.g. "
+             "'250M:4B,1B:10B,5B:end' -> <checkpoint_dir>/weights/ (never pruned).",
+    )
+    p.add_argument(
+        "--anchor_tokens", type=str, default=None,
+        help="Comma list of token counts (e.g. '10B') for protected FULL "
+             "checkpoints in <checkpoint_dir>/anchors/ (branch-cooldown fork points).",
+    )
     p.add_argument(
         "--async_checkpoint", action="store_true",
         help="Async checkpointing: CPU clone + background SHM write + zstd",

@@ -1,0 +1,68 @@
+# 1B formation ladder — arm A0: no NCA (random init), 30B language tokens.
+# The NCA-free control; every other arm reads against it (and A0' = seed 43
+# sets the noise floor the pre-registered thresholds are relative to).
+#
+# Launch (8 GPUs, one node, --max-retries 0; pass --global_batch_tokens on the
+# CLI too so heimdall derives the tokens axis):
+#   tools/run_train.sh --config configs/ladder-a0.yaml --global_batch_tokens 2097152 \
+#     --data_path <train.bin> --checkpoint_dir <ladder>/a0
+# Second seed (A0'): add --seed 43 and its own --checkpoint_dir + --checkpoint_shm_dir.
+#
+# Annealed read (mid-run branch): the anchor at 10B is a full checkpoint in
+# <checkpoint_dir>/anchors/. Branch = copy it into a fresh dir and resume with
+#   --checkpoint_dir <branch-dir> --checkpoint_shm_dir <unique> --total_tokens 12000000000
+#   --decay_start_pct 0.8333333 --save_schedule 2B:end --anchor_tokens ""
+# (2B-token cosine decay starting exactly at the 10B anchor step).
+
+extends: base/optim-muon.yaml
+
+model_size: 1b
+attn_res: true
+# DD-3B verbatim (presets.DEFAULT_BOUNDARIES["1b"]).
+attn_res_boundaries: "0,1,3,7,15,19,24"
+
+sequence_length: 4096
+micro_batch_size: 8
+global_batch_tokens: 2097152
+total_tokens: 30_000_000_000
+# ASSUMPTION: 500 steps (~1.05B tokens, 3.5% of the arm). The 3B's 2000-step
+# warmup was 4.2B tokens; scaling it by tokens would eat 14% of a 30B arm.
+warmup_steps: 500
+# Every arm ends annealed (ruling D12): the last 6B tokens decay — the 3B's
+# induction unlock took ~6B tokens of decay.
+decay_start_pct: 0.80
+decay_type: cosine
+
+doc_masking: true
+seed: 42
+
+# Runtime: the benched 1B stack (582-590K tok/s @ clock 1552), bf16 (D9).
+compile: true
+attn_impl: fa4
+use_liger: true
+fp8: false
+activation_checkpointing: false
+muon_distributed: true
+prefetch_batches: 2
+
+# Optimizer riders: norm gains excluded from weight decay (ruling D13).
+adamw_no_decay_norms: true
+
+# Checkpoints: weights-only on the spec cadence (26 points, never pruned),
+# one protected full anchor at the branch fork, rolling fulls for resume.
+save_schedule: "250M:4B,1B:10B,5B:end"
+anchor_tokens: "10B"
+save_every: 1000
+keep_checkpoints: 2
+async_checkpoint: true
+# MUST be unique per arm AND per branch: resume scans this dir for step_*.pt,
+# so a shared one would resume A1 (or a branch) from A0's leftover SHM copies.
+# A0' / branches override it on the CLI (e.g. /dev/shm/luxia-ladder-a0s43).
+checkpoint_shm_dir: /dev/shm/luxia-ladder-a0
+
+# Telemetry: geometric families + norm-gain families to heimdall.
+geo_monitor: true
+geo_monitor_schedule: "0:50,2000:100,8000:200"
+norm_gain_every: 50
+log_every: 10
+wandb: false

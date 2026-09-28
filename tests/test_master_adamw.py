@@ -132,6 +132,66 @@ def test_legacy_stock_state_loads_gracefully():
     _grad_steps(opt, [p_new], [torch.full((16,), 1e-3)], 5)  # keeps running
 
 
+def _tiny_attnres_model() -> LuxiaBaseModel:
+    torch.manual_seed(0)
+    return LuxiaBaseModel(LuxiaModelConfig(
+        hidden_size=64, num_layers=2, num_attention_heads=2, num_kv_heads=1,
+        head_dim=32, intermediate_size=128, vocab_size=256,
+        max_position_embeddings=128, attn_res=True, attn_res_boundaries=[0, 1],
+        attn_impl="sdpa",
+    )).to(torch.bfloat16)
+
+
+def test_no_decay_norms_splits_groups():
+    model = _tiny_attnres_model()
+    names = {id(p): n for n, p in model.named_parameters()}
+    _, adamw = build_hybrid_optimizer(model, adamw_no_decay_norms=True)
+    assert len(adamw.param_groups) == 2
+    decayed, free = adamw.param_groups
+    assert free["weight_decay"] == 0.0 and decayed["weight_decay"] == 0.1
+    free_names = {names[id(p)] for p in free["params"]}
+    assert free_names and all(n.endswith("norm.weight") for n in free_names)
+    decayed_names = {names[id(p)] for p in decayed["params"]}
+    assert not any(n.endswith("norm.weight") for n in decayed_names)
+    assert any("res_query" in n for n in decayed_names), "routing queries keep decay"
+    # default stays one group (existing lineages resume unchanged)
+    _, legacy = build_hybrid_optimizer(model)
+    assert len(legacy.param_groups) == 1
+
+
+def test_no_decay_group_does_not_shrink_under_zero_grad():
+    p_free = torch.ones(32, dtype=torch.bfloat16)
+    p_dec = torch.ones(32, dtype=torch.bfloat16)
+    opt = MasterAdamW([{"params": [p_dec]}, {"params": [p_free], "weight_decay": 0.0}],
+                      lr=LR, weight_decay=WD)
+    _grad_steps(opt, [p_dec, p_free], [torch.zeros(32), torch.zeros(32)], 200)
+    assert torch.equal(opt.state[p_free]["master"], torch.ones(32))
+    assert opt.state[p_dec]["master"].max() < 1.0  # decay really applies there
+
+
+def test_split_layout_refuses_one_group_checkpoint():
+    model = _tiny_attnres_model()
+    _, one = build_hybrid_optimizer(model)
+    _, two = build_hybrid_optimizer(model, adamw_no_decay_norms=True)
+    with pytest.raises(ValueError):
+        two.load_state_dict(one.state_dict())
+
+
+def test_norm_gain_metrics_family_keys():
+    from kotodama.training.train import _norm_gain_metrics
+
+    model = _tiny_attnres_model()
+    m = _norm_gain_metrics(model)
+    assert m["norm_gain/layer_0/q_norm"] == 1.0
+    assert m["norm_gain_std/layer_1/k_norm"] == 0.0
+    assert "norm_gain/final_norm" in m
+    assert {k.split("/")[-1] for k in m if "/layer_1/" in k} >= {
+        "attn_norm", "q_norm", "k_norm", "ffn_norm"}
+    with torch.no_grad():
+        model.layers[1].attn.q_norm.weight.mul_(1.5)
+    assert _norm_gain_metrics(model)["norm_gain/layer_1/q_norm"] == 1.5
+
+
 def test_layout_mismatch_refused():
     p = torch.ones(8, dtype=torch.bfloat16)
     opt = MasterAdamW([p], lr=LR)

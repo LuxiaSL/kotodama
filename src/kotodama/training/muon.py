@@ -423,6 +423,7 @@ def build_hybrid_optimizer(
     adamw_lr: float = 6e-4,
     adamw_betas: tuple[float, float] = (0.9, 0.95),
     adamw_weight_decay: float = 0.1,
+    adamw_no_decay_norms: bool = False,
 ) -> tuple[Muon, "MasterAdamW"]:
     """
     Build hybrid Muon + AdamW optimizer for a transformer model.
@@ -430,21 +431,30 @@ def build_hybrid_optimizer(
     Muon handles all 2D weight matrices (Q/K/V/O projections, FFN weights).
     AdamW handles everything else (embeddings, norms, LM head if untied).
 
+    ``adamw_no_decay_norms`` puts the RMSNorm/QK-norm gains in a second AdamW
+    group with weight_decay=0: a gain's neutral value is 1, so decay toward 0
+    dims channels (and softens attention via the QK gains) rather than
+    regularizing. Off by default — a two-group state dict cannot resume a
+    one-group checkpoint, and existing lineages must keep resuming.
+
     Returns separate optimizers that should both be stepped each training step.
     """
     muon_params = []
     adamw_params = []
+    norm_params = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if param.ndim == 2 and "embed" not in name and "lm_head" not in name:
             muon_params.append(param)
+        elif adamw_no_decay_norms and param.ndim == 1 and name.endswith("norm.weight"):
+            norm_params.append(param)
         else:
             adamw_params.append(param)
 
     muon_count = sum(p.numel() for p in muon_params)
-    adamw_count = sum(p.numel() for p in adamw_params)
+    adamw_count = sum(p.numel() for p in adamw_params) + sum(p.numel() for p in norm_params)
     total = muon_count + adamw_count
 
     # Only print on rank 0 (or when not distributed)
@@ -457,6 +467,8 @@ def build_hybrid_optimizer(
     if should_print:
         print(f"Muon params:  {muon_count:>12,} ({muon_count/total*100:.1f}%)")
         print(f"AdamW params: {adamw_count:>12,} ({adamw_count/total*100:.1f}%)")
+        if norm_params:
+            print(f"  of which no-decay norm gains: {len(norm_params)} tensors")
 
     muon_opt = Muon(
         muon_params,
@@ -469,8 +481,11 @@ def build_hybrid_optimizer(
         distributed=muon_distributed,
     )
 
+    adamw_groups: list[dict[str, Any]] = [{"params": adamw_params}]
+    if norm_params:
+        adamw_groups.append({"params": norm_params, "weight_decay": 0.0})
     adamw_opt = MasterAdamW(
-        adamw_params,
+        adamw_groups,
         lr=adamw_lr,
         betas=adamw_betas,
         weight_decay=adamw_weight_decay,

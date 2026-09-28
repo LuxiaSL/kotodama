@@ -33,6 +33,103 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
+_TOKEN_SUFFIX = {"K": 10**3, "M": 10**6, "B": 10**9, "T": 10**12}
+
+
+def parse_token_count(text: str) -> int:
+    """``"250M"`` -> 250_000_000; plain integers pass through."""
+    s = text.strip().upper()
+    if not s:
+        raise ValueError("empty token count")
+    mult = _TOKEN_SUFFIX.get(s[-1])
+    num = s[:-1] if mult else s
+    try:
+        value = float(num) * (mult or 1)
+    except ValueError as e:
+        raise ValueError(f"bad token count {text!r}") from e
+    if value <= 0:
+        raise ValueError(f"token count must be positive: {text!r}")
+    return int(round(value))
+
+
+def parse_save_schedule(spec: str, total_tokens: int) -> list[int]:
+    """Piecewise token cadence -> sorted save thresholds (tokens).
+
+    ``"250M:4B,1B:10B,5B:end"`` = every 250M up to 4B, every 1B up to 10B,
+    every 5B to the end of training. Each segment starts where the previous
+    stopped; ``end`` = ``total_tokens``. Bounds are included when they land
+    on the cadence.
+    """
+    thresholds: list[int] = []
+    start = 0
+    for seg in (s.strip() for s in spec.split(",") if s.strip()):
+        try:
+            every_s, until_s = seg.split(":")
+        except ValueError as e:
+            raise ValueError(f"save_schedule segment {seg!r} is not EVERY:UNTIL") from e
+        every = parse_token_count(every_s)
+        until = total_tokens if until_s.strip().lower() == "end" else parse_token_count(until_s)
+        if until <= start:
+            raise ValueError(f"save_schedule segment {seg!r} ends before it starts ({start})")
+        t = start + every
+        while t <= min(until, total_tokens):
+            thresholds.append(t)
+            t += every
+        start = until
+    return sorted(set(thresholds))
+
+
+class TokenThresholds:
+    """Fires once per crossed threshold set; resume-safe via ``skip_through``."""
+
+    def __init__(self, thresholds: list[int]) -> None:
+        self._t = sorted(thresholds)
+        self._i = 0
+
+    def skip_through(self, tokens: int) -> None:
+        while self._i < len(self._t) and self._t[self._i] <= tokens:
+            self._i += 1
+
+    def due(self, tokens: int) -> bool:
+        """True if ``tokens`` crossed >=1 pending threshold (all crossed ones consumed)."""
+        if self._i < len(self._t) and self._t[self._i] <= tokens:
+            self.skip_through(tokens)
+            return True
+        return False
+
+    def __len__(self) -> int:
+        return len(self._t)
+
+
+def save_weights_only(
+    directory: str | Path,
+    step: int,
+    model: torch.nn.Module,
+    tokens_consumed: int,
+    rank: int = 0,
+) -> Optional[Path]:
+    """Model-only checkpoint in the ``kotodama.ckpt`` format (``{"model", "step",
+    "tokens_consumed"}``) — the formation-ladder cadence save. Never pruned.
+    All ranks must call (barrier); rank 0 writes."""
+    path: Optional[Path] = None
+    if rank == 0:
+        d = Path(directory)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"step_{step:08d}.pt"
+        raw = model.module if hasattr(model, "module") else model
+        raw = getattr(raw, "_orig_mod", raw)
+        t0 = time.time()
+        tmp = path.with_suffix(".tmp")
+        torch.save({"model": raw.state_dict(), "step": step,
+                    "tokens_consumed": tokens_consumed}, tmp)
+        tmp.rename(path)
+        logger.info("Weights saved: %s (%.1fs, %.2fB tokens)",
+                    path, time.time() - t0, tokens_consumed / 1e9)
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.barrier()
+    return path
+
+
 class SIGTERMHandler:
     """
     Cooperative SIGTERM handler for Scheduler integration.
@@ -182,7 +279,9 @@ class CheckpointManager:
     # -- Helpers ---------------------------------------------------------------
 
     def _cleanup_old(self, keep: int = 5) -> None:
-        """Remove old checkpoints, keeping the most recent ``keep``."""
+        """Remove old checkpoints, keeping the most recent ``keep`` (<=0 keeps all)."""
+        if keep <= 0:
+            return
         checkpoints = sorted(self.checkpoint_dir.glob("step_*.pt"))
         if len(checkpoints) > keep:
             for old_ckpt in checkpoints[:-keep]:
