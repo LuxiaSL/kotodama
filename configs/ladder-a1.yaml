@@ -1,0 +1,14 @@
+# 1B formation ladder — arm A1, phase 2 of 2: language, from the A1 NCA base.
+# = the A0 recipe exactly (same data order, schedule, cadence, telemetry) plus
+# the 3B's NCA -> language transition: load the NCA final, reinitialize
+# embeddings only (NCA-trained attention/MLP circuits kept).
+#
+# Launch: tools/run_train.sh --config configs/ladder-a1.yaml \
+#   --global_batch_tokens 2097152 --data_path <train.bin> \
+#   --checkpoint_dir <ladder>/a1 --resume_nca <ladder>/a1-nca/step_XXXXXXXX.pt
+# (resume_nca only applies on a fresh checkpoint_dir; resumes ignore it.)
+# Second seed (A1'): BOTH phases re-run with --seed 18 (NCA) / 43 (language).
+
+extends: ladder-a0.yaml
+
+checkpoint_shm_dir: /dev/shm/luxia-ladder-a1
