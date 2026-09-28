@@ -36,7 +36,9 @@ doc_masking: false
 seed: 17
 
 compile: true
-attn_impl: fa4
+# auto (= FA2, else SDPA) as the 3B NCA phase ran it: fa4 + compile needs the
+# doc_masking varlen path, and this phase runs without doc_masking (F6).
+attn_impl: auto
 use_liger: true
 fp8: false
 activation_checkpointing: false
