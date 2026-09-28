@@ -665,6 +665,7 @@ def train(args: argparse.Namespace) -> None:
             adamw_betas=(args.adamw_beta1, args.adamw_beta2),
             adamw_weight_decay=args.adamw_weight_decay,
             adamw_no_decay_norms=getattr(args, "adamw_no_decay_norms", False),
+            muon_fp32_master=getattr(args, "muon_fp32_master", False),
         )
 
     # -- Compute training geometry ---------------------------------------------
@@ -1714,6 +1715,12 @@ def parse_args() -> argparse.Namespace:
         "--norm_gain_every", type=int, default=0,
         help="Log RMSNorm/QK-norm gain mean/std per layer to heimdall every N "
              "steps (checked on log steps; 0 = off).",
+    )
+    p.add_argument(
+        "--muon_fp32_master", action="store_true",
+        help="Muon keeps fp32 master weights + fp32 momentum (weight decay and updates "
+             "applied in fp32). Without it, bf16 Muon weight decay is a no-op. Cannot "
+             "resume a checkpoint made without it losslessly (masters rebuilt from params).",
     )
     p.add_argument(
         "--adamw_no_decay_norms", action="store_true",

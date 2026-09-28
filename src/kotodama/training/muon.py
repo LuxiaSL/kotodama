@@ -205,6 +205,13 @@ class Muon(Optimizer):
         ns_coefficients: Coefficient preset for NS iteration. Options:
             "original" (MoonshotAI fixed), "gram_ns" (Dao-AILab per-iteration),
             "polar_express" (Dao-AILab conservative). None defaults to "original".
+        fp32_master: keep an fp32 master copy + fp32 momentum per parameter and
+            apply weight decay and the update there; the (bf16) parameter is
+            refreshed from the master every step. Without it, on a bf16 model the
+            decay factor (1 - lr*wd ≈ 0.9998) rounds back to 1.0 for every element
+            (weight decay is a no-op) and late-training updates fall below the
+            bf16 spacing of the grown weights. Off = the legacy bf16 path, kept
+            bit-identical so existing lineages resume unchanged.
     """
 
     def __init__(
@@ -217,7 +224,9 @@ class Muon(Optimizer):
         ns_iterations: int = 5,
         ns_coefficients: Optional[str] = None,
         distributed: bool = False,
+        fp32_master: bool = False,
     ) -> None:
+        self._fp32_master = fp32_master
         defaults = dict(
             lr=lr,
             momentum=momentum,
@@ -243,9 +252,14 @@ class Muon(Optimizer):
         state["ns_coefficients"] = self._ns_coefficients
         return state
 
+    @torch.no_grad()
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        state_dict = dict(state_dict)
         ns_coeff = state_dict.pop("ns_coefficients", None)
-        super().load_state_dict(state_dict)
+        if self._fp32_master:
+            self._load_fp32_state(state_dict)
+        else:
+            super().load_state_dict(state_dict)
         if ns_coeff is not None:
             if self._ns_coefficients is not None and self._ns_coefficients != ns_coeff:
                 logger.warning(
@@ -254,6 +268,38 @@ class Muon(Optimizer):
                     ns_coeff, self._ns_coefficients,
                 )
             self._ns_coefficients = ns_coeff
+
+    def _load_fp32_state(self, state_dict: dict[str, Any]) -> None:
+        """Dtype-preserving load: torch's default casts float state to the param
+        dtype (bf16), which would silently re-break the master path on resume."""
+        groups, saved_groups = self.param_groups, state_dict["param_groups"]
+        if len(groups) != len(saved_groups) or any(
+            len(g["params"]) != len(sg["params"]) for g, sg in zip(groups, saved_groups)
+        ):
+            raise ValueError("loaded Muon state dict has a different parameter layout")
+        saved_state = state_dict["state"]
+        legacy = False
+        for group, saved_group in zip(groups, saved_groups):
+            for k, v in saved_group.items():
+                if k != "params":
+                    group[k] = v
+            for p, idx in zip(group["params"], saved_group["params"]):
+                s = saved_state.get(idx, saved_state.get(str(idx)))
+                if not s:
+                    continue
+                if "master" in s:
+                    master = s["master"].detach().to(device=p.device, dtype=torch.float32)
+                else:
+                    legacy = True
+                    master = p.detach().clone().to(torch.float32)
+                buf = s["momentum_buffer"].detach().to(device=p.device, dtype=torch.float32)
+                self.state[p] = {"momentum_buffer": buf, "master": master}
+                p.copy_(master.to(p.dtype))
+        if legacy:
+            logger.warning(
+                "Muon fp32_master: checkpoint had no fp32 masters (legacy bf16 state) — "
+                "masters initialized from the current params, momentum upcast."
+            )
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> torch.Tensor | None:
@@ -283,8 +329,14 @@ class Muon(Optimizer):
                 state = self.state[p]
 
                 if len(state) == 0:
-                    state["momentum_buffer"] = torch.zeros_like(grad)
+                    if self._fp32_master:
+                        state["momentum_buffer"] = torch.zeros_like(grad, dtype=torch.float32)
+                        state["master"] = p.detach().clone().to(torch.float32)
+                    else:
+                        state["momentum_buffer"] = torch.zeros_like(grad)
 
+                if self._fp32_master:
+                    grad = grad.float()
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(grad)
 
@@ -405,6 +457,13 @@ class Muon(Optimizer):
                         info["shard_dim"], start, info["local_size"]
                     ).contiguous()
 
+                if self._fp32_master:
+                    master = self.state[p]["master"]
+                    if weight_decay > 0:
+                        master.mul_(1 - lr * weight_decay)
+                    master.add_(orth.to(torch.float32), alpha=-lr * scales[i])
+                    p.copy_(master.to(p.dtype))
+                    continue
                 if weight_decay > 0:
                     p.mul_(1 - lr * weight_decay)
                 p.add_(orth, alpha=-lr * scales[i])
@@ -424,6 +483,7 @@ def build_hybrid_optimizer(
     adamw_betas: tuple[float, float] = (0.9, 0.95),
     adamw_weight_decay: float = 0.1,
     adamw_no_decay_norms: bool = False,
+    muon_fp32_master: bool = False,
 ) -> tuple[Muon, "MasterAdamW"]:
     """
     Build hybrid Muon + AdamW optimizer for a transformer model.
@@ -479,6 +539,7 @@ def build_hybrid_optimizer(
         ns_iterations=muon_ns_iterations,
         ns_coefficients=muon_ns_coefficients,
         distributed=muon_distributed,
+        fp32_master=muon_fp32_master,
     )
 
     adamw_groups: list[dict[str, Any]] = [{"params": adamw_params}]
