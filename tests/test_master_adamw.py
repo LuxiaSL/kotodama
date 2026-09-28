@@ -169,6 +169,23 @@ def test_no_decay_group_does_not_shrink_under_zero_grad():
     assert opt.state[p_dec]["master"].max() < 1.0  # decay really applies there
 
 
+def test_resume_on_real_model_parameters():
+    """Resume writes masters back into live nn.Parameters (requires_grad) —
+    the unit tensors above can't catch an autograd error there; the ladder
+    rehearsal's branch resume did (2026-09-27)."""
+    model = _tiny_attnres_model()
+    _, opt = build_hybrid_optimizer(model, adamw_no_decay_norms=True)
+    ids = torch.randint(0, 256, (2, 16))
+    model(ids, labels=ids)["loss"].backward()
+    opt.step()
+    sd = copy.deepcopy(opt.state_dict())
+    _, fresh = build_hybrid_optimizer(model, adamw_no_decay_norms=True)
+    fresh.load_state_dict(sd)
+    for p in model.parameters():
+        if p in fresh.state:
+            assert torch.equal(p, fresh.state[p]["master"].to(p.dtype))
+
+
 def test_split_layout_refuses_one_group_checkpoint():
     model = _tiny_attnres_model()
     _, one = build_hybrid_optimizer(model)

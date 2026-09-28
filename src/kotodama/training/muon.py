@@ -561,6 +561,7 @@ class MasterAdamW(Optimizer):
                 p.copy_(master.to(p.dtype))
         return loss
 
+    @torch.no_grad()
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Dtype-preserving load (masters/moments stay fp32; legacy upcasts)."""
         groups = self.param_groups
