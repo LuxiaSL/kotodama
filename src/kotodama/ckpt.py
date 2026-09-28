@@ -19,6 +19,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import shutil
@@ -136,7 +137,12 @@ def decompress_cached(path: str | Path) -> Path:
         return beside
     tmp_dir = Path(os.environ.get("TMPDIR") or tempfile.gettempdir()) / "kotodama_checkpoints"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    out = tmp_dir / beside.name
+    # Key on the SOURCE (absolute path + size + mtime), not the basename: every
+    # ladder arm ends in step_00014304.pt.zst, and a basename key silently served
+    # one run's weights for another's (2026-09-28).
+    st = path.stat()
+    key = hashlib.sha1(f"{path.resolve()}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()[:12]
+    out = tmp_dir / f"{key}_{beside.name}"
     if out.exists():
         return out
     # Process-unique partial + atomic rename: racing shards never read a half file.

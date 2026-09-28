@@ -99,3 +99,31 @@ def test_registry_resolution(tiny_ckpt, tmp_path, monkeypatch):
         ckpt.resolve("kotodama-3b-base-final")  # registered, absent under this data root
     with pytest.raises(FileNotFoundError):
         ckpt.resolve("no-such-name")
+
+
+def test_decompress_cached_does_not_collide_on_basename(tmp_path, monkeypatch):
+    """Two different checkpoints with the same filename must never share a cache
+    entry (every ladder arm ends in step_00014304.pt.zst)."""
+    import shutil
+    import subprocess
+
+    import pytest
+    import torch
+
+    from kotodama import ckpt
+
+    if shutil.which("zstd") is None:
+        pytest.skip("zstd not on PATH")
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    paths = []
+    for run, val in (("a0", 1.0), ("a1", 2.0)):
+        d = tmp_path / run
+        d.mkdir()
+        pt = d / "step_00000029.pt"
+        torch.save({"model": {"w": torch.full((4,), val)}}, pt)
+        subprocess.run(["zstd", "-q", "--rm", str(pt), "-o", str(pt) + ".zst"], check=True)
+        paths.append(d / "step_00000029.pt.zst")
+    out_a, out_b = ckpt.decompress_cached(paths[0]), ckpt.decompress_cached(paths[1])
+    assert out_a != out_b
+    assert torch.load(out_a)["model"]["w"][0].item() == 1.0
+    assert torch.load(out_b)["model"]["w"][0].item() == 2.0
