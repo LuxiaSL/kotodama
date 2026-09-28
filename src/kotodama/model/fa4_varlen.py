@@ -1,4 +1,10 @@
-"""FA4 (CuTeDSL SM100) varlen attention wrapped as a torch custom op.
+"""FA4 (CuTeDSL SM100) attention wrapped as torch custom ops.
+
+Two op pairs, one import guard:
+  - kotodama::fa4_varlen / fa4_varlen_bwd — packed (total, H, D) + cu_seqlens
+    (doc masking).
+  - kotodama::fa4_dense / fa4_dense_bwd — full-causal (B, S, H, D), no
+    cu_seqlens (the plain --attn_impl fa4 path).
 
 C1 candidate (SPEC-7B): flash_attn.cute kernels are Blackwell-native
 (tcgen05/TMA) but expose no torch.library registration — calling them raw
@@ -11,6 +17,16 @@ FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 so compiled kernels persist.
 
 Same math as FA2 varlen up to fp reassociation (Tier-C: gate with parity
 smoke + canary loss overlay before any production use).
+
+Return-arity: the installed flash_attn.cute (upstream 98024f9) returns
+(out, lse) from _flash_attn_fwd; upstream head returns a longer tuple. Both
+wrappers take res[0], res[1] (and bwd res[0..2]) so either works.
+
+LSE layout (read from _flash_attn_fwd's `lse_shape` at 98024f9):
+dense (B, H, S) fp32; varlen (H, total) fp32. Fakes mirror that, and every
+fake allocates with new_empty(shape) — real outputs are always freshly
+allocated contiguous tensors (the kernels contiguify q/k/v first), so an
+empty_like of a strided input would lie about strides.
 """
 
 from __future__ import annotations
@@ -40,7 +56,7 @@ def fa4_varlen_op(
     Returns (out, lse); lse is (nheads, total_tokens) fp32 — kept for the
     backward, discarded by the caller.
     """
-    out, lse = _flash_attn_fwd(
+    res = _flash_attn_fwd(
         q,
         k,
         v,
@@ -51,12 +67,12 @@ def fa4_varlen_op(
         causal=True,
         return_lse=True,
     )
-    return out, lse
+    return res[0], res[1]
 
 
 @fa4_varlen_op.register_fake
 def _(q, k, v, cu_seqlens, max_seqlen):
-    out = torch.empty_like(q)
+    out = q.new_empty((*q.shape[:-1], v.shape[-1]))
     lse = q.new_empty((q.shape[1], q.shape[0]), dtype=torch.float32)
     return out, lse
 
@@ -77,7 +93,7 @@ def fa4_varlen_bwd_op(
     undefined behavior (NaN grads, canary 2026-07-09). Same reason the
     AttnRes phase kernels register backward as separate triton_ops.
     """
-    dq, dk, dv = _flash_attn_bwd(
+    res = _flash_attn_bwd(
         q,
         k,
         v,
@@ -90,12 +106,16 @@ def fa4_varlen_bwd_op(
         max_seqlen_q=max_seqlen,
         max_seqlen_k=max_seqlen,
     )
-    return dq, dk, dv
+    return res[0], res[1], res[2]
+
+
+def _fake_grads(q, k, v):
+    return q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
 
 
 @fa4_varlen_bwd_op.register_fake
 def _(q, k, v, out, grad_out, lse, cu_seqlens, max_seqlen):
-    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    return _fake_grads(q, k, v)
 
 
 def _setup_context(ctx, inputs, output):
@@ -114,6 +134,72 @@ def _backward(ctx, grad_out, _grad_lse):
 
 
 fa4_varlen_op.register_autograd(_backward, setup_context=_setup_context)
+
+
+# ── dense (full-causal, no cu_seqlens) ────────────────────────────────────
+# Same kernel + args as flash_attn.cute.flash_attn_func(q, k, v, causal=True)
+# (default softmax_scale = 1/sqrt(head_dim), no window, no softcap, GQA via
+# k/v head count; pack_gqa auto). return_lse=True is required: inside a
+# custom op the inputs never require grad, so without it the kernel would
+# skip the LSE the backward needs. In training (inputs requiring grad) the
+# raw call allocated the LSE anyway, so this is the same kernel variant.
+
+
+@torch.library.custom_op("kotodama::fa4_dense", mutates_args=())
+def fa4_dense_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Causal attention, (B, S, nheads, head_dim) layout; k/v may have fewer
+    heads (GQA). Returns (out, lse); out is (B, S, nheads, head_dim_v), lse is
+    (B, nheads, S) fp32 — kept for the backward, discarded by the caller.
+    """
+    res = _flash_attn_fwd(q, k, v, causal=True, return_lse=True)
+    return res[0], res[1]
+
+
+@fa4_dense_op.register_fake
+def _(q, k, v):
+    bsz, seqlen, nheads, _ = q.shape
+    out = q.new_empty((bsz, seqlen, nheads, v.shape[-1]))
+    lse = q.new_empty((bsz, nheads, seqlen), dtype=torch.float32)
+    return out, lse
+
+
+@torch.library.custom_op("kotodama::fa4_dense_bwd", mutates_args=())
+def fa4_dense_bwd_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    grad_out: torch.Tensor,
+    lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Opaque backward — see fa4_varlen_bwd_op for why it must be its own op."""
+    res = _flash_attn_bwd(q, k, v, out, grad_out.contiguous(), lse, causal=True)
+    return res[0], res[1], res[2]
+
+
+@fa4_dense_bwd_op.register_fake
+def _(q, k, v, out, grad_out, lse):
+    return _fake_grads(q, k, v)
+
+
+def _dense_setup_context(ctx, inputs, output):
+    q, k, v = inputs
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse)
+
+
+def _dense_backward(ctx, grad_out, _grad_lse):
+    # LSE gradient dropped: callers discard lse (same as flash_attn_func with
+    # return_lse=False, which passes dlse=None).
+    q, k, v, out, lse = ctx.saved_tensors
+    return fa4_dense_bwd_op(q, k, v, out, grad_out, lse)
+
+
+fa4_dense_op.register_autograd(_dense_backward, setup_context=_dense_setup_context)
 
 
 def fa4_varlen_available() -> bool:

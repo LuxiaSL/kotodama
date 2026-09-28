@@ -14,7 +14,7 @@ Optional Liger kernel fusion (--use_liger):
 Optional attention backends (--attn_impl):
   - "sdpa": PyTorch F.scaled_dot_product_attention (default)
   - "fa2": Flash Attention 2 (flash_attn_func)
-  - "fa4": Flash Attention 4 CuTeDSL SM100 kernels (lazy import, incompatible with torch.compile)
+  - "fa4": Flash Attention 4 CuTeDSL SM100 kernels (lazy import; custom ops, compile-safe)
 """
 
 from __future__ import annotations
@@ -91,43 +91,27 @@ except ImportError:
     flex_attention = None  # type: ignore[assignment,misc]
 
 # ── Optional Flash Attention 4 (CuTeDSL SM100) ────────────────────────────
-# Lazy import: FA4 patches cute.compile globally on import.
-_FA4_AVAILABLE = False
-_fa4_func = None
-
-
-def _init_fa4() -> bool:
-    """Initialize FA4 on first use. Heavy import — not done at module level."""
-    global _FA4_AVAILABLE, _fa4_func
-    if _FA4_AVAILABLE:
-        return True
-    try:
-        from flash_attn.cute import flash_attn_func as _f
-
-        _fa4_func = _f
-        _FA4_AVAILABLE = True
-        return True
-    except ImportError:
-        return False
-
-
+# Lazy import: FA4 patches cute.compile globally on import. Both paths go
+# through the kotodama::fa4_* custom ops (fa4_varlen.py), which make the CuTe
+# kernels opaque to torch.compile.
+_fa4_dense_op = None
 _fa4_varlen_op = None
 
 
-def _init_fa4_varlen() -> bool:
-    """FA4 varlen custom op (compile-safe, doc masking). Lazy — see _init_fa4."""
-    global _fa4_varlen_op
-    if _fa4_varlen_op is not None:
+def _init_fa4() -> bool:
+    """Load the FA4 custom ops on first use. Heavy import — not done at module level."""
+    global _fa4_dense_op, _fa4_varlen_op
+    if _fa4_dense_op is not None:
         return True
     try:
-        from .fa4_varlen import fa4_varlen_available, fa4_varlen_op
-
-        if not fa4_varlen_available():
-            return False
-        _fa4_varlen_op = fa4_varlen_op
-        return True
+        from .fa4_varlen import fa4_dense_op, fa4_varlen_available, fa4_varlen_op
     except ImportError:
         return False
+    if not fa4_varlen_available():
+        return False
+    _fa4_dense_op = fa4_dense_op
+    _fa4_varlen_op = fa4_varlen_op
+    return True
 
 
 @dataclass
@@ -350,7 +334,6 @@ def _resolve_attn_impl(config: LuxiaModelConfig) -> str:
                 "attn_impl='fa4' requested but flash_attn.cute is not available. "
                 "Requires flash-attn with CuTeDSL SM100 support."
             )
-        _init_fa4_varlen()  # optional: enables the compile-safe varlen path
         return "fa4"
     if impl == "auto":
         # Don't auto-select FA4 (heavy import, JIT compile overhead)
@@ -564,7 +547,9 @@ class GQAttention(nn.Module):
         rope_sin: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """FA4 path: (B, S, nheads, D) layout, CuTeDSL SM100 kernels."""
+        """FA4 path: (B, S, nheads, D) layout, CuTeDSL SM100 kernels via the
+        kotodama::fa4_dense custom op (same kernel + args as the raw
+        flash_attn.cute.flash_attn_func(q, k, v, causal=True))."""
         bsz, seq_len, _ = x.shape
 
         q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)
@@ -590,8 +575,7 @@ class GQAttention(nn.Module):
         # FA4 doesn't participate in autocast — ensure bf16
         q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
 
-        # FA4 returns (out, lse) tuple — unpack
-        attn_output, _lse = _fa4_func(q, k, v, causal=True)
+        attn_output, _lse = _fa4_dense_op(q, k, v)
 
         attn_output = attn_output.contiguous().view(bsz, seq_len, -1)
         return self.o_proj(attn_output)

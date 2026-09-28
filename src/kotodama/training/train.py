@@ -569,16 +569,9 @@ def train(args: argparse.Namespace) -> None:
 
     # torch.compile for throughput (compile before DDP)
     if args.compile:
-        if args.attn_impl == "fa4" and not getattr(args, "doc_masking", False):
-            # With doc masking, attention runs through the kotodama::fa4_varlen
-            # custom op (opaque to dynamo — compile-safe). The full-causal
-            # path still calls raw CuTe kernels, which break tracing.
-            raise ValueError(
-                "--compile and --attn_impl fa4 are incompatible without --doc_masking. "
-                "The raw CuTeDSL full-causal path has no custom_op registration and "
-                "breaks torch.compile; the varlen doc-masking path is wrapped and safe. "
-                "Use --doc_masking, or --attn_impl fa2/sdpa, or drop --compile."
-            )
+        # --attn_impl fa4 is compile-safe with or without --doc_masking: both
+        # the dense and varlen paths run through kotodama::fa4_* custom ops
+        # (model/fa4_varlen.py), opaque to dynamo.
         compile_mode = getattr(args, "compile_mode", None)
         if getattr(args, "capture_scalar_outputs", False):
             # Lets dynamo trace through the Liger FLCE .item() call — the one
@@ -1899,7 +1892,7 @@ def parse_args() -> argparse.Namespace:
         "--attn_impl", type=str, default="auto",
         choices=["auto", "fa2", "fa4", "flex", "sdpa"],
         help="Attention backend. 'auto': FA2 if available, else SDPA. "
-             "'fa2': Flash Attention 2. 'fa4': CuTeDSL SM100 (lazy import, breaks compile). "
+             "'fa2': Flash Attention 2. 'fa4': CuTeDSL SM100 (lazy import; compile-safe custom ops). "
              "'flex': FlexAttention + BlockMask doc masking (Inductor-fused). "
              "'sdpa': PyTorch SDPA.",
     )
