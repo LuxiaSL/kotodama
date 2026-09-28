@@ -30,6 +30,7 @@ activates the venv, and sets the package path and compile caches.
 | pretrain (NCA → language, CPT) | `tools/run_train.sh --config configs/<run>.yaml [--flag value ...]` |
 | lm-eval anchors | `tools/launch_lmeval_sharded.sh <ckpt> 0,1,2` · single GPU: `tools/run_py.sh -m scripts.eval.run_lm_eval --checkpoint <ckpt> --config-section 3b` |
 | induction score | `tools/run_py.sh -m kotodama.eval.induction --checkpoint <ckpt> --config-section proxy --attn-res-boundaries ddv1 --tag <t>` (random-token repeat loss drop + per-head prefix matching on AttnRes models) |
+| telemetry (heimdall) | post per-checkpoint results: `python scripts/eval/hm_backfill.py --job <id> --gates <dir>` · read a family back as PNG + text gist: `python scripts/eval/hm_portrait.py --job <id> --x 'norm_gain/layer_{i}/q_norm' [--y 'geo/layer_{i}/attn_entropy_mean'] --out <png>` (comet with `--y`, heatmap without; repeat `--job` to compare runs) |
 | binding rider grid | `python -m kotodama.eval.riders {gen,run,aggregate}` (logprob battery against a server) |
 | checkpoints | `python -m kotodama.ckpt {info,strip,list}` — names from `configs/checkpoints.yaml` |
 | capture / readout | `kotodama.model.capture` (instrumented AttnRes forward, parity-tested) |
