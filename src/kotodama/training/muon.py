@@ -423,7 +423,7 @@ def build_hybrid_optimizer(
     adamw_lr: float = 6e-4,
     adamw_betas: tuple[float, float] = (0.9, 0.95),
     adamw_weight_decay: float = 0.1,
-) -> tuple[Muon, AdamW]:
+) -> tuple[Muon, "MasterAdamW"]:
     """
     Build hybrid Muon + AdamW optimizer for a transformer model.
 
@@ -469,7 +469,7 @@ def build_hybrid_optimizer(
         distributed=muon_distributed,
     )
 
-    adamw_opt = AdamW(
+    adamw_opt = MasterAdamW(
         adamw_params,
         lr=adamw_lr,
         betas=adamw_betas,
@@ -477,6 +477,118 @@ def build_hybrid_optimizer(
     )
 
     return muon_opt, adamw_opt
+
+
+class MasterAdamW(Optimizer):
+    """AdamW with fp32 master weights + fp32 moments for low-precision params.
+
+    THE BUG THIS EXISTS FOR (found 2026-09-27 by the 3B archaeology): under
+    pure-bf16 training, AdamW's ~6e-4 steps on RMSNorm/QK-norm gains sitting
+    at 1.0 round away entirely (bf16 spacing at 1.0 is 0.0039), so every norm
+    gain in the shipped 3B stayed BIT-FROZEN at its init for the whole run.
+    Here updates accumulate in an fp32 master; the (possibly bf16) module
+    param is refreshed from the master each step, so quantization can no
+    longer eat sub-spacing progress. The Muon side is unaffected by design:
+    its orthogonalized updates are orders of magnitude above bf16 spacing
+    (verified empirically — the 3B's matrices drifted on schedule).
+
+    Semantics match ``torch.optim.AdamW`` (decoupled weight decay, bias
+    correction) so fp32 trajectories are comparable; the master IS the
+    trajectory, the param is its low-precision view.
+
+    ``load_state_dict`` is custom: torch's default policy casts floating
+    state to the PARAM dtype on load, which would silently downcast the
+    masters to bf16 on every resume — reintroducing the bug through
+    checkpointing. Legacy states from stock AdamW load gracefully: masters
+    initialize from the current (quantized) params and moments upcast, with
+    a warning.
+    """
+
+    def __init__(self, params: Any, lr: float = 6e-4,
+                 betas: tuple[float, float] = (0.9, 0.95),
+                 eps: float = 1e-8, weight_decay: float = 0.1) -> None:
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure: Any = None) -> torch.Tensor | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["master"] = p.detach().clone().to(torch.float32)
+                    state["exp_avg"] = torch.zeros_like(state["master"])
+                    state["exp_avg_sq"] = torch.zeros_like(state["master"])
+                master = state["master"]
+                m, v = state["exp_avg"], state["exp_avg_sq"]
+                grad = p.grad.detach().to(torch.float32)
+                state["step"] += 1
+                t = state["step"]
+                if wd != 0:
+                    master.mul_(1.0 - lr * wd)
+                m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                bc1 = 1.0 - beta1 ** t
+                bc2 = 1.0 - beta2 ** t
+                denom = (v.sqrt() / (bc2 ** 0.5)).add_(eps)
+                master.addcdiv_(m, denom, value=-lr / bc1)
+                p.copy_(master.to(p.dtype))
+        return loss
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Dtype-preserving load (masters/moments stay fp32; legacy upcasts)."""
+        groups = self.param_groups
+        saved_groups = state_dict["param_groups"]
+        if len(groups) != len(saved_groups) or any(
+            len(g["params"]) != len(sg["params"])
+            for g, sg in zip(groups, saved_groups)
+        ):
+            raise ValueError("loaded state dict has a different parameter layout")
+        saved_state = state_dict["state"]
+        legacy = False
+        for group, saved_group in zip(groups, saved_groups):
+            for k, v in saved_group.items():
+                if k != "params":
+                    group[k] = v
+            for p, idx in zip(group["params"], saved_group["params"]):
+                s = saved_state.get(idx, saved_state.get(str(idx)))
+                if not s:
+                    continue
+                step = s.get("step", 0)
+                new: dict[str, Any] = {
+                    "step": int(step.item() if torch.is_tensor(step) else step)
+                }
+                if "master" in s:
+                    new["master"] = s["master"].detach().to(
+                        device=p.device, dtype=torch.float32)
+                else:  # stock-AdamW checkpoint
+                    legacy = True
+                    new["master"] = p.detach().clone().to(torch.float32)
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in s:
+                        new[key] = s[key].detach().to(
+                            device=p.device, dtype=torch.float32)
+                    else:
+                        new[key] = torch.zeros_like(new["master"])
+                self.state[p] = new
+                p.copy_(new["master"].to(p.dtype))
+        if legacy:
+            logger.warning(
+                "MasterAdamW: legacy optimizer state had no fp32 masters — "
+                "initialized them from the current (quantized) params; "
+                "sub-spacing progress before this resume is not recoverable."
+            )
 
 
 class HybridScheduler:

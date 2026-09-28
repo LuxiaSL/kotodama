@@ -630,8 +630,10 @@ def train(args: argparse.Namespace) -> None:
     raw_model = model.module if hasattr(model, "module") else model
 
     if args.adamw_only:
-        # Pure AdamW baseline (no Muon) — all params in one optimizer
-        from torch.optim import AdamW as TorchAdamW
+        # Pure AdamW baseline (no Muon) — all params in one optimizer.
+        # MasterAdamW keeps fp32 masters: stock AdamW on a bf16 model freezes
+        # every RMSNorm gain at 1.0 (the 3B norm-freeze bug, 2026-09-27).
+        from kotodama.training.muon import MasterAdamW as TorchAdamW
 
         all_params = [p for p in raw_model.parameters() if p.requires_grad]
         adamw_opt = TorchAdamW(
