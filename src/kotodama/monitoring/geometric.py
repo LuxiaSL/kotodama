@@ -512,9 +512,9 @@ class GeometricMonitor:
                     ]:
                         metrics[f"{prefix}/stable_rank_{name}"] = _stable_rank(param)
 
+                    metrics.update(self._mlp_unit_metrics(layer_idx, prefix))
                     if layer_idx in hidden_states:
                         h = hidden_states[layer_idx]
-                        metrics[f"{prefix}/dead_units"] = _dead_unit_fraction(h)
                         h_flat = h.reshape(-1, h.shape[-1])
                         metrics[f"{prefix}/anisotropy"] = _anisotropy(h_flat, max_samples=512)
 
@@ -660,10 +660,7 @@ class GeometricMonitor:
                 metrics[f"{prefix}/stable_rank_{name}"] = sr
 
             # Dead unit fraction (fraction of neurons with near-zero activation)
-            if layer_idx in hidden_states:
-                h = hidden_states[layer_idx]
-                dead_frac = _dead_unit_fraction(h)
-                metrics[f"{prefix}/dead_units"] = dead_frac
+            metrics.update(self._mlp_unit_metrics(layer_idx, prefix))
 
             # Anisotropy (average pairwise cosine similarity)
             if layer_idx in hidden_states:
@@ -780,11 +777,47 @@ class GeometricMonitor:
         if use_attn_res and input_ids.shape[0] > 16:
             input_ids = input_ids[:16]
 
+        # MLP neuron activity: the SwiGLU output feeding down_proj, reduced per
+        # neuron inside the hook (the residual stream has no "dead" dims to find).
+        self._mlp_mean_abs = {}
+        mlp_hooks: list[Any] = []
+
+        def _make_mlp_hook(layer_idx: int):
+            def hook(_module: nn.Module, args: tuple) -> None:
+                act = args[0].detach().float().abs()
+                self._mlp_mean_abs[layer_idx] = act.reshape(-1, act.shape[-1]).mean(dim=0)
+            return hook
+
+        for i in self.config.tier1_sample_layers:
+            ffn = getattr(self.model.layers[i], "ffn", None)
+            if ffn is not None and hasattr(ffn, "down_proj"):
+                mlp_hooks.append(ffn.down_proj.register_forward_pre_hook(_make_mlp_hook(i)))
+
+        try:
+            self._probe_forward_inner(input_ids, needed_layers, use_attn_res,
+                                      hidden_states, attn_weights)
+        finally:
+            for h in mlp_hooks:
+                h.remove()
+
+        if was_training:
+            self.model.train()
+
+        return hidden_states, attn_weights
+
+    def _probe_forward_inner(
+        self,
+        input_ids: torch.Tensor,
+        needed_layers: set[int],
+        use_attn_res: bool,
+        hidden_states: dict[int, torch.Tensor],
+        attn_weights: dict[int, torch.Tensor],
+    ) -> None:
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             if use_attn_res:
-                hidden_states, attn_weights = self._probe_forward_attn_res(
-                    input_ids, needed_layers
-                )
+                hs, aw = self._probe_forward_attn_res(input_ids, needed_layers)
+                hidden_states.update(hs)
+                attn_weights.update(aw)
             else:
                 x = self.model.embed_tokens(input_ids)
                 rope_cos = self.model.rope_cos
@@ -803,10 +836,17 @@ class GeometricMonitor:
                             if attn_w is not None:
                                 attn_weights[i] = attn_w
 
-        if was_training:
-            self.model.train()
-
-        return hidden_states, attn_weights
+    def _mlp_unit_metrics(self, layer_idx: int, prefix: str) -> dict[str, float]:
+        """dead_mlp_units: neurons with mean |act| < 1e-6 over the probe;
+        weak_mlp_units: below 1% of the layer's median neuron activity."""
+        m = getattr(self, "_mlp_mean_abs", {}).get(layer_idx)
+        if m is None:
+            return {}
+        med = m.median()
+        return {
+            f"{prefix}/dead_mlp_units": (m < 1e-6).float().mean().item(),
+            f"{prefix}/weak_mlp_units": (m < 0.01 * med).float().mean().item(),
+        }
 
     def _probe_forward_attn_res(
         self, input_ids: torch.Tensor, needed_layers: set[int]
@@ -966,20 +1006,6 @@ def _stable_rank(W: torch.Tensor) -> float:
         return (frob_sq / (spectral_sq + 1e-10)).item()
     except Exception:
         return 0.0
-
-
-def _dead_unit_fraction(
-    hidden: torch.Tensor, threshold: float = 1e-6
-) -> float:
-    """
-    Fraction of neurons with near-zero mean absolute activation.
-
-    hidden: [batch, seq_len, hidden_dim]
-    """
-    # Mean absolute activation per neuron across batch and sequence
-    mean_abs = hidden.float().abs().mean(dim=(0, 1))  # [hidden_dim]
-    dead = (mean_abs < threshold).float().mean()
-    return dead.item()
 
 
 def _anisotropy(H: torch.Tensor, max_samples: int = 512) -> float:
