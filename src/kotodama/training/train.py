@@ -23,6 +23,7 @@ FSDP sharding complications.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import math
 import os
@@ -1019,6 +1020,9 @@ def train(args: argparse.Namespace) -> None:
     _loss_accum = torch.zeros(1, device=device)
     _z_loss_accum = torch.zeros(1, device=device)
 
+    # Opt-in data-path diagnostic: token-ID hashes of each rank-0 micro-batch.
+    _debug_hash_steps = int(os.environ.get("KOTODAMA_DEBUG_BATCH_HASH", "0") or 0)
+
     for step in range(start_step, total_steps):
         # Start profiler at the configured step
         if _profiler is None and is_main and step == getattr(args, "profile_start_step", -1) and getattr(args, "profile", False):
@@ -1051,6 +1055,12 @@ def train(args: argparse.Namespace) -> None:
                 data_iter = _make_data_iter()
                 batch = next(data_iter)
             log_data_wait += time.perf_counter() - _t_data
+
+            if _debug_hash_steps and step < _debug_hash_steps and is_main:
+                _ids = batch["input_ids"] if isinstance(batch, dict) else batch
+                _h = hashlib.md5(_ids.cpu().numpy().tobytes()).hexdigest()[:12]
+                logger.info("batch-hash step=%d micro=%d shape=%s md5=%s",
+                            step, micro_step, tuple(_ids.shape), _h)
 
             # Unpack: doc_masking yields dict, legacy yields tensor
             if doc_masking:

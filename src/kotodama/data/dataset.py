@@ -149,6 +149,10 @@ def build_block_causal_mask(
     return mask.unsqueeze(1)  # (B, 1, S, S)
 
 
+# Decorrelates the loader shuffle from data-assembly shuffles that use the same seed.
+_LOADER_SALT = 0x6B6F746F
+
+
 class TokenizedDataset(IterableDataset):
     """
     Memory-mapped tokenized text dataset for language model pretraining.
@@ -268,7 +272,12 @@ class TokenizedDataset(IterableDataset):
 
     def _shuffled_indices(self, epoch: int) -> np.ndarray:
         """Return a deterministically shuffled array of sequence indices for this rank."""
-        rng = np.random.RandomState(self.seed + epoch)
+        # Salted: train.bin is assembled with RandomState(seed).permutation(N), and a
+        # single-rank loader shuffling arange(N) with the SAME seed reproduces that
+        # permutation exactly — reading the corpus back in its original, unshuffled
+        # source order (found 2026-09-28: 1-GPU runs memorized their stream).
+        rng = np.random.RandomState(
+            np.random.SeedSequence([self.seed, epoch, _LOADER_SALT]).generate_state(1)[0])
         indices = np.arange(self.start_seq, self.end_seq)
         rng.shuffle(indices)
         return indices
