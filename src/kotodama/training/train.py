@@ -1279,6 +1279,13 @@ def train(args: argparse.Namespace) -> None:
         )
 
         if should_save:
+            _spread = param_checksum_spread(raw_model)
+            if is_main:
+                hm_log(step, **{"dist/param_checksum_spread": _spread})
+                if _spread != 0.0:
+                    logger.error("RANK DESYNC at step %d: weight checksum spread %.6e "
+                                 "across DDP ranks (replicas must be bitwise identical)",
+                                 step, _spread)
             data_state = _current_data_state()
             _extra: dict[str, Any] = {}
             if monitor is not None and monitor._probe_batch is not None:
@@ -1455,6 +1462,24 @@ def _compute_grad_norm(params: Any) -> torch.Tensor:
     if not norms:
         return torch.tensor(0.0)
     return torch.stack(norms).square().sum().sqrt()
+
+
+def param_checksum_spread(model: torch.nn.Module) -> float:
+    """max - min over ranks of a float64 weight checksum. DDP replicas must be
+    bitwise identical, so anything but 0.0 is a silent rank desync (the old
+    sharpness probe caused one). 0.0 when not distributed. Collective: every
+    rank must call it."""
+    total = torch.zeros((), dtype=torch.float64)
+    for p in model.parameters():
+        total = total + p.detach().double().sum().cpu()
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() < 2:
+        return 0.0
+    dev = next(model.parameters()).device
+    hi = total.to(dev).clone()
+    lo = total.to(dev).clone()
+    dist.all_reduce(hi, op=dist.ReduceOp.MAX)
+    dist.all_reduce(lo, op=dist.ReduceOp.MIN)
+    return (hi - lo).item()
 
 
 _LAYER_RE = re.compile(r"layers\.(\d+)\.")
