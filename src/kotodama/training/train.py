@@ -379,6 +379,7 @@ def train(args: argparse.Namespace) -> None:
     model_kwargs["z_loss_weight"] = args.z_loss_weight
     model_kwargs["activation_checkpointing"] = args.activation_checkpointing
     model_kwargs["use_liger"] = getattr(args, "use_liger", False)
+    model_kwargs["rope_fp32"] = getattr(args, "rope_fp32", False)
     model_kwargs["attn_impl"] = getattr(args, "attn_impl", "auto")
     model_kwargs["attn_res"] = args.attn_res
     model_kwargs["attn_res_n_blocks"] = args.attn_res_n_blocks
@@ -1745,6 +1746,10 @@ def parse_args() -> argparse.Namespace:
         "--norm_gain_every", type=int, default=0,
         help="Log RMSNorm/QK-norm gain mean/std per layer to heimdall every N "
              "steps (checked on log steps; 0 = off).",
+    )
+    p.add_argument(
+        "--rope_fp32", action="store_true",
+        help="Keep RoPE tables fp32 through the bf16 cast and rotate in fp32.",
     )
     p.add_argument(
         "--muon_fp32_master", action="store_true",

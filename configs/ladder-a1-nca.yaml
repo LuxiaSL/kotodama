@@ -50,6 +50,8 @@ adamw_no_decay_norms: true
 # decay is a no-op and late/anneal updates round away (A0-old: 5.5% of q_proj frozen
 # through the anneal).
 muon_fp32_master: true
+# fp32 RoPE tables (audit A9; minor: ~10% less shift error).
+rope_fp32: true
 
 # Dense formation view of the NCA phase itself (13 points) + the final full.
 save_schedule: "250M:end"

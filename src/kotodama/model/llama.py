@@ -134,6 +134,10 @@ class LuxiaModelConfig:
     activation_checkpointing: bool = False
     # Liger fused kernels (RMSNorm, SwiGLU, CrossEntropy)
     use_liger: bool = False
+    # Keep RoPE cos/sin tables in fp32 through .to(bf16) and rotate in fp32 (one
+    # rounding back to the activation dtype). Off = the bf16 tables every model
+    # through the 3B trained with (23% of cos entries round to exactly 1.0).
+    rope_fp32: bool = False
     # Attention implementation: "auto" (FA2 if available, else SDPA), "fa2",
     # "fa4", "flex" (FlexAttention + BlockMask doc masking), "sdpa"
     attn_impl: str = "auto"
@@ -219,7 +223,7 @@ def apply_rope(
     else:
         cos = cos.unsqueeze(1)  # (B, 1, S, D)
         sin = sin.unsqueeze(1)
-    return x * cos + x_rotated * sin
+    return (x * cos + x_rotated * sin).to(x.dtype)
 
 
 def apply_rope_fa2(
@@ -240,7 +244,7 @@ def apply_rope_fa2(
     else:
         cos = cos.unsqueeze(2)  # (B, S, 1, D)
         sin = sin.unsqueeze(2)
-    return x * cos + x_rotated * sin
+    return (x * cos + x_rotated * sin).to(x.dtype)
 
 
 def _select_norm_class(config: LuxiaModelConfig) -> type:
@@ -514,7 +518,7 @@ class GQAttention(nn.Module):
             pos_sin = rope_sin[position_ids]
             q = apply_rope(q, pos_cos, pos_sin)
             k = apply_rope(k, pos_cos, pos_sin)
-        elif self._use_liger_rope:
+        elif self._use_liger_rope and rope_cos.dtype == q.dtype:
             pos_offset = past_kv[0].shape[2] if past_kv is not None else 0
             cos = rope_cos[pos_offset:pos_offset + seq_len].unsqueeze(0)
             sin = rope_sin[pos_offset:pos_offset + seq_len].unsqueeze(0)
@@ -902,6 +906,13 @@ class LuxiaBaseModel(nn.Module):
 
         # Initialize weights
         self._init_weights()
+
+    def _apply(self, fn, recurse: bool = True):  # type: ignore[override]
+        super()._apply(fn, recurse)
+        if getattr(self.config, "rope_fp32", False) and self.rope_cos.dtype != torch.float32:
+            self.rope_cos = self.rope_cos.float()
+            self.rope_sin = self.rope_sin.float()
+        return self
 
     def _init_weights(self) -> None:
         """Standard Llama initialization."""
