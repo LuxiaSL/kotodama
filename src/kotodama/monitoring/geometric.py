@@ -343,61 +343,8 @@ class GeometricMonitor:
             with torch.no_grad():
                 hidden_states, _ = self._probe_forward(batch)
 
-            use_attn_res = getattr(self.model.config, "attn_res", False)
-
-            for layer_idx in self.config.tier1_sample_layers:
-                if layer_idx not in hidden_states:
-                    continue
-
-                h_detached = hidden_states[layer_idx].detach()
-                layer = self.model.layers[layer_idx]
-                rope_cos = self.model.rope_cos
-                rope_sin = self.model.rope_sin
-
-                if use_attn_res:
-                    # AttnRes: compute separate σ for attn and MLP sub-layers
-                    # (they receive independently routed inputs in actual forward)
-                    for sublayer_name, sublayer_fn in [
-                        ("attn", lambda h: h + layer.attn(layer.attn_norm(h), rope_cos, rope_sin)),
-                        ("mlp", lambda h: h + layer.ffn(layer.ffn_norm(h))),
-                    ]:
-                        warm_key = f"jacobian_v_{layer_idx}_{sublayer_name}"
-                        sigma = self._power_iterate(
-                            h_detached, sublayer_fn, warm_key, device, n_iters
-                        )
-                        metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/{sublayer_name}"] = sigma
-                    # Composite: max of sub-layers as the layer's amplification bound
-                    s_attn = metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/attn"]
-                    s_mlp = metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/mlp"]
-                    metrics[f"eoc/jacobian_sigma/layer_{layer_idx}"] = max(s_attn, s_mlp)
-                else:
-                    warm_key = f"jacobian_v_{layer_idx}"
-                    sigma = self._power_iterate(
-                        h_detached,
-                        lambda h: layer(h, rope_cos, rope_sin),
-                        warm_key, device, n_iters,
-                    )
-                    metrics[f"eoc/jacobian_sigma/layer_{layer_idx}"] = sigma
-
-            if metrics:
-                # Layer 0 has anomalously high σ due to embedding-to-residual
-                # scale mismatch (see "Spike No More", Takase et al. COLM 2025).
-                # Report it separately; aggregate only interior layers.
-                layer0_key = "eoc/jacobian_sigma/layer_0"
-                if layer0_key in metrics:
-                    metrics["eoc/layer0_sigma"] = metrics[layer0_key]
-
-                interior_sigmas = [
-                    v for k, v in metrics.items()
-                    if k.startswith("eoc/jacobian_sigma/layer_")
-                    and k[-1].isdigit()
-                    and k != layer0_key
-                ]
-                if interior_sigmas:
-                    metrics["eoc/sigma_max"] = max(interior_sigmas)
-                    metrics["eoc/sigma_min"] = min(interior_sigmas)
-                    metrics["eoc/sigma_mean"] = sum(interior_sigmas) / len(interior_sigmas)
-
+            self._eoc_call_count += 1
+            metrics.update(self._eoc_metrics(hidden_states, device, n_iters))
             metrics["eoc/time_s"] = time.time() - t0
 
             logger.info(
@@ -417,6 +364,9 @@ class GeometricMonitor:
 
         return metrics
 
+    COLD_ITERS = 20      # iterations from a random vector (cold start AND re-randomize)
+    EOC_REL_TOL = 1e-3   # stop once σ changes by less than this (relative)
+
     def _power_iterate(
         self,
         h_detached: torch.Tensor,
@@ -424,28 +374,35 @@ class GeometricMonitor:
         warm_key: str,
         device: torch.device,
         n_iters: int,
-    ) -> float:
-        """Run power iteration for σ_max of the Jacobian of layer_fn at h_detached.
+    ) -> tuple[float, float]:
+        """Power iteration on the Jacobian J = ∂f/∂h of layer_fn at h_detached.
 
-        Re-randomizes the warm vector every 10 calls to prevent drift onto
-        subdominant eigenvalues. Uses extra iterations (20) when starting cold.
+        Iterates vector-Jacobian products only (v ← Jᵀv), so σ is the dominant
+        |eigenvalue| of J — the spectral RADIUS, the edge-of-chaos quantity — not
+        the spectral norm (that needs Jᵀ J, i.e. forward-mode AD, which the FA4
+        attention path does not support). Returns (σ, relative gain); the
+        relative gain σ·‖h‖/‖f(h)‖ is scale-free (log-log amplification), so layers
+        whose input sits at a very different scale (layer 0 reads the raw embedding)
+        compare with the rest — raw σ there is ~‖W‖/rms(embedding), not chaos.
+
+        Re-randomizes the warm vector every 10 calls to avoid drifting onto a
+        subdominant direction. A random start (cold OR re-randomized) gets
+        COLD_ITERS iterations: before 2026-09-29 re-randomized calls ran the warm
+        budget (5) from scratch, under-converged, and printed a sawtooth into
+        every σ series (a dip each 10th call, then a creep back up).
+        Iteration stops early once σ is stable to EOC_REL_TOL.
         """
         cold_start = warm_key not in self._warm_vectors
         rerandomize = (self._eoc_call_count % 10 == 0) and not cold_start
 
-        if cold_start or rerandomize:
+        v = None if (cold_start or rerandomize) else self._warm_vectors[warm_key].to(device)
+        if v is None or v.shape != h_detached.shape:
             v = torch.randn_like(h_detached)
-            if cold_start:
-                n_iters = max(n_iters, 20)
-        else:
-            v = self._warm_vectors[warm_key].to(device)
-            if v.shape != h_detached.shape:
-                v = torch.randn_like(h_detached)
-                n_iters = max(n_iters, 20)
+            n_iters = max(n_iters, self.COLD_ITERS)
         v = v / v.norm()
 
-        sigma = 0.0
-        for _ in range(n_iters):
+        sigma, prev = 0.0, None
+        for it in range(n_iters):
             h_input = h_detached.clone().requires_grad_(True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 layer_out = layer_fn(h_input)
@@ -456,9 +413,77 @@ class GeometricMonitor:
             if sigma < 1e-10:
                 break
             v = (Jt_v / sigma).detach()
+            if prev is not None and it >= 2 and abs(sigma - prev) <= self.EOC_REL_TOL * sigma:
+                break
+            prev = sigma
+
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            out_norm = layer_fn(h_detached).float().norm().item()
+        in_norm = h_detached.float().norm().item()
+        rel = sigma * in_norm / out_norm if out_norm > 0 else float("nan")
 
         self._warm_vectors[warm_key] = v.cpu()
-        return sigma
+        return sigma, rel
+
+    def _eoc_metrics(
+        self,
+        hidden_states: dict[int, torch.Tensor],
+        device: torch.device,
+        n_iters: int,
+        n_seq: Optional[int] = None,
+    ) -> dict[str, float]:
+        """Per-layer Jacobian σ (raw) + relative gain, and interior aggregates.
+
+        AttnRes: attn and MLP sub-layers are probed at their own routed inputs
+        (pre-attn from attn_norm, pre-MLP from ffn_norm).
+        """
+        metrics: dict[str, float] = {}
+        use_attn_res = getattr(self.model.config, "attn_res", False)
+        rope_cos, rope_sin = self.model.rope_cos, self.model.rope_sin
+        mlp_inputs = getattr(self, "_mlp_inputs", {})
+        cut = (lambda t: t[:n_seq]) if n_seq else (lambda t: t)
+
+        for layer_idx in self.config.tier1_sample_layers:
+            if layer_idx not in hidden_states:
+                continue
+            layer = self.model.layers[layer_idx]
+            h_attn = cut(hidden_states[layer_idx]).detach()
+            base = f"layer_{layer_idx}"
+            if use_attn_res:
+                h_mlp = cut(mlp_inputs.get(layer_idx, hidden_states[layer_idx])).detach()
+                for name, h, fn in [
+                    ("attn", h_attn, lambda h, _l=layer: h + _l.attn(_l.attn_norm(h), rope_cos, rope_sin)),
+                    ("mlp", h_mlp, lambda h, _l=layer: h + _l.ffn(_l.ffn_norm(h))),
+                ]:
+                    sigma, rel = self._power_iterate(h, fn, f"jacobian_v_{layer_idx}_{name}", device, n_iters)
+                    metrics[f"eoc/jacobian_sigma/{base}/{name}"] = sigma
+                    metrics[f"eoc/jacobian_gain/{base}/{name}"] = rel
+                metrics[f"eoc/jacobian_sigma/{base}"] = max(
+                    metrics[f"eoc/jacobian_sigma/{base}/attn"], metrics[f"eoc/jacobian_sigma/{base}/mlp"])
+                metrics[f"eoc/jacobian_gain/{base}"] = max(
+                    metrics[f"eoc/jacobian_gain/{base}/attn"], metrics[f"eoc/jacobian_gain/{base}/mlp"])
+            else:
+                sigma, rel = self._power_iterate(
+                    h_attn, lambda h, _l=layer: _l(h, rope_cos, rope_sin),
+                    f"jacobian_v_{layer_idx}", device, n_iters)
+                metrics[f"eoc/jacobian_sigma/{base}"] = sigma
+                metrics[f"eoc/jacobian_gain/{base}"] = rel
+
+        # Layer 0 raw σ is an embedding-scale artefact ("Spike No More", Takase et al.
+        # COLM 2025): report it apart and keep it out of the raw aggregates. The
+        # scale-free gain aggregates include every layer.
+        layer0_key = "eoc/jacobian_sigma/layer_0"
+        if layer0_key in metrics:
+            metrics["eoc/layer0_sigma"] = metrics[layer0_key]
+        for fam, agg, skip in [("eoc/jacobian_sigma/layer_", "eoc/sigma", layer0_key),
+                               ("eoc/jacobian_gain/layer_", "eoc/gain", None)]:
+            vals = [v for k, v in metrics.items()
+                    if k.startswith(fam) and k[-1].isdigit() and k != skip]
+            if vals:
+                metrics[f"{agg}_max"] = max(vals)
+                metrics[f"{agg}_min"] = min(vals)
+                metrics[f"{agg}_mean"] = sum(vals) / len(vals)
+        return metrics
 
     # =========================================================================
     # Unified monitoring: shared probe forward, all metrics
@@ -545,54 +570,7 @@ class GeometricMonitor:
 
             # == Phase 2: EoC Jacobian spectral radius (needs autograd) ==
             self._eoc_call_count += 1
-            use_attn_res = getattr(self.model.config, "attn_res", False)
-
-            for layer_idx in self.config.tier1_sample_layers:
-                if layer_idx not in hidden_states:
-                    continue
-
-                h_detached = hidden_states[layer_idx][:4].detach()
-                layer = self.model.layers[layer_idx]
-                rope_cos = self.model.rope_cos
-                rope_sin = self.model.rope_sin
-
-                if use_attn_res:
-                    for sublayer_name, sublayer_fn in [
-                        ("attn", lambda h, _l=layer: h + _l.attn(_l.attn_norm(h), rope_cos, rope_sin)),
-                        ("mlp", lambda h, _l=layer: h + _l.ffn(_l.ffn_norm(h))),
-                    ]:
-                        warm_key = f"jacobian_v_{layer_idx}_{sublayer_name}"
-                        sigma = self._power_iterate(
-                            h_detached, sublayer_fn, warm_key, device, n_eoc_iters,
-                        )
-                        metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/{sublayer_name}"] = sigma
-                    s_attn = metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/attn"]
-                    s_mlp = metrics[f"eoc/jacobian_sigma/layer_{layer_idx}/mlp"]
-                    metrics[f"eoc/jacobian_sigma/layer_{layer_idx}"] = max(s_attn, s_mlp)
-                else:
-                    warm_key = f"jacobian_v_{layer_idx}"
-                    sigma = self._power_iterate(
-                        h_detached,
-                        lambda h, _l=layer: _l(h, rope_cos, rope_sin),
-                        warm_key, device, n_eoc_iters,
-                    )
-                    metrics[f"eoc/jacobian_sigma/layer_{layer_idx}"] = sigma
-
-            # EoC aggregates
-            layer0_key = "eoc/jacobian_sigma/layer_0"
-            if layer0_key in metrics:
-                metrics["eoc/layer0_sigma"] = metrics[layer0_key]
-
-            interior_sigmas = [
-                v for k, v in metrics.items()
-                if k.startswith("eoc/jacobian_sigma/layer_")
-                and k[-1].isdigit()
-                and k != layer0_key
-            ]
-            if interior_sigmas:
-                metrics["eoc/sigma_max"] = max(interior_sigmas)
-                metrics["eoc/sigma_min"] = min(interior_sigmas)
-                metrics["eoc/sigma_mean"] = sum(interior_sigmas) / len(interior_sigmas)
+            metrics.update(self._eoc_metrics(hidden_states, device, n_eoc_iters, n_seq=4))
 
         except Exception as e:
             logger.warning("compute_all failed: %s", e, exc_info=True)
@@ -783,6 +761,7 @@ class GeometricMonitor:
         # MLP neuron activity: the SwiGLU output feeding down_proj, reduced per
         # neuron inside the hook (the residual stream has no "dead" dims to find).
         self._mlp_mean_abs = {}
+        self._mlp_inputs: dict[int, torch.Tensor] = {}  # AttnRes pre-MLP routed inputs
         mlp_hooks: list[Any] = []
 
         def _make_mlp_hook(layer_idx: int):
@@ -884,6 +863,14 @@ class GeometricMonitor:
         def _final_norm_hook(_module: nn.Module, args: tuple) -> None:
             hidden_states[last_layer_idx] = args[0].detach()
 
+        # The MLP sub-layer reads its OWN routed input (pre-MLP AttnRes), not the
+        # pre-attn one; EoC must probe its Jacobian there (2026-09-29: probing the MLP at
+        # the pre-attn input put layer 0's MLP on the raw embedding it never sees).
+        def _make_ffn_norm_hook(layer_idx: int):
+            def hook(_module: nn.Module, args: tuple) -> None:
+                self._mlp_inputs[layer_idx] = args[0].detach()
+            return hook
+
         for i in needed_layers:
             if i < len(model.layers):
                 hooks.append(
@@ -891,6 +878,12 @@ class GeometricMonitor:
                         _make_norm_hook(i)
                     )
                 )
+                if i in self.config.tier1_sample_layers:
+                    hooks.append(
+                        model.layers[i].ffn_norm.register_forward_pre_hook(
+                            _make_ffn_norm_hook(i)
+                        )
+                    )
         hooks.append(model.norm.register_forward_pre_hook(_final_norm_hook))
 
         try:
