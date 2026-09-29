@@ -59,6 +59,7 @@ def load_model(
     config_section: str = "proxy",
     attn_res_config: dict[str, Any] | None = None,
     device: str = "cuda:0",
+    meta: dict[str, Any] | None = None,
 ) -> LuxiaBaseModel:
     """Load a model from a checkpoint file.
 
@@ -79,6 +80,8 @@ def load_model(
         attn_res_config: Explicit AttnRes kwargs (attn_res, attn_res_n_blocks,
             attn_res_boundaries). Preferred over auto-detection.
         device: Target device for the model.
+        meta: If given, filled with the checkpoint's bookkeeping (``step``,
+            ``tokens_consumed``; None when the file does not carry them).
 
     Returns:
         Model in eval mode on the specified device.
@@ -94,6 +97,10 @@ def load_model(
     # Load checkpoint state dict
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cleaned = ckpt.model_state(state)
+    if meta is not None:
+        wrapped = isinstance(state, dict) and "model" in state
+        meta["step"] = state.get("step") if wrapped else None
+        meta["tokens_consumed"] = state.get("tokens_consumed") if wrapped else None
 
     # Configure AttnRes
     if attn_res_config is not None:

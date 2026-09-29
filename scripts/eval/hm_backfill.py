@@ -19,6 +19,9 @@ Two targets:
 
 Inputs (repeatable, mixable):
 - ``--gates summary.json``   nca_gates_sweep output (rows carry step+tokens).
+- ``--uncheatable r.json``   kotodama.eval.uncheatable output (one per
+                             checkpoint) -> ``uncheatable/{domain}`` +
+                             ``uncheatable/mean`` (BPB) at the ckpt's step.
 - ``--points rows.jsonl``    escape hatch: {"step": N, "tokens": N?,
                              "metrics": {...}} per line — any sweep adapts.
 - ``--config k=v``           run hyperparameters (arm, shape, seed) for the
@@ -71,6 +74,29 @@ def gates_rows_to_points(summary: dict[str, Any],
         if metrics:
             points.append({"step": step, "metrics": metrics})
     return points
+
+
+def uncheatable_to_points(result: dict[str, Any], prefix: str = "uncheatable",
+                          step: int | None = None) -> list[dict[str, Any]]:
+    """kotodama.eval.uncheatable result JSON -> one metric point.
+
+    ``<prefix>/<domain>`` = that domain's BPB, ``<prefix>/mean`` = the mean
+    over domains; the result's ``tokens`` becomes ``tokens_seen``. ``step``
+    overrides the result's own step (which comes from the checkpoint).
+    """
+    if not str(result.get("schema", "")).startswith("kotodama.uncheatable/"):
+        raise ValueError("not a kotodama.eval.uncheatable result "
+                         f"(schema={result.get('schema')!r})")
+    step = result.get("step") if step is None else step
+    if step is None:
+        raise ValueError(f"{result.get('checkpoint')}: result has no step; "
+                         "pass --uncheatable-step or rerun with --step")
+    metrics = {f"{prefix}/{name}": float(d["bpb"])
+               for name, d in result["domains"].items()}
+    metrics[f"{prefix}/mean"] = float(result["mean_bpb"])
+    if result.get("tokens") is not None:
+        metrics["tokens_seen"] = float(result["tokens"])
+    return [{"step": int(step), "metrics": metrics}]
 
 
 def jsonl_to_points(path: Path) -> list[dict[str, Any]]:
@@ -151,6 +177,11 @@ def main() -> None:
                     help="jsonl of {step, tokens?, metrics} rows (repeatable)")
     ap.add_argument("--prefix", default="gates",
                     help="metric prefix for --gates rows")
+    ap.add_argument("--uncheatable", action="append", default=[],
+                    help="kotodama.eval.uncheatable result JSON, one per "
+                         "checkpoint (repeatable) -> uncheatable/{domain,mean}")
+    ap.add_argument("--uncheatable-step", type=int, default=None,
+                    help="step for a single --uncheatable result that has none")
     ap.add_argument("--config", action="append", default=[],
                     help="k=v run hyperparameter (repeatable)")
     ap.add_argument("--url", default=os.environ.get(
@@ -166,9 +197,15 @@ def main() -> None:
                                           prefix=args.prefix))
     for p in args.points:
         lists.append(jsonl_to_points(Path(p)))
+    if args.uncheatable_step is not None and len(args.uncheatable) != 1:
+        raise SystemExit("--uncheatable-step applies to exactly one --uncheatable")
+    for u in args.uncheatable:
+        lists.append(uncheatable_to_points(json.loads(Path(u).read_text()),
+                                           step=args.uncheatable_step))
     points = merge_points(*lists)
     if not points:
-        raise SystemExit("nothing to post (no --gates / --points rows)")
+        raise SystemExit("nothing to post (no --gates / --points / "
+                         "--uncheatable rows)")
     config = parse_config_args(args.config)
 
     if args.dry_run:
