@@ -283,6 +283,51 @@ class TokenizedDataset(IterableDataset):
         return indices
 
 
+class MixedTokenDataset(IterableDataset):
+    """Interleave a secondary stream into a primary one at an exact token fraction.
+
+    Token-debt rule: before each sequence, emit from ``secondary`` iff its share so
+    far is below ``fraction`` — deterministic, exact to one sequence, no rebuilt bins.
+    Both streams must share seq_len and EOS (all sequences are full length, so the
+    fraction by sequences IS the fraction by tokens). Each stream keeps its own
+    rank partition and shuffle; ``state_dict`` covers both positions + the counters.
+    """
+
+    def __init__(self, primary: TokenizedDataset, secondary: TokenizedDataset,
+                 fraction: float) -> None:
+        super().__init__()
+        if not 0.0 < fraction < 1.0:
+            raise ValueError(f"mix fraction must be in (0, 1), got {fraction}")
+        if primary.seq_len != secondary.seq_len:
+            raise ValueError("primary and secondary streams must share seq_len")
+        self.primary, self.secondary, self.fraction = primary, secondary, fraction
+        self.seq_len = primary.seq_len
+        self._n_total = 0
+        self._n_secondary = 0
+
+    def state_dict(self) -> dict:
+        return {"primary": self.primary.state_dict(), "secondary": self.secondary.state_dict(),
+                "n_total": self._n_total, "n_secondary": self._n_secondary}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.primary.load_state_dict(state["primary"])
+        self.secondary.load_state_dict(state["secondary"])
+        self._n_total = int(state["n_total"])
+        self._n_secondary = int(state["n_secondary"])
+
+    def __iter__(self) -> Iterator[torch.Tensor | PackedSample]:
+        it_p, it_s = iter(self.primary), iter(self.secondary)
+        while True:
+            use_secondary = self._n_secondary < self.fraction * (self._n_total + 1)
+            sample = next(it_s) if use_secondary else next(it_p)
+            self._n_total += 1
+            self._n_secondary += int(use_secondary)
+            yield sample
+
+    def __len__(self) -> int:
+        return len(self.primary) + len(self.secondary)
+
+
 class RandomTokenDataset(IterableDataset):
     """
     Generates random token sequences for testing/smoke tests.

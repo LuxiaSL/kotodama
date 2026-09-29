@@ -1,0 +1,16 @@
+# 1B formation ladder — arm A2, phase 1 of 2: NCA-v1 at the SHORT dose (~150M
+# tokens, the literature's synthetic pre-pretraining optimum) — tests dose as the
+# cause of the 3B's anti-copy prior / void. Everything else = ladder-a1-nca.yaml.
+# Phase 2 = configs/ladder-a2.yaml (resume_nca = this run's final checkpoint).
+#
+# Launch: tools/run_train.sh --config configs/ladder-a2-nca.yaml \
+#   --global_batch_tokens 2097152 --data_path <nca_3b_seed17_train.bin> \
+#   --checkpoint_dir <ladder>/a2-nca
+
+extends: ladder-a1-nca.yaml
+
+total_tokens: 150_000_000
+# Same warmup FRACTION of the dose as the 3B / A1 NCA phases (1/6): 71 steps -> 12.
+warmup_steps: 12
+save_schedule: "25M:end"
+checkpoint_shm_dir: /dev/shm/luxia-ladder-a2-nca

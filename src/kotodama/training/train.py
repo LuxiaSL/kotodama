@@ -48,7 +48,12 @@ warnings.filterwarnings("ignore", message="Online softmax", module=r"torch\._ind
 # Project imports — launch from the luxia-base/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from kotodama.data.dataset import RandomTokenDataset, TokenizedDataset, collate_packed
+from kotodama.data.dataset import (
+    MixedTokenDataset,
+    RandomTokenDataset,
+    TokenizedDataset,
+    collate_packed,
+)
 from kotodama import presets
 from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
 from kotodama.monitoring.geometric import GeometricMonitor, MonitorConfig, MonitorSchedule
@@ -731,6 +736,17 @@ def train(args: argparse.Namespace) -> None:
             seed=args.seed,
             doc_masking=doc_masking,
         )
+        mix_fraction = float(getattr(args, "mix_fraction", 0.0) or 0.0)
+        if getattr(args, "mix_data_path", None) and mix_fraction > 0.0:
+            dataset = MixedTokenDataset(
+                dataset,
+                TokenizedDataset(path=args.mix_data_path, seq_len=seq_len, rank=dp_rank,
+                                 world_size=dp_size, seed=args.seed, doc_masking=doc_masking),
+                mix_fraction,
+            )
+            if is_main:
+                logger.info("Mixing %s at %.2f%% of tokens (token-debt interleave)",
+                            args.mix_data_path, 100 * mix_fraction)
 
     def _make_data_iter():
         collate_fn = collate_packed if doc_masking else None
@@ -1770,6 +1786,10 @@ def parse_args() -> argparse.Namespace:
 
     # Data
     p.add_argument("--data_path", type=str, default="")
+    p.add_argument("--mix_data_path", type=str, default=None,
+                   help="Secondary token bin interleaved into --data_path (e.g. ladder A4 dyadic).")
+    p.add_argument("--mix_fraction", type=float, default=0.0,
+                   help="Exact token fraction of --mix_data_path (token-debt interleave).")
     p.add_argument(
         "--random_data",
         action="store_true",

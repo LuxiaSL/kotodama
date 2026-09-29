@@ -7,6 +7,8 @@
 #   tools/run_train.sh --config configs/ladder-a0.yaml --global_batch_tokens 2097152 \
 #     --data_path <train.bin> --checkpoint_dir <ladder>/a0
 # Second seed (A0'): add --seed 43 and its own --checkpoint_dir + --checkpoint_shm_dir.
+# Seed floor across nodes: run A0' on a DIFFERENT node than A0 (so 'noise' includes node
+# variation) after scripts/utils/node_parity.py reports PARITY OK.
 #
 # Annealed read (mid-run branch): the anchor at 10B is a full checkpoint in
 # <checkpoint_dir>/anchors/. Branch = copy it into a fresh dir and resume with

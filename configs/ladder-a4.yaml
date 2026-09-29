@@ -1,0 +1,14 @@
+# 1B formation ladder — arm A4: A0 recipe + 3% dyadic-v3 synthetic interleaved into
+# the language stream (token-debt mix, ruling 2026-09-28). Matched on LANGUAGE tokens
+# (ruling D2 principle): 30B language + ~0.93B dyadic = 30.93B total.
+#
+# Launch: tools/run_train.sh --config configs/ladder-a4.yaml --global_batch_tokens 2097152 \
+#   --data_path <train.bin> --mix_data_path <dyadic-only v3 bin> --checkpoint_dir <ladder>/a4
+# Dyadic bin: gen_dyadic_data with P0.5's flags but --orig-frac 0 and a fresh seed
+# (see the lab handover for the exact generation command).
+
+extends: ladder-a0.yaml
+
+mix_fraction: 0.03
+total_tokens: 30_927_835_052
+checkpoint_shm_dir: /dev/shm/luxia-ladder-a4
