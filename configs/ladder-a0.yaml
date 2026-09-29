@@ -47,6 +47,10 @@ prefetch_batches: 2
 
 # Optimizer riders: norm gains excluded from weight decay (ruling D13).
 adamw_no_decay_norms: true
+# fp32 Muon masters + momentum (2026-09-28 audit): without them bf16 Muon weight
+# decay is a no-op and late/anneal updates round away (A0-old: 5.5% of q_proj frozen
+# through the anneal).
+muon_fp32_master: true
 
 # Checkpoints: weights-only on the spec cadence (26 points, never pruned),
 # one protected full anchor at the branch fork, rolling fulls for resume.
