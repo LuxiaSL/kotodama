@@ -306,3 +306,16 @@ def test_model_fa4_dense_compiles(cpu_reference_kernels) -> None:
             continue
         err = ((p2.grad - p1.grad).norm() / p1.grad.norm().clamp_min(1e-12)).item()
         assert err < 5e-2, (n, err)
+
+
+def test_varlen_op_refuses_without_scheduler_stub(monkeypatch):
+    """A reinstall that drops the producer_tail stub must fail loudly, not deep in CuTe."""
+    import pytest
+
+    from kotodama.model import fa4_varlen
+
+    monkeypatch.setattr(fa4_varlen, "_FA4_VARLEN_STUB_OK", False)
+    with pytest.raises(RuntimeError, match="producer_tail"):
+        fa4_varlen._require_varlen_stub()
+    monkeypatch.setattr(fa4_varlen, "_FA4_VARLEN_STUB_OK", True)
+    fa4_varlen._require_varlen_stub()

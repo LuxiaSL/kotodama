@@ -42,6 +42,29 @@ except ImportError:
     _flash_attn_fwd = None  # type: ignore[assignment]
     _flash_attn_bwd = None  # type: ignore[assignment]
 
+# The pinned FA4 (upstream 98024f9) calls SingleTileVarlenScheduler.producer_tail
+# in the varlen forward but never defines it; our installs carry a no-op stub
+# (upstream added the same stub in 29e40cf). A plain reinstall drops it.
+_FA4_VARLEN_STUB_OK = True
+if _FA4_CUTE_AVAILABLE:
+    try:
+        from flash_attn.cute import tile_scheduler as _ts
+
+        _cls = getattr(_ts, "SingleTileVarlenScheduler", None)
+        _FA4_VARLEN_STUB_OK = _cls is None or hasattr(_cls, "producer_tail")
+    except ImportError:
+        pass
+
+
+def _require_varlen_stub() -> None:
+    if not _FA4_VARLEN_STUB_OK:
+        raise RuntimeError(
+            "flash_attn.cute lacks SingleTileVarlenScheduler.producer_tail: this FA4 "
+            "install is missing the varlen stub (pinned upstream 98024f9 + stub; see the "
+            "lab note fa4-sm100-compile-review-2026-09-28). Re-apply the stub or use "
+            "--attn_impl fa2 / the dense fa4 path (no doc masking)."
+        )
+
 
 @torch.library.custom_op("kotodama::fa4_varlen", mutates_args=())
 def fa4_varlen_op(
@@ -56,6 +79,7 @@ def fa4_varlen_op(
     Returns (out, lse); lse is (nheads, total_tokens) fp32 — kept for the
     backward, discarded by the caller.
     """
+    _require_varlen_stub()
     res = _flash_attn_fwd(
         q,
         k,

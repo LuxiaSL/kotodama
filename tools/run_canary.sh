@@ -46,7 +46,7 @@ run_canary() {
     start_time=$(date +%s.%N)
 
     set +e
-    torchrun --nproc_per_node="$NUM_GPUS" -m kotodama.training.train \
+    torchrun --standalone --nproc_per_node="$NUM_GPUS" -m kotodama.training.train \
         --config "$config" \
         --checkpoint_dir "$ckpt_dir" \
         2>&1 | tee "$log_file"

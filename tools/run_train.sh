@@ -7,4 +7,4 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/_env.sh"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1  # persist FA4 JIT kernels to disk
-exec torchrun --nproc_per_node="${KOTODAMA_NPROC:-8}" -m kotodama.training.train "$@"
+exec torchrun --standalone --nproc_per_node="${KOTODAMA_NPROC:-8}" -m kotodama.training.train "$@"
