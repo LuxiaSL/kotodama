@@ -42,6 +42,7 @@ class LuxiaEvalLM(TemplateLM):
         max_length: int = 4096,
         compile: bool = False,
         max_batch_tokens: int = 32768,
+        model_overrides: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
 
@@ -54,6 +55,7 @@ class LuxiaEvalLM(TemplateLM):
             config_section=config_section,
             attn_res_config=attn_res_config,
             device=device,
+            overrides=model_overrides,
         )
 
         if compile:

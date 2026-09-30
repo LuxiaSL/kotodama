@@ -89,6 +89,11 @@ def parse_args() -> argparse.Namespace:
              "Overrides the default DD-v1 boundaries.",
     )
     parser.add_argument(
+        "--rope-fp32",
+        action="store_true",
+        help="Model config rope_fp32=True (the 1B ladder arms were trained with it)",
+    )
+    parser.add_argument(
         "--compile",
         action="store_true",
         help="Enable torch.compile for faster inference",
@@ -133,6 +138,7 @@ def run_eval(args: argparse.Namespace) -> None:
                 batch_size=args.batch_size,
                 compile=getattr(args, "compile", False),
                 max_batch_tokens=args.max_batch_tokens,
+                model_overrides={"rope_fp32": True} if args.rope_fp32 else None,
             )
 
             eval_kwargs: dict = {

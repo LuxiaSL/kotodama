@@ -60,6 +60,7 @@ def load_model(
     attn_res_config: dict[str, Any] | None = None,
     device: str = "cuda:0",
     meta: dict[str, Any] | None = None,
+    overrides: dict[str, Any] | None = None,
 ) -> LuxiaBaseModel:
     """Load a model from a checkpoint file.
 
@@ -82,6 +83,8 @@ def load_model(
         device: Target device for the model.
         meta: If given, filled with the checkpoint's bookkeeping (``step``,
             ``tokens_consumed``; None when the file does not carry them).
+        overrides: Extra LuxiaModelConfig fields applied last, independent of
+            the AttnRes handling (e.g. ``{"rope_fp32": True}`` for the ladder arms).
 
     Returns:
         Model in eval mode on the specified device.
@@ -115,6 +118,10 @@ def load_model(
                 "AttnRes auto-detected from checkpoint keys — using default "
                 "n_blocks=7. Pass attn_res_config explicitly for reliability."
             )
+
+    if overrides:
+        cfg.update(overrides)
+        logger.info("Model config overrides: %s", overrides)
 
     # Build model — filter out YAML keys that aren't LuxiaModelConfig fields
     import dataclasses

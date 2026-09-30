@@ -106,7 +106,7 @@ DEFAULT_REPETITION_PENALTY = 1.2
 
 # Architecture-size label used to build the served model id
 # (e.g. "kotodama-3b-instruct"). Falls back to the raw --model_size string.
-SIZE_LABELS = {"proxy": "108m", "3b": "3b"}
+SIZE_LABELS = {"proxy": "108m", "1b": "1b", "3b": "3b"}
 
 
 PROXY_CONFIG = dict(
@@ -135,7 +135,11 @@ CONFIG_3B = dict(
     attn_res_boundaries=DD3B_BOUNDARIES,
 )
 
-MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "3b": CONFIG_3B}
+# 1B formation-ladder shape (presets "1b"); DD-3B boundaries like the 3B. The
+# ladder arms trained with rope_fp32 — serve them with --rope_fp32.
+CONFIG_1B = dict(CONFIG_3B, **presets.shape("1b"))
+
+MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "1b": CONFIG_1B, "3b": CONFIG_3B}
 
 
 # ── Global state ────────────────────────────────────────────────────────────────
@@ -144,6 +148,7 @@ _model: LuxiaBaseModel | None = None
 _tokenizer: AutoTokenizer | None = None
 _attn_res_override: str = "config"   # config | on | off (CLI --attn_res)
 _attn_res_boundaries_override: str | None = None
+_rope_fp32_override: bool = False   # CLI --rope_fp32 (1B ladder arms)
 _device: torch.device = torch.device("cpu")
 _serve_mode: str = "base"
 _stop_token_ids: frozenset[int] = BASE_STOP_TOKEN_IDS
@@ -269,6 +274,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     if _attn_res_boundaries_override:
         model_cfg["attn_res_boundaries"] = [
             int(x) for x in _attn_res_boundaries_override.split(",")]
+    if _rope_fp32_override:
+        model_cfg["rope_fp32"] = True
     config = LuxiaModelConfig(**model_cfg)
     _max_seq_len = config.max_position_embeddings if max_seq_len is None else max_seq_len
     if not 16 <= _max_seq_len <= config.max_position_embeddings:
@@ -1547,7 +1554,7 @@ if __name__ == "__main__":
                              "prompt prefix (multi-turn TTFT win; requires --engine fast and "
                              "per-conversation replica pinning)")
     parser.add_argument("--model_size", choices=list(MODEL_CONFIGS), default="3b",
-                        help="Model architecture size (3b=2.97B, proxy=108M legacy)")
+                        help="Model architecture size (3b=2.97B, 1b=1.42B ladder, proxy=108M legacy)")
     parser.add_argument("--served_model_name", default=None,
                         help="Override the model id reported by /info and /v1/models "
                              "(default: kotodama-<size>-<base|instruct>)")
@@ -1566,6 +1573,8 @@ if __name__ == "__main__":
                              "baseline/NCA-only checkpoints have no AttnRes params)")
     parser.add_argument("--attn_res_boundaries", default=None,
                         help="Override boundaries, comma ints (proxy DD-v1: 0,3,7,12,21,25)")
+    parser.add_argument("--rope_fp32", action="store_true",
+                        help="Model config rope_fp32=True (the 1B ladder arms trained with it)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
@@ -1579,6 +1588,7 @@ if __name__ == "__main__":
     _model_size_arg = args.model_size
     _attn_res_override = args.attn_res
     _attn_res_boundaries_override = args.attn_res_boundaries
+    _rope_fp32_override = args.rope_fp32
     _engine_arg = args.engine
     _max_seq_len_arg = args.max_seq_len
     _prefix_cache_arg = args.prefix_cache

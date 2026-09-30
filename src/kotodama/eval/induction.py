@@ -267,6 +267,8 @@ def main() -> None:
                     help="prefix-matching head read (AttnRes models only)")
     ap.add_argument("--attn-n-seqs", type=int, default=16)
     ap.add_argument("--attn-batch-size", type=int, default=4)
+    ap.add_argument("--rope-fp32", action="store_true",
+                    help="model config rope_fp32=True (the 1B ladder arms)")
     ap.add_argument("--device", default=None,
                     help="default: cuda if available else cpu")
     ap.add_argument("--out", default=None,
@@ -286,7 +288,8 @@ def main() -> None:
     from kotodama.eval.model_loader import load_model
     model = load_model(args.checkpoint, config_path=args.config_path,
                        config_section=args.config_section,
-                       attn_res_config=attn_res_config, device=device)
+                       attn_res_config=attn_res_config, device=device,
+                       overrides={"rope_fp32": True} if args.rope_fp32 else None)
     if "cuda" not in str(device):
         logger.info("CPU run: attention -> sdpa on %d modules",
                     _force_sdpa(model))
