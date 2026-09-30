@@ -101,6 +101,26 @@ def hm_log(step: int, **metrics: float) -> None:
         pass  # Never crash the training loop
 
 
+_SECRETISH = re.compile(r"(key|secret|passw|auth|credential|_token$|^token$)", re.I)
+
+
+def hm_config(config: dict[str, Any]) -> None:
+    """Record run hyperparameters with Scheduler (runs-table columns, group-by, scatter
+    axes). Scalars and strings only; merged server-side. No-op outside Scheduler."""
+    if not _hm_job_id:
+        return
+    clean = {k: v for k, v in config.items()
+             if v is not None and isinstance(v, (bool, int, float, str))
+             and not _SECRETISH.search(k)}
+    try:
+        import httpx
+        with httpx.Client(base_url=os.environ.get("KOTODAMA_SCHEDULER_URL", "http://127.0.0.1:7000"),
+                          timeout=5) as c:
+            c.post(f"/api/v1/jobs/{_hm_job_id}/config", json={"config": clean})
+    except Exception:
+        pass  # Never crash the training loop
+
+
 def _upload_checkpoint_to_hf(
     repo_id: str,
     checkpoint_dir: Path,
@@ -1025,6 +1045,15 @@ def train(args: argparse.Namespace) -> None:
     # -- Training loop ---------------------------------------------------------
     if is_main:
         logger.info("Starting training from step %d", start_step)
+        hm_config({
+            **{k: (",".join(map(str, v)) if isinstance(v, (list, tuple)) else v)
+               for k, v in vars(args).items()},
+            "total_steps": total_steps, "grad_accum": grad_accum,
+            "tokens_per_step": tokens_per_step, "micro_batch_size": micro_batch,
+            "sequence_length": seq_len, "world_size": world_size,
+            "dp_size": dp_size, "tp_size": tp_size, "param_count": param_count,
+            "start_step": start_step,
+        })
 
     model.train()
     step_t0 = time.time()
@@ -1036,6 +1065,12 @@ def train(args: argparse.Namespace) -> None:
     # Pre-allocate loss accumulators on GPU to avoid .item() sync per micro-step
     _loss_accum = torch.zeros(1, device=device)
     _z_loss_accum = torch.zeros(1, device=device)
+    # Log-window extremes: loss/grad_norm are logged every log_every steps, so a
+    # one-step spike between log steps would otherwise never reach telemetry.
+    # Kept on device (no extra sync); read once per log step.
+    _gn_win_max = torch.zeros((), device=device)
+    _gn_win_clipped = torch.zeros((), device=device)
+    _loss_win_max = -math.inf
 
     # Opt-in data-path diagnostic: token-ID hashes of each rank-0 micro-batch.
     _debug_hash_steps = int(os.environ.get("KOTODAMA_DEBUG_BATCH_HASH", "0") or 0)
@@ -1144,10 +1179,23 @@ def train(args: argparse.Namespace) -> None:
         else:
             grad_norm = _compute_grad_norm(model.parameters())
 
+        _gn_t = grad_norm if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device)
+        _gn_win_max = torch.maximum(_gn_win_max, _gn_t.detach().float())
+        if args.gradient_clip > 0:
+            _gn_win_clipped = _gn_win_clipped + (_gn_t.detach().float() > args.gradient_clip).float()
+
         # Per-layer gradient analysis (before optimizer step clears grads)
         if wb is not None and step % 50 == 0:
             grad_metrics = _per_layer_grad_norms(raw_model)
             wb.log_custom(step, grad_metrics)
+        _ng_every_h = getattr(args, "norm_gain_every", 0)
+        if is_main and _ng_every_h > 0 and (step % _ng_every_h == 0 or step == total_steps - 1):
+            try:
+                hm_log(step, **_layer_health_metrics(raw_model))
+            except Exception as e:  # telemetry must never stop a run (e.g. sharded params)
+                if not getattr(_layer_health_metrics, "_warned", False):
+                    logger.warning("layer health metrics disabled: %s: %s", type(e).__name__, e)
+                    _layer_health_metrics._warned = True  # type: ignore[attr-defined]
 
         # EoS sharpness (needs live gradients, must be before zero_grad)
         if monitor is not None and monitor.should_monitor(step):
@@ -1175,6 +1223,7 @@ def train(args: argparse.Namespace) -> None:
         # -- Logging -----------------------------------------------------------
         log_loss_accum += step_loss
         log_z_loss_accum += step_z_loss
+        _loss_win_max = max(_loss_win_max, step_loss)
         log_steps += 1
 
         if is_main and (step % args.log_every == 0 or step == total_steps - 1):
@@ -1228,11 +1277,23 @@ def train(args: argparse.Namespace) -> None:
                 })
 
             if is_main:
+                _gn_max_s, _gn_clip_s = torch.stack([_gn_win_max, _gn_win_clipped]).tolist()
                 hm_log(
                     step,
                     **{"train/loss": avg_loss, "train/grad_norm": _grad_norm_scalar,
                        "train/perplexity": math.exp(min(avg_loss, 20)),
+                       "train/loss_max": _loss_win_max,
+                       "train/grad_norm_max": _gn_max_s,
+                       "train/grad_clip_frac": _gn_clip_s / max(log_steps, 1),
+                       "train/z_loss": avg_z_loss,
+                       "train/muon_lr": lrs["muon_lr"],
+                       "train/adamw_lr": lrs["adamw_lr"],
+                       "tokens_seen": float(tokens_consumed),
                        "perf/tokens_per_sec": tokens_per_sec,
+                       "perf/iters_per_sec": iters_per_sec,
+                       "perf/step_time_s": elapsed / max(log_steps, 1),
+                       "perf/data_wait_s_per_step": data_wait_per_step,
+                       "perf/gpu_mem_gb": gpu_mem,
                        "perf/mfu": mfu},
                 )
 
@@ -1243,6 +1304,9 @@ def train(args: argparse.Namespace) -> None:
             # Reset accumulators
             log_loss_accum = 0.0
             log_z_loss_accum = 0.0
+            _gn_win_max = torch.zeros((), device=device)
+            _gn_win_clipped = torch.zeros((), device=device)
+            _loss_win_max = -math.inf
             log_steps = 0
             log_data_wait = 0.0
             step_t0 = time.time()
@@ -1520,6 +1584,58 @@ def _norm_gain_metrics(model: torch.nn.Module) -> dict[str, float]:
     if not stats:
         return {}
     return dict(zip(keys, torch.stack(stats).tolist()))
+
+
+def _layer_health_metrics(model: torch.nn.Module) -> dict[str, float]:
+    """Per-layer weight scale, gradient norms and AttnRes router health; one host sync.
+
+    Call after backward (and clipping) and before ``zero_grad`` — it reads ``.grad``.
+
+    - ``weight_rms/layer_{i}/{q,k,v,o,gate,up,down}_proj`` (+ ``weight_rms/embed``): the
+      Muon weight-decay equilibrium read (without live WD, weights grow and act as an
+      implicit LR anneal — ledger D-class).
+    - ``grad/layer_{i}/{attn,mlp}``: grad norm of the sublayer's projection matrices
+      (post-clip; the routing queries are counted under ``router/``, not here).
+    - ``router/layer_{i}/{attn,mlp}/{query_norm,grad_norm}`` and ``router/final/…``:
+      the AttnRes routing queries. ``grad_norm == 0`` exactly is the dead-router signature
+      (ledger E5); ``router/dead_sites`` counts them (queries with no ``.grad`` — frozen or
+      structurally unused, like layer 0's pre-attn — are not sites).
+    """
+    keys: list[str] = []
+    vals: list[torch.Tensor] = []
+    grad_sq: dict[str, list[torch.Tensor]] = {}
+    router_grads: list[torch.Tensor] = []
+    for name, p in model.named_parameters():
+        m = _LAYER_RE.search(name)
+        leaf = name.split(".")[-2] if name.endswith(".weight") else name.split(".")[-1]
+        if name.endswith("res_query"):
+            where = (f"layer_{m.group(1)}/{'attn' if leaf == 'attn_res_query' else 'mlp'}"
+                     if m else "final")
+            keys.append(f"router/{where}/query_norm"); vals.append(p.detach().float().norm())
+            if p.grad is not None:
+                g = p.grad.detach().float().norm()
+                keys.append(f"router/{where}/grad_norm"); vals.append(g)
+                router_grads.append(g)
+            continue
+        if p.ndim != 2:
+            continue
+        if m and leaf.endswith("_proj"):
+            keys.append(f"weight_rms/layer_{m.group(1)}/{leaf}")
+            vals.append(p.detach().float().pow(2).mean().sqrt())
+            if p.grad is not None:
+                sub = "attn" if ".attn." in name else "mlp"
+                grad_sq.setdefault(f"grad/layer_{m.group(1)}/{sub}", []).append(
+                    p.grad.detach().float().pow(2).sum())
+        elif name == "embed_tokens.weight":
+            keys.append("weight_rms/embed"); vals.append(p.detach().float().pow(2).mean().sqrt())
+    for k, parts in grad_sq.items():
+        keys.append(k); vals.append(torch.stack(parts).sum().sqrt())
+    if router_grads:
+        keys.append("router/dead_sites")
+        vals.append((torch.stack(router_grads) == 0).sum().float())
+    if not vals:
+        return {}
+    return dict(zip(keys, torch.stack(vals).tolist()))
 
 
 def _per_layer_grad_norms(model: torch.nn.Module) -> dict[str, float]:
