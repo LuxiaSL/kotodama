@@ -47,7 +47,10 @@ mkdir -p "$ROOT/logs" "$SHARD_ROOT"
 if [[ "$CKPT" == *.zst ]]; then
   export TMPDIR="${TMPDIR:-$KOTODAMA_DATA_ROOT/tmp}"
   DECOMP_DIR="$TMPDIR/kotodama_checkpoints"
-  DECOMP="$DECOMP_DIR/$(basename "${CKPT%.zst}")"
+  # Key the cache on the SOURCE path, not the basename: every ladder arm ends in
+  # step_00014304.pt.zst, and a basename key silently scored one model twice (ledger D7).
+  SRC_KEY="$(readlink -f "$CKPT" | sha1sum | cut -c1-12)"
+  DECOMP="$DECOMP_DIR/${SRC_KEY}-$(basename "${CKPT%.zst}")"
   if [ ! -f "$DECOMP" ] && [ ! -f "${CKPT%.zst}" ]; then
     mkdir -p "$DECOMP_DIR"
     echo "pre-decompressing $CKPT -> $DECOMP"
