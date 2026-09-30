@@ -98,10 +98,16 @@ def _sdpa_attention(attn, x_normed, rope_cos, rope_sin):
 
 
 @torch.no_grad()
-def instrumented_forward(model, input_ids, light=False):
+def instrumented_forward(model, input_ids, light=False, routing_only=False):
     """Faithful mirror of `_forward_attn_res` (eval/non-cached/non-batched) with eager attn + full capture.
     `light=True`: SDPA attn + capture ONLY residual_partial + committed (skip keys/values/queries/attn/gate/
-    routing) — for positional-mean calibration where only the residual is needed (≈10× faster, low-memory)."""
+    routing) — for positional-mean calibration where only the residual is needed (≈10× faster, low-memory).
+    `routing_only=True`: SDPA attn + capture ONLY `routing` — for layer × source routing reads over many
+    tokens (no O(S²) attention maps held)."""
+    if light and routing_only:
+        raise ValueError("light and routing_only capture disjoint surfaces; pick one")
+    keep_routing = not light
+    full = not light and not routing_only
     layers = model.layers
     rope_cos, rope_sin = model.rope_cos, model.rope_sin
     block_ranges = model._attn_res_block_ranges
@@ -120,11 +126,12 @@ def instrumented_forward(model, input_ids, light=False):
         else:
             h_attn, w = _route_capture(committed_stack, n_committed, partial,
                                        layers[block_start].attn_res_query, layers[block_start].attn_res_norm)
-            if not light:
+            if keep_routing:
                 cap["routing"].append(("pre_attn", block_start, w.detach()))
         # commit at boundary
         committed.append(partial)
-        cap["committed"].append(partial.detach())
+        if not routing_only:
+            cap["committed"].append(partial.detach())
         partial = torch.zeros_like(embed)
         committed_stack = torch.stack(committed, dim=0)
         n_committed = len(committed)
@@ -134,28 +141,31 @@ def instrumented_forward(model, input_ids, light=False):
             if i != block_start:
                 h_attn, w = _route_capture(committed_stack, n_committed, partial,
                                            lyr.attn_res_query, lyr.attn_res_norm)
-                if not light:
+                if keep_routing:
                     cap["routing"].append(("pre_attn", i, w.detach()))
-            if light:
+            if not full:
                 attn_out = _sdpa_attention(lyr.attn, lyr.attn_norm(h_attn), rope_cos, rope_sin)
             else:
                 attn_out, ck, cv, cq, aw = _eager_attention(lyr.attn, lyr.attn_norm(h_attn), rope_cos, rope_sin)
                 cap["keys"].append(ck); cap["values"].append(cv); cap["queries"].append(cq); cap["attn"].append(aw)
             partial = partial + attn_out
-            cap["residual_partial"].append(partial.detach())
+            if not routing_only:
+                cap["residual_partial"].append(partial.detach())
 
             h_mlp, w = _route_capture(committed_stack, n_committed, partial,
                                       lyr.mlp_res_query, lyr.mlp_res_norm)
             ffn_in = lyr.ffn_norm(h_mlp)
-            if not light:
+            if keep_routing:
                 cap["routing"].append(("pre_mlp", i, w.detach()))
+            if full:
                 cap["gate"].append(lyr.ffn.gate_proj(ffn_in).detach())       # pre-SiLU gate
             partial = partial + lyr.ffn(ffn_in)
-            cap["residual_partial"].append(partial.detach())
+            if not routing_only:
+                cap["residual_partial"].append(partial.detach())
 
     h_final, w = _route_capture(committed_stack, len(committed), partial,
                                 model.final_res_query, model.final_res_norm)
-    if not light:
+    if keep_routing:
         cap["routing"].append(("final", -1, w.detach()))
     logits = F.linear(model.norm(h_final), model.get_lm_head_weight())
     return logits, cap

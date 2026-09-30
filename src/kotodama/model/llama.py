@@ -267,14 +267,14 @@ def _compute_routing_alphas(
     qw: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Compute routing softmax weights for one routing point. Returns (n_src,) avg alphas."""
+    """Compute routing softmax weights for one routing point. Returns (n_src, B, T) per-token
+    weights (the diagnostics take token means, per-token entropy and the source split)."""
     if n_committed == 0:
-        return torch.ones(1, device=partial.device)
+        return torch.ones(1, *partial.shape[:2], device=partial.device)
     all_src = torch.cat([committed_stack[:n_committed], partial.unsqueeze(0)], dim=0)
     rsqrt = torch.rsqrt(all_src.pow(2).mean(-1) + eps)
     logits = (all_src * qw).sum(-1) * rsqrt
-    weights = F.softmax(logits, dim=0)
-    return weights.mean(dim=(1, 2))
+    return F.softmax(logits.float(), dim=0)
 
 
 @torch.no_grad()
@@ -285,8 +285,22 @@ def _compute_attn_res_diagnostics(
     final_norm_weight: torch.Tensor,
     eps: float,
     intermediate_alphas: Optional[list[tuple[int, str, torch.Tensor]]] = None,
+    block_ranges: Optional[list[tuple[int, int]]] = None,
 ) -> dict[str, float]:
-    """Compute per-block norms, final routing weights, and intermediate routing stats."""
+    """Compute per-block norms, final routing weights, and intermediate routing stats.
+
+    ``intermediate_alphas`` holds per-token weights (n_src, B, T) per site. With
+    ``block_ranges``, every site (and the final aggregation) also gets who-reads-what
+    keys from ``kotodama.model.routing_read``: ``attnres/route/layer_{i}/{pre_attn,pre_mlp}/
+    from_{emb,prev,older,self}`` (token-mean weight per relative source), ``…/lookback``
+    (α-weighted layers back) and ``…/token_entropy`` (mean per-token routing entropy);
+    the final aggregation as ``attnres/route/final/…``.
+
+    Note ``avg_alpha/block_b`` averages source index b over ALL sites: index b is
+    block b-1's finished output where committed, and a site's own in-progress block
+    where it is the partial — so it mixes self-reads with later reads (kept as-is for
+    comparability with earlier runs; the route keys are the clean view)."""
+    from kotodama.model import routing_read as rr
     diag: dict[str, float] = {}
     for i, c in enumerate(committed):
         diag[f"attnres/block_norm/{i}"] = c.float().norm(dim=-1).mean().item()
@@ -303,6 +317,9 @@ def _compute_attn_res_diagnostics(
     for i in range(len(all_src)):
         label = f"block_{i}" if i < len(committed) else "partial"
         diag[f"attnres/final_alpha/{label}"] = avg_w[i].item()
+    if block_ranges is not None:
+        _route_keys(diag, "attnres/route/final",
+                    rr.site_layout(block_ranges, -1, "final", len(all_src)), weights, rr)
 
     # Intermediate routing: per-layer entropy + per-block average alpha
     if intermediate_alphas:
@@ -310,8 +327,13 @@ def _compute_attn_res_diagnostics(
         block_alpha_sums = [0.0] * (n_blocks + 1)  # +1 for partial
         block_alpha_counts = [0] * (n_blocks + 1)
 
-        for layer_idx, sublayer, alphas in intermediate_alphas:
+        for layer_idx, sublayer, per_token in intermediate_alphas:
+            alphas = per_token.float().reshape(per_token.shape[0], -1).mean(1)
             n_src = alphas.shape[0]
+            if block_ranges is not None and n_src > 1:
+                _route_keys(diag, f"attnres/route/layer_{layer_idx}/{sublayer}",
+                            rr.site_layout(block_ranges, layer_idx, sublayer, n_src),
+                            per_token, rr)
             entropy = -(alphas * (alphas + 1e-10).log()).sum().item()
             max_entropy = math.log(n_src) if n_src > 1 else 1.0
             diag[f"attnres/routing_entropy/layer_{layer_idx}/{sublayer}"] = entropy / max_entropy
@@ -327,6 +349,15 @@ def _compute_attn_res_diagnostics(
                 diag[f"attnres/avg_alpha/{label}"] = block_alpha_sums[b] / block_alpha_counts[b]
 
     return diag
+
+
+def _route_keys(diag: dict[str, float], prefix: str, site: Any, weights: torch.Tensor,
+                rr: Any) -> None:
+    """Who-reads-what keys for one site (see ``_compute_attn_res_diagnostics``)."""
+    for src, v in rr.relative_split(weights, site).items():
+        diag[f"{prefix}/from_{src}"] = v
+    diag[f"{prefix}/lookback"] = rr.lookback(weights, site)
+    diag[f"{prefix}/token_entropy"] = rr.token_entropy(weights)
 
 
 def _resolve_attn_impl(config: LuxiaModelConfig) -> str:
@@ -1241,6 +1272,7 @@ class LuxiaBaseModel(nn.Module):
                 committed, partial, self.final_res_query,
                 self.final_res_norm.weight, self.config.norm_eps,
                 intermediate_alphas=intermediate_alphas,
+                block_ranges=block_ranges,
             )
 
         return self.norm(h_final)
