@@ -1,0 +1,16 @@
+# 1B DD boundary re-fit — leg B, phase 1: a SAFE NCA dose without AttnRes. 0.75B tokens =
+# the held-out-unseen-rule loss minimum measured on A1-NCA (2026-10-01; past it the model
+# specializes to training rules). Everything else = the A1-NCA recipe.
+# Phase 2 = configs/ladder-cf-nca-lang.yaml (resume_nca = this run's final).
+#
+# Launch: tools/run_train.sh --config configs/ladder-cf-nca.yaml \
+#   --global_batch_tokens 2097152 --data_path <nca_3b_seed17_train.bin> \
+#   --checkpoint_dir <ladder>/cf-nca
+
+extends: ladder-a1-nca.yaml
+
+attn_res: false
+total_tokens: 750_000_000
+# Same warmup FRACTION as the 3B / A1 NCA phases (1/6): 357 steps -> 60.
+warmup_steps: 60
+checkpoint_shm_dir: /dev/shm/luxia-ladder-cf-nca

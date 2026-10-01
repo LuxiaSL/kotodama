@@ -1,0 +1,19 @@
+# 1B DD boundary re-fit — leg A: the NO-AttnRes LANGUAGE counterfactual (Luxia 2026-10-01).
+# Boundaries are fit where LANGUAGE circuits settle (the regime every ladder arm shares),
+# not on NCA geometry. = the A0 recipe (same data order, seed, warmup, constant LR) with
+# AttnRes off, cut at 5B tokens with decay disabled so the LR path equals A0's first 5B
+# exactly (A0 holds constant LR until its 24B decay start).
+# Fit: scripts/eval/fit_boundaries.py over every 250M snapshot; stop rule = the suggested
+# boundaries hold for >=3 consecutive snapshots (the run may be cancelled once they do).
+#
+# Launch: tools/run_train.sh --config configs/ladder-cf-lang.yaml \
+#   --global_batch_tokens 2097152 --data_path <train.bin> --checkpoint_dir <ladder>/cf-lang
+
+extends: ladder-a0.yaml
+
+attn_res: false
+total_tokens: 5_000_000_000
+decay_start_pct: 1.0
+save_schedule: "250M:end"
+anchor_tokens: ""
+checkpoint_shm_dir: /dev/shm/luxia-ladder-cf-lang

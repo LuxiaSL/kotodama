@@ -1,0 +1,11 @@
+# 1B DD boundary re-fit — leg B, phase 2: language without AttnRes from the safe-dose NCA
+# base (= leg A + the NCA phase). Same boundaries as leg A => NCA does not move where
+# language circuits settle (one set serves every arm); different => NCA relocates them.
+#
+# Launch: tools/run_train.sh --config configs/ladder-cf-nca-lang.yaml \
+#   --global_batch_tokens 2097152 --data_path <train.bin> \
+#   --checkpoint_dir <ladder>/cf-nca-lang --resume_nca <ladder>/cf-nca/step_*.pt.zst
+
+extends: ladder-cf-lang.yaml
+
+checkpoint_shm_dir: /dev/shm/luxia-ladder-cf-nca-lang

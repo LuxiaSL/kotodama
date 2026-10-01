@@ -71,3 +71,63 @@ def test_profile_walk_both_rulers():
 def test_profile_refuses_attnres_model():
     with pytest.raises(SystemExit):
         npf.extract_profile(_model(True), torch.randint(0, 10002, (2, 16)))
+
+
+# ── 2026-10-01 re-fit additions ───────────────────────────────────────────────
+
+import argparse  # noqa: E402
+
+import fit_boundaries as fb  # noqa: E402
+
+
+def test_select_boundaries_reduces_to_the_archived_pick():
+    rng = random.Random(11)
+    for _ in range(200):
+        n = rng.choice([12, 28])
+        prof = {k: [rng.uniform(0, 300) for _ in range(n)]
+                for k in ("anisotropy", "attn_entropy_mean", "stable_rank_q", "stable_rank_down")}
+        for mbs, mxb in ((2, 6), (1, 7)):
+            b, scores = npf.suggest_boundaries(prof, n, mbs, mxb)
+            assert npf.select_boundaries(scores, n, mbs, mxb, forced=(), min_last_block=2) == b
+
+
+def test_select_boundaries_honours_the_hand_rules():
+    rng = random.Random(3)
+    for _ in range(100):
+        scores = [rng.random() for _ in range(27)]
+        b = npf.select_boundaries(scores, 28, min_block_size=2, max_boundaries=7,
+                                  forced=(1,), min_last_block=4)
+        assert b[:2] == [0, 1] and len(b) <= 7
+        assert 28 - b[-1] >= 4
+        assert all(y - x >= 1 for x, y in zip(b, b[1:]))
+        assert all(y - x >= 2 for x, y in zip(b[1:], b[2:]))   # beyond the forced L0 block
+
+
+def test_linear_cka_invariances():
+    torch.manual_seed(0)
+    x = torch.randn(512, 32)
+    q, _ = torch.linalg.qr(torch.randn(32, 32))
+    assert abs(npf.linear_cka(x, x) - 1) < 1e-9
+    assert abs(npf.linear_cka(x, 3.0 * x @ q) - 1) < 1e-9      # rotation + isotropic scale
+    assert npf.linear_cka(x, torch.randn(512, 32)) < 0.2
+
+
+def test_settled_at():
+    s = [(1, [0, 1, 5]), (2, [0, 1, 6]), (3, [0, 1, 6]), (4, [0, 1, 6]), (5, [0, 1, 7])]
+    assert fb.settled_at(s, 3) == 2
+    assert fb.settled_at(s, 3, tol=1) == 1
+    assert fb.settled_at(s, 4) is None
+
+
+def test_fits_end_to_end_tiny():
+    m = _model(False)
+    hid: list = []
+    prof = npf.extract_profile(m, torch.randint(0, 10002, (4, 32)), attn_chunk=2,
+                               hidden_sink=hid, hidden_rows=64)
+    assert len(hid) == 6 and hid[0].shape == (64, 64)
+    args = argparse.Namespace(v1_min_block=1, v1_max_boundaries=4, min_block=2, max_boundaries=4,
+                              forced=[1], min_last_block=2)
+    fits = fb.fits_for(prof, npf.cka_transition_scores(hid), 6, args)
+    assert set(fits) == set(fb.METHODS)
+    for f in ("rules_true", "rules_cka"):
+        assert fits[f]["boundaries"][:2] == [0, 1]

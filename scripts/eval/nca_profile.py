@@ -98,9 +98,13 @@ def _legacy_attention_weights(attn: Any, x_normed: torch.Tensor) -> torch.Tensor
 
 
 @torch.no_grad()
-def extract_profile(model: Any, probe: torch.Tensor, attn_chunk: int = 8) -> dict[str, dict[str, list[float]]]:
+def extract_profile(model: Any, probe: torch.Tensor, attn_chunk: int = 8,
+                    hidden_sink: list[torch.Tensor] | None = None,
+                    hidden_rows: int = 4096) -> dict[str, dict[str, list[float]]]:
     """Walk the (no-AttnRes) layers; per-layer profile under both attention-entropy rulers.
-    Returns {"legacy": profile, "true": profile}; non-entropy metrics are shared."""
+    Returns {"legacy": profile, "true": profile}; non-entropy metrics are shared.
+    ``hidden_sink``: if given, receives each layer's output on a fixed token subsample
+    (``hidden_rows`` rows, fp32, CPU) — for layer-similarity (CKA) segmentation."""
     from kotodama.model.capture import _eager_attention
 
     if getattr(model.config, "attn_res", False):
@@ -125,6 +129,11 @@ def extract_profile(model: Any, probe: torch.Tensor, attn_chunk: int = 8) -> dic
             ent[r]["attn_entropy_std"].append(float(np.mean(acc[r][1])))
         x = layer(x, rope_cos[:S], rope_sin[:S])
         h = x.reshape(-1, x.shape[-1])
+        if hidden_sink is not None:
+            if i == 0:
+                g = torch.Generator().manual_seed(1234)
+                rows = torch.randperm(h.shape[0], generator=g)[:hidden_rows].to(h.device)
+            hidden_sink.append(h[rows].float().cpu())
         shared["anisotropy"].append(_anisotropy(h))
         shared["dead_units"].append(_dead_unit_fraction(x))
         a, f = layer.attn, layer.ffn
@@ -225,6 +234,42 @@ def suggest_boundaries(
 
     boundaries.sort()
     return boundaries, combined
+
+
+def select_boundaries(scores: list[float], num_layers: int, min_block_size: int = 2,
+                      max_boundaries: int = 6, forced: tuple[int, ...] = (),
+                      min_last_block: int = 2) -> list[int]:
+    """The archived greedy pick over transition scores (``scores[i]`` = transition L_i ->
+    L_{i+1}, i.e. a boundary at i+1), generalized with the DD-3B hand rules as explicit
+    constraints: ``forced`` boundaries (e.g. ``(1,)`` isolates the embedding layer L0) and
+    ``min_last_block`` (output cushion). ``forced=()``, ``min_last_block=2`` reproduces
+    ``suggest_boundaries`` exactly (its ``boundary >= num_layers - 1`` skip)."""
+    boundaries = sorted({0, *forced})
+    for i in sorted(range(len(scores)), key=lambda i: scores[i], reverse=True):
+        if len(boundaries) >= max_boundaries:
+            break
+        b = i + 1
+        if b > num_layers - min_last_block or b in boundaries:
+            continue
+        if any(abs(b - x) < min_block_size for x in boundaries):
+            continue
+        boundaries.append(b)
+    return sorted(boundaries)
+
+
+def linear_cka(x: torch.Tensor, y: torch.Tensor) -> float:
+    """Linear CKA between two (n, d) representations of the same n tokens."""
+    x = x.double() - x.double().mean(0, keepdim=True)
+    y = y.double() - y.double().mean(0, keepdim=True)
+    xy = (y.T @ x).pow(2).sum()
+    xx = (x.T @ x).pow(2).sum().sqrt()
+    yy = (y.T @ y).pow(2).sum().sqrt()
+    return float(xy / (xx * yy).clamp_min(1e-30))
+
+
+def cka_transition_scores(hiddens: list[torch.Tensor]) -> list[float]:
+    """1 - CKA(L_i, L_{i+1}) per transition: how much the representation changes there."""
+    return [1.0 - linear_cka(hiddens[i], hiddens[i + 1]) for i in range(len(hiddens) - 1)]
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
