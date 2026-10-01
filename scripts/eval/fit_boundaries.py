@@ -12,7 +12,10 @@ random-token probe, as DD-3B was. Per snapshot, four fits:
 - ``rules_true``: same transition scores, picked under the DD-3B hand rules made explicit
   (``--forced 1`` isolates the embedding layer, ``--min-last-block`` cushions the output);
 - ``rules_cka``: independent signal — 1 - linear CKA between adjacent layers' outputs,
-  picked under the same rules.
+  picked under the same rules;
+- ``*_nomid``: the rules fits without the middle-block rule (``--min-mid-block``: the
+  block holding the midpoint layer keeps >= K layers, Luxia's "contiguous middle"), to
+  show whether that rule binds or the data already agrees.
 
 Stop rule (``summary.json``): a fit is SETTLED at the first snapshot whose boundaries are
 identical for ``--settle`` consecutive snapshots (also reported with ±1-layer tolerance).
@@ -41,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import nca_profile as npf  # noqa: E402
 
 logger = logging.getLogger("fit_boundaries")
-METHODS = ("v1_legacy", "v1_true", "rules_true", "rules_cka")
+METHODS = ("v1_legacy", "v1_true", "rules_true", "rules_cka", "rules_true_nomid", "rules_cka_nomid")
 
 
 def fits_for(profiles: dict[str, dict[str, list[float]]], cka_scores: list[float], n: int,
@@ -53,8 +56,11 @@ def fits_for(profiles: dict[str, dict[str, list[float]]], cka_scores: list[float
     true_scores = out["v1_true"]["scores"]
     rules = dict(min_block_size=args.min_block, max_boundaries=args.max_boundaries,
                  forced=tuple(args.forced), min_last_block=args.min_last_block)
-    out["rules_true"] = {"boundaries": npf.select_boundaries(true_scores, n, **rules), "scores": true_scores}
-    out["rules_cka"] = {"boundaries": npf.select_boundaries(cka_scores, n, **rules), "scores": cka_scores}
+    for name, sc in (("true", true_scores), ("cka", cka_scores)):
+        out[f"rules_{name}"] = {"boundaries": npf.select_boundaries(
+            sc, n, min_mid_block=args.min_mid_block, **rules), "scores": sc}
+        # the same pick without the middle rule: does the rule bind, or does the data agree?
+        out[f"rules_{name}_nomid"] = {"boundaries": npf.select_boundaries(sc, n, **rules), "scores": sc}
     return out
 
 
@@ -129,6 +135,9 @@ def main() -> int:
     ap.add_argument("--min-block", type=int, default=2)
     ap.add_argument("--forced", type=int, nargs="*", default=[1])
     ap.add_argument("--min-last-block", type=int, default=4)
+    ap.add_argument("--min-mid-block", type=int, default=8,
+                    help="block containing the midpoint layer keeps >= this many layers "
+                         "(DD-3B's middle block L7-14 = 8; 0 disables)")
     ap.add_argument("--settle", type=int, default=3)
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--out-dir", required=True)
@@ -177,7 +186,7 @@ def main() -> int:
                                    "probe_shape": list(probe.shape), "settings": {
                                        k: getattr(args, k) for k in ("v1_max_boundaries", "v1_min_block",
                                                                      "max_boundaries", "min_block", "forced",
-                                                                     "min_last_block")},
+                                                                     "min_last_block", "min_mid_block")},
                                    "profiles": profiles, "fits": fits}))
         logger.info("step %d: %s", step, {k: v["boundaries"] for k, v in fits.items()})
         del model

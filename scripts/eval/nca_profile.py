@@ -236,13 +236,31 @@ def suggest_boundaries(
     return boundaries, combined
 
 
+def mid_block_size(boundaries: list[int], num_layers: int) -> int:
+    """Size of the block that contains the model's midpoint layer (num_layers // 2)."""
+    mid = num_layers // 2
+    starts = sorted(boundaries)
+    for s, e in zip(starts, starts[1:] + [num_layers]):
+        if s <= mid < e:
+            return e - s
+    return 0
+
+
 def select_boundaries(scores: list[float], num_layers: int, min_block_size: int = 2,
                       max_boundaries: int = 6, forced: tuple[int, ...] = (),
-                      min_last_block: int = 2) -> list[int]:
+                      min_last_block: int = 2, min_mid_block: int = 0) -> list[int]:
     """The archived greedy pick over transition scores (``scores[i]`` = transition L_i ->
     L_{i+1}, i.e. a boundary at i+1), generalized with the DD-3B hand rules as explicit
-    constraints: ``forced`` boundaries (e.g. ``(1,)`` isolates the embedding layer L0) and
-    ``min_last_block`` (output cushion). ``forced=()``, ``min_last_block=2`` reproduces
+    constraints:
+
+    - ``forced`` boundaries (``(1,)`` isolates the embedding layer L0);
+    - ``min_last_block``: output cushion;
+    - ``min_mid_block``: the block containing the midpoint layer keeps at least this many
+      layers (Luxia: middle layers build longer, more intricate circuits that develop and
+      mutate representations toward the next response, so they want one contiguous block);
+      a cut that would shrink it below the minimum is skipped for the next-best cut.
+
+    ``forced=()``, ``min_last_block=2``, ``min_mid_block=0`` reproduces
     ``suggest_boundaries`` exactly (its ``boundary >= num_layers - 1`` skip)."""
     boundaries = sorted({0, *forced})
     for i in sorted(range(len(scores)), key=lambda i: scores[i], reverse=True):
@@ -252,6 +270,8 @@ def select_boundaries(scores: list[float], num_layers: int, min_block_size: int 
         if b > num_layers - min_last_block or b in boundaries:
             continue
         if any(abs(b - x) < min_block_size for x in boundaries):
+            continue
+        if min_mid_block and mid_block_size(boundaries + [b], num_layers) < min_mid_block:
             continue
         boundaries.append(b)
     return sorted(boundaries)

@@ -126,8 +126,21 @@ def test_fits_end_to_end_tiny():
                                hidden_sink=hid, hidden_rows=64)
     assert len(hid) == 6 and hid[0].shape == (64, 64)
     args = argparse.Namespace(v1_min_block=1, v1_max_boundaries=4, min_block=2, max_boundaries=4,
-                              forced=[1], min_last_block=2)
+                              forced=[1], min_last_block=2, min_mid_block=2)
     fits = fb.fits_for(prof, npf.cka_transition_scores(hid), 6, args)
     assert set(fits) == set(fb.METHODS)
     for f in ("rules_true", "rules_cka"):
         assert fits[f]["boundaries"][:2] == [0, 1]
+
+
+def test_middle_block_rule():
+    rng = random.Random(5)
+    bound = 0
+    for _ in range(200):
+        scores = [rng.random() for _ in range(27)]
+        free = npf.select_boundaries(scores, 28, 2, 7, forced=(1,), min_last_block=4)
+        mid = npf.select_boundaries(scores, 28, 2, 7, forced=(1,), min_last_block=4, min_mid_block=8)
+        assert npf.mid_block_size(mid, 28) >= 8
+        bound += free != mid
+    assert bound > 0  # the rule actually changes picks on some score profiles
+    assert npf.mid_block_size([0, 1, 3, 7, 15, 19, 24], 28) == 8   # DD-3B: L7-14 holds L14
