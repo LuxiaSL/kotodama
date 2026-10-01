@@ -15,7 +15,9 @@ the training batch, so kept apart from the live keys)::
     offline/attnres/route/layer_{i}/{pre_attn,pre_mlp}/{from_emb,from_prev,from_older,from_self,
                                                         lookback,token_entropy}
 
-Text: Uncheatable Eval domains (fresh web text, never trained on), the first
+Text: ``--token-bin`` reads raw token windows from a training-format .bin instead (e.g. the
+NCA eval stream, for NCA checkpoints); every domain also reports held-out ``nll``.
+Default text: Uncheatable Eval domains (fresh web text, never trained on), the first
 documents in data order until ``--tokens-per-domain``, packed into ``[BOS] + chunk``
 sequences of ``--seq-len`` — the same text at every checkpoint.
 
@@ -92,6 +94,7 @@ class Acc:
     def result(self) -> dict[str, Any]:
         return {
             "n_tokens": self.n,
+            "nll": getattr(self, "nll", None),  # mean next-token NLL (nats) on these sequences
             "mean": [(w / self.n).tolist() for w in self.w],
             "token_entropy": [e / self.n for e in self.ent],
             "pos": {b: [(p[b] / self.pos_n[b]).tolist() for p in self.pos] if self.pos_n[b] else None
@@ -125,6 +128,17 @@ def step_of(path: str, meta: dict[str, Any]) -> int:
     return int(m.group(1))
 
 
+def token_bin_sequences(path: str, seq_len: int, n_seqs: int) -> list[list[int]]:
+    """``n_seqs`` windows of raw uint16 tokens (the training .bin format), evenly spaced
+    over the file — deterministic, no BOS added (the stream is used as trained)."""
+    import numpy as np
+    data = np.memmap(path, dtype=np.uint16, mode="r")
+    if len(data) < seq_len * n_seqs:
+        raise SystemExit(f"{path}: {len(data)} tokens < {n_seqs} x {seq_len}")
+    stride = (len(data) - seq_len) // max(n_seqs - 1, 1)
+    return [data[i * stride:i * stride + seq_len].astype(np.int64).tolist() for i in range(n_seqs)]
+
+
 def build_sequences(domains: dict[str, list[str]], encode: Any, bos: int, seq_len: int,
                     tokens_per_domain: int) -> dict[str, list[list[int]]]:
     """First docs in data order until the budget; packed into [BOS] + (seq_len-1) chunks."""
@@ -153,16 +167,20 @@ def run_capture(args: argparse.Namespace) -> None:
     from kotodama.presets import TOKENIZER_NAME
 
     torch.set_num_threads(args.threads)
-    domains = load_domains(args.data_dir or os.environ.get("KOTODAMA_UNCHEATABLE_DATA", DEFAULT_DATASET))
-    if args.domains:
-        want = [d.strip() for d in args.domains.split(",") if d.strip()]
-        missing = [d for d in want if d not in domains]
-        if missing:
-            raise SystemExit(f"unknown domains {missing}; have {sorted(domains)}")
-        domains = {d: domains[d] for d in want}
-    tok = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-    seqs = build_sequences(domains, lambda t: tok(t, add_special_tokens=False)["input_ids"],
-                           int(tok.bos_token_id), args.seq_len, args.tokens_per_domain)
+    if args.token_bin:
+        seqs = {Path(args.token_bin).stem: token_bin_sequences(
+            args.token_bin, args.seq_len, args.token_bin_seqs)}
+    else:
+        domains = load_domains(args.data_dir or os.environ.get("KOTODAMA_UNCHEATABLE_DATA", DEFAULT_DATASET))
+        if args.domains:
+            want = [d.strip() for d in args.domains.split(",") if d.strip()]
+            missing = [d for d in want if d not in domains]
+            if missing:
+                raise SystemExit(f"unknown domains {missing}; have {sorted(domains)}")
+            domains = {d: domains[d] for d in want}
+        tok = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+        seqs = build_sequences(domains, lambda t: tok(t, add_special_tokens=False)["input_ids"],
+                               int(tok.bos_token_id), args.seq_len, args.tokens_per_domain)
     logger.info("text: %d domains × %d seqs × %d tokens", len(seqs),
                 min(len(v) for v in seqs.values()), args.seq_len)
 
@@ -193,9 +211,13 @@ def run_capture(args: argparse.Namespace) -> None:
         with torch.no_grad():
             for dom, dseqs in seqs.items():
                 acc = Acc()
+                nll_sum, nll_n = 0.0, 0
                 for s in dseqs:
                     ids = torch.tensor([s], dtype=torch.long, device=args.device)
-                    _, cap = instrumented_forward(model, ids, routing_only=True)
+                    logits, cap = instrumented_forward(model, ids, routing_only=True)
+                    nll_sum += float(torch.nn.functional.cross_entropy(
+                        logits[0, :-1].float(), ids[0, 1:], reduction="sum"))
+                    nll_n += ids.shape[1] - 1
                     routing = [(sub, layer, w.cpu()) for sub, layer, w in cap["routing"]]
                     if sites is None:
                         sites = []
@@ -204,6 +226,7 @@ def run_capture(args: argparse.Namespace) -> None:
                             sites.append(SiteInfo(layer, sub, list(lay.labels), list(lay.rel),
                                                   list(lay.end_layer)))
                     acc.add(routing, rr)
+                acc.nll = nll_sum / max(nll_n, 1)
                 per_dom[dom] = acc
         assert sites is not None
         dom_res = {d: a.result() for d, a in per_dom.items()}
@@ -312,6 +335,10 @@ def main() -> None:
     ap.add_argument("--rope-fp32", action="store_true")
     ap.add_argument("--data-dir", default=None)
     ap.add_argument("--domains", default=None)
+    ap.add_argument("--token-bin", default=None,
+                    help="read raw uint16 token windows from this .bin instead of Uncheatable "
+                         "text (e.g. the NCA eval stream)")
+    ap.add_argument("--token-bin-seqs", type=int, default=8)
     ap.add_argument("--tokens-per-domain", type=int, default=4092)
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--threads", type=int, default=16)
