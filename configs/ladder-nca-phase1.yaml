@@ -1,0 +1,16 @@
+# 1B formation ladder — DD boundary derivation, Phase 1: raw NCA WITHOUT AttnRes.
+# The boundary method of record (how DD-3B was fit from nca-3b-phase1.yaml):
+#   Phase 1 (this) -> dense checkpoints -> pick the knee -> scripts/eval/nca_profile.py
+#   -> suggested boundaries ("DD-1B") -> its own ladder arm beside A0 (DD-3B) and
+#   A5 (uniform). Everything else = the A1-NCA recipe (same stream, seed, dose, LR).
+#
+# Launch: tools/run_train.sh --config configs/ladder-nca-phase1.yaml \
+#   --global_batch_tokens 2097152 --data_path <nca_3b_seed17_train.bin> \
+#   --checkpoint_dir <ladder>/nca-phase1
+
+extends: ladder-a1-nca.yaml
+
+attn_res: false
+# Denser than A1-NCA's 250M: the knee pick needs resolution (22 weights snapshots).
+save_schedule: "125M:end"
+checkpoint_shm_dir: /dev/shm/luxia-ladder-nca-phase1
