@@ -1,7 +1,8 @@
 #!/bin/bash
 # Mirror this repo's TRACKED files to a remote checkout (a machine without git):
 # exactly `git ls-files`, extras deleted — except the remote's own site.env,
-# .venv*, caches and __pycache__, which are protected.
+# .venv*, caches, __pycache__, logs/ and analysis/ (eval results written on the
+# node, e.g. lm-eval) — all protected from --delete.
 #
 # Usage: tools/sync.sh [host:/path]      (default: $KOTODAMA_SYNC_TARGET from site.env)
 #        tools/sync.sh -n [host:/path]   (dry run)
@@ -16,7 +17,7 @@ cd "$ROOT"
 LIST="$(mktemp)"; trap 'rm -f "$LIST"' EXIT
 git ls-files > "$LIST"
 rsync -a --delete --delete-excluded "${DRY[@]}" \
-  --filter='P site.env' --filter='P .venv*/' --filter='P .cache/' --filter='P __pycache__/' --filter='P logs/' \
+  --filter='P site.env' --filter='P .venv*/' --filter='P .cache/' --filter='P __pycache__/' --filter='P logs/' --filter='P analysis/' \
   --include-from=<(sed 's|^|/|' "$LIST"; awk -F/ '{p=""; for(i=1;i<NF;i++){p=p"/"$i; print p"/"}}' "$LIST" | sort -u) \
   --exclude='*' ./ "$TARGET/"
 echo "synced $(wc -l < "$LIST") tracked files -> $TARGET"
