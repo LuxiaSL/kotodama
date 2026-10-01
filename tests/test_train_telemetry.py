@@ -82,3 +82,13 @@ def test_hm_config_drops_secretish_and_nonscalar(monkeypatch):
                  "wandb_api_key": "x", "hf_token": "x", "token": "x", "auth_header": "x",
                  "seq": [1, 2], "none": None, "flag": True})
     assert sent == {"muon_lr": 0.02, "total_tokens": 30, "anchor_tokens": "10B,24B", "flag": True}
+
+
+def test_wrapped_model_names_still_resolve():
+    """The training model can carry a wrapper prefix (compile / DDP); keys must not depend on it."""
+    m = _model()
+    wrapper = torch.nn.Module()
+    wrapper._orig_mod = m
+    h = T._layer_health_metrics(wrapper)
+    assert "weight_rms/embed" in h and "weight_rms/layer_3/down_proj" in h
+    assert "router/final/query_norm" in h

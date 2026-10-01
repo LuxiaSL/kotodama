@@ -1626,7 +1626,7 @@ def _layer_health_metrics(model: torch.nn.Module) -> dict[str, float]:
                 sub = "attn" if ".attn." in name else "mlp"
                 grad_sq.setdefault(f"grad/layer_{m.group(1)}/{sub}", []).append(
                     p.grad.detach().float().pow(2).sum())
-        elif name == "embed_tokens.weight":
+        elif name.endswith("embed_tokens.weight"):
             keys.append("weight_rms/embed"); vals.append(p.detach().float().pow(2).mean().sqrt())
     for k, parts in grad_sq.items():
         keys.append(k); vals.append(torch.stack(parts).sum().sqrt())
