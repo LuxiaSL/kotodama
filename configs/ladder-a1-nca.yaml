@@ -36,8 +36,12 @@ doc_masking: false
 seed: 17
 
 compile: true
-# auto (= FA2, else SDPA) as the 3B NCA phase ran it: fa4 + compile needs the
-# doc_masking varlen path, and this phase runs without doc_masking (F6).
+# auto (= FA2, else SDPA) as the 3B NCA phase ran it. History: chosen when fa4 +
+# compile still needed the doc_masking varlen path (ledger B4, the 2026-09-28
+# startup crash); B4 is fixed (455cf47 kotodama::fa4_dense, parity PASS), so fa4
+# would now run here (~+20% tok/s). Kept on FA2 for 3B faithfulness (and FA2's
+# deterministic backward, cf. B3) and so A1 / A1' stay a matched pair — change it
+# only for a new arm, never between A1 and A1'.
 attn_impl: auto
 use_liger: true
 fp8: false
