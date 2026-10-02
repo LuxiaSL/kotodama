@@ -114,9 +114,13 @@ def test_linear_cka_invariances():
 
 def test_settled_at():
     s = [(1, [0, 1, 5]), (2, [0, 1, 6]), (3, [0, 1, 6]), (4, [0, 1, 6]), (5, [0, 1, 7])]
-    assert fb.settled_at(s, 3) == 2
-    assert fb.settled_at(s, 3, tol=1) == 1
-    assert fb.settled_at(s, 4) is None
+    assert fb.settled_at(s, 3) is None            # moved again at the end: not settled
+    assert fb.settled_at(s, 3, tol=1) == 2        # 6,6,6,7 within ±1 of the last (7)
+    s2 = s[:-1] + [(5, [0, 1, 6]), (6, [0, 1, 6])]
+    assert fb.settled_at(s2, 3) == 2
+    assert fb.settled_at(s2, 6) is None
+    f = fb.cut_frequency(s2)
+    assert f[6] == 1.0 and f[0] == 1.0
 
 
 def test_fits_end_to_end_tiny():

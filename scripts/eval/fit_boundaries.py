@@ -17,8 +17,10 @@ random-token probe, as DD-3B was. Per snapshot, four fits:
   block holding the midpoint layer keeps >= K layers, Luxia's "contiguous middle"), to
   show whether that rule binds or the data already agrees.
 
-Stop rule (``summary.json``): a fit is SETTLED at the first snapshot whose boundaries are
-identical for ``--settle`` consecutive snapshots (also reported with ±1-layer tolerance).
+Stop rule (``summary.json``): a fit is SETTLED at the first snapshot from which its boundaries
+never change again through the last snapshot (at least ``--settle`` snapshots; also with
+±1-layer tolerance); ``cut_freq_last_half`` gives each cut's frequency over the second half —
+the robust read when near-tied placements flip.
 
 Usage::
 
@@ -65,13 +67,26 @@ def fits_for(profiles: dict[str, dict[str, list[float]]], cka_scores: list[float
 
 
 def settled_at(series: list[tuple[int, list[int]]], k: int, tol: int = 0) -> int | None:
-    """First step whose boundaries match the next k-1 snapshots (each boundary within tol)."""
+    """First step from which the boundaries never change again through the LAST snapshot
+    (each boundary within tol), provided that holds for at least k snapshots. (Was: the first
+    k-in-a-row run — it fired early on fits that kept moving afterwards.)"""
     def same(a: list[int], b: list[int]) -> bool:
         return len(a) == len(b) and all(abs(x - y) <= tol for x, y in zip(a, b))
-    for i in range(len(series) - k + 1):
-        if all(same(series[i][1], series[j][1]) for j in range(i + 1, i + k)):
+    last = series[-1][1] if series else None
+    for i in range(len(series)):
+        if len(series) - i < k:
+            return None
+        if all(same(series[j][1], last) for j in range(i, len(series))):
             return series[i][0]
     return None
+
+
+def cut_frequency(series: list[tuple[int, list[int]]], frac: float = 0.5) -> dict[int, float]:
+    """How often each boundary appears over the last ``frac`` of the snapshots — the robust
+    read when a fit flips between near-tied placements."""
+    tail = [b for _, b in series[int(len(series) * (1 - frac)):]]
+    cuts = sorted({c for b in tail for c in b})
+    return {c: sum(c in b for b in tail) / len(tail) for c in cuts}
 
 
 def summarize(run_dir: Path, k: int) -> dict[str, Any]:
@@ -84,11 +99,12 @@ def summarize(run_dir: Path, k: int) -> dict[str, Any]:
         series = [(s["step"], s["fits"][m]["boundaries"]) for s in snaps]
         summ["methods"][m] = {"series": series, "settled_at": settled_at(series, k),
                               "settled_at_tol1": settled_at(series, k, tol=1),
-                              "latest": series[-1][1]}
+                              "latest": series[-1][1], "cut_freq_last_half": cut_frequency(series)}
     (run_dir / "summary.json").write_text(json.dumps(summ, indent=1))
     print(f"== {run_dir.name}: boundaries per snapshot (settle = {k} identical in a row)")
     for m, d in summ["methods"].items():
         print(f"  {m:10s} settled_at={d['settled_at']} (±1: {d['settled_at_tol1']})  latest={d['latest']}")
+        print("      cut freq (last half): " + " ".join(f"{c}:{f:.2f}" for c, f in d["cut_freq_last_half"].items()))
         for step, b in d["series"]:
             print(f"      {step:6d}  {b}")
     return summ
