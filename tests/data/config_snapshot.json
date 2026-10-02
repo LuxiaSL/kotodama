@@ -1071,17 +1071,17 @@
       "resume_weights": null,
       "rope_fp32": true,
       "save_every": 400,
-      "save_schedule": "25M:end",
+      "save_schedule": "125M:end",
       "seed": 17,
       "sequence_length": 4096,
       "total_steps": null,
-      "total_tokens": 150000000,
+      "total_tokens": 750000000,
       "tp_size": 1,
       "use_liger": true,
       "wandb": false,
       "wandb_project": "luxia-base",
       "wandb_run_name": null,
-      "warmup_steps": 12,
+      "warmup_steps": 60,
       "z_loss_weight": 1e-05
     },
     "resolved": {
@@ -1120,13 +1120,13 @@
       "prefetch_batches": 2,
       "rope_fp32": true,
       "save_every": 400,
-      "save_schedule": "25M:end",
+      "save_schedule": "125M:end",
       "seed": 17,
       "sequence_length": 4096,
-      "total_tokens": 150000000,
+      "total_tokens": 750000000,
       "use_liger": true,
       "wandb": false,
-      "warmup_steps": 12
+      "warmup_steps": 60
     }
   },
   "ladder-a2.yaml": {
