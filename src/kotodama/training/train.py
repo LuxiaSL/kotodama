@@ -104,6 +104,20 @@ def hm_log(step: int, **metrics: float) -> None:
 _SECRETISH = re.compile(r"(key|secret|passw|auth|credential|_token$|^token$)", re.I)
 
 
+def data_parallel_rank(rank: int, dp_group: Any, legacy_rank0: bool = False) -> int:
+    """This process's data-partition index.
+
+    Under TP, TP peers must share data, so the rank inside the DP group is used. Without TP
+    (``dp_group is None``) every DDP rank is its own data-parallel replica: its global rank.
+    BUG-LEDGER D12: from 4909ffc (2026-04-27) to 2026-10-02 this fell back to 0, so every rank
+    read rank 0's slice — an effective batch of 1/world_size of the global batch, computed
+    world_size times. ``legacy_rank0=True`` reproduces that regime on purpose (pairing a new
+    seed with a ladder arm trained under it); never use it for new science."""
+    if dp_group is not None:
+        return dist.get_rank(dp_group)
+    return 0 if legacy_rank0 else rank
+
+
 def hm_config(config: dict[str, Any]) -> None:
     """Record run hyperparameters with Scheduler (runs-table columns, group-by, scatter
     axes). Scalars and strings only; merged server-side. No-op outside Scheduler."""
@@ -732,7 +746,11 @@ def train(args: argparse.Namespace) -> None:
     # -- Data ------------------------------------------------------------------
     # Under TP, all ranks in a TP group must see the same data.
     # Partition by dp_rank so TP peers share batches.
-    dp_rank = dist.get_rank(dp_group) if dp_group is not None else 0
+    dp_rank = data_parallel_rank(rank, dp_group,
+                                 legacy_rank0=getattr(args, "legacy_rank0_data", False))
+    if is_main and getattr(args, "legacy_rank0_data", False):
+        logger.warning("--legacy_rank0_data: EVERY rank reads rank 0's data (the pre-2026-10-02 "
+                       "regime, BUG-LEDGER D12) — effective batch = 1/%d of the global batch", dp_size)
     doc_masking = getattr(args, "doc_masking", False)
 
     if args.random_data:
@@ -2073,6 +2091,15 @@ def parse_args() -> argparse.Namespace:
              "'fa2': Flash Attention 2. 'fa4': CuTeDSL SM100 (lazy import; compile-safe custom ops). "
              "'flex': FlexAttention + BlockMask doc masking (Inductor-fused). "
              "'sdpa': PyTorch SDPA.",
+    )
+
+    # Data-parallel partitioning (BUG-LEDGER D12)
+    p.add_argument(
+        "--legacy_rank0_data",
+        action="store_true",
+        default=False,
+        help="Reproduce the pre-2026-10-02 bug: every DDP rank reads rank 0's data (effective "
+             "batch = global/world_size). ONLY for replicating ladder arms trained under it.",
     )
 
     # Tensor parallelism
