@@ -729,7 +729,7 @@ def replay_extract_cached_koto(
     `RawGenerationData` on the anamnesis banking contract, plus the
     kotodama-native AttnRes fields.
 
-    The contract, mirrored from `anamnesis.extraction.replay_cached` at
+    The contract, mirrored from `anamnesis.extraction.replay.cached` (formerly `replay_cached`) at
     source (sha 4282447d... state_extractor / bfb27e09... pipeline, cluster
     deploy): T = n-1 steps for n continuation tokens; `logits[i]` is the
     distribution produced AT continuation index i (abs position offset+i);
@@ -740,7 +740,10 @@ def replay_extract_cached_koto(
     """
     import numpy as np
 
-    from anamnesis.extraction.replay_cached import remap_positional_means
+    try:  # anamnesis >= 2026-10 layout
+        from anamnesis.extraction.replay.cached import remap_positional_means
+    except ImportError:  # older layout (e.g. the pleroma-public tree)
+        from anamnesis.extraction.replay_cached import remap_positional_means
     from anamnesis.extraction.state_extractor import RawGenerationData
 
     assert_lane_pinned()
