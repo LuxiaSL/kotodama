@@ -512,7 +512,7 @@ def train(args: argparse.Namespace) -> None:
 
     # -- NCA → language transition ---------------------------------------------
     # Skip if checkpoint dir already has saves (restart after preemption).
-    _has_existing_ckpts = any(Path(args.checkpoint_dir).glob("step_*.pt")) if args.checkpoint_dir else False
+    _has_existing_ckpts = (any(Path(args.checkpoint_dir).glob("step_*.pt")) or any(Path(args.checkpoint_dir).glob("step_*.pt.zst"))) if args.checkpoint_dir else False
     if args.resume_nca and not _has_existing_ckpts:
         if is_main:
             logger.info("Loading NCA checkpoint: %s", args.resume_nca)

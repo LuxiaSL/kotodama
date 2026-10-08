@@ -503,13 +503,28 @@ class AsyncCheckpointManager(CheckpointManager):
                 raise RuntimeError(
                     f"Checkpoint {latest} is zstd-compressed but zstd CLI not found"
                 )
-            decompressed = latest.with_name(latest.name.replace(".pt.zst", ".pt"))
-            subprocess.run(
-                ["zstd", "-d", str(latest), "-o", str(decompressed), "-f"],
-                check=True, capture_output=True,
-            )
-            state = torch.load(decompressed, map_location=device, weights_only=False)
-            decompressed.unlink()  # cleanup temp decompressed file
+            # Rank 0 alone decompresses (tmp + rename); every rank loads the
+            # same file between barriers; rank 0 removes it. (Each rank used to
+            # zstd -f into one shared path and unlink it — a multi-rank resume
+            # from a compressed checkpoint died on the first unlink.)
+            decompressed = latest.with_name(latest.name.replace(".pt.zst", ".pt.decomp"))
+            distributed = dist.is_initialized() and dist.get_world_size() > 1
+            if self.rank == 0:
+                tmp = decompressed.with_name(decompressed.name + ".tmp")
+                subprocess.run(
+                    ["zstd", "-d", str(latest), "-o", str(tmp), "-f"],
+                    check=True, capture_output=True,
+                )
+                tmp.rename(decompressed)
+            if distributed:
+                dist.barrier()
+            try:
+                state = torch.load(decompressed, map_location=device, weights_only=False)
+            finally:
+                if distributed:
+                    dist.barrier()
+                if self.rank == 0:
+                    decompressed.unlink(missing_ok=True)
         else:
             state = torch.load(latest, map_location=device, weights_only=False)
 
