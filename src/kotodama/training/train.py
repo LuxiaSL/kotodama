@@ -559,6 +559,14 @@ def train(args: argparse.Namespace) -> None:
             )
         model.reinit_embeddings(new_vocab_size=config.vocab_size)
 
+        # Optionally return named routing points to fresh init (handoff fix arm)
+        if args.reset_routing_layers:
+            _rr_layers, _rr_final = parse_routing_spec(args.reset_routing_layers, config.num_layers)
+            _rr_names = model.reset_routing(_rr_layers, final=_rr_final)
+            if is_main:
+                logger.info("Reset AttnRes routing to fresh init (%s): %d params",
+                            args.reset_routing_layers, len(_rr_names))
+
         # Optionally reinitialize MLPs
         if args.reinit_mlps:
             if is_main:
@@ -721,6 +729,10 @@ def train(args: argparse.Namespace) -> None:
         total_steps = total_tokens // (grad_accum * tokens_per_global_micro)
 
     tokens_per_step = grad_accum * tokens_per_global_micro
+    loop_end = _loop_end_step(total_steps, args.stop_at_step)
+    if is_main and loop_end < total_steps:
+        logger.info("--stop_at_step: exiting after step %d of a %d-step schedule",
+                    loop_end - 1, total_steps)
 
     if is_main:
         logger.info(
@@ -1093,7 +1105,7 @@ def train(args: argparse.Namespace) -> None:
     # Opt-in data-path diagnostic: token-ID hashes of each rank-0 micro-batch.
     _debug_hash_steps = int(os.environ.get("KOTODAMA_DEBUG_BATCH_HASH", "0") or 0)
 
-    for step in range(start_step, total_steps):
+    for step in range(start_step, loop_end):
         # Start profiler at the configured step
         if _profiler is None and is_main and step == getattr(args, "profile_start_step", -1) and getattr(args, "profile", False):
             _profiler = torch.profiler.profile(
@@ -1207,7 +1219,7 @@ def train(args: argparse.Namespace) -> None:
             grad_metrics = _per_layer_grad_norms(raw_model)
             wb.log_custom(step, grad_metrics)
         _ng_every_h = getattr(args, "norm_gain_every", 0)
-        if is_main and _ng_every_h > 0 and (step % _ng_every_h == 0 or step == total_steps - 1):
+        if is_main and _ng_every_h > 0 and (step % _ng_every_h == 0 or step == loop_end - 1):
             try:
                 hm_log(step, **_layer_health_metrics(raw_model))
             except Exception as e:  # telemetry must never stop a run (e.g. sharded params)
@@ -1244,7 +1256,7 @@ def train(args: argparse.Namespace) -> None:
         _loss_win_max = max(_loss_win_max, step_loss)
         log_steps += 1
 
-        if is_main and (step % args.log_every == 0 or step == total_steps - 1):
+        if is_main and (step % args.log_every == 0 or step == loop_end - 1):
             elapsed = time.time() - step_t0
             avg_loss = log_loss_accum / max(log_steps, 1)
             avg_z_loss = log_z_loss_accum / max(log_steps, 1)
@@ -1316,7 +1328,7 @@ def train(args: argparse.Namespace) -> None:
                 )
 
             _ng_every = getattr(args, "norm_gain_every", 0)
-            if _ng_every > 0 and (step % _ng_every == 0 or step == total_steps - 1):
+            if _ng_every > 0 and (step % _ng_every == 0 or step == loop_end - 1):
                 hm_log(step, **_norm_gain_metrics(raw_model))
 
             # Reset accumulators
@@ -1465,8 +1477,9 @@ def train(args: argparse.Namespace) -> None:
     elif not sigterm.received:
         if is_main:
             logger.info(
-                "Training complete: %d steps, %.2fB tokens",
-                total_steps,
+                "Training complete: %d steps%s, %.2fB tokens",
+                loop_end,
+                f" (stopped early; schedule {total_steps})" if loop_end < total_steps else "",
                 tokens_consumed / 1e9,
             )
         data_state = _current_data_state()
@@ -1474,7 +1487,7 @@ def train(args: argparse.Namespace) -> None:
         if monitor is not None and monitor._probe_batch is not None:
             _extra_final["probe_batch"] = monitor._probe_batch.cpu()
         ckpt_mgr.save(
-            step=total_steps - 1,
+            step=loop_end - 1,
             model=model,
             muon_opt=muon_opt,
             adamw_opt=adamw_opt,
@@ -1497,7 +1510,7 @@ def train(args: argparse.Namespace) -> None:
         _upload_checkpoint_to_hf(
             repo_id=args.hf_upload_repo,
             checkpoint_dir=Path(args.checkpoint_dir),
-            step=total_steps - 1,
+            step=loop_end - 1,
             tokens_consumed=tokens_consumed,
             config_file=getattr(args, "_config_file", None),
         )
@@ -1506,6 +1519,49 @@ def train(args: argparse.Namespace) -> None:
         wb.finish()
     sigterm.restore()
     cleanup_distributed()
+
+
+def parse_routing_spec(spec: str, num_layers: int) -> tuple[list[int], bool]:
+    """Parse a ``--reset_routing_layers`` spec: comma-separated layer indices,
+    inclusive ranges ``a-b``, and ``final`` (the final readout). E.g.
+    ``"24-27,final"`` -> ([24, 25, 26, 27], True)."""
+    layers: set[int] = set()
+    final = False
+    for raw in spec.split(","):
+        tok = raw.strip()
+        if not tok:
+            continue
+        if tok == "final":
+            final = True
+            continue
+        try:
+            if "-" in tok:
+                lo_s, hi_s = tok.split("-", 1)
+                lo, hi = int(lo_s), int(hi_s)
+                if lo > hi:
+                    raise ValueError
+                layers.update(range(lo, hi + 1))
+            else:
+                layers.add(int(tok))
+        except ValueError:
+            raise ValueError(f"--reset_routing_layers: bad token {tok!r} in {spec!r}") from None
+    bad = sorted(i for i in layers if not 0 <= i < num_layers)
+    if bad:
+        raise ValueError(f"--reset_routing_layers: layers out of range 0..{num_layers - 1}: {bad}")
+    if not layers and not final:
+        raise ValueError(f"--reset_routing_layers: empty spec {spec!r}")
+    return sorted(layers), final
+
+
+def _loop_end_step(total_steps: int, stop_at_step: Optional[int]) -> int:
+    """Exclusive end of the step loop. ``--stop_at_step N`` runs steps < N (final
+    checkpoint saved as step N-1) while the LR/batch schedule still spans
+    ``total_steps`` — unlike ``--total_steps``, which redefines the schedule."""
+    if stop_at_step is None:
+        return total_steps
+    if stop_at_step <= 0:
+        raise ValueError(f"--stop_at_step must be > 0, got {stop_at_step}")
+    return min(total_steps, stop_at_step)
 
 
 def _compute_grad_accum_for_step(
@@ -1836,6 +1892,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override total_tokens with explicit step count",
     )
+    p.add_argument(
+        "--stop_at_step",
+        type=int,
+        default=None,
+        help="Exit (final checkpoint) after step N-1 WITHOUT changing the LR/batch "
+             "schedule (--total_steps redefines it) — short arms of a long recipe",
+    )
     p.add_argument("--sequence_length", type=int, default=2048)
     p.add_argument("--micro_batch_size", type=int, default=8)
     p.add_argument(
@@ -2040,6 +2103,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to NCA checkpoint — loads weights, reinitializes embeddings",
     )
+    p.add_argument(
+        "--reset_routing_layers",
+        type=str,
+        default=None,
+        help="With --resume_nca: return these layers' AttnRes routing (query + key-norm "
+             "gain, pre-attn and pre-MLP) to fresh init at the handoff; spec like "
+             "'24-27,final' ('final' = final readout)",
+    )
     # CPT / weight-only resume (no optimizer, no step, no embedding reinit)
     p.add_argument(
         "--resume_weights",
@@ -2177,6 +2248,10 @@ def parse_args() -> argparse.Namespace:
         args = p.parse_args()
         args._config_file = args.config
 
+    if args.reset_routing_layers and not args.resume_nca:
+        p.error("--reset_routing_layers only applies at the NCA -> language handoff (needs --resume_nca)")
+    if args.stop_at_step is not None and args.stop_at_step <= 0:
+        p.error(f"--stop_at_step must be > 0, got {args.stop_at_step}")
     return args
 
 

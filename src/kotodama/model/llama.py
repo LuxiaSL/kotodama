@@ -23,7 +23,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import torch
 import torch.nn as nn
@@ -1443,6 +1443,35 @@ class LuxiaBaseModel(nn.Module):
             nn.init.normal_(layer.ffn.gate_proj.weight, mean=0.0, std=std)
             nn.init.normal_(layer.ffn.up_proj.weight, mean=0.0, std=std)
             nn.init.normal_(layer.ffn.down_proj.weight, mean=0.0, std=std * residual_scale)
+
+    def reset_routing(self, layers: Iterable[int], final: bool = False) -> list[str]:
+        """Return the listed layers' AttnRes routing params to their fresh-init values.
+
+        Per layer: both routing points (pre-attn ``attn_res_*`` and pre-MLP
+        ``mlp_res_*``) — query -> zeros (uniform weighting), key-norm gain -> ones.
+        ``final`` does the same for the final readout (``final_res_*``). Used at
+        the NCA -> language handoff to drop an NCA-era routing imprint while
+        keeping the trained circuits. Returns the reset parameter names.
+        """
+        if not self.config.attn_res:
+            raise ValueError("reset_routing: model has no AttnRes routing (attn_res=False)")
+        idx = sorted(set(int(i) for i in layers))
+        bad = [i for i in idx if not 0 <= i < self.config.num_layers]
+        if bad:
+            raise ValueError(f"reset_routing: layer index out of range 0..{self.config.num_layers - 1}: {bad}")
+        reset: list[str] = []
+        with torch.no_grad():
+            for i in idx:
+                layer = self.layers[i]
+                for site in ("attn", "mlp"):
+                    getattr(layer, f"{site}_res_query").zero_()
+                    getattr(layer, f"{site}_res_norm").weight.fill_(1.0)
+                    reset += [f"layers.{i}.{site}_res_query", f"layers.{i}.{site}_res_norm.weight"]
+            if final:
+                self.final_res_query.zero_()
+                self.final_res_norm.weight.fill_(1.0)
+                reset += ["final_res_query", "final_res_norm.weight"]
+        return reset
 
     def reinit_embeddings(self, new_vocab_size: Optional[int] = None) -> None:
         """Reinitialize embedding layer. Used when switching from NCA to language vocab."""
