@@ -529,10 +529,11 @@ def train(args: argparse.Namespace) -> None:
 
         nca_state = torch.load(load_path, map_location=device, weights_only=False)
 
-        if nca_path.name.endswith(".pt.zst") and is_main:
-            load_path.unlink(missing_ok=True)
+        # Every rank must finish loading before rank 0 removes the temp file.
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.barrier()
+        if nca_path.name.endswith(".pt.zst") and is_main:
+            load_path.unlink(missing_ok=True)
 
         nca_model_state = nca_state.get("model", nca_state)
 
