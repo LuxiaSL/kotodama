@@ -512,6 +512,8 @@ def train(args: argparse.Namespace) -> None:
 
     # -- NCA → language transition ---------------------------------------------
     # Skip if checkpoint dir already has saves (restart after preemption).
+    if args.reset_routing_layers and not args.resume_nca:
+        raise ValueError("--reset_routing_layers only applies at the NCA -> language handoff (needs --resume_nca)")
     _has_existing_ckpts = (any(Path(args.checkpoint_dir).glob("step_*.pt")) or any(Path(args.checkpoint_dir).glob("step_*.pt.zst"))) if args.checkpoint_dir else False
     if args.resume_nca and not _has_existing_ckpts:
         if is_main:
@@ -2249,8 +2251,6 @@ def parse_args() -> argparse.Namespace:
         args = p.parse_args()
         args._config_file = args.config
 
-    if args.reset_routing_layers and not args.resume_nca:
-        p.error("--reset_routing_layers only applies at the NCA -> language handoff (needs --resume_nca)")
     if args.stop_at_step is not None and args.stop_at_step <= 0:
         p.error(f"--stop_at_step must be > 0, got {args.stop_at_step}")
     return args

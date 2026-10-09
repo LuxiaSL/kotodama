@@ -1,0 +1,12 @@
+# 1B formation ladder — arm A2d, phase 2 of 2: language from the dyadic-v3 NCA base, with the
+# handoff routing reset (= the F4 fix) — so A2d vs F4 differs only in the NCA corpus.
+#
+# Launch: tools/run_train.sh --config configs/ladder-a2d.yaml \
+#   --global_batch_tokens 2097152 --data_path <train.bin> --checkpoint_dir <ladder>/a2d \
+#   --muon_lr 0.04 --anchor_tokens 24B --resume_nca <ladder>/a2d-nca/step_00000356.pt.zst
+# (resume_nca only applies on a fresh checkpoint_dir; resumes ignore it.)
+
+extends: ladder-a2.yaml
+
+reset_routing_layers: "24-27,final"
+checkpoint_shm_dir: /dev/shm/luxia-ladder-a2d
