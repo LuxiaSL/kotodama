@@ -134,3 +134,11 @@ def test_integration_real_model_real_items():
     assert all(np.isfinite(r["gold_lp"]) for r in rows)
     srows = score_smoothing(model, smo)
     assert len(srows) == 2 and all(0.0 <= r["si"] <= 1.0 for r in srows)
+
+
+def test_model_overrides_cpu_and_rope():
+    from kotodama.eval.nca_gates import model_overrides
+    assert model_overrides("cpu") == {"attn_impl": "sdpa", "use_liger": False}
+    assert model_overrides("cuda") == {}
+    assert model_overrides("cuda:0", rope_fp32=True) == {"rope_fp32": True}
+    assert model_overrides("cpu", rope_fp32=True)["rope_fp32"] is True

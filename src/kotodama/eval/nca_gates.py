@@ -221,6 +221,18 @@ def score_eval_dir(model: ModelFn, eval_dir: Path | str, tag: str,
     return result
 
 
+def model_overrides(device: str, rope_fp32: bool = False) -> dict[str, Any]:
+    """LuxiaModelConfig overrides for scoring: CPU has no flash-attn / Liger kernels, so
+    CPU runs use SDPA and plain norms/CE; ``rope_fp32`` matches models trained with fp32
+    RoPE tables (the 1B ladder)."""
+    ov: dict[str, Any] = {}
+    if not str(device).startswith("cuda"):
+        ov.update(attn_impl="sdpa", use_liger=False)
+    if rope_fp32:
+        ov["rope_fp32"] = True
+    return ov
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     ap = argparse.ArgumentParser(description="NCA in-domain gates")
@@ -238,6 +250,8 @@ def main() -> None:
                     default="auto")
     ap.add_argument("--device", default=None,
                     help="default: cuda if available else cpu")
+    ap.add_argument("--rope-fp32", action="store_true",
+                    help="model trained with fp32 RoPE tables (the 1B ladder arms)")
     ap.add_argument("--out", default=None,
                     help="default: <eval-dir>/gates_<tag>.json")
     args = ap.parse_args()
@@ -255,7 +269,8 @@ def main() -> None:
     from kotodama.eval.model_loader import load_model
     model = load_model(args.checkpoint, config_path=args.config_path,
                        config_section=args.config_section,
-                       attn_res_config=attn_res_config, device=device)
+                       attn_res_config=attn_res_config, device=device,
+                       overrides=model_overrides(device, args.rope_fp32))
 
     ev = Path(args.eval_dir)
     result: dict[str, Any] = {"tag": args.tag,
