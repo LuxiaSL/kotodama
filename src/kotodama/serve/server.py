@@ -498,14 +498,17 @@ class ModelInfo(BaseModel):
 
 
 # ── /logprobs: batched prefill-only scoring (P0.6 four-register battery) ────────
-# One forward per BATCH, no decode loop: prompts are right-padded and logits are
-# gathered at each sequence's last REAL position — exactly correct under causal
-# attention (pad tokens sit after the read position and can never attend into
-# it), so no attention mask is needed. This is the fast path for logprob evals;
-# the decode engine is irrelevant here because nothing is generated.
+# One forward per BATCH, no decode loop (the computation lives in
+# kotodama.eval.riders.score, shared with the training loop's in-loop riders).
+# This is the fast path for logprob evals; the decode engine is irrelevant here
+# because nothing is generated.
 
-LOGPROB_MAX_BATCH = 64
-LOGPROB_MAX_TOTAL_TOKENS = 96_000  # sum over the batch; logits are B x T x 49152 bf16
+from kotodama.eval.riders.score import (  # noqa: E402
+    LOGPROB_MAX_BATCH,
+    LOGPROB_MAX_TOTAL_TOKENS,
+    LogprobLimitError,
+    score_logprob_batch,
+)
 
 
 class LogprobItem(BaseModel):
@@ -521,44 +524,12 @@ class LogprobRequest(BaseModel):
 
 @torch.inference_mode()
 def _score_logprobs(req: LogprobRequest) -> dict[str, Any]:
-    tok = _tokenizer
-    enc = [tok.encode(it.prompt) for it in req.items]
-    lens = [len(e) for e in enc]
-    if max(lens) >= _max_seq_len:
-        raise HTTPException(400, f"prompt too long ({max(lens)} tokens, max {_max_seq_len})")
-    if sum(lens) > LOGPROB_MAX_TOTAL_TOKENS:
-        raise HTTPException(400, f"batch too large ({sum(lens)} total tokens, "
-                                 f"max {LOGPROB_MAX_TOTAL_TOKENS})")
-    batch = torch.zeros((len(enc), max(lens)), dtype=torch.long)
-    for r, e in enumerate(enc):
-        batch[r, : len(e)] = torch.tensor(e, dtype=torch.long)
-    batch = batch.to(_device)
-    logits = _model(batch)["logits"]
-
-    results: list[dict[str, Any]] = []
-    for r, it in enumerate(req.items):
-        last = logits[r, lens[r] - 1].float()
-        logsm = torch.log_softmax(last, dim=-1)
-        probs = logsm.exp()
-        entropy = float(-(probs * logsm).sum())
-        cands = []
-        for c in it.candidates:
-            cids = tok.encode(c, add_special_tokens=False)
-            first = cids[0]
-            cands.append({
-                "text": c,
-                "id": int(first),
-                "n_tokens": len(cids),  # runner treats >1 as a verification failure
-                "logprob": float(logsm[first]),
-                "rank_full": int((logsm > logsm[first]).sum()) + 1,
-            })
-        top = []
-        if req.top_n:
-            tv, ti = logsm.topk(req.top_n)
-            top = [{"token": tok.decode([int(i)]), "id": int(i), "logprob": float(v)}
-                   for v, i in zip(tv, ti)]
-        results.append({"id": it.id, "prompt_tokens": lens[r],
-                        "entropy": entropy, "candidates": cands, "top": top})
+    try:
+        results = score_logprob_batch(
+            lambda batch: _model(batch)["logits"], _tokenizer, req.items, req.top_n,
+            _device, max_seq_len=_max_seq_len, max_total_tokens=LOGPROB_MAX_TOTAL_TOKENS)
+    except LogprobLimitError as e:
+        raise HTTPException(400, str(e)) from e
     return {"results": results, "model": _model_name()}
 
 

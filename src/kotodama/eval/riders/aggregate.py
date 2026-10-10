@@ -54,14 +54,26 @@ def load(grid_dir: Path) -> list[Row]:
     return rows
 
 
+def _cc(acc: float, chance: float) -> float:
+    return (acc - chance) / (1 - chance) if chance < 1 else 0.0
+
+
+def cc_point(rows: list[Row]) -> float:
+    """Chance-corrected accuracy, point estimate only (no bootstrap)."""
+    if not rows:
+        return float("nan")
+    acc = float(np.mean([r["gold_rank_cand"] == 1 for r in rows]))
+    chance = float(np.mean([1.0 / r["n_candidates"] for r in rows]))
+    return _cc(acc, chance)
+
+
 def cc_acc(rows: list[Row]) -> tuple[float, float, float]:
     """Chance-corrected accuracy with bootstrap 95% CI: (point, lo, hi)."""
     top1 = np.array([r["gold_rank_cand"] == 1 for r in rows], dtype=float)
     chance = np.array([1.0 / r["n_candidates"] for r in rows])
 
     def cc(idx: np.ndarray) -> float:
-        a, c = top1[idx].mean(), chance[idx].mean()
-        return (a - c) / (1 - c) if c < 1 else 0.0
+        return _cc(top1[idx].mean(), chance[idx].mean())
 
     n = len(rows)
     point = cc(np.arange(n))

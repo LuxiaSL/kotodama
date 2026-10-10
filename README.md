@@ -28,6 +28,7 @@ activates the venv, and sets the package path and compile caches.
 | NCA data | `tools/nca_gen.sh` (defaults = the 3B recipe: 3500 rules × 20 sims, seed 17) |
 | NCA v3 data + gates | `python -m kotodama.nca.gen_dyadic_data --out <dir> ...` (token-level mix, banded rules, sidecar; `--finalize` emits eval sets) · score: `python -m kotodama.eval.nca_gates --checkpoint <ckpt> --eval-dir <dir> --tag <t>` · every checkpoint of a run (formation curve): `tools/run_py.sh -m scripts.eval.nca_gates_sweep --ckpt-dir <run> --eval-dir <dir> --init-seed <seed>` |
 | pretrain (NCA → language, CPT) | `tools/run_train.sh --config configs/<run>.yaml [--flag value ...]` |
+| in-loop evals | add `--inloop_evals riders,induction` to a train launch (see [In-loop evals](#in-loop-evals)) |
 | lm-eval anchors | `tools/launch_lmeval_sharded.sh <ckpt> 0,1,2` · single GPU: `tools/run_py.sh -m scripts.eval.run_lm_eval --checkpoint <ckpt> --config-section 3b` |
 | Uncheatable BPB | `tools/run_py.sh -m kotodama.eval.uncheatable --checkpoint <ckpt> --config-section 3b --attn-res-boundaries dd3b --out <json>` (per-domain bits/byte on the Uncheatable Eval release, same math as the 3B's published 0.852; data = `--data-dir` / `$KOTODAMA_UNCHEATABLE_DATA`, else the HF dataset; formation sweeps: `--max-docs-per-domain N`; post with `hm_backfill.py --uncheatable <json>`) |
 | induction score | `tools/run_py.sh -m kotodama.eval.induction --checkpoint <ckpt> --config-section proxy --attn-res-boundaries ddv1 --tag <t>` (random-token repeat loss drop + per-head prefix matching on AttnRes models) |
@@ -46,6 +47,25 @@ Configs are flat YAML (keys = `train.py` flags) with `extends:` inheritance;
 shared blocks live in `configs/base/`. The 3B lineage configs
 (`nca-3b-phase1` → `nca-3b-phase3-cotrain` → `3b-language`, plus
 `3b-chinchilla-decay`) are the record of the shipped run.
+
+### In-loop evals
+
+`train.py --inloop_evals <suites>` scores small suites on the live weights during
+training (in-process, every DDP rank takes a shard; off by default):
+
+| suite | what | needs |
+|---|---|---|
+| `riders` (`on` = this alone) | riders-lite: 200 balanced std items × 4 registers × {0shot, 3shot, 3shot_relet} (shots re-lettered F/G/H→A/B/C), scored by the same function as `/logprobs`; acc, chance-corrected acc, margin, error types (`wrong_box` / `init_query` / `other`) | nothing (generates the standard battery; or `--inloop_riders_items` + `--inloop_riders_shots`) |
+| `induction` | random-token repeat loss drop | nothing |
+| `uncheatable` | bits/byte on the first `--inloop_uncheatable_docs` docs per domain | `--inloop_uncheatable_path` |
+| `nca_gates` | NCA ledger accuracy (NCA-phase runs) | `--inloop_nca_gates_dir` |
+
+Cadence `--inloop_schedule` (default `0:0.025,decay:0.005`: every 2.5% of tokens,
+every 0.5% once the LR decay starts, plus the first and final steps). Each point
+posts one `hm_log` batch (`inloop/riders/narrative/3shot/acc`, …, `inloop/time_s`)
+and writes every row to `<checkpoint_dir>/inloop/step_<N>.jsonl` (same weights as
+checkpoint `step_<N>`); resumes skip points already written. Size knobs:
+`--inloop_riders_n`, `--inloop_max_batch_tokens`, `--no_inloop_riders_relet`.
 
 The server exposes `/v1/chat/completions`, `/v1/completions`, `/generate`
 (full sampling control, streaming), `/logprobs` (batched prefill scoring),

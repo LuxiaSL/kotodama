@@ -668,6 +668,12 @@ class MasterAdamW(Optimizer):
             )
 
 
+def decay_start_step(total_steps: int, decay_start_pct: float) -> int:
+    """First step of the WSD decay phase: the LR multiplier is 1.0 (after warmup)
+    for steps below it and decays to zero from it to ``total_steps``."""
+    return int(total_steps * decay_start_pct)
+
+
 class HybridScheduler:
     """
     WSD (Warmup-Stable-Decay) schedule applied to both Muon and AdamW.
@@ -688,7 +694,7 @@ class HybridScheduler:
         self.adamw_opt = adamw_opt
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
-        self.decay_start_step = int(total_steps * decay_start_pct)
+        self.decay_start_step = decay_start_step(total_steps, decay_start_pct)
         self.decay_type = decay_type
 
         # Store base LRs

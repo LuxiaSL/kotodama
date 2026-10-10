@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import logging
 import math
 import os
@@ -67,7 +68,8 @@ from kotodama.training.checkpoint import (
     parse_token_count,
     save_weights_only,
 )
-from kotodama.training.muon import HybridScheduler, build_hybrid_optimizer
+from kotodama.training.inloop import InloopConfig, InloopEvaluator
+from kotodama.training.muon import HybridScheduler, build_hybrid_optimizer, decay_start_step
 
 logger = logging.getLogger(__name__)
 
@@ -1041,6 +1043,26 @@ def train(args: argparse.Namespace) -> None:
             hm_log(step, **{"eval/loss": avg, "eval/perplexity": math.exp(min(avg, 20))})
         return avg
 
+    # -- In-loop evals (live weights; every rank, deterministic schedule) --------
+    inloop: Optional[InloopEvaluator] = None
+    _inloop_cfg = InloopConfig.from_args(args)
+    if _inloop_cfg.suites:
+        if tp_size > 1:
+            raise ValueError("--inloop_evals is not supported with --tp_size > 1 "
+                             "(prompts are sharded across ranks; TP shards the model)")
+        inloop = InloopEvaluator(
+            _inloop_cfg, out_dir=args.checkpoint_dir, rank=rank, world_size=world_size,
+            device=device, max_seq_len=config.max_position_embeddings,
+            vocab_size=config.vocab_size, log_fn=hm_log)
+        _cum_tokens = None
+        if args.batch_ramp_pct > 0 and args.batch_ramp_initial < 1.0:
+            _cum_tokens = list(itertools.accumulate(
+                _compute_grad_accum_for_step(s, total_steps, grad_accum,
+                                             args.batch_ramp_initial, args.batch_ramp_pct)
+                * tokens_per_global_micro for s in range(total_steps)))
+        inloop.plan(total_steps, decay_start_step(total_steps, args.decay_start_pct),
+                    final_step=loop_end - 1, start_step=start_step, cum_tokens=_cum_tokens)
+
     # -- Data prefetcher ---------------------------------------------------------
     # Started AFTER resume + probe-batch setup: both iterate the same dataset
     # object, and the prefetch thread must not race their position advances.
@@ -1427,6 +1449,12 @@ def train(args: argparse.Namespace) -> None:
                 scheduler=scheduler, tokens_consumed=tokens_consumed,
                 data_state=_current_data_state(), extra=_extra_anchor or None,
             )
+
+        # -- In-loop evals (weights == checkpoint step_<step>) -------------------
+        if inloop is not None and inloop.due(step):
+            _il = inloop.run(step, model, tokens_consumed, stop_requested=sigterm.received)
+            if _il and wb is not None:
+                wb.log_custom(step, _il)
 
         # -- Eval on held-out data ---------------------------------------------
         if eval_every > 0 and step > 0 and step % eval_every == 0:
@@ -2016,6 +2044,49 @@ def parse_args() -> argparse.Namespace:
         "--eval_batches", type=int, default=20,
         help="Number of micro-batches per eval pass",
     )
+
+    # In-loop evals (kotodama.training.inloop): small suites on the live weights
+    p.add_argument(
+        "--inloop_evals", type=str, default=None,
+        help="Comma list of in-loop eval suites scored on the live weights: riders "
+             "(riders-lite), induction, uncheatable (needs --inloop_uncheatable_path), "
+             "nca_gates (needs --inloop_nca_gates_dir). Unset/empty = off.",
+    )
+    p.add_argument(
+        "--inloop_schedule", type=str, default="0:0.025,decay:0.005",
+        help="In-loop cadence as START:INTERVAL token fractions; START = fraction or "
+             "'decay' (LR decay start). Default: every 2.5%%, every 0.5%% in the decay; "
+             "first and final steps always.",
+    )
+    p.add_argument("--inloop_max_batch", type=int, default=64,
+                   help="In-loop: prompts per forward")
+    p.add_argument("--inloop_max_batch_tokens", type=int, default=8192,
+                   help="In-loop: summed prompt tokens per forward (bounds logits memory)")
+    p.add_argument("--inloop_riders_items", type=str, default=None,
+                   help="Rider items.jsonl (default: generate the standard battery in-process)")
+    p.add_argument("--inloop_riders_shots", type=str, default=None,
+                   help="Rider shots.json (with --inloop_riders_items)")
+    p.add_argument("--inloop_riders_n", type=int, default=200,
+                   help="Rider items per register (balanced over the std (n,m) cells)")
+    p.add_argument("--inloop_riders_seed", type=int, default=0,
+                   help="Seed of the rider item selection")
+    p.add_argument("--inloop_riders_relet", action="store_true", default=True,
+                   help="Also score 3-shot with re-lettered exemplar shots (default on)")
+    p.add_argument("--no_inloop_riders_relet", dest="inloop_riders_relet",
+                   action="store_false", help="Skip the 3shot_relet condition")
+    p.add_argument("--inloop_riders_top_n", type=int, default=5,
+                   help="Full-vocab top-n tokens kept per rider row")
+    p.add_argument("--inloop_induction_n_seqs", type=int, default=32)
+    p.add_argument("--inloop_induction_len", type=int, default=128,
+                   help="Random prefix length (sequence = 2x + EOS)")
+    p.add_argument("--inloop_uncheatable_path", type=str, default=None,
+                   help="Uncheatable data (domain files / parquet dir) for the uncheatable suite")
+    p.add_argument("--inloop_uncheatable_docs", type=int, default=8,
+                   help="Leading documents scored per Uncheatable domain")
+    p.add_argument("--inloop_nca_gates_dir", type=str, default=None,
+                   help="NCA eval dir (eval_ledger*.jsonl + meta.json) for the nca_gates suite")
+    p.add_argument("--inloop_nca_gates_max_items", type=int, default=256,
+                   help="Leading items scored per ledger file")
 
     # Checkpointing
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
