@@ -48,3 +48,27 @@ def test_rejects_bad_fraction(tmp_path):
     p = TokenizedDataset(path=_bin(tmp_path / "a.bin", 10, 0), seq_len=SEQ)
     with pytest.raises(ValueError):
         MixedTokenDataset(p, p, 0.0)
+
+
+def test_resume_from_unmixed_state_introduces_mix_at_fork(tmp_path):
+    """A decay branch can introduce the mix at a fork: resuming a MixedTokenDataset from a plain
+    TokenizedDataset state continues the language stream exactly and holds the fraction from there."""
+    lang = _bin(tmp_path / "lang.bin", 4000, 0)
+    plain = TokenizedDataset(path=lang, seq_len=SEQ, seed=1)
+    it = iter(plain)
+    for _ in range(250):
+        next(it)
+    fork_state = plain.state_dict()
+    cont = TokenizedDataset(path=lang, seq_len=SEQ, seed=1)
+    cont.load_state_dict(fork_state)
+    expected_lang = [tuple(t.tolist()) for t in itertools.islice(iter(cont), 500)]
+
+    mixed = _mixed(tmp_path)
+    mixed.load_state_dict(fork_state)
+    out = list(itertools.islice(iter(mixed), 515))
+    got_lang = [tuple(t.tolist()) for t in out if _src(t) == 0]
+    assert len(got_lang) >= 490 and got_lang == expected_lang[:len(got_lang)]  # language continues exactly from the fork
+    n_dyad = sum(_src(t) for t in out)
+    assert abs(n_dyad - 0.03 * len(out)) <= 1  # fraction holds from the resume point
+    state = mixed.state_dict()  # and the branch's own checkpoints are mixed-format
+    assert set(state) == {"primary", "secondary", "n_total", "n_secondary"}

@@ -310,6 +310,17 @@ class MixedTokenDataset(IterableDataset):
                 "n_total": self._n_total, "n_secondary": self._n_secondary}
 
     def load_state_dict(self, state: dict) -> None:
+        if "primary" not in state:
+            # Resume from an UNMIXED checkpoint (plain TokenizedDataset state) — e.g. a decay
+            # branch that introduces the mix at a fork point. The primary stream continues
+            # exactly where it was; the secondary starts fresh and the token-debt counters
+            # start at the resume point, so the fraction holds from here on.
+            logger.warning("MixedTokenDataset: resuming from an unmixed data state; the "
+                           "secondary stream and mix counters start fresh at this point")
+            self.primary.load_state_dict(state)
+            self._n_total = 0
+            self._n_secondary = 0
+            return
         self.primary.load_state_dict(state["primary"])
         self.secondary.load_state_dict(state["secondary"])
         self._n_total = int(state["n_total"])
