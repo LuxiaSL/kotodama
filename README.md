@@ -36,6 +36,7 @@ activates the venv, and sets the package path and compile caches.
 | spike resilience | `python scripts/eval/resilience.py --job <id> [--signal train/grad_norm]` (per spike: does geo/rankme_last recover to its pre-spike level, and when) |
 | node parity | `python scripts/utils/node_parity.py --hosts <h1> <h2> --mirror <path> --python <venv python>` (same stack on every node before hopping runs) |
 | binding rider grid | `python -m kotodama.eval.riders {gen,run,aggregate}` (logprob battery against a server) |
+| binding probes (other shapes) | `python -m kotodama.eval.bindprobes {gen,run,aggregate}` (attr / codevar / dialogue × {0shot, 3shot, 3shot_collide}; same `/logprobs` scorer as the riders) |
 | checkpoints | `python -m kotodama.ckpt {info,strip,list}` — names from `configs/checkpoints.yaml` |
 | capture / readout | `kotodama.model.capture` (instrumented AttnRes forward, parity-tested) |
 | serve one model | `tools/run_serve.sh --checkpoint <ckpt> [--mode chat]` · public base: `tools/serve_3b_base.sh` |
@@ -79,7 +80,7 @@ src/kotodama/
   nca/        NCA trajectory generator (+ dyadic variant)
   training/   train.py, Muon, checkpointing
   data/       uint16 token-stream dataset
-  eval/       model loading, lm-eval adapter, riders/ (binding battery)
+  eval/       model loading, lm-eval adapter, riders/ (binding battery), bindprobes/ (binding probes)
   serve/      server, gateway, chatml, laws, chat client
   presets.py  shapes + AttnRes boundaries + tokenizer
   ckpt.py     checkpoint load/strip/info/registry
