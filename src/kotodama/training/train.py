@@ -713,6 +713,7 @@ def train(args: argparse.Namespace) -> None:
             adamw_weight_decay=args.adamw_weight_decay,
             adamw_no_decay_norms=getattr(args, "adamw_no_decay_norms", False),
             muon_fp32_master=getattr(args, "muon_fp32_master", False),
+            attn_group=_attn_lr_scaled(args),
         )
 
     # -- Compute training geometry ---------------------------------------------
@@ -758,7 +759,11 @@ def train(args: argparse.Namespace) -> None:
         total_steps=total_steps,
         decay_start_pct=args.decay_start_pct,
         decay_type=args.decay_type,
+        attn_lr_scale=getattr(args, "attn_lr_scale", 1.0),
+        attn_lr_scale_steps=getattr(args, "attn_lr_scale_steps", 0),
     )
+    if is_main and _attn_lr_scaled(args):
+        logger.info("Attention-projection LR x%.3g for steps < %d", args.attn_lr_scale, args.attn_lr_scale_steps)
 
     # -- Data ------------------------------------------------------------------
     # Under TP, all ranks in a TP group must see the same data.
@@ -1859,6 +1864,11 @@ def _resolve_yaml_config(path: Path, chain: tuple[Path, ...]) -> dict[str, Any]:
     return merged
 
 
+def _attn_lr_scaled(args: argparse.Namespace) -> bool:
+    """True iff the run scales the attention projections' LR for a window (needs their own Muon group)."""
+    return (getattr(args, "attn_lr_scale", 1.0) != 1.0 and getattr(args, "attn_lr_scale_steps", 0) > 0)
+
+
 def training_data_seed(args: argparse.Namespace) -> int:
     """The training-data order seed: ``--data_seed`` if given, else ``--seed`` (the historical tie)."""
     ds = getattr(args, "data_seed", None)
@@ -2039,6 +2049,14 @@ def parse_args() -> argparse.Namespace:
              "Uses flash_attn_varlen_func to prevent cross-document attention.",
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--attn_lr_scale", type=float, default=1.0,
+        help="Multiply the attention projections' (q/k/v/o) Muon LR by this for the first "
+             "--attn_lr_scale_steps steps (e.g. 0.1 or 0 to protect NCA-formed attention through the "
+             "handoff while embeddings/MLPs learn the interface). Puts them in their own Muon group.",
+    )
+    p.add_argument("--attn_lr_scale_steps", type=int, default=0,
+                   help="Steps (from 0) during which --attn_lr_scale applies.")
     p.add_argument(
         "--data_seed", type=int, default=None,
         help="Seed for the training-data order (shuffle) only; default = --seed. Lets init and data order vary "

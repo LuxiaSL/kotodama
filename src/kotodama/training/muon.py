@@ -484,6 +484,7 @@ def build_hybrid_optimizer(
     adamw_weight_decay: float = 0.1,
     adamw_no_decay_norms: bool = False,
     muon_fp32_master: bool = False,
+    attn_group: bool = False,
 ) -> tuple[Muon, "MasterAdamW"]:
     """
     Build hybrid Muon + AdamW optimizer for a transformer model.
@@ -497,9 +498,15 @@ def build_hybrid_optimizer(
     regularizing. Off by default — a two-group state dict cannot resume a
     one-group checkpoint, and existing lineages must keep resuming.
 
+    ``attn_group`` puts the attention projections (q/k/v/o) in their own Muon group tagged
+    ``"attn"`` so :class:`HybridScheduler` can scale their LR separately (``attn_lr_scale``,
+    e.g. protecting NCA-formed attention through a handoff). Off by default — like the norm
+    group, a two-group Muon state dict cannot resume a one-group checkpoint.
+
     Returns separate optimizers that should both be stepped each training step.
     """
     muon_params = []
+    attn_params = []
     adamw_params = []
     norm_params = []
 
@@ -507,13 +514,18 @@ def build_hybrid_optimizer(
         if not param.requires_grad:
             continue
         if param.ndim == 2 and "embed" not in name and "lm_head" not in name:
-            muon_params.append(param)
+            if attn_group and ".attn." in name and name.endswith("_proj.weight"):
+                attn_params.append(param)
+            else:
+                muon_params.append(param)
         elif adamw_no_decay_norms and param.ndim == 1 and name.endswith("norm.weight"):
             norm_params.append(param)
         else:
             adamw_params.append(param)
 
-    muon_count = sum(p.numel() for p in muon_params)
+    if attn_group and not attn_params:
+        raise ValueError("attn_group=True but no attention projection weights (*.attn.*_proj.weight) found")
+    muon_count = sum(p.numel() for p in muon_params) + sum(p.numel() for p in attn_params)
     adamw_count = sum(p.numel() for p in adamw_params) + sum(p.numel() for p in norm_params)
     total = muon_count + adamw_count
 
@@ -530,8 +542,13 @@ def build_hybrid_optimizer(
         if norm_params:
             print(f"  of which no-decay norm gains: {len(norm_params)} tensors")
 
+    muon_groups: Any = muon_params
+    if attn_group:
+        muon_groups = [{"params": muon_params, "tag": "main"}, {"params": attn_params, "tag": "attn"}]
+        if should_print:
+            print(f"  of which attention projections (own group 'attn'): {len(attn_params)} tensors")
     muon_opt = Muon(
-        muon_params,
+        muon_groups,
         lr=muon_lr,
         momentum=muon_momentum,
         nesterov=True,
@@ -689,7 +706,16 @@ class HybridScheduler:
         total_steps: int = 100000,
         decay_start_pct: float = 0.90,
         decay_type: str = "sqrt",
+        attn_lr_scale: float = 1.0,
+        attn_lr_scale_steps: int = 0,
     ) -> None:
+        if attn_lr_scale < 0:
+            raise ValueError(f"attn_lr_scale must be >= 0, got {attn_lr_scale}")
+        if attn_lr_scale != 1.0 and attn_lr_scale_steps > 0 and not any(
+                g.get("tag") == "attn" for g in muon_opt.param_groups):
+            raise ValueError("attn_lr_scale needs the optimizer built with attn_group=True")
+        self.attn_lr_scale = attn_lr_scale
+        self.attn_lr_scale_steps = attn_lr_scale_steps
         self.muon_opt = muon_opt
         self.adamw_opt = adamw_opt
         self.warmup_steps = warmup_steps
@@ -725,7 +751,9 @@ class HybridScheduler:
     def step(self, step: int) -> None:
         mult = self.get_lr_multiplier(step)
         for group in self.muon_opt.param_groups:
-            group["lr"] = self.muon_base_lr * mult
+            scale = (self.attn_lr_scale if group.get("tag") == "attn" and step < self.attn_lr_scale_steps
+                     else 1.0)
+            group["lr"] = self.muon_base_lr * mult * scale
         for group in self.adamw_opt.param_groups:
             group["lr"] = self.adamw_base_lr * mult
 
