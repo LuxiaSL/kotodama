@@ -1,0 +1,404 @@
+"""``dialogue`` — multi-party scene referents, in prose (NOT user/assistant).
+
+3–4 named people sit at a table holding 3 objects; objects are handed around,
+partly through pronouns that resolve only by tracking the scene::
+
+    Lucy, Tom and Anna are sitting at a table. Lucy has the cup. Tom has the
+    lamp and the bell. Lucy hands the cup to Tom. He passes it to Anna. Anna
+    asks Tom for the lamp, so he gives it to her. Now the cup is with
+    -> " Anna"
+
+Transfer forms (each counts as ONE transfer):
+  give   ``G hands the o to R.`` / ``G hands the o1 and the o2 to R.``
+  chain  ``<G|He|She> passes <it|them> to R.`` — ``it``/``them`` = the object(s)
+         of the PREVIOUS transfer (number must agree); a subject pronoun resolves
+         to the one person of that gender among the previous transfer's giver and
+         recipient (only emitted when their genders differ, so it is unique)
+  ask    ``R asks G for the o, so <he|she> gives it to <him|her>.`` — only for a
+         mixed-gender pair, so both pronouns are unique
+
+Cell = (n_people ∈ {3,4}, transfers ∈ {1,2,4}, query kind ∈ {holder, object}):
+  holder  ``Now the cup is with`` -> a name; candidates = every person. The
+          queried object has moved at least once.
+  object  ``Now Anna has the``   -> an object; candidates = every object. The
+          queried person holds exactly one object, and their holdings changed.
+At transfers >= 2 every item has at least one pronoun transfer (chain or ask).
+Recency control, balanced 50/50 in every cell: ``gold_is_last_mention`` = the gold
+is the last-mentioned name (holder) / object (object query) in the text.
+Holder-query exemplars never answer with the test item's gold slot, so under
+``3shot_collide`` (positional re-label) no exemplar answer equals the test gold —
+as in the other families, whose exemplar answers are shot-pool objects.
+
+The simulator resolves the SURFACE ops (pronouns included) — ``resolve`` is the
+one place pronoun semantics live. Error types: ``previous`` (holder query: an
+earlier holder of the object; object query: an object the person held earlier),
+``other_person`` (anyone else / another person's current object), ``other``.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any, Mapping, Optional, TypedDict
+
+from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection, the_list
+from kotodama.eval.bindprobes.pools import FEMALE_CANDIDATES, MALE_CANDIDATES, Gender, Pools
+
+FAMILY = "dialogue"
+N_PEOPLE = (3, 4)
+TRANSFERS = (1, 2, 4)
+QKINDS = ("holder", "object")
+CELLS: list[Cell] = [(n, t, q) for n in N_PEOPLE for t in TRANSFERS for q in QKINDS]
+DEFAULT_PER_CELL = 100            # 12 cells -> 1200 items
+SEPARATOR = "\n\n* * *\n\n"
+N_OBJECTS = 3
+ERROR_TYPES = ("previous", "other_person", "other")
+SUBJ: dict[Gender, str] = {"m": "he", "f": "she"}
+OBJ: dict[Gender, str] = {"m": "him", "f": "her"}
+PRON_GENDER: dict[str, Gender] = {"he": "m", "him": "m", "she": "f", "her": "f"}
+FORM_WEIGHTS = (("chain", 0.4), ("ask", 0.25), ("give1", 0.25), ("give2", 0.1))
+
+
+class Spec(TypedDict):
+    people: list[list[str]]        # [[name, gender], ...] in intro order
+    holdings0: list[list[str]]     # [[obj, holder], ...] in intro mention order
+    ops: list[dict[str, Any]]      # surface ops (see module doc)
+    query: dict[str, str]          # {"kind": "holder", "obj": o} | {"kind": "object", "person": p}
+
+
+class Resolved(TypedDict):
+    giver: str
+    recipient: str
+    objs: list[str]
+
+
+def resolve(spec: Spec) -> tuple[list[Resolved], dict[str, list[str]]]:
+    """Resolve every surface op (pronouns included) and run the transfers.
+
+    Returns (resolved ops, per-object holder history incl. the initial holder).
+    Raises ``ValueError`` on any ambiguity, agreement or possession violation."""
+    gender: dict[str, Gender] = {n: g for n, g in spec["people"]}  # type: ignore[misc]
+    if len(gender) != len(spec["people"]):
+        raise ValueError("duplicate people")
+    holder: dict[str, str] = {}
+    for obj, who in spec["holdings0"]:
+        if who not in gender or obj in holder:
+            raise ValueError(f"bad initial holding {obj!r} -> {who!r}")
+        holder[obj] = who
+    hist: dict[str, list[str]] = {o: [w] for o, w in holder.items()}
+    out: list[Resolved] = []
+
+    def unique(pron: str, among: list[str]) -> str:
+        g = PRON_GENDER.get(pron)
+        if g is None:
+            raise ValueError(f"unknown pronoun {pron!r}")
+        hits = list(dict.fromkeys(p for p in among if gender[p] == g))
+        if len(hits) != 1:
+            raise ValueError(f"pronoun {pron!r} is ambiguous/unresolvable among {among}")
+        return hits[0]
+
+    for k, op in enumerate(spec["ops"]):
+        form = op["form"]
+        if form == "give":
+            giver, recip, objs = op["giver"], op["recipient"], list(op["objs"])
+        elif form == "chain":
+            if not out:
+                raise ValueError(f"op {k}: '{op['pronoun']}' has no antecedent")
+            prev = out[-1]
+            objs = list(prev["objs"])
+            want = {"it": 1, "them": 2}.get(op["pronoun"])
+            if want != len(objs):
+                raise ValueError(f"op {k}: '{op['pronoun']}' does not agree with {objs}")
+            subj = op["subj"]
+            giver = subj if subj in gender else unique(subj, [prev["giver"], prev["recipient"]])
+            recip = op["recipient"]
+        elif form == "ask":
+            pair = [op["asker"], op["askee"]]
+            giver, recip = unique(op["subj_pron"], pair), unique(op["obj_pron"], pair)
+            if (giver, recip) != (op["askee"], op["asker"]):
+                raise ValueError(f"op {k}: ask pronouns do not resolve askee -> asker")
+            objs = [op["obj"]]
+        else:
+            raise ValueError(f"op {k}: unknown form {form!r}")
+        if recip not in gender or giver not in gender or recip == giver:
+            raise ValueError(f"op {k}: bad giver/recipient {giver!r} -> {recip!r}")
+        for o in objs:
+            if holder.get(o) != giver:
+                raise ValueError(f"op {k}: {giver} does not hold the {o}")
+            holder[o] = recip
+            hist[o].append(recip)
+        out.append({"giver": giver, "recipient": recip, "objs": objs})
+    return out, hist
+
+
+def final_holdings(spec: Spec) -> dict[str, list[str]]:
+    """person -> objects held at the end (people order; objects in intro order)."""
+    _, hist = resolve(spec)
+    out: dict[str, list[str]] = {n: [] for n, _ in spec["people"]}
+    for obj, _ in spec["holdings0"]:
+        out[hist[obj][-1]].append(obj)
+    return out
+
+
+def held_ever(spec: Spec, person: str) -> list[str]:
+    _, hist = resolve(spec)
+    return [o for o, _ in spec["holdings0"] if person in hist[o]]
+
+
+def simulate(item: Item) -> str:
+    spec: Spec = item.spec  # type: ignore[assignment]
+    q = spec["query"]
+    _, hist = resolve(spec)
+    if q["kind"] == "holder":
+        return hist[q["obj"]][-1]
+    held = final_holdings(spec)[q["person"]]
+    if len(held) != 1:
+        raise ValueError(f"{item.item_id}: {q['person']} holds {held}, not exactly one")
+    return held[0]
+
+
+# ── Rendering ──────────────────────────────────────────────────────────────────
+
+def _op_sentence(op: dict[str, Any]) -> str:
+    form = op["form"]
+    if form == "give":
+        return f"{op['giver']} hands {the_list(op['objs'])} to {op['recipient']}."
+    if form == "chain":
+        subj = op["subj"]
+        subj = subj.capitalize() if subj in PRON_GENDER else subj
+        return f"{subj} passes {op['pronoun']} to {op['recipient']}."
+    if form == "ask":
+        return (f"{op['asker']} asks {op['askee']} for the {op['obj']}, so "
+                f"{op['subj_pron']} gives it to {op['obj_pron']}.")
+    raise ValueError(f"unknown form {form!r}")
+
+
+def _intro(spec: Spec) -> list[str]:
+    names = [n for n, _ in spec["people"]]
+    out = [f"{name_list(names)} are sitting at a table."]
+    for n in names:
+        objs = [o for o, w in spec["holdings0"] if w == n]
+        if objs:
+            out.append(f"{n} has {the_list(objs)}.")
+    return out
+
+
+def _lead(spec: Spec) -> str:
+    q = spec["query"]
+    return (f"Now the {q['obj']} is with" if q["kind"] == "holder"
+            else f"Now {q['person']} has the")
+
+
+def render(item: Item, with_answer: bool) -> str:
+    spec: Spec = item.spec  # type: ignore[assignment]
+    body = " ".join(_intro(spec) + [_op_sentence(o) for o in spec["ops"]])
+    lead = f"{body} {_lead(spec)}"
+    return f"{lead} {item.gold}." if with_answer else lead
+
+
+def _mentions(spec: Spec) -> list[str]:
+    """Candidate-type strings (names for holder queries, objects otherwise) in
+    text order; pronouns are not mentions."""
+    names = [n for n, _ in spec["people"]]
+    if spec["query"]["kind"] == "holder":
+        out = list(names)
+        out += [n for n in names if any(w == n for _, w in spec["holdings0"])]
+        for op in spec["ops"]:
+            if op["form"] == "give":
+                out += [op["giver"], op["recipient"]]
+            elif op["form"] == "chain":
+                out += ([op["subj"]] if op["subj"] in names else []) + [op["recipient"]]
+            else:
+                out += [op["asker"], op["askee"]]
+        return out
+    out = [o for n in names for o, w in spec["holdings0"] if w == n]
+    for op in spec["ops"]:
+        if op["form"] == "give":
+            out += list(op["objs"])
+        elif op["form"] == "ask":
+            out.append(op["obj"])
+    return out
+
+
+def labels(item: Item) -> list[str]:
+    return [n for n, _ in item.spec["people"]]
+
+
+def build(item_id: str, cell: Cell, spec: Spec) -> Item:
+    names = [n for n, _ in spec["people"]]
+    objs_intro = [o for n in names for o, w in spec["holdings0"] if w == n]
+    if [o for o, _ in spec["holdings0"]] != objs_intro:
+        raise ValueError(f"{item_id}: holdings0 must be in intro (people) order")
+    cands = names if spec["query"]["kind"] == "holder" else objs_intro
+    mentions = _mentions(spec)
+    ops = spec["ops"]
+    n_pron = sum(1 for o in ops if o["form"] in ("chain", "ask"))
+    it = Item(item_id=item_id, family=FAMILY, cell=list(cell), spec=dict(spec), gold="",
+              candidates=list(cands), mention_order=mentions,
+              meta={"qkind": spec["query"]["kind"], "n_pronoun_ops": n_pron,
+                    "forms": [o["form"] for o in ops], "gold_is_last_mention": False})
+    it.gold = simulate(it)
+    it.meta["gold_is_last_mention"] = bool(mentions) and mentions[-1] == it.gold
+    return it
+
+
+# ── Generation ─────────────────────────────────────────────────────────────────
+
+def _pick_form(rng: random.Random, feasible: set[str]) -> str:
+    forms = [(f, w) for f, w in FORM_WEIGHTS if f in feasible]
+    total = sum(w for _, w in forms)
+    x = rng.random() * total
+    for f, w in forms:
+        x -= w
+        if x <= 0:
+            return f
+    return forms[-1][0]
+
+
+def gen_item(rng: random.Random, cell: Cell, pools: Pools, item_id: str, k: int,
+             per_cell: int, template: Optional[Item] = None) -> Item:
+    n, n_tr, qkind = int(cell[0]), int(cell[1]), str(cell[2])
+    if (n, n_tr, qkind) not in CELLS:
+        raise ValueError(f"dialogue: unknown cell {cell}")
+    # recency control: test items alternate gold == / != the last-mentioned
+    # candidate-type string; exemplars are unconstrained
+    want_last: Optional[bool] = (k % 2 == 0) if template is None else None
+
+    def draw() -> Optional[Item]:
+        if template is not None:
+            genders: list[Gender] = [g for _, g in template.spec["people"]]  # type: ignore[misc]
+        else:
+            genders = [rng.choice(("f", "m")) for _ in range(n)]
+            if len(set(genders)) < 2:
+                return None
+        fem = rng.sample(pools.female, genders.count("f"))
+        mal = rng.sample(pools.male, genders.count("m"))
+        names = [fem.pop() if g == "f" else mal.pop() for g in genders]
+        gender = dict(zip(names, genders))
+        objs = rng.sample(pools.objects, N_OBJECTS)
+        first = {o: rng.choice(names) for o in objs}
+        holdings0 = [[o, w] for w in names for o in objs if first[o] == w]
+        holder = dict(first)
+        ops: list[dict[str, Any]] = []
+        prev: Optional[Resolved] = None
+        for _ in range(n_tr):
+            held = {p: [o for o in objs if holder[o] == p] for p in names}
+            feasible = {"give1"}
+            if any(len(v) >= 2 for v in held.values()):
+                feasible.add("give2")
+            if prev is not None:
+                feasible.add("chain")
+            if any(held[p] and any(gender[r] != gender[p] for r in names) for p in names):
+                feasible.add("ask")
+            form = _pick_form(rng, feasible)
+            if form in ("give1", "give2"):
+                need = 1 if form == "give1" else 2
+                g = rng.choice([p for p in names if len(held[p]) >= need])
+                moved = rng.sample(held[g], need)
+                r = rng.choice([p for p in names if p != g])
+                ops.append({"form": "give", "giver": g, "recipient": r, "objs": moved})
+            elif form == "chain":
+                assert prev is not None
+                g, moved = prev["recipient"], list(prev["objs"])
+                r = rng.choice([p for p in names if p != g])
+                subj = g
+                if gender[prev["giver"]] != gender[g] and rng.random() < 0.6:
+                    subj = SUBJ[gender[g]]
+                ops.append({"form": "chain", "subj": subj, "recipient": r,
+                            "pronoun": "it" if len(moved) == 1 else "them"})
+            else:
+                g = rng.choice([p for p in names if held[p]
+                                and any(gender[x] != gender[p] for x in names)])
+                r = rng.choice([p for p in names if gender[p] != gender[g]])
+                moved = [rng.choice(held[g])]
+                ops.append({"form": "ask", "asker": r, "askee": g, "obj": moved[0],
+                            "subj_pron": SUBJ[gender[g]], "obj_pron": OBJ[gender[r]]})
+            for o in moved:
+                holder[o] = r
+            prev = {"giver": g, "recipient": r, "objs": moved}
+        if n_tr >= 2 and not any(o["form"] in ("chain", "ask") for o in ops):
+            return None
+        spec: Spec = {"people": [[p, gender[p]] for p in names], "holdings0": holdings0,
+                      "ops": ops, "query": {}}
+        _, hist = resolve(spec)
+        if qkind == "holder":
+            choices = [o for o in objs if len(hist[o]) > 1]
+            if not choices:
+                return None
+            spec["query"] = {"kind": "holder", "obj": rng.choice(choices)}
+        else:
+            fin = final_holdings(spec)
+            choices = [p for p in names if len(fin[p]) == 1
+                       and set(fin[p]) != {o for o, w in holdings0 if w == p}]
+            if not choices:
+                return None
+            spec["query"] = {"kind": "object", "person": rng.choice(choices)}
+        it = build(item_id, cell, spec)
+        assert it.gold == (holder[spec["query"]["obj"]] if qkind == "holder"
+                           else [o for o in objs if holder[o] == spec["query"]["person"]][0])
+        if want_last is not None and it.meta["gold_is_last_mention"] != want_last:
+            return None
+        if template is not None and qkind == "holder":
+            # the collide re-label is positional: keep the exemplar's answer off the
+            # test item's gold slot, so a collide exemplar can only interfere
+            t_names = labels(template)
+            if names.index(it.gold) == t_names.index(template.gold):
+                return None
+        return it
+
+    return rejection(draw, f"dialogue item {item_id}", tries=5000)
+
+
+def relabel(item: Item, mapping: Mapping[str, str], target: Optional[Item] = None) -> Item:
+    """Rename people. The map must preserve gender (pronouns stay valid): target
+    genders come from ``target``'s people (the collide case: the test item), else
+    from the curated name candidates; a gender-changing map raises."""
+    spec: Spec = item.spec  # type: ignore[assignment]
+    missing = set(labels(item)) - set(mapping)
+    if missing:
+        raise ValueError(f"{item.item_id}: people {sorted(missing)} not in the map")
+    known: dict[str, str] = {n: "f" for n in FEMALE_CANDIDATES}
+    known.update({n: "m" for n in MALE_CANDIDATES})
+    if target is not None:
+        known.update({n: g for n, g in target.spec["people"]})
+    for n, g in spec["people"]:
+        if known.get(mapping[n]) != g:
+            raise ValueError(f"{item.item_id}: map {n}->{mapping[n]} does not keep gender {g!r}")
+
+    def m(x: str) -> str:
+        return mapping.get(x, x) if x not in PRON_GENDER else x
+
+    ops = []
+    for op in spec["ops"]:
+        o = dict(op)
+        for key in ("giver", "recipient", "subj", "asker", "askee"):
+            if key in o:
+                o[key] = m(o[key])
+        ops.append(o)
+    q = dict(spec["query"])
+    if "person" in q:
+        q["person"] = mapping[q["person"]]
+    new: Spec = {"people": [[mapping[n], g] for n, g in spec["people"]],
+                 "holdings0": [[o, mapping[w]] for o, w in spec["holdings0"]],
+                 "ops": ops, "query": q}
+    out = build(f"{item.item_id}_collide", tuple(item.cell), new)
+    expect = mapping[item.gold] if q["kind"] == "holder" else item.gold
+    if out.gold != expect:
+        raise ValueError(f"{item.item_id}: re-label changed the gold")
+    return out
+
+
+def error_types(item: Item, pick: str) -> list[str]:
+    spec: Spec = item.spec  # type: ignore[assignment]
+    q = spec["query"]
+    _, hist = resolve(spec)
+    if q["kind"] == "holder":
+        earlier = set(hist[q["obj"]][:-1]) - {item.gold}
+        if pick in earlier:
+            return ["previous"]
+        return ["other_person"] if pick in labels(item) else ["other"]
+    t: list[str] = []
+    if pick in held_ever(spec, q["person"]):
+        t.append("previous")
+    if any(pick in objs for p, objs in final_holdings(spec).items() if p != q["person"]):
+        t.append("other_person")
+    return t or ["other"]

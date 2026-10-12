@@ -1,0 +1,314 @@
+"""Bindprobe items: generation, exemplars, conditions, prompts, validation.
+
+Each test item carries its OWN three exemplars (same family, same cell, shot
+pools) and, per exemplar, the positional label map into the test item's labels.
+Conditions are rendered from that one record:
+
+  0shot          the item alone
+  3shot          3 exemplars (with answers) from the disjoint SHOT pools — no
+                 name/variable/object is shared with the item
+  3shot_collide  the SAME 3 exemplars, re-labeled into the item's own names /
+                 variable labels (objects stay shot-pool, so every binding
+                 differs) — measures cross-episode referent collision
+
+so 3shot vs 3shot_collide differ ONLY in the exemplar labels. Episodes are joined
+by the family's separator (blank line + marker: ``* * *`` in prose, ``# ---`` in
+code). Every rendered prompt stays under ``MAX_PROMPT_BYTES`` (BPE tokens <=
+UTF-8 bytes, so this bounds the token count without a tokenizer).
+"""
+
+from __future__ import annotations
+
+import json
+import random
+import re
+import sys
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence
+
+from kotodama.eval.bindprobes import attr, codevar, dialogue
+from kotodama.eval.bindprobes.base import FamilyModule, Item
+from kotodama.eval.bindprobes.pools import (Pools, PoolSplit, check_split, load_pools,
+                                            load_tokenizer)
+from kotodama.presets import TOKENIZER_NAME
+
+FAMILIES: dict[str, FamilyModule] = {
+    "attr": attr,          # type: ignore[dict-item]
+    "codevar": codevar,    # type: ignore[dict-item]
+    "dialogue": dialogue,  # type: ignore[dict-item]
+}
+FAMILY_NAMES: tuple[str, ...] = tuple(FAMILIES)
+CONDITIONS: tuple[str, ...] = ("0shot", "3shot", "3shot_collide")
+N_SHOTS = 3
+COND_NSHOTS: dict[str, int] = {"0shot": 0, "3shot": N_SHOTS, "3shot_collide": N_SHOTS}
+DEFAULT_SEED = 2026
+MAX_PROMPT_BYTES = 3072   # => < 3072 tokens; the model context is 4096
+
+
+def family(name: str) -> FamilyModule:
+    if name not in FAMILIES:
+        raise ValueError(f"unknown family {name!r}; choose from {FAMILY_NAMES}")
+    return FAMILIES[name]
+
+
+# ── Generation ─────────────────────────────────────────────────────────────────
+
+def gen_with_shots(fam: FamilyModule, rng: random.Random, cell: tuple[Any, ...],
+                   split: PoolSplit, item_id: str, k: int, per_cell: int,
+                   shot_seed: str) -> Item:
+    """One test item + its exemplars (shot pools, same cell) + collide maps."""
+    it = fam.gen_item(rng, cell, split.item, item_id, k, per_cell)
+    srng = random.Random(shot_seed)
+    shots: list[Item] = []
+    used_labels: set[str] = set()
+    used_objs: set[str] = set()
+    for j in range(N_SHOTS):
+        shots.append(_gen_shot(fam, srng, cell, split.shot, f"{item_id}_shot{j}", j, it,
+                               used_labels, used_objs))
+        used_labels |= set(fam.labels(shots[-1]))
+        used_objs |= _objects(shots[-1])
+    # exemplar-vs-exemplar overlap (exemplar-vs-ITEM overlap is impossible by the split)
+    it.meta["shots_disjoint"] = {
+        "labels": _pairwise_disjoint([set(fam.labels(s)) for s in shots]),
+        "objects": _pairwise_disjoint([_objects(s) for s in shots])}
+    item_labels = fam.labels(it)
+    maps = []
+    for s in shots:
+        sl = fam.labels(s)
+        if len(sl) != len(item_labels):
+            raise RuntimeError(f"{s.item_id}: {len(sl)} labels vs item's {len(item_labels)}")
+        maps.append(dict(zip(sl, item_labels)))
+    it.shots = [s.to_dict() for s in shots]
+    it.collide_maps = maps
+    return it
+
+
+def _pairwise_disjoint(sets: Sequence[set[str]]) -> bool:
+    return sum(len(s) for s in sets) == len(set().union(*sets)) if sets else True
+
+
+# Which shot-pool categories to keep exemplars apart in, most to least strict:
+# (labels, objects). The shot pools are small (16 names, 16 objects, 11
+# variables), so wide cells (attr N=8, codevar depth 3) fall back to reuse ACROSS
+# exemplars — never across exemplar and item.
+_SHOT_AVOID_ORDER: tuple[tuple[bool, bool], ...] = ((True, True), (False, True),
+                                                    (True, False), (False, False))
+
+
+def _gen_shot(fam: FamilyModule, srng: random.Random, cell: tuple[Any, ...], shot: Pools,
+              shot_id: str, j: int, template: Item, used_labels: set[str],
+              used_objs: set[str]) -> Item:
+    """One exemplar, kept disjoint from the earlier exemplars where the pools allow."""
+    last: Exception | None = None
+    for avoid_labels, avoid_objs in _SHOT_AVOID_ORDER:
+        lab = used_labels if avoid_labels else set()
+        obj = used_objs if avoid_objs else set()
+        pools = Pools(tuple(n for n in shot.female if n not in lab),
+                      tuple(n for n in shot.male if n not in lab),
+                      tuple(o for o in shot.objects if o not in obj),
+                      tuple(v for v in shot.variables if v not in lab))
+        try:
+            return fam.gen_item(srng, cell, pools, shot_id, j, N_SHOTS, template=template)
+        except (ValueError, RuntimeError) as exc:  # pool too small for this cell
+            last = exc
+    raise RuntimeError(f"{shot_id}: could not generate an exemplar: {last}")
+
+
+def generate_family(name: str, split: PoolSplit, per_cell: Optional[int] = None,
+                    seed: int = DEFAULT_SEED) -> list[Item]:
+    """Balanced items for one family: ``per_cell`` per cell (family default if None)."""
+    fam = family(name)
+    per = fam.DEFAULT_PER_CELL if per_cell is None else per_cell
+    if per < 1:
+        raise ValueError(f"per_cell must be >= 1, got {per}")
+    rng = random.Random(f"bindprobes:{name}:{seed}")
+    items: list[Item] = []
+    for cell in fam.CELLS:
+        for k in range(per):
+            iid = f"{name}_{'-'.join(map(str, cell))}_{k:03d}"
+            it = gen_with_shots(fam, rng, cell, split, iid, k, per,
+                                shot_seed=f"bindprobes:{name}:{seed}:{iid}:shots")
+            validate(it, split)
+            items.append(it)
+    return items
+
+
+def generate(split: PoolSplit, seed: int = DEFAULT_SEED,
+             families: Sequence[str] = FAMILY_NAMES,
+             per_cell: Optional[Mapping[str, int]] = None) -> list[Item]:
+    per_cell = per_cell or {}
+    return [it for f in families for it in generate_family(f, split, per_cell.get(f), seed)]
+
+
+# ── Conditions + prompts ───────────────────────────────────────────────────────
+
+def collide_shots(item: Item) -> list[Item]:
+    """The item's exemplars re-labeled into the item's own labels (re-simulated)."""
+    fam = family(item.family)
+    shots = item.shot_items()
+    if len(item.collide_maps) != len(shots):
+        raise ValueError(f"{item.item_id}: {len(item.collide_maps)} maps for {len(shots)} shots")
+    return [fam.relabel(s, m, item) for s, m in zip(shots, item.collide_maps)]
+
+
+def condition_shots(item: Item, condition: str) -> list[Item]:
+    if condition not in COND_NSHOTS:
+        raise ValueError(f"unknown condition {condition!r}; choose from {CONDITIONS}")
+    if condition == "0shot":
+        return []
+    shots = collide_shots(item) if condition == "3shot_collide" else item.shot_items()
+    if len(shots) < COND_NSHOTS[condition]:
+        raise ValueError(f"{item.item_id}: {condition} needs {N_SHOTS} shots, has {len(shots)}")
+    return shots[:COND_NSHOTS[condition]]
+
+
+def build_prompt(item: Item, condition: str) -> str:
+    fam = family(item.family)
+    blocks = [fam.render(s, True) for s in condition_shots(item, condition)]
+    blocks.append(fam.render(item, False))
+    return fam.SEPARATOR.join(blocks)
+
+
+# ── Validation ─────────────────────────────────────────────────────────────────
+
+def _objects(item: Item) -> set[str]:
+    """Every object string an item's text can mention (its candidate universe)."""
+    if item.family == "dialogue":
+        return {o for o, _ in item.spec["holdings0"]}
+    return set(item.candidates)
+
+
+def validate(item: Item, split: Optional[PoolSplit] = None) -> None:
+    """Raise ``ValueError`` on any broken invariant (see ``selftest`` for the list)."""
+    fam = family(item.family)
+    iid = item.item_id
+    if fam.simulate(item) != item.gold:
+        raise ValueError(f"{iid}: simulator gold != stored gold {item.gold!r}")
+    if item.gold not in item.candidates or len(set(item.candidates)) != len(item.candidates):
+        raise ValueError(f"{iid}: gold not in candidates, or duplicate candidates")
+    if len(item.candidates) < 2:
+        raise ValueError(f"{iid}: fewer than 2 candidates")
+    if tuple(item.cell) not in [tuple(c) for c in fam.CELLS]:
+        raise ValueError(f"{iid}: cell {item.cell} not in the family's cells")
+    if item.family == "codevar" and item.meta["depth"] != item.cell[0]:
+        raise ValueError(f"{iid}: measured depth {item.meta['depth']} != cell {item.cell[0]}")
+    pat = re.compile(r"\b(" + "|".join(map(re.escape, item.candidates)) + r")\b")
+    text = fam.render(item, False)
+    if pat.findall(text) != item.mention_order:
+        raise ValueError(f"{iid}: rendered mention order != stored mention order")
+    if text.endswith(" ") or not fam.render(item, True).startswith(text):
+        raise ValueError(f"{iid}: lead-in has a trailing space / answer render mismatch")
+    shots = item.shot_items()
+    if shots:
+        item_labels, item_objs = set(fam.labels(item)), _objects(item)
+        for s in shots:
+            if fam.simulate(s) != s.gold or s.cell != item.cell:
+                raise ValueError(f"{s.item_id}: exemplar gold/cell mismatch")
+            if set(fam.labels(s)) & item_labels or _objects(s) & item_objs:
+                raise ValueError(f"{s.item_id}: exemplar shares a label/object with the item")
+        for c in collide_shots(item):
+            if not set(fam.labels(c)) <= item_labels or _objects(c) & item_objs:
+                raise ValueError(f"{c.item_id}: collide exemplar labels not the item's")
+            if c.gold == item.gold:
+                raise ValueError(f"{c.item_id}: collide exemplar answers the test gold")
+    if split is not None:
+        item_side = split.item
+        allowed = set(item_side.names) | set(item_side.variables)
+        if not set(fam.labels(item)) <= allowed or not _objects(item) <= set(item_side.objects):
+            raise ValueError(f"{iid}: item uses strings outside the ITEM pools")
+        for s in shots:
+            shot_allowed = set(split.shot.names) | set(split.shot.variables)
+            if not set(fam.labels(s)) <= shot_allowed or not _objects(s) <= set(split.shot.objects):
+                raise ValueError(f"{s.item_id}: exemplar uses strings outside the SHOT pools")
+    for cond in CONDITIONS if shots else ("0shot",):
+        n = len(build_prompt(item, cond).encode("utf-8"))
+        if n >= MAX_PROMPT_BYTES:
+            raise ValueError(f"{iid}/{cond}: prompt is {n} bytes (max {MAX_PROMPT_BYTES})")
+
+
+def check_tokens(items: Sequence[Item], tokenizer: Any) -> int:
+    """Max prompt tokens over every (item, condition); raises past MAX_PROMPT_BYTES.
+    Also re-checks every candidate is one token in its scored form."""
+    longest = 0
+    for it in items:
+        for c in it.candidates:
+            if len(tokenizer(" " + c, add_special_tokens=False).input_ids) != 1:
+                raise ValueError(f"{it.item_id}: candidate {c!r} is not one token")
+        for cond in CONDITIONS:
+            longest = max(longest, len(tokenizer(build_prompt(it, cond)).input_ids))
+    if longest >= MAX_PROMPT_BYTES:
+        raise ValueError(f"longest prompt {longest} tokens >= {MAX_PROMPT_BYTES}")
+    return longest
+
+
+# ── Emission ───────────────────────────────────────────────────────────────────
+
+def emit(out_dir: Path, seed: int = DEFAULT_SEED, families: Sequence[str] = FAMILY_NAMES,
+         per_cell: Optional[Mapping[str, int]] = None, names_path: Optional[Path] = None,
+         verify: bool = False) -> Path:
+    """Write items.jsonl + emit_meta.json. ``verify`` loads the presets tokenizer and
+    hard-fails on any multi-token pool string or over-long prompt."""
+    split = load_pools(names_path)
+    items = generate(split, seed, families, per_cell)
+    meta: dict[str, Any] = {
+        "seed": seed, "families": list(families), "names": split.source,
+        "per_cell": {f: (per_cell or {}).get(f, family(f).DEFAULT_PER_CELL) for f in families},
+        "cells": {f: [list(c) for c in family(f).CELLS] for f in families},
+        "conditions": list(CONDITIONS),
+        "n_items": {f: sum(it.family == f for it in items) for f in families},
+        "shot_pool": {"names": list(split.shot.names), "objects": list(split.shot.objects),
+                      "variables": list(split.shot.variables)},
+    }
+    if verify:
+        tok = load_tokenizer(TOKENIZER_NAME)
+        check_split(split, tok)
+        meta["verified_tokenizer"] = TOKENIZER_NAME
+        meta["max_prompt_tokens"] = check_tokens(items, tok)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with (out_dir / "items.jsonl").open("w") as fh:
+        for it in items:
+            fh.write(json.dumps(it.to_dict()) + "\n")
+    (out_dir / "emit_meta.json").write_text(json.dumps(meta, indent=2))
+    print(f"{len(items)} items {meta['n_items']} -> {out_dir / 'items.jsonl'}", flush=True)
+    return out_dir / "items.jsonl"
+
+
+def load_items(path: Path) -> list[Item]:
+    try:
+        rows = [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
+        return [Item.from_dict(r) for r in rows]
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"unreadable items file {path}: {exc}") from exc
+
+
+# ── Self-test ──────────────────────────────────────────────────────────────────
+
+def selftest(per_cell: int = 12, seed: int = 7) -> int:
+    """Generate a sample of every family and run :func:`validate` on each item
+    (simulator gold, candidates, mention order, exemplar disjointness, collide
+    re-labels, prompt bound) plus error typing of every wrong candidate.
+    Returns the failure count."""
+    split = load_pools(None)
+    failures = n = 0
+    for f in FAMILY_NAMES:
+        fam = family(f)
+        try:
+            items = generate_family(f, split, per_cell, seed)
+        except (ValueError, RuntimeError) as exc:
+            print(f"FAIL: {f}: generation: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        for it in items:
+            n += 1
+            try:
+                validate(it, split)
+                for c in it.candidates:
+                    if c != it.gold:
+                        types = fam.error_types(it, c)
+                        if not types or types[0] not in fam.ERROR_TYPES:
+                            raise ValueError(f"{it.item_id}: bad error type {types} for {c!r}")
+            except ValueError as exc:
+                failures += 1
+                print(f"FAIL: {exc}", file=sys.stderr)
+    print(f"selftest: {n} items checked, {failures} failures", flush=True)
+    return failures
