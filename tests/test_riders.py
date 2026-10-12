@@ -311,6 +311,13 @@ def test_score_row_ties_and_errors(grid_items):
     res = {"candidates": cands, "entropy": 0.5, "prompt_tokens": 9}
     row = grid.score_row(it, res, "code", 0, "m", None)
     assert row["gold_rank_cand"] == len(cands) and row["margin"] == 0.0  # ties count against gold
+    # the banked row shape (key order included) is unchanged by the shared read_result
+    assert list(row) == ["model", "item_id", "renderer", "nshots", "tier", "n", "m",
+                         "recency_control", "gold", "n_candidates", "gold_lp", "margin",
+                         "gold_rank_cand", "gold_rank_full", "entropy", "prompt_tokens",
+                         "cand_lps", "top", "multi_token_candidates", "chat_format"]
+    read = grid.read_result(res, " " + it.gold, it.item_id)
+    assert {k: row[k] for k in read} == read
     with pytest.raises(grid.LogprobsError):
         grid.score_row(it, dict(res, candidates=[c for c in cands if c["text"] != " " + it.gold]),
                        "code", 0, "m", None)

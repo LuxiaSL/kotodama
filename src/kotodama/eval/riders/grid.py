@@ -98,33 +98,55 @@ def request_batch(endpoint: str, payload_items: list[dict[str, Any]],
     raise LogprobsError(f"/logprobs failed after {RETRIES} attempts: {last}")
 
 
-def score_row(item: Item, res: dict[str, Any], renderer: str, nshots: int,
-              model: str, chat_format: str | None) -> dict[str, Any]:
-    """One grid row from one ``/logprobs`` result. Ties rank against gold."""
+def read_result(res: dict[str, Any], gold_text: str, item_id: str) -> dict[str, Any]:
+    """The closed-candidate read of one ``/logprobs`` result: gold rank among the
+    in-item candidates (ties rank AGAINST gold), margin = logp(gold) -
+    max(logp(distractor)), and the multi-token candidates (must stay empty).
+
+    ``gold_text`` is the candidate string exactly as sent (leading space included).
+    Shared by every closed-candidate battery (riders, bindprobes) so a row's
+    rank/margin mean the same thing everywhere."""
     cands = res["candidates"]
     bad = [c["text"] for c in cands if c["n_tokens"] != 1]
     by_text = {c["text"]: c for c in cands}
-    gold_key = " " + item.gold
-    if gold_key not in by_text:
-        raise LogprobsError(f"{item.item_id}: gold {gold_key!r} missing from result")
-    gold_lp = by_text[gold_key]["logprob"]
-    distractor_lps = [c["logprob"] for c in cands if c["text"] != gold_key]
+    if gold_text not in by_text:
+        raise LogprobsError(f"{item_id}: gold {gold_text!r} missing from result")
+    gold_lp = by_text[gold_text]["logprob"]
+    distractor_lps = [c["logprob"] for c in cands if c["text"] != gold_text]
     if not distractor_lps:
-        raise LogprobsError(f"{item.item_id}: no distractors in result")
+        raise LogprobsError(f"{item_id}: no distractors in result")
     margin = gold_lp - max(distractor_lps)
     rank = 1 + sum(1 for lp in distractor_lps if lp >= gold_lp)
     return {
-        "model": model, "item_id": item.item_id, "renderer": renderer,
-        "nshots": nshots, "tier": item.tier, "n": item.n, "m": item.m,
-        "recency_control": item.recency_control, "gold": item.gold,
         "n_candidates": len(cands), "gold_lp": gold_lp, "margin": margin,
-        "gold_rank_cand": rank, "gold_rank_full": by_text[gold_key]["rank_full"],
+        "gold_rank_cand": rank, "gold_rank_full": by_text[gold_text]["rank_full"],
         "entropy": res["entropy"], "prompt_tokens": res["prompt_tokens"],
         "cand_lps": {c["text"].strip(): c["logprob"] for c in cands},
         "top": res.get("top", []),
         "multi_token_candidates": bad,  # must stay empty; aggregate hard-fails otherwise
+    }
+
+
+def score_row(item: Item, res: dict[str, Any], renderer: str, nshots: int,
+              model: str, chat_format: str | None) -> dict[str, Any]:
+    """One grid row from one ``/logprobs`` result. Ties rank against gold."""
+    return {
+        "model": model, "item_id": item.item_id, "renderer": renderer,
+        "nshots": nshots, "tier": item.tier, "n": item.n, "m": item.m,
+        "recency_control": item.recency_control, "gold": item.gold,
+        **read_result(res, " " + item.gold, item.item_id),
         "chat_format": chat_format,
     }
+
+
+def check_health(endpoint: str, log: Callable[[str], None]) -> dict[str, Any]:
+    """GET ``/health``; fail fast (``LogprobsError``) on a wrong/absent server."""
+    try:
+        h = requests.get(f"{endpoint.rstrip('/')}/health", timeout=30).json()
+    except Exception as exc:  # noqa: BLE001
+        raise LogprobsError(f"no healthy server at {endpoint}: {exc}") from exc
+    log(f"server: {h}")
+    return h
 
 
 def _done_keys(out_path: Path) -> set[tuple[str, str, int]]:
@@ -158,12 +180,7 @@ def run_grid(model: str, kind: str, items: list[Item], shots_all: list[Item],
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done = _done_keys(out_path)
 
-    # health check — fail fast on a wrong/absent server
-    try:
-        h = requests.get(f"{endpoint.rstrip('/')}/health", timeout=30).json()
-    except Exception as exc:  # noqa: BLE001
-        raise LogprobsError(f"no healthy server at {endpoint}: {exc}") from exc
-    log(f"server: {h}")
+    check_health(endpoint, log)  # fail fast on a wrong/absent server
 
     jobs: list[tuple[Item, str, int]] = [
         (it, rd, ns) for rd in renderers for ns in SHOT_CONDS for it in items
