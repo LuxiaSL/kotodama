@@ -6,6 +6,9 @@
         --items bindprobes/items/items.jsonl --out bindprobes/grids/kotodama-3b-base.jsonl \\
         [--endpoint URL] [--families attr,codevar,dialogue] [--conditions 0shot,3shot,3shot_collide]
     python -m kotodama.eval.bindprobes aggregate --grids bindprobes/grids
+    python -m kotodama.eval.bindprobes gates --grids bindprobes/grids \
+        --items bindprobes/items/items.jsonl --chance-model <0.25B ckpt> \
+        --learn-model <A0* 30B ckpt> [--ge2b m1,m2,...]          # deixis V1–V5
     python -m kotodama.eval.bindprobes verify-names --out bindprobes/verified_names.json [--tokenizers smollm2]
 
 The endpoint defaults to ``$KOTODAMA_ENDPOINT``, else http://localhost:2222.
@@ -18,7 +21,7 @@ import sys
 from pathlib import Path
 
 from kotodama.eval.bindprobes import aggregate as agg
-from kotodama.eval.bindprobes import grid, items, pools
+from kotodama.eval.bindprobes import gates, grid, items, pools
 from kotodama.eval.riders.aggregate import MultiTokenCandidateError
 from kotodama.eval.riders.grid import LogprobsError
 
@@ -52,8 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--seed", type=int, default=items.DEFAULT_SEED)
     g.add_argument("--families", default=",".join(items.FAMILY_NAMES))
     g.add_argument("--per-cell", default=None,
-                   help="N for every family, or 'attr=110,codevar=100,dialogue=100' "
-                        "(default: each family's ~1200-item default)")
+                   help="N for every family, or 'attr=110,codevar=100,dialogue=100,deixis=60' "
+                        "(default: each family's default; deixis counts BASE items per "
+                        "cell, each emitted as deictic + third + twin)")
     g.add_argument("--names", default=None,
                    help="verify-names JSON (default: the banked pools)")
     g.add_argument("--verify", action="store_true",
@@ -80,6 +84,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     a = sub.add_parser("aggregate", help="summary + per-cell + error-type tables")
     a.add_argument("--grids", required=True, help="directory of bindprobe grid JSONLs")
+
+    gt = sub.add_parser("gates", help="deixis validity gates V1-V5 (PASS/FAIL per gate)")
+    gt.add_argument("--grids", required=True, help="directory of bindprobe grid JSONLs")
+    gt.add_argument("--items", required=True, help="the items.jsonl the grids were scored on")
+    gt.add_argument("--chance-model", required=True,
+                    help="grid model name of the 0.25B checkpoint (V2, V5)")
+    gt.add_argument("--learn-model", required=True,
+                    help="grid model name of the A0* 30B checkpoint (V3)")
+    gt.add_argument("--ge2b", default=None,
+                    help="comma list of grid model names >= 2B (V4; default: every model "
+                         "except --chance-model)")
     return ap
 
 
@@ -104,6 +119,11 @@ def main(argv: list[str] | None = None) -> int:
                                 top_n=args.top_n)
         elif args.cmd == "aggregate":
             agg.write_tables(Path(args.grids))
+        elif args.cmd == "gates":
+            ok, _ = gates.write_gates(Path(args.grids), Path(args.items), args.chance_model,
+                                      args.learn_model,
+                                      _csv(args.ge2b) if args.ge2b else None)
+            return 0 if ok else 1
     except (ValueError, FileNotFoundError, RuntimeError, LogprobsError,
             MultiTokenCandidateError) as exc:
         print(f"error: {exc}", file=sys.stderr)

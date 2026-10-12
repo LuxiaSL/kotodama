@@ -11,6 +11,9 @@ label is the one tabulated. Labels per family (priority order):
             the value read) > alias (another var's final value) > init (an
             initial literal) > other
   dialogue  previous (earlier holder / object held earlier) > other_person > other
+  deixis    speaker_confusion (the wrong side of I/you) > previous_owner >
+            other_participant (owner query) / other_object (object queries) —
+            exact definitions in ``deixis``
 """
 
 from __future__ import annotations

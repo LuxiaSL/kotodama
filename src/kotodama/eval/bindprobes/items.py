@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-from kotodama.eval.bindprobes import attr, codevar, dialogue
+from kotodama.eval.bindprobes import attr, codevar, deixis, dialogue
 from kotodama.eval.bindprobes.base import FamilyModule, Item
 from kotodama.eval.bindprobes.pools import (Pools, PoolSplit, check_split, load_pools,
                                             load_tokenizer)
@@ -36,6 +36,7 @@ FAMILIES: dict[str, FamilyModule] = {
     "attr": attr,          # type: ignore[dict-item]
     "codevar": codevar,    # type: ignore[dict-item]
     "dialogue": dialogue,  # type: ignore[dict-item]
+    "deixis": deixis,      # type: ignore[dict-item]
 }
 FAMILY_NAMES: tuple[str, ...] = tuple(FAMILIES)
 CONDITIONS: tuple[str, ...] = ("0shot", "3shot", "3shot_collide")
@@ -43,6 +44,18 @@ N_SHOTS = 3
 COND_NSHOTS: dict[str, int] = {"0shot": 0, "3shot": N_SHOTS, "3shot_collide": N_SHOTS}
 DEFAULT_SEED = 2026
 MAX_PROMPT_BYTES = 3072   # => < 3072 tokens; the model context is 4096
+
+
+def max_prompt_tokens(fam: FamilyModule) -> int:
+    """The family's token bound (``MAX_PROMPT_TOKENS``; default: the byte bound)."""
+    return int(getattr(fam, "MAX_PROMPT_TOKENS", MAX_PROMPT_BYTES))
+
+
+def expand(fam: FamilyModule, item: Item) -> list[Item]:
+    """The emitted items for one generated item: ``[item]``, or the family's paired
+    variants (``deixis``: deictic / third / twin) when it defines ``expand``."""
+    fn = getattr(fam, "expand", None)
+    return fn(item) if fn is not None else [item]
 
 
 def family(name: str) -> FamilyModule:
@@ -128,8 +141,12 @@ def generate_family(name: str, split: PoolSplit, per_cell: Optional[int] = None,
             iid = f"{name}_{'-'.join(map(str, cell))}_{k:03d}"
             it = gen_with_shots(fam, rng, cell, split, iid, k, per,
                                 shot_seed=f"bindprobes:{name}:{seed}:{iid}:shots")
-            validate(it, split)
-            items.append(it)
+            for v in expand(fam, it):
+                validate(v, split)
+                items.append(v)
+    check = getattr(fam, "check_family", None)
+    if check is not None:
+        check(items)
     return items
 
 
@@ -175,6 +192,8 @@ def _objects(item: Item) -> set[str]:
     """Every object string an item's text can mention (its candidate universe)."""
     if item.family == "dialogue":
         return {o for o, _ in item.spec["holdings0"]}
+    if item.family == "deixis":
+        return set(item.spec["objects"])
     return set(item.candidates)
 
 
@@ -198,6 +217,9 @@ def validate(item: Item, split: Optional[PoolSplit] = None) -> None:
         raise ValueError(f"{iid}: rendered mention order != stored mention order")
     if text.endswith(" ") or not fam.render(item, True).startswith(text):
         raise ValueError(f"{iid}: lead-in has a trailing space / answer render mismatch")
+    extra = getattr(fam, "validate_item", None)
+    if extra is not None:
+        extra(item)
     shots = item.shot_items()
     if shots:
         item_labels, item_objs = set(fam.labels(item)), _objects(item)
@@ -220,24 +242,34 @@ def validate(item: Item, split: Optional[PoolSplit] = None) -> None:
             shot_allowed = set(split.shot.names) | set(split.shot.variables)
             if not set(fam.labels(s)) <= shot_allowed or not _objects(s) <= set(split.shot.objects):
                 raise ValueError(f"{s.item_id}: exemplar uses strings outside the SHOT pools")
+    approx = getattr(fam, "approx_tokens", None)
     for cond in CONDITIONS if shots else ("0shot",):
-        n = len(build_prompt(item, cond).encode("utf-8"))
+        prompt = build_prompt(item, cond)
+        n = len(prompt.encode("utf-8"))
         if n >= MAX_PROMPT_BYTES:
             raise ValueError(f"{iid}/{cond}: prompt is {n} bytes (max {MAX_PROMPT_BYTES})")
+        # tokenizer-free guard for a family with a tighter token bound; the exact
+        # count is ``check_tokens`` (``gen --verify``)
+        if approx is not None and approx(prompt) >= max_prompt_tokens(fam):
+            raise ValueError(f"{iid}/{cond}: ~{approx(prompt)} tokens "
+                             f"(max {max_prompt_tokens(fam)})")
 
 
 def check_tokens(items: Sequence[Item], tokenizer: Any) -> int:
-    """Max prompt tokens over every (item, condition); raises past MAX_PROMPT_BYTES.
-    Also re-checks every candidate is one token in its scored form."""
+    """Max prompt tokens over every (item, condition); raises past the family's
+    bound (``max_prompt_tokens``: deixis 1024, else MAX_PROMPT_BYTES). Also
+    re-checks every candidate is one token in its scored form."""
     longest = 0
     for it in items:
         for c in it.candidates:
             if len(tokenizer(" " + c, add_special_tokens=False).input_ids) != 1:
                 raise ValueError(f"{it.item_id}: candidate {c!r} is not one token")
+        bound = max_prompt_tokens(family(it.family))
         for cond in CONDITIONS:
-            longest = max(longest, len(tokenizer(build_prompt(it, cond)).input_ids))
-    if longest >= MAX_PROMPT_BYTES:
-        raise ValueError(f"longest prompt {longest} tokens >= {MAX_PROMPT_BYTES}")
+            n = len(tokenizer(build_prompt(it, cond)).input_ids)
+            if n >= bound:
+                raise ValueError(f"{it.item_id}/{cond}: prompt is {n} tokens (max {bound})")
+            longest = max(longest, n)
     return longest
 
 
@@ -259,6 +291,12 @@ def emit(out_dir: Path, seed: int = DEFAULT_SEED, families: Sequence[str] = FAMI
         "shot_pool": {"names": list(split.shot.names), "objects": list(split.shot.objects),
                       "variables": list(split.shot.variables)},
     }
+    for f in families:
+        aud = getattr(family(f), "audit", None)
+        if aud is not None:   # deixis: shortcut-control shares per cell x variant
+            a = aud([it for it in items if it.family == f])
+            meta.setdefault("audit", {})[f] = a
+            meta.setdefault("audit_failures", {})[f] = family(f).audit_failures(a)
     if verify:
         tok = load_tokenizer(TOKENIZER_NAME)
         check_split(split, tok)

@@ -3,7 +3,7 @@
 The HTTP path is the riders' (``riders.grid.request_batch`` / ``check_health`` /
 ``default_endpoint``) and the row's rank/margin come from the riders'
 closed-candidate read (``riders.grid.read_result``), so a bindprobe row means
-what a rider row means. All three families are plain-text prompts, so there is
+what a rider row means. All families are plain-text prompts, so there is
 no model "kind": koto and HF models get the same strings.
 
 Row = ``{model, item_id, family, cell, cell_key, condition, nshots, <controls>,
@@ -34,6 +34,8 @@ ROW_CONTROLS: dict[str, tuple[str, ...]] = {
     "attr": ("qpos", "recency_control", "n_distractors"),
     "codevar": ("gold_is_last_literal", "n_stale", "n_reference"),
     "dialogue": ("qkind", "n_pronoun_ops", "gold_is_last_mention"),
+    "deixis": ("variant", "pair_id", "qkind", "gold_is_last_mention", "gold_is_last_speaker",
+               "gold_in_last_line"),
 }
 
 
