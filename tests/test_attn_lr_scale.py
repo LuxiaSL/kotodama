@@ -55,3 +55,15 @@ def test_attn_group_optimizer_steps() -> None:
     loss.backward(); muon.step(); adamw.step()
     assert torch.equal(q, q0)            # frozen (scale 0) inside the window
     assert not torch.equal(other, o0)    # everything else trains
+
+
+def test_attn_layers_restricts_group() -> None:
+    from kotodama.training.train import parse_layer_range
+    assert parse_layer_range("") is None
+    assert parse_layer_range("0-2,5") == {0, 1, 2, 5}
+    model = _tiny()
+    muon, _ = build_hybrid_optimizer(model, muon_lr=0.04, attn_group=True, attn_layers={0})
+    attn_ids = {id(p) for p in muon.param_groups[1]["params"]}
+    names = {n for n, p in model.named_parameters() if id(p) in attn_ids}
+    assert names and all(n.startswith("layers.0.attn.") for n in names)
+    assert len(names) == 4

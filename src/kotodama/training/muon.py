@@ -20,6 +20,8 @@ Usage:
 
 from __future__ import annotations
 
+import re
+
 import logging
 from typing import Any, Optional
 
@@ -485,6 +487,7 @@ def build_hybrid_optimizer(
     adamw_no_decay_norms: bool = False,
     muon_fp32_master: bool = False,
     attn_group: bool = False,
+    attn_layers: Optional[set[int]] = None,
 ) -> tuple[Muon, "MasterAdamW"]:
     """
     Build hybrid Muon + AdamW optimizer for a transformer model.
@@ -500,8 +503,10 @@ def build_hybrid_optimizer(
 
     ``attn_group`` puts the attention projections (q/k/v/o) in their own Muon group tagged
     ``"attn"`` so :class:`HybridScheduler` can scale their LR separately (``attn_lr_scale``,
-    e.g. protecting NCA-formed attention through a handoff). Off by default — like the norm
-    group, a two-group Muon state dict cannot resume a one-group checkpoint.
+    e.g. protecting NCA-formed attention through a handoff). ``attn_layers`` restricts the group
+    to those layer indices (e.g. shallow layers frozen during an NCA phase so its circuit forms
+    deeper). Off by default — like the norm group, a two-group Muon state dict cannot resume a
+    one-group checkpoint.
 
     Returns separate optimizers that should both be stepped each training step.
     """
@@ -514,7 +519,9 @@ def build_hybrid_optimizer(
         if not param.requires_grad:
             continue
         if param.ndim == 2 and "embed" not in name and "lm_head" not in name:
-            if attn_group and ".attn." in name and name.endswith("_proj.weight"):
+            m_layer = re.search(r"layers\.(\d+)\.attn\.", name)
+            if (attn_group and m_layer and name.endswith("_proj.weight")
+                    and (attn_layers is None or int(m_layer.group(1)) in attn_layers)):
                 attn_params.append(param)
             else:
                 muon_params.append(param)

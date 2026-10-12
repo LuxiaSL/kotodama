@@ -714,6 +714,7 @@ def train(args: argparse.Namespace) -> None:
             adamw_no_decay_norms=getattr(args, "adamw_no_decay_norms", False),
             muon_fp32_master=getattr(args, "muon_fp32_master", False),
             attn_group=_attn_lr_scaled(args),
+            attn_layers=parse_layer_range(getattr(args, "attn_lr_scale_layers", "")),
         )
 
     # -- Compute training geometry ---------------------------------------------
@@ -1864,6 +1865,25 @@ def _resolve_yaml_config(path: Path, chain: tuple[Path, ...]) -> dict[str, Any]:
     return merged
 
 
+def parse_layer_range(spec: Optional[str]) -> Optional[set[int]]:
+    """``"0-6,20"`` -> {0..6, 20}; empty/None -> None (all layers)."""
+    if not spec:
+        return None
+    out: set[int] = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = (int(x) for x in part.split("-", 1))
+            if b < a:
+                raise ValueError(f"bad layer range {part!r}")
+            out.update(range(a, b + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
 def _attn_lr_scaled(args: argparse.Namespace) -> bool:
     """True iff the run scales the attention projections' LR for a window (needs their own Muon group)."""
     return (getattr(args, "attn_lr_scale", 1.0) != 1.0 and getattr(args, "attn_lr_scale_steps", 0) > 0)
@@ -2057,6 +2077,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--attn_lr_scale_steps", type=int, default=0,
                    help="Steps (from 0) during which --attn_lr_scale applies.")
+    p.add_argument("--attn_lr_scale_layers", type=str, default="",
+                   help="Restrict --attn_lr_scale to these layers' attention, e.g. '0-6' (default: all layers).")
     p.add_argument(
         "--data_seed", type=int, default=None,
         help="Seed for the training-data order (shuffle) only; default = --seed. Lets init and data order vary "
