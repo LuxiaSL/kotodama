@@ -769,12 +769,15 @@ def train(args: argparse.Namespace) -> None:
         logger.warning("--legacy_rank0_data: EVERY rank reads rank 0's data (the pre-2026-10-02 "
                        "regime, BUG-LEDGER D12) — effective batch = 1/%d of the global batch", dp_size)
     doc_masking = getattr(args, "doc_masking", False)
+    data_seed = training_data_seed(args)
+    if is_main and data_seed != args.seed:
+        logger.info("Data order seed %d (init seed %d)", data_seed, args.seed)
 
     if args.random_data:
         dataset = RandomTokenDataset(
             vocab_size=config.vocab_size,
             seq_len=seq_len,
-            seed=args.seed,
+            seed=data_seed,
             rank=dp_rank,
             doc_masking=doc_masking,
         )
@@ -788,7 +791,7 @@ def train(args: argparse.Namespace) -> None:
             seq_len=seq_len,
             rank=dp_rank,
             world_size=dp_size,
-            seed=args.seed,
+            seed=data_seed,
             doc_masking=doc_masking,
         )
         mix_fraction = float(getattr(args, "mix_fraction", 0.0) or 0.0)
@@ -796,7 +799,7 @@ def train(args: argparse.Namespace) -> None:
             dataset = MixedTokenDataset(
                 dataset,
                 TokenizedDataset(path=args.mix_data_path, seq_len=seq_len, rank=dp_rank,
-                                 world_size=dp_size, seed=args.seed, doc_masking=doc_masking),
+                                 world_size=dp_size, seed=data_seed, doc_masking=doc_masking),
                 mix_fraction,
             )
             if is_main:
@@ -1856,6 +1859,12 @@ def _resolve_yaml_config(path: Path, chain: tuple[Path, ...]) -> dict[str, Any]:
     return merged
 
 
+def training_data_seed(args: argparse.Namespace) -> int:
+    """The training-data order seed: ``--data_seed`` if given, else ``--seed`` (the historical tie)."""
+    ds = getattr(args, "data_seed", None)
+    return int(args.seed if ds is None else ds)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="luxia-base distributed training")
 
@@ -2030,6 +2039,11 @@ def parse_args() -> argparse.Namespace:
              "Uses flash_attn_varlen_func to prevent cross-document attention.",
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--data_seed", type=int, default=None,
+        help="Seed for the training-data order (shuffle) only; default = --seed. Lets init and data order vary "
+             "independently (init x data-order studies); --seed alone keeps both tied, as every earlier run was.",
+    )
 
     # Eval (held-out data for overfit detection)
     p.add_argument(
