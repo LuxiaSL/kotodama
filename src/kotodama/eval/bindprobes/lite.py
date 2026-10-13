@@ -7,7 +7,7 @@ shaped request per item × condition — the same payload the HTTP runner sends)
 ``collision_gap`` and ``shot_gap`` per family, in acc).
 
 deixis is selected by PAIR (10 base items per cell by default, each with its
-deictic + third + twin variants); ``summarize`` reports its deictic rows as
+deictic + third (+ twin at P=3) variants); ``summarize`` reports its deictic rows as
 ``bindprobes/deixis/...``, the variants as ``bindprobes/deixis.third/...`` and
 ``bindprobes/deixis.twin/...``, plus ``bindprobes/deixis/penalty`` (3shot
 cc(third) − cc(deictic)), ``twin_joint`` and ``twin_dependence`` (3shot).

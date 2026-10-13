@@ -8,7 +8,14 @@
     python -m kotodama.eval.bindprobes aggregate --grids bindprobes/grids
     python -m kotodama.eval.bindprobes gates --grids bindprobes/grids \
         --items bindprobes/items/items.jsonl --chance-model <0.25B ckpt> \
-        --learn-model <A0* 30B ckpt> [--ge2b m1,m2,...]          # deixis V1–V5
+        --learn-model <A0* 30B ckpt> [--ge2b m1,m2,...] [--pilot] # deixis V1–V5
+    # deixis v2 PILOT (addendum §5): 10 base items/cell = 150 base, 390 texts
+    python -m kotodama.eval.bindprobes gen --out bindprobes/pilot --families deixis \
+        --per-cell deixis=10 --verify
+    python -m kotodama.eval.bindprobes run --model <M> --items bindprobes/pilot/items.jsonl \
+        --out bindprobes/pilot-grids/<M>.jsonl --families deixis   # A0* 0.25B and A0* 30B
+    python -m kotodama.eval.bindprobes gates --grids bindprobes/pilot-grids \
+        --items bindprobes/pilot/items.jsonl --chance-model <0.25B> --learn-model <30B> --pilot
     python -m kotodama.eval.bindprobes verify-names --out bindprobes/verified_names.json [--tokenizers smollm2]
 
 The endpoint defaults to ``$KOTODAMA_ENDPOINT``, else http://localhost:2222.
@@ -57,7 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--per-cell", default=None,
                    help="N for every family, or 'attr=110,codevar=100,dialogue=100,deixis=60' "
                         "(default: each family's default; deixis counts BASE items per "
-                        "cell, each emitted as deictic + third + twin)")
+                        "cell, each emitted as deictic + third (+ twin at P=3); the v2 "
+                        "pilot is '--families deixis --per-cell deixis=10')")
     g.add_argument("--names", default=None,
                    help="verify-names JSON (default: the banked pools)")
     g.add_argument("--verify", action="store_true",
@@ -95,6 +103,9 @@ def build_parser() -> argparse.ArgumentParser:
     gt.add_argument("--ge2b", default=None,
                     help="comma list of grid model names >= 2B (V4; default: every model "
                          "except --chance-model)")
+    gt.add_argument("--pilot", action="store_true",
+                    help="v2 pilot gate: V2 band |cc| <= .08; verdict = V1 and V2 and V3 "
+                         "(V4/V5 informational)")
     return ap
 
 
@@ -122,7 +133,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "gates":
             ok, _ = gates.write_gates(Path(args.grids), Path(args.items), args.chance_model,
                                       args.learn_model,
-                                      _csv(args.ge2b) if args.ge2b else None)
+                                      _csv(args.ge2b) if args.ge2b else None,
+                                      pilot=args.pilot)
             return 0 if ok else 1
     except (ValueError, FileNotFoundError, RuntimeError, LogprobsError,
             MultiTokenCandidateError) as exc:

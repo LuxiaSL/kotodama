@@ -1,4 +1,4 @@
-"""``deixis`` — conversational referent binding through I / you / my / your.
+"""``deixis`` (v2) — conversational referent binding through I / you / my / your.
 
 A non-assistant chat transcript (``Name: utterance`` lines, no ChatML, no
 User/Assistant) opened by a scene line; who owns what is stated ONLY through
@@ -7,100 +7,102 @@ speaker-relative reference::
     A chat between Ada, Ken and Rosa.
     Ada: I have the lamp.
     Ken: The cup is mine.
-    Ken: Rosa, take my cup.
-    Ada: Rosa, give me your cup.
-    Rosa: Ada, here you go.
-    (Now the cup belongs to
-    -> " Ada"
+    Rosa: I have the bell.
+    Ken: Here, Rosa, take my cup.
+    Rosa: Ada, my bell is yours now.
+    Now the cup is with
+    -> " Rosa"
 
-Addressee rule (the unambiguity law): P = 2 -> "you" is the other speaker (no
-vocatives); P = 3 -> EVERY utterance containing you/your/yours begins with a
-vocative naming the addressee — so the request reply is ``Rosa: Ada, here you
-go.`` at P = 3 (the spec's bare ``Here you go.`` contains "you"), and every give /
-request / swap line carries a vocative. ``resolve`` is the one place pronoun
-semantics live: it turns the SURFACE events into explicit (giver, recipient)
-events, raising on any unresolvable or ambiguous "you" and on every violated
-precondition.
+v2 (SPEC-bindprobes-deixis v2 addendum, after v1 failed V2/V3/V4): declarations +
+GIVE only, ≥ 3 candidates, a dialogue-worded third-person control. Items carry
+``meta.deixis_version = VERSION``; ``items`` ids/seeds carry ``-v2``; aggregate and
+gates refuse deixis rows/items of any other version (:func:`check_version`).
+
+Addressee rule (the unambiguity law): P = 2 -> "you" is the other speaker and no
+utterance carries a vocative (the addendum's "P=2 may drop the vocative" — v2
+always drops it, as v1 did); P = 3 -> EVERY utterance containing you/your/yours or
+an imperative opens with a vocative naming the addressee (``Here, Ben, take ...``
+counts: the vocative follows the interjection). ``resolve_addressee`` is the one
+place pronoun semantics live; :func:`explicit_events` raises on any unresolvable
+or ambiguous "you", :func:`run` on every violated precondition.
 
 Events (deictic surface -> effect; precondition):
-  declare  ``I have the o.`` / ``The o is mine.``          owner(o)=speaker; o unowned
-  give     ``[V, ]take my o.`` / ``[V, ]I'm giving you my o.``  owner(o)=addressee; owner(o)=speaker
-  request  ``[V, ]give me your o.`` + replier ``[S, ]here you go.`` (one event, two lines)
-                                                          owner(o)=requester; owner(o)=addressee,
-                                                          and the replier IS that addressee
-  swap     ``[V, ]let's swap: you take my o1 and I'll take your o2.``
-                                                          exchange; o1=speaker's, o2=addressee's
-Declarations open the scene (each object declared once, by its first owner);
-then E ∈ {1, 2, 4} events from {give, request, swap}. 2–4 objects in play.
+  declare  ``I have the o.`` / ``The o is mine.``             owner(o)=speaker; o unowned
+  give     rotated within an item (random start), P=3 / P=2 surfaces:
+             giving  ``V, I'm giving you my o.`` / ``I'm giving you my o.``
+             here    ``Here, V, take my o.``     / ``Here, take my o.``
+             yours   ``V, my o is yours now.``   / ``My o is yours now.``
+                                                              owner(o)=addressee; owner(o)=speaker
+Declarations open the scene, grouped by declarer in scene order (each object
+declared once); then E ∈ {1, 2, 3} gives.
 
-Queries (the completion ends right before the scored single token):
-  owner      ``(Now the o belongs to``                  -> a name; candidates = all P names.
-             The queried object has changed owner at least once.
-  self       ``S: Right now I'm holding the``           -> an object; candidates = all objects
-  addressee  ``S: A, right now you're holding the``     -> an object (P = 2 omits the vocative)
-self/addressee query a person holding EXACTLY one object whose holdings changed.
+Queries (the completion ends right before the scored single token, closer ``.``):
+  owner      ``Now the o is with``            -> a name; P = 3 ONLY (3 candidates).
+             Same line in every variant. E ≥ 2: the queried object has moved and
+             is not in the last line. E = 1: the recency slot (1/3) queries the
+             given object; the other 2/3 query an object that stayed with its
+             declarer (the giver's other object / the bystander's) — with one give
+             and the recipient always named last, this is the only way to keep
+             "gold = last-mentioned name" off 100% (``meta.queried_obj_moved``).
+  self       ``S: Right now I'm holding the``          -> an object
+  addressee  ``S: A, right now you're holding the``    -> an object (P = 2: no vocative)
+  self/addressee: 3–4 objects in play, candidates = all objects in play; the
+  queried person holds EXACTLY one object, and their holdings changed.
 
-Paired variants — every base item ``x`` is emitted three times, linked by
-``meta.pair_id`` (= the base item id), all under every shot condition:
+Paired variants — every base item ``x`` is emitted as linked variants
+(``meta.pair_id`` = the base item id), all under every shot condition:
   deictic  ``x`` itself.
-  third    the same events as narrator lines in the third person WITH NAMES and no
-           pronouns at all (P=3 ``(Ada gives the cup to Ken.)``, P=2 ``(Ken gets the
-           cup from Ada.)`` — the form mirrors which name the deictic line mentions
-           last, so recency is identical across the pair; no possessive "her lamp"
-           either, since names carry no gender here); same scene line, same
-           question, same gold and candidates. The self/addressee question is narrated
-           too (``(Right now Ken is holding the``) so the control carries no deictic
-           step; the owner question is already a narrator line and is identical.
-  twin     the same skeleton under a transposition sigma of two speakers (P = 3: the
-           third is unchanged): every utterance spoken by a in ``x`` is spoken by b and
-           vice versa, with vocatives transposed with it (so I/you re-derive), the scene
-           line and the query line UNCHANGED. sigma is chosen so the true answer flips
-           (owner: sigma moves the gold owner; self/addressee: sigma moves the queried
-           person and a partner who also holds exactly one object). Its
-           ``3shot_collide`` maps are sigma∘(the base maps), i.e. the twin's collide
-           exemplars are the base's transposed too — which keeps "no collide exemplar
-           answers the test gold" true for both members of the pair.
+  third    the same events as dialogue-family prose with names, one paragraph, no
+           pronouns, no parentheses: ``Ada, Ken and Rosa are sitting at a table. Ada
+           has the lamp. Ken has the cup and the bell. Ken gives the cup to Rosa.
+           Now Rosa is holding the`` (owner: ``Now the cup is with``). Same gold,
+           candidates and object-mention order as ``x``.
+  twin     P = 3 only. The same skeleton under a transposition sigma of two
+           speakers (the third unchanged): every utterance spoken by a in ``x`` is
+           spoken by b and vice versa, vocatives transposed with it (so I/you
+           re-derive), the scene and query lines UNCHANGED, so the true answer
+           flips. Owner: sigma moves the gold owner. self/addressee: sigma swaps
+           the queried person with a partner who also holds exactly one object.
+           Its ``3shot_collide`` maps are sigma∘(the base maps).
+           P = 2 object cells have NO twin: with ≥ 3 objects and 2 people the
+           partner holds ≥ 2 objects, so the transposed query has no single gold
+           (the addendum's "candidates ≥ 3" and "queried speaker holds exactly one"
+           cannot both hold for a P = 2 twin). Their pairs are (deictic, third).
 
-Shortcut controls (enforced per cell on the deictic items — the third variant
-mirrors them exactly; the twin only AUDITS them, since its text keeps x's objects
-while its gold moves; every variant records them in ``meta``):
-  gold_is_last_mention   gold is the last-mentioned candidate-type string (names
-                         for owner, objects for self/addressee); 50% per cell.
-  gold_is_last_speaker   owner items: the gold owner speaks the last line; 50% per
-                         owner cell (jointly scheduled with recency — see
-                         ``_schedule``; a cell where some combinations are
-                         infeasible uses the feasible diagonal).
-  gold_in_last_line      the ownership-word rule: the gold object (owner items: the
-                         queried object) is NOT named in the line immediately
-                         preceding the query (a request's reply line — "Here you
-                         go." / its narration — names no object). Exempt cells
-                         (rule cannot hold): owner E=1 (spec) and P=2 E=1
-                         self/addressee (both speakers must hold exactly one object,
-                         so the only legal event is a swap of the two objects).
-                         NB: "last EVENT" instead of "last line" would make the
-                         recency control unbalanceable for object queries (the
-                         last-mentioned object would then never be the gold — an
-                         anti-recency shortcut that solves P=2 two-object items).
+Shortcut controls (scheduled per cell on the deictic items; third mirrors them,
+the twin only audits; every variant records them in ``meta``). v2 schedules them
+at the SHORTCUT-NEUTRAL rate (= chance 1/C) rather than v1's 50%: with ≥ 3
+candidates a 50% "gold = last mention" rate is itself a recency shortcut worth
+cc ≈ .25–.33, and the spec bound is "≤ 50% ± 5%":
+  gold_is_last_mention  gold is the last-mentioned candidate-type string.
+                        owner: 1/3; object cells: 1/3 of the 3-object items and
+                        1/4 of the 4-object items (n_objects is scheduled too).
+  gold_is_last_speaker  owner: the gold owner speaks the last line; 1/3. (At
+                        P = 3 the last name is the last give's recipient and the last
+                        speaker its giver, so the owner schedule cycles
+                        recipient / giver / bystander — the bystander is gold 1/3.)
+  gold_in_last_line     the ownership-word rule: the gold object (owner: the
+                        queried object) is NOT in the line before the query.
+                        Enforced for owner E ≥ 2. Exempt: owner E = 1 (spec) and
+                        every self/addressee cell — with give-only events every
+                        line names exactly one object and the query line none, so
+                        for object queries this IS gold_is_last_mention; enforcing
+                        it (0%) would hand out an exclusion shortcut (chance
+                        1/(C−1)), so the neutral recency schedule replaces it.
+Audit: per cell, |share − chance| ≤ max(BALANCE_TOL, 1/n) (:func:`audit_failures`).
 
 Error types (``error_types`` returns every label that applies, primary first):
   speaker_confusion  the wrong side of I/you. Owner query: the pick is the OTHER
-                     party of the event that last moved the queried object (its
-                     giver / the request's addressee / the swap partner). Object
+                     party of the give that last moved the queried object. Object
                      queries: the pick is an object currently held by the query's
                      counterpart — addressee query: the query SPEAKER ("you" read
                      as "I"); self query: walking back from the last line, the
                      first line's speaker that is not the queried person, or the
-                     addressee of a line the queried person spoke (P = 2: always the
-                     other speaker).
+                     addressee of a line the queried person spoke.
   previous_owner     owner query: an earlier owner of the queried object. Object
                      queries: an object the queried person owned earlier but not now.
   other_participant  owner query, none of the above.
   other_object       object query, none of the above.
-speaker_confusion is ranked first (the spec lists previous owner first): for owner
-queries the other party of the last transfer is almost always also a previous
-owner, so under the spec's order the deixis-specific label could never be
-primary. The third variant is typed by the same rules on the same event
-structure, so deictic - third differences per label are comparable.
 """
 
 from __future__ import annotations
@@ -109,30 +111,37 @@ import random
 import re
 import string
 from collections import defaultdict
-from functools import cache
 from typing import Any, Mapping, Optional, Sequence, TypedDict
 
-from kotodama.eval.bindprobes.base import Cell, Item, cell_key, name_list, rejection
+from kotodama.eval.bindprobes.base import Cell, Item, cell_key, name_list, rejection, the_list
 from kotodama.eval.bindprobes.pools import Pools
 
 FAMILY = "deixis"
+VERSION = 2                       # meta.deixis_version; items' id/seed tag "deixis-v2"
 PS = (2, 3)
-ES = (1, 2, 4)
+ES = (1, 2, 3)
 QKINDS = ("owner", "self", "addressee")
-CELLS: list[Cell] = [(p, e, q) for p in PS for e in ES for q in QKINDS]
-DEFAULT_PER_CELL = 60             # 18 cells -> 1080 base items -> 3240 item texts
+OBJECT_KINDS = ("self", "addressee")
+# owner only at P = 3 (3 name candidates): 3 + 6 + 6 = 15 cells
+CELLS: list[Cell] = [(p, e, q) for p in PS for e in ES for q in QKINDS
+                     if q != "owner" or p == 3]
+DEFAULT_PER_CELL = 60             # 15 cells -> 900 base items
+PILOT_PER_CELL = 10               # addendum §5 pilot: --per-cell deixis=10 (150 base)
+LITE_PER_CELL = 10                # lite slice: 10 base items (+ variants) per cell
 SEPARATOR = "\n\n* * *\n\n"
 VARIANTS = ("deictic", "third", "twin")
 ERROR_TYPES = ("speaker_confusion", "previous_owner", "other_participant", "other_object")
 MAX_PROMPT_TOKENS = 1024          # spec: prompts < 1024 tokens (checked with the tokenizer)
-N_OBJECTS = (2, 3, 4)
-EVENT_WEIGHTS = (("give", 0.4), ("request", 0.3), ("swap", 0.3))
-LITE_PER_CELL = 10                # lite slice: 10 base items (x 3 variants) per cell
-BALANCE_TOL = 0.05                # spec: <= 50% ± 5% per cell
+MIN_CANDIDATES = 3                # addendum §2: chance ≤ 1/3
+N_OBJECTS_OWNER = (2, 3, 4)
+N_OBJECTS_HELD = (3, 4)           # self/addressee: 3–4 objects in play
+BALANCE_TOL = 0.05                # spec: ± 5% per cell
 
-TRANSFERS = ("give", "request", "swap")
+TRANSFERS = ("give",)
+GIVE_ORDER = ("giving", "here", "yours")
 _YOU = re.compile(r"\byou(?:r|rs|'re)?\b", re.IGNORECASE)
-_IMPERATIVE = re.compile(r"^(?:take|give|let's)\b", re.IGNORECASE)
+_IMPERATIVE = re.compile(r"^(?:take|give)\b", re.IGNORECASE)
+_HERE = re.compile(r"^Here, ")
 _PRONOUNS = re.compile(r"\b(?:I|I'm|I'll|me|my|mine|you|your|yours|you're|he|him|his|she|"
                        r"her|hers|they|them|their|it)\b", re.IGNORECASE)
 
@@ -143,13 +152,22 @@ class Spec(TypedDict):
     objects: list[str]           # objects in play, declaration order
     events: list[dict[str, Any]]  # surface events (deictic/twin) or explicit ones (third)
     query: dict[str, Any]
-    sigma: Optional[list[str]]   # the twin transposition [a, b] (on every variant)
+    sigma: Optional[list[str]]   # the twin transposition [a, b] (P = 3; None at P = 2)
 
 
 class Line(TypedDict):
     speaker: str
     addressee: Optional[str]
     objs: list[str]
+
+
+def has_twin(cell: Sequence[Any]) -> bool:
+    """P = 3 cells carry a twin; P = 2 (object queries only) cannot (module doc)."""
+    return int(cell[0]) == 3
+
+
+def variants(cell: Sequence[Any]) -> tuple[str, ...]:
+    return VARIANTS if has_twin(cell) else VARIANTS[:2]
 
 
 # ── Resolution + simulation ────────────────────────────────────────────────────
@@ -184,7 +202,9 @@ def explicit_events(spec: Spec) -> list[dict[str, Any]]:
         raise ValueError(f"bad people {people}")
     if spec["variant"] == "third":
         for ev in spec["events"]:
-            for k in ("owner", "giver", "recipient", "requester", "holder", "a", "b"):
+            if ev["ev"] not in ("declare",) + TRANSFERS:
+                raise ValueError(f"unknown event {ev['ev']!r}")
+            for k in ("owner", "giver", "recipient"):
                 if k in ev and ev[k] not in people:
                     raise ValueError(f"{ev['ev']}: {k}={ev[k]!r} is not in the chat")
         return [dict(ev) for ev in spec["events"]]
@@ -195,22 +215,13 @@ def explicit_events(spec: Spec) -> list[dict[str, Any]]:
             if s not in people:
                 raise ValueError(f"event {k}: speaker {s!r} not in the chat")
             out.append({"ev": "declare", "owner": s, "obj": ev["obj"]})
-            continue
-        a = resolve_addressee(people, s, ev.get("voc"))
-        if kind == "give":
-            out.append({"ev": "give", "giver": s, "recipient": a, "obj": ev["obj"]})
-        elif kind == "request":
-            if ev["replier"] != a:
-                raise ValueError(f"event {k}: {ev['replier']} replies to a request addressed "
-                                 f"to {a}")
-            back = resolve_addressee(people, ev["replier"], ev.get("reply_voc"))
-            if back != s:
-                raise ValueError(f"event {k}: the reply's 'you' is {back}, not the requester {s}")
-            out.append({"ev": "request", "requester": s, "holder": a, "obj": ev["obj"]})
-        elif kind == "swap":
-            out.append({"ev": "swap", "a": s, "b": a, "a_obj": ev["give"], "b_obj": ev["take"]})
+        elif kind == "give":
+            a = resolve_addressee(people, s, ev.get("voc"))
+            # the surface form rides along (meta only: the third paraphrase is one form)
+            out.append({"ev": "give", "giver": s, "recipient": a, "obj": ev["obj"],
+                        "form": ev.get("form")})
         else:
-            raise ValueError(f"event {k}: unknown event {kind!r}")
+            raise ValueError(f"event {k}: unknown event {kind!r} (v2: declare/give only)")
     return out
 
 
@@ -224,19 +235,9 @@ def run(spec: Spec) -> tuple[dict[str, str], dict[str, list[str]]]:
     owner: dict[str, str] = {}
     hist: dict[str, list[str]] = {}
     seen_transfer = False
-
-    def move(o: str, frm: str, to: str, k: int) -> None:
-        if owner.get(o) != frm:
-            raise ValueError(f"event {k}: {frm} does not own the {o} (owner {owner.get(o)})")
-        if frm == to:
-            raise ValueError(f"event {k}: {frm} transfers to themself")
-        owner[o] = to
-        hist[o].append(to)
-
     for k, ev in enumerate(evs):
-        kind = ev["ev"]
-        if kind == "declare":
-            o = ev["obj"]
+        o = ev["obj"]
+        if ev["ev"] == "declare":
             if seen_transfer:
                 raise ValueError(f"event {k}: declaration after a transfer")
             if o not in objects or o in owner:
@@ -245,20 +246,13 @@ def run(spec: Spec) -> tuple[dict[str, str], dict[str, list[str]]]:
             hist[o] = [ev["owner"]]
             continue
         seen_transfer = True
-        if kind == "give":
-            move(ev["obj"], ev["giver"], ev["recipient"], k)
-        elif kind == "request":
-            move(ev["obj"], ev["holder"], ev["requester"], k)
-        elif kind == "swap":
-            if ev["a_obj"] == ev["b_obj"]:
-                raise ValueError(f"event {k}: swap of an object with itself")
-            if owner.get(ev["b_obj"]) != ev["b"]:
-                raise ValueError(f"event {k}: {ev['b']} does not own the {ev['b_obj']}")
-            move(ev["a_obj"], ev["a"], ev["b"], k)
-            owner[ev["b_obj"]] = ev["a"]
-            hist[ev["b_obj"]].append(ev["a"])
-        else:
-            raise ValueError(f"event {k}: unknown event {kind!r}")
+        frm, to = ev["giver"], ev["recipient"]
+        if owner.get(o) != frm:
+            raise ValueError(f"event {k}: {frm} does not own the {o} (owner {owner.get(o)})")
+        if frm == to:
+            raise ValueError(f"event {k}: {frm} gives to themself")
+        owner[o] = to
+        hist[o].append(to)
     if set(owner) != set(objects):
         raise ValueError(f"undeclared objects: {sorted(set(objects) - set(owner))}")
     return owner, hist
@@ -296,6 +290,8 @@ def simulate(item: Item) -> str:
     q = spec["query"]
     owner, _ = run(spec)
     if q["kind"] == "owner":
+        if len(spec["people"]) != 3:
+            raise ValueError(f"{item.item_id}: owner queries are P = 3 only (v2)")
         if q["obj"] not in owner:
             raise ValueError(f"{item.item_id}: queried object {q['obj']!r} not in play")
         return owner[q["obj"]]
@@ -313,23 +309,15 @@ def lines(spec: Spec) -> list[Line]:
     structure, also for the third variant (whose events encode who would speak)."""
     out: list[Line] = []
     for ev in explicit_events(spec):
-        kind = ev["ev"]
-        if kind == "declare":
+        if ev["ev"] == "declare":
             out.append({"speaker": ev["owner"], "addressee": None, "objs": [ev["obj"]]})
-        elif kind == "give":
-            out.append({"speaker": ev["giver"], "addressee": ev["recipient"], "objs": [ev["obj"]]})
-        elif kind == "request":
-            out.append({"speaker": ev["requester"], "addressee": ev["holder"], "objs": [ev["obj"]]})
-            out.append({"speaker": ev["holder"], "addressee": ev["requester"], "objs": []})
         else:
-            out.append({"speaker": ev["a"], "addressee": ev["b"],
-                        "objs": [ev["a_obj"], ev["b_obj"]]})
+            out.append({"speaker": ev["giver"], "addressee": ev["recipient"], "objs": [ev["obj"]]})
     return out
 
 
 def last_line_objects(spec: Spec) -> list[str]:
-    """Objects named in the line immediately preceding the query (a request's
-    reply line names none)."""
+    """Objects named in the line immediately preceding the query."""
     return lines(spec)[-1]["objs"]
 
 
@@ -340,139 +328,137 @@ def n_transfers(spec: Spec) -> int:
 # ── Rendering ──────────────────────────────────────────────────────────────────
 
 _FMT = string.Formatter()
+Segment = tuple[str, list[str]]   # (text, slot values in text order)
 
 
-def _fill(tmpl: str, **kw: str) -> tuple[str, list[str]]:
+def _fill(tmpl: str, **kw: str) -> Segment:
     """Format ``tmpl`` and return (text, slot values in text order)."""
     slots = [kw[f] for _, f, _, _ in _FMT.parse(tmpl) if f]
     return tmpl.format(**kw), slots
 
 
-def _utt(speaker: str, voc: Optional[str], body: str, **kw: str) -> tuple[str, list[str]]:
-    """``Speaker: [Voc, ]body`` — the body is capitalized when there is no vocative."""
-    if voc:
-        return _fill("{_s}: {_v}, " + body, _s=speaker, _v=voc, **kw)
-    return _fill("{_s}: " + body[0].upper() + body[1:], _s=speaker, **kw)
-
-
-DECLARE_FORMS = {"have": "I have the {o}.", "mine": "the {o} is mine."}
-GIVE_FORMS = {"take": "take my {o}.", "giving": "I'm giving you my {o}."}
-
-
-def _deictic_lines(ev: Mapping[str, Any]) -> list[tuple[str, list[str]]]:
-    kind, s = ev["ev"], ev["speaker"]
-    if kind == "declare":
-        return [_utt(s, None, DECLARE_FORMS[ev["form"]], o=ev["obj"])]
-    if kind == "give":
-        return [_utt(s, ev.get("voc"), GIVE_FORMS[ev["form"]], o=ev["obj"])]
-    if kind == "request":
-        return [_utt(s, ev.get("voc"), "give me your {o}.", o=ev["obj"]),
-                _utt(ev["replier"], ev.get("reply_voc"), "here you go.")]
-    if kind == "swap":
-        return [_utt(s, ev.get("voc"), "let's swap: you take my {o1} and I'll take your {o2}.",
-                     o1=ev["give"], o2=ev["take"])]
-    raise ValueError(f"unknown event {kind!r}")
-
-
-# Third-person line forms. ``form`` picks which party is named LAST in the line
-# ("to": the receiving side / swap partner b; "from": the giving side / initiator
-# a), so the narration can mirror the deictic line's last-mentioned name (P=2: the
-# speaker tag; P=3: the addressee's vocative) — see ``to_third``. Object order
-# always matches the deictic line, and the fulfil line names no object (as
-# "Here you go." does not).
-THIRD_FORMS: dict[str, dict[str, tuple[str, ...]]] = {
-    "give": {"to": ("({g} gives the {o} to {r}.)",),
-             "from": ("({r} gets the {o} from {g}.)",)},
-    "request": {"to": ("({r} asks {h} for the {o}.)", "({h} gives {r} what {r2} asked for.)"),
-                "from": ("({r} asks {h} for the {o}.)",
-                         "({r} gets what {r2} asked for from {h}.)")},
-    "swap": {"to": ("({a} and {b} swap: {a2} gives {b2} the {ao} and gets the {bo}.)",),
-             "from": ("({a} and {b} swap: {b2} takes the {ao} and {a2} takes the {bo}.)",)},
+DECLARE_FORMS = {"have": "I have the {o}.", "mine": "The {o} is mine."}
+# give surfaces: (P = 3 with the vocative {v}, P = 2 without)
+GIVE_FORMS: dict[str, tuple[str, str]] = {
+    "giving": ("{v}, I'm giving you my {o}.", "I'm giving you my {o}."),
+    "here": ("Here, {v}, take my {o}.", "Here, take my {o}."),
+    "yours": ("{v}, my {o} is yours now.", "My {o} is yours now."),
 }
 
 
-def _third_lines(ev: Mapping[str, Any]) -> list[tuple[str, list[str]]]:
-    kind = ev["ev"]
+def _deictic_line(ev: Mapping[str, Any]) -> Segment:
+    kind, s = ev["ev"], ev["speaker"]
     if kind == "declare":
-        return [_fill("({p} has the {o}.)", p=ev["owner"], o=ev["obj"])]
-    if kind not in THIRD_FORMS:
-        raise ValueError(f"unknown event {kind!r}")
-    tmpls = THIRD_FORMS[kind][ev.get("form", "to")]
+        return _fill("{_s}: " + DECLARE_FORMS[ev["form"]], _s=s, o=ev["obj"])
     if kind == "give":
-        kw = {"g": ev["giver"], "r": ev["recipient"], "o": ev["obj"]}
-    elif kind == "request":
-        kw = {"r": ev["requester"], "r2": ev["requester"], "h": ev["holder"], "o": ev["obj"]}
-    else:
-        kw = {"a": ev["a"], "a2": ev["a"], "b": ev["b"], "b2": ev["b"], "ao": ev["a_obj"],
-              "bo": ev["b_obj"]}
-    return [_fill(t, **kw) for t in tmpls]
+        with_voc, bare = GIVE_FORMS[ev["form"]]
+        if ev.get("voc"):
+            return _fill("{_s}: " + with_voc, _s=s, v=ev["voc"], o=ev["obj"])
+        return _fill("{_s}: " + bare, _s=s, o=ev["obj"])
+    raise ValueError(f"unknown event {kind!r}")
 
 
-def _lead(spec: Spec) -> tuple[str, list[str], str]:
-    """(query lead-in, its slots, the closer appended after the answer)."""
+def _third_sentences(events: Sequence[Mapping[str, Any]]) -> list[Segment]:
+    """dialogue-family prose: ``X has the a and the b.`` (consecutive declarations
+    by one person merged, as dialogue's intro does) and ``G gives the o to R.``"""
+    out: list[Segment] = []
+    k = 0
+    while k < len(events):
+        ev = events[k]
+        if ev["ev"] == "declare":
+            objs = [ev["obj"]]
+            while k + 1 < len(events) and events[k + 1]["ev"] == "declare" \
+                    and events[k + 1]["owner"] == ev["owner"]:
+                k += 1
+                objs.append(events[k]["obj"])
+            out.append((f"{ev['owner']} has {the_list(objs)}.", [ev["owner"]] + objs))
+        elif ev["ev"] == "give":
+            out.append(_fill("{g} gives the {o} to {r}.", g=ev["giver"], o=ev["obj"],
+                             r=ev["recipient"]))
+        else:
+            raise ValueError(f"unknown event {ev['ev']!r}")
+        k += 1
+    return out
+
+
+def _lead(spec: Spec) -> Segment:
+    """The query lead-in (the closer after the answer is always ``.``)."""
     q = spec["query"]
     if q["kind"] == "owner":
-        t, s = _fill("(Now the {o} belongs to", o=q["obj"])
-        return t, s, ".)"
+        return _fill("Now the {o} is with", o=q["obj"])
     if spec["variant"] == "third":
-        t, s = _fill("(Right now {p} is holding the", p=q["person"])
-        return t, s, ".)"
+        return _fill("Now {p} is holding the", p=q["person"])
     if q["kind"] == "self":
-        t, s = _fill("{s}: Right now I'm holding the", s=q["speaker"])
-        return t, s, "."
-    t, s = _utt(q["speaker"], q.get("voc"), "right now you're holding the")
-    return t, s, "."
+        return _fill("{s}: Right now I'm holding the", s=q["speaker"])
+    if q.get("voc"):
+        return _fill("{s}: {v}, right now you're holding the", s=q["speaker"], v=q["voc"])
+    return _fill("{s}: Right now you're holding the", s=q["speaker"])
 
 
-def _rendered(spec: Spec) -> tuple[list[str], list[str]]:
-    """(text lines incl. scene + lead, slot values in text order)."""
-    scene, slots = _fill("A chat between " + name_list([f"{{p{i}}}" for i in
-                                                        range(len(spec["people"]))]) + ".",
-                         **{f"p{i}": p for i, p in enumerate(spec["people"])})
-    out, mentions = [scene], list(slots)
-    fn = _third_lines if spec["variant"] == "third" else _deictic_lines
-    for ev in spec["events"]:
-        for t, s in fn(ev):
-            out.append(t)
-            mentions += s
-    t, s, _ = _lead(spec)
-    return out + [t], mentions + s
+def _segments(spec: Spec) -> tuple[list[Segment], str]:
+    """(scene + body + lead segments, the joiner): chat lines for deictic/twin, one
+    prose paragraph for third."""
+    people = spec["people"]
+    names = {f"p{i}": p for i, p in enumerate(people)}
+    slots = name_list([f"{{p{i}}}" for i in range(len(people))])
+    if spec["variant"] == "third":
+        segs = [_fill(slots + " are sitting at a table.", **names)]
+        segs += _third_sentences(spec["events"])
+        return segs + [_lead(spec)], " "
+    segs = [_fill("A chat between " + slots + ".", **names)]
+    segs += [_deictic_line(ev) for ev in spec["events"]]
+    return segs + [_lead(spec)], "\n"
+
+
+def _rendered(spec: Spec) -> tuple[str, list[str]]:
+    """(text without the answer, slot values in text order)."""
+    segs, joiner = _segments(spec)
+    return joiner.join(t for t, _ in segs), [s for _, ss in segs for s in ss]
 
 
 def render(item: Item, with_answer: bool) -> str:
-    spec: Spec = item.spec  # type: ignore[assignment]
-    text_lines, _ = _rendered(spec)
-    text = "\n".join(text_lines)
-    return f"{text} {item.gold}{_lead(spec)[2]}" if with_answer else text
+    text, _ = _rendered(item.spec)  # type: ignore[arg-type]
+    return f"{text} {item.gold}." if with_answer else text
 
 
 def check_surface(item: Item) -> None:
-    """Surface-level law checks on the rendered text (independent of the simulator):
-    deictic/twin — every P=3 utterance containing you/your/yours, or addressed by
-    an imperative (take / give / let's), opens with a vocative naming another
-    participant; P=2 utterances carry none; every line is ``Name: utterance``;
-    third — no pronoun at all in the body or the question."""
+    """Surface-level law checks on the rendered text (independent of the simulator).
+
+    Every variant: no parentheses. deictic/twin: every line after the scene is
+    ``Name: utterance`` (owner: the final narrator query line excepted); a P = 3
+    utterance containing you/your/yours or an imperative opens (after an optional
+    ``Here, ``) with a vocative naming another participant; P = 2 utterances carry
+    none. third: one paragraph, no chat lines, no pronoun at all."""
     spec: Spec = item.spec  # type: ignore[assignment]
     people = spec["people"]
-    body = render(item, False).split("\n")[1:]
+    text = render(item, False)
+    if "(" in text or ")" in text:
+        raise ValueError(f"{item.item_id}: parentheses in the text")
+    if spec["variant"] == "third":
+        if "\n" in text or ":" in text:
+            raise ValueError(f"{item.item_id}: third variant is not one prose paragraph")
+        if _PRONOUNS.search(text):
+            raise ValueError(f"{item.item_id}: pronoun in the third variant: "
+                             f"{_PRONOUNS.search(text).group(0)!r}")  # type: ignore[union-attr]
+        return
+    body = text.split("\n")[1:]
+    if spec["query"]["kind"] == "owner":
+        if not body or not body[-1].startswith("Now the "):
+            raise ValueError(f"{item.item_id}: owner query is not the narrator line")
+        body = body[:-1]
     for ln in body:
-        if spec["variant"] == "third" or ln.startswith("("):
-            if not ln.startswith("("):
-                raise ValueError(f"{item.item_id}: third-variant line is not narration: {ln!r}")
-            if _PRONOUNS.search(ln):
-                raise ValueError(f"{item.item_id}: pronoun in a narrated line: {ln!r}")
-            continue
         m = re.match(r"^(\w+): (.*)$", ln)
         if not m or m.group(1) not in people:
             raise ValueError(f"{item.item_id}: not a 'Name: utterance' line: {ln!r}")
         spk, utt = m.groups()
-        v = re.match(r"^(\w+), ", utt)
+        rest = _HERE.sub("", utt)
+        v = re.match(r"^(\w+), ", rest)
         if v and (v.group(1) not in people or v.group(1) == spk):
             raise ValueError(f"{item.item_id}: vocative is not another participant: {ln!r}")
-        if len(people) == 3 and not v and (_YOU.search(utt) or _IMPERATIVE.match(utt)):
+        if len(people) == 3 and not v and (_YOU.search(utt) or _IMPERATIVE.match(rest)):
             raise ValueError(f"{item.item_id}: P=3 addressed utterance without a vocative: "
                              f"{ln!r}")
-        if len(people) == 2 and re.match(r"^(\w+), ", utt):
+        if len(people) == 2 and v:
             raise ValueError(f"{item.item_id}: P=2 utterance carries a vocative: {ln!r}")
 
 
@@ -487,8 +473,9 @@ def objects(item: Item) -> set[str]:
 
 
 def exempt_ownership_word(cell: Sequence[Any]) -> bool:
-    p, e, kind = int(cell[0]), int(cell[1]), str(cell[2])
-    return e == 1 and (kind == "owner" or p == 2)
+    """Owner E = 1 (spec) and every object cell (module doc: there the rule IS
+    the recency control, scheduled at the neutral rate instead)."""
+    return str(cell[2]) != "owner" or int(cell[1]) == 1
 
 
 def build(item_id: str, cell: Cell, spec: Spec, pair_id: Optional[str] = None) -> Item:
@@ -501,111 +488,107 @@ def build(item_id: str, cell: Cell, spec: Spec, pair_id: Optional[str] = None) -
     mentions = [s for s in slots if s in cands]
     it = Item(item_id=item_id, family=FAMILY, cell=list(cell), spec=dict(spec), gold="",
               candidates=cands, mention_order=mentions,
-              meta={"variant": spec["variant"], "pair_id": pair_id or item_id, "qkind": kind,
+              meta={"deixis_version": VERSION, "variant": spec["variant"],
+                    "pair_id": pair_id or item_id, "qkind": kind,
                     "n_objects": len(spec["objects"]),
-                    "events": [ev["ev"] for ev in spec["events"] if ev["ev"] in TRANSFERS]})
+                    "events": [ev["ev"] for ev in spec["events"] if ev["ev"] in TRANSFERS],
+                    "give_forms": [ev.get("form") for ev in spec["events"]
+                                   if ev["ev"] in TRANSFERS]})
     it.gold = simulate(it)
     body = lines(spec)
     gold_obj = spec["query"]["obj"] if kind == "owner" else it.gold
+    _, hist = run(spec)
     it.meta.update({
         "query_person": query_person(spec),
         "gold_is_last_mention": bool(mentions) and mentions[-1] == it.gold,
-        # the deictic transcript's last speaker (third: the speaker that line narrates)
+        # the deictic transcript's last speaker (third: the giver that sentence narrates)
         "gold_is_last_speaker": (body[-1]["speaker"] == it.gold) if kind == "owner" else None,
         "gold_in_last_line": gold_obj in last_line_objects(spec),
         "ownership_word_exempt": exempt_ownership_word(cell),
+        "queried_obj_moved": (len(hist[gold_obj]) > 1) if kind == "owner" else None,
     })
     return it
 
 
 # ── Generation ─────────────────────────────────────────────────────────────────
 
-def _pick(rng: random.Random, feasible: set[str]) -> str:
-    opts = [(f, w) for f, w in EVENT_WEIGHTS if f in feasible]
-    x = rng.random() * sum(w for _, w in opts)
-    for f, w in opts:
-        x -= w
-        if x <= 0:
-            return f
-    return opts[-1][0]
+Want = dict[str, Any]   # owner: {"lm", "ls"}; object cells: {"n", "lm"}
+
+# Shortcut-neutral schedules (module doc), cycled by the item index k.
+_OWNER_SCHED: tuple[Want, ...] = ({"lm": True, "ls": False},    # gold = last recipient
+                                  {"lm": False, "ls": True},    # gold = last giver
+                                  {"lm": False, "ls": False})   # gold = the bystander
+_OBJECT_SCHED: tuple[Want, ...] = tuple(
+    {"n": n, "lm": j == 0} for n in N_OBJECTS_HELD for j in range(n))   # 1/n per n
+
+
+def schedule(cell: Sequence[Any]) -> tuple[Want, ...]:
+    return _OWNER_SCHED if str(cell[2]) == "owner" else _OBJECT_SCHED
 
 
 def _draw(rng: random.Random, cell: Cell, pools: Pools, item_id: str,
-          template: Optional[Item]) -> Optional[Item]:
+          template: Optional[Item], want: Optional[Want]) -> Optional[Item]:
     """One random base (deictic) item for ``cell`` with its sigma, or None."""
     p, e, kind = int(cell[0]), int(cell[1]), str(cell[2])
     people = rng.sample(pools.names, p)
-    n_obj = 2 if (p == 2 and kind != "owner") else rng.choice(N_OBJECTS)
-    objs = rng.sample(pools.objects, n_obj)
-    owner = {o: rng.choice(people) for o in objs}
+    if want is not None and "n" in want:
+        n_obj = int(want["n"])
+    else:
+        n_obj = rng.choice(N_OBJECTS_OWNER if kind == "owner" else N_OBJECTS_HELD)
+    objs0 = rng.sample(pools.objects, n_obj)
+    first = {o: rng.choice(people) for o in objs0}
+    objs = [o for x in people for o in objs0 if first[o] == x]   # declarations grouped
+    owner = dict(first)
     events: list[dict[str, Any]] = [{"ev": "declare", "speaker": owner[o], "obj": o,
                                      "form": rng.choice(tuple(DECLARE_FORMS))} for o in objs]
-
-    def voc(x: str) -> Optional[str]:
-        return x if p == 3 else None
-
-    for _ in range(e):
-        held = {x: [o for o in objs if owner[o] == x] for x in people}
-        owners = [x for x in people if held[x]]
-        feasible = {"give", "request"} | ({"swap"} if len(owners) >= 2 else set())
-        kind_ev = _pick(rng, feasible)
-        if kind_ev == "give":
-            s = rng.choice(owners)
-            a = rng.choice([x for x in people if x != s])
-            o = rng.choice(held[s])
-            events.append({"ev": "give", "speaker": s, "voc": voc(a), "obj": o,
-                           "form": rng.choice(tuple(GIVE_FORMS))})
-            owner[o] = a
-        elif kind_ev == "request":
-            a = rng.choice(owners)                      # the holder (addressee)
-            s = rng.choice([x for x in people if x != a])
-            o = rng.choice(held[a])
-            events.append({"ev": "request", "speaker": s, "voc": voc(a), "obj": o,
-                           "replier": a, "reply_voc": voc(s)})
-            owner[o] = s
-        else:
-            s, a = rng.sample(owners, 2)
-            o1, o2 = rng.choice(held[s]), rng.choice(held[a])
-            events.append({"ev": "swap", "speaker": s, "voc": voc(a), "give": o1, "take": o2})
-            owner[o1], owner[o2] = a, s
+    start = rng.randrange(len(GIVE_ORDER))
+    for i in range(e):
+        s = rng.choice([x for x in people if any(owner[o] == x for o in objs)])
+        a = rng.choice([x for x in people if x != s])
+        o = rng.choice([o for o in objs if owner[o] == s])
+        events.append({"ev": "give", "speaker": s, "voc": a if p == 3 else None, "obj": o,
+                       "form": GIVE_ORDER[(start + i) % len(GIVE_ORDER)]})
+        owner[o] = a
     spec: Spec = {"variant": "deictic", "people": people, "objects": objs, "events": events,
                   "query": {}, "sigma": None}
     _, hist = run(spec)
-    fin = holdings(spec)
-    decl = declared(spec)
-    one = [x for x in people if len(fin[x]) == 1]
+    last = lines(spec)[-1]
     if kind == "owner":
-        moved = [o for o in objs if len(hist[o]) > 1]
-        if not exempt_ownership_word(cell):
-            moved = [o for o in moved if o not in last_line_objects(spec)]
-        if not moved:
+        if e >= 2:
+            pool = [o for o in objs if len(hist[o]) > 1 and o not in last["objs"]]
+        elif want is not None and want["lm"]:
+            pool = list(last["objs"])       # E = 1 recency slot: the given object
+        else:
+            pool = list(objs)
+        if want is not None:
+            pool = [o for o in pool if (owner[o] == last["addressee"]) == want["lm"]
+                    and (owner[o] == last["speaker"]) == want["ls"]]
+        if not pool:
             return None
-        o = rng.choice(moved)
+        o = rng.choice(pool)
         gold = owner[o]
-        partner = rng.choice([x for x in people if x != gold])
         spec["query"] = {"kind": "owner", "obj": o}
-        sigma = [gold, partner]
+        spec["sigma"] = [gold, rng.choice([x for x in people if x != gold])]
     else:
+        fin = holdings(spec)
+        decl = declared(spec)
+        one = [x for x in people if len(fin[x]) == 1]
         targets = [x for x in one if set(fin[x]) != set(decl[x])]
-        if not exempt_ownership_word(cell):
-            targets = [x for x in targets if fin[x][0] not in last_line_objects(spec)]
+        if p == 3:   # the twin needs a partner who also holds exactly one object
+            targets = [x for x in targets if any(y != x for y in one)]
+        if want is not None:
+            targets = [x for x in targets if (fin[x][0] in last["objs"]) == want["lm"]]
         if not targets:
             return None
         q = rng.choice(targets)
         if kind == "self":
-            partners = [x for x in one if x != q]
-            if not partners:
-                return None
             spec["query"] = {"kind": "self", "speaker": q}
-            sigma = [q, rng.choice(partners)]
         else:
-            s = rng.choice([x for x in people if x != q])
-            partners = [x for x in one if x != q]
-            if not partners:
-                return None
-            spec["query"] = {"kind": "addressee", "speaker": s, "voc": voc(q)}
-            sigma = [q, rng.choice(partners)]
-    spec["sigma"] = sigma
+            spec["query"] = {"kind": "addressee", "speaker": rng.choice([x for x in people
+                                                                         if x != q]),
+                             "voc": q if p == 3 else None}
+        if p == 3:
+            spec["sigma"] = [q, rng.choice([y for y in one if y != q])]
     it = build(item_id, cell, spec)
     # the collide re-label is positional: keep an owner exemplar's answer off the
     # test item's gold slot (so no collide exemplar answers the test gold)
@@ -615,87 +598,36 @@ def _draw(rng: random.Random, cell: Cell, pools: Pools, item_id: str,
     return it
 
 
-# Recency × last-speaker schedules (owner cells), most to least balanced.
-_FULL = ((True, True), (False, False), (True, False), (False, True))
-_DIAG = ((True, True), (False, False))
-_ANTI = ((True, False), (False, True))
-
-
-@cache
-def _schedule(cell: Cell) -> tuple[tuple[bool, Optional[bool]], ...]:
-    """The per-k (gold_is_last_mention, gold_is_last_speaker) targets for a cell.
-
-    Owner cells: the full 4-cycle if every combination occurs, else the feasible
-    diagonal — both marginals stay 50% either way. (At P=2 the last-mentioned name
-    IS the last speaker, so the two controls coincide; at P=3 the last name is the
-    addressee's vocative, so they are disjoint.) Object cells: recency alternates.
-    Feasibility is probed on a fixed-seed sample of draws from the banked item pool
-    (deterministic; independent of the battery seed)."""
-    from kotodama.eval.bindprobes.pools import load_pools
-    pools = load_pools(None).item
-    rng = random.Random(f"deixis-schedule:{cell_key(cell)}")
-    seen: set[tuple[bool, Optional[bool]]] = set()
-    for _ in range(4000):
-        it = _draw(rng, cell, pools, "probe", None)
-        if it is not None:
-            ls = it.meta["gold_is_last_speaker"]
-            seen.add((bool(it.meta["gold_is_last_mention"]), None if ls is None else bool(ls)))
-        if len(seen) == 4:
-            break
-    scheds = (_FULL, _DIAG, _ANTI) if cell[2] == "owner" else (((True, None), (False, None)),)
-    for sched in scheds:
-        if set(sched) <= seen:
-            return sched
-    raise RuntimeError(f"deixis {cell}: no balanced recency/speaker schedule in {seen}")
-
-
 def gen_item(rng: random.Random, cell: Cell, pools: Pools, item_id: str, k: int,
              per_cell: int, template: Optional[Item] = None) -> Item:
-    """A BASE (deictic) item; :func:`expand` derives its third + twin variants."""
+    """A BASE (deictic) item; :func:`expand` derives its third (+ twin) variants.
+    Test items follow the cell's :func:`schedule` cyclically; exemplars draw their
+    slot from it at random (same mix, so the shots teach no recency regularity)."""
     if tuple(cell) not in CELLS:
         raise ValueError(f"deixis: unknown cell {cell}")
     cell = tuple(cell)
-    want: Optional[tuple[bool, Optional[bool]]] = None
-    if template is None:
-        sched = _schedule(cell)
-        want = sched[k % len(sched)]
-
-    def draw() -> Optional[Item]:
-        it = _draw(rng, cell, pools, item_id, template)
-        if it is None or want is None:
-            return it
-        if it.meta["gold_is_last_mention"] != want[0]:
-            return None
-        if want[1] is not None and it.meta["gold_is_last_speaker"] != want[1]:
-            return None
-        return it
-
-    return rejection(draw, f"deixis item {item_id}", tries=20000)
+    sched = schedule(cell)
+    want: Want = sched[k % len(sched)] if template is None else rng.choice(sched)
+    return rejection(lambda: _draw(rng, cell, pools, item_id, template, want),
+                     f"deixis item {item_id}", tries=20000)
 
 
 # ── Variants ───────────────────────────────────────────────────────────────────
 
 def to_third(spec: Spec) -> Spec:
-    """The same events and question narrated in the third person with names."""
+    """The same events and question narrated as dialogue-family prose with names."""
     if spec["variant"] == "third":
         return spec
     q = dict(spec["query"])
     if q["kind"] != "owner":
         q = {"kind": q["kind"], "person": query_person(spec),
              "asker": q["speaker"] if q["kind"] == "addressee" else None}
-    # mirror each deictic line's last-mentioned name: P=2 lines end on the speaker
-    # tag's side (giver / fulfiller / initiator) -> "from"; P=3 lines end on the
-    # addressee's vocative (recipient / requester / partner) -> "to"
-    form = "from" if len(spec["people"]) == 2 else "to"
-    events = [ev if ev["ev"] == "declare" else {**ev, "form": form}
-              for ev in explicit_events(spec)]
     return {"variant": "third", "people": list(spec["people"]), "objects": list(spec["objects"]),
-            "events": events, "query": q,
+            "events": explicit_events(spec), "query": q,
             "sigma": list(spec["sigma"]) if spec["sigma"] else None}
 
 
-_NAME_KEYS = ("speaker", "voc", "replier", "reply_voc", "owner", "giver", "recipient",
-              "requester", "holder", "a", "b", "person", "asker")
+_NAME_KEYS = ("speaker", "voc", "owner", "giver", "recipient", "person", "asker")
 
 
 def _rename(d: Mapping[str, Any], m: Mapping[str, str]) -> dict[str, Any]:
@@ -707,7 +639,7 @@ def to_twin(spec: Spec) -> Spec:
     """Transpose the two speakers of ``spec['sigma']`` in every EVENT (speakers and
     vocatives), keeping the scene line and the query line unchanged."""
     if spec["variant"] != "deictic" or not spec["sigma"]:
-        raise ValueError("the twin is built from a deictic spec with a sigma")
+        raise ValueError("the twin is built from a deictic spec with a sigma (P = 3)")
     a, b = spec["sigma"]
     sig = {a: b, b: a}
     return {"variant": "twin", "people": list(spec["people"]), "objects": list(spec["objects"]),
@@ -716,7 +648,7 @@ def to_twin(spec: Spec) -> Spec:
 
 
 def expand(base: Item) -> list[Item]:
-    """[deictic, third, twin] for one base item (with shots + collide maps).
+    """[deictic, third(, twin)] for one base item (with shots + collide maps).
 
     deictic + twin share the deictic exemplars; the third variant's exemplars are
     the same exemplars narrated in the third person. The twin's collide maps are
@@ -725,7 +657,7 @@ def expand(base: Item) -> list[Item]:
     spec: Spec = base.spec  # type: ignore[assignment]
     shots = base.shot_items()
     out: list[Item] = []
-    for variant in VARIANTS:
+    for variant in variants(base.cell):
         if variant == "deictic":
             vspec, vshots, maps = spec, shots, base.collide_maps
         elif variant == "third":
@@ -779,19 +711,36 @@ def relabel(item: Item, mapping: Mapping[str, str], target: Optional[Item] = Non
 
 def approx_tokens(text: str) -> int:
     """A tokenizer-free, conservative token estimate: 1.25 x (words + punctuation +
-    newlines). Every template word, name and object is a common single-token word;
-    measured SmolLM2 tokens / pieces on the default battery: 0.91-1.17."""
+    newlines). Every template word, name and object is a common single-token word."""
     return int(1.25 * len(re.findall(r"\w+|[^\w\s]|\n", text))) + 1
+
+
+def check_version(records: Sequence[Mapping[str, Any]], what: str) -> None:
+    """Refuse deixis records (item ``meta`` dicts or grid rows) not built by this
+    generation: v1 grids/items must never be silently mixed with v2."""
+    bad = [r for r in records if r.get("deixis_version") != VERSION]
+    if bad:
+        raise ValueError(f"{len(bad)} deixis {what} lack deixis_version={VERSION} (first: "
+                         f"{bad[0].get('item_id')!r}, version {bad[0].get('deixis_version')!r}); "
+                         f"regenerate the items and re-run the grid with deixis v{VERSION}")
 
 
 def validate_item(item: Item) -> None:
     """Deixis-specific invariants (called by ``items.validate``)."""
     spec: Spec = item.spec  # type: ignore[assignment]
     p, e, kind = item.cell
+    if item.meta.get("deixis_version") != VERSION:
+        raise ValueError(f"{item.item_id}: deixis_version {item.meta.get('deixis_version')!r} "
+                         f"!= {VERSION}")
     if len(spec["people"]) != p or n_transfers(spec) != e or spec["query"]["kind"] != kind:
         raise ValueError(f"{item.item_id}: spec does not match cell {item.cell}")
-    if item.meta.get("variant") != spec["variant"]:
-        raise ValueError(f"{item.item_id}: meta variant != spec variant")
+    if item.meta.get("variant") != spec["variant"] or spec["variant"] not in variants(item.cell):
+        raise ValueError(f"{item.item_id}: variant {spec['variant']!r} invalid for {item.cell}")
+    if len(item.candidates) < MIN_CANDIDATES:
+        raise ValueError(f"{item.item_id}: {len(item.candidates)} candidates (v2 needs "
+                         f">= {MIN_CANDIDATES})")
+    if kind != "owner" and len(spec["objects"]) not in N_OBJECTS_HELD:
+        raise ValueError(f"{item.item_id}: {len(spec['objects'])} objects in an object cell")
     check_surface(item)
     if not item.meta["ownership_word_exempt"] and item.meta["variant"] == "deictic" \
             and item.meta["gold_in_last_line"]:
@@ -803,7 +752,7 @@ def final_state(spec: Spec) -> dict[str, str]:
 
 
 def check_pairs(items: Sequence[Item]) -> None:
-    """Pair linking: every pair_id has exactly deictic/third/twin, same cell and
+    """Pair linking: every pair_id has exactly its cell's variants, same cell and
     candidates; third has the identical final state + gold; twin's final state is
     sigma(deictic's) and its gold differs (the flip)."""
     by: defaultdict[str, dict[str, Item]] = defaultdict(dict)
@@ -815,14 +764,20 @@ def check_pairs(items: Sequence[Item]) -> None:
             raise ValueError(f"pair {it.meta['pair_id']}: duplicate {v}")
         by[it.meta["pair_id"]][v] = it
     for pid, g in by.items():
-        if set(g) != set(VARIANTS):
+        x = g.get("deictic")
+        if x is None or set(g) != set(variants(x.cell)):
             raise ValueError(f"pair {pid}: variants {sorted(g)}")
-        x, t, w = g["deictic"], g["third"], g["twin"]
-        if not (x.cell == t.cell == w.cell and x.candidates == t.candidates == w.candidates):
+        if any(v.cell != x.cell or v.candidates != x.candidates for v in g.values()):
             raise ValueError(f"pair {pid}: cell/candidates differ across variants")
+        t = g["third"]
         fx = final_state(x.spec)  # type: ignore[arg-type]
         if final_state(t.spec) != fx or t.gold != x.gold:  # type: ignore[arg-type]
             raise ValueError(f"pair {pid}: third variant changes the state or gold")
+        if t.mention_order != x.mention_order and x.cell[2] != "owner":
+            raise ValueError(f"pair {pid}: third variant changes the object-mention order")
+        if "twin" not in g:
+            continue
+        w = g["twin"]
         a, b = x.spec["sigma"]
         sig = {a: b, b: a}
         if final_state(w.spec) != {o: sig.get(h, h) for o, h in fx.items()}:  # type: ignore[arg-type]
@@ -834,7 +789,7 @@ def check_pairs(items: Sequence[Item]) -> None:
 
 
 def audit(items: Sequence[Item]) -> dict[str, dict[str, dict[str, Any]]]:
-    """Per cell × variant: n and the share of each shortcut control."""
+    """Per cell × variant: n, chance (mean 1/C) and the share of each control."""
     by: defaultdict[tuple[str, str], list[Item]] = defaultdict(list)
     for it in items:
         if it.family == FAMILY:
@@ -849,30 +804,39 @@ def audit(items: Sequence[Item]) -> dict[str, dict[str, dict[str, Any]]]:
             n = len(sub)
             ls = [it.meta["gold_is_last_speaker"] for it in sub
                   if it.meta["gold_is_last_speaker"] is not None]
+            mv = [it.meta["queried_obj_moved"] for it in sub
+                  if it.meta.get("queried_obj_moved") is not None]
             out.setdefault(ck, {})[v] = {
                 "n": n,
+                "chance": sum(1.0 / len(it.candidates) for it in sub) / n,
                 "gold_is_last_mention": sum(it.meta["gold_is_last_mention"] for it in sub) / n,
                 "gold_is_last_speaker": (sum(ls) / len(ls)) if ls else None,
                 "gold_in_last_line": sum(it.meta["gold_in_last_line"] for it in sub) / n,
                 "ownership_word_exempt": exempt_ownership_word(c),
+                "queried_obj_moved": (sum(mv) / len(mv)) if mv else None,
             }
     return out
 
 
 def audit_failures(aud: Mapping[str, Mapping[str, Mapping[str, Any]]],
                    tol: float = BALANCE_TOL) -> list[str]:
-    """Spec §2 controls on the deictic items: recency and (owner) last-speaker within
-    50% ± tol; ownership-word rule never violated outside the exempt cells."""
+    """§2 controls on the deictic items: recency and (owner) last-speaker within
+    max(tol, 1/n) of the cell's chance rate (the shortcut-neutral target; always
+    inside the spec's "≤ 50% ± 5%"); the ownership-word rule never violated outside
+    the exempt cells."""
     bad: list[str] = []
     for ck, per in aud.items():
         a = per.get("deictic")
         if a is None:
             continue
-        if abs(a["gold_is_last_mention"] - 0.5) > tol + 1e-9:
-            bad.append(f"{ck}: recency {a['gold_is_last_mention']:.3f}")
+        band = max(tol, 1.0 / a["n"]) + 1e-9
+        if abs(a["gold_is_last_mention"] - a["chance"]) > band:
+            bad.append(f"{ck}: recency {a['gold_is_last_mention']:.3f} vs chance "
+                       f"{a['chance']:.3f}")
         if a["gold_is_last_speaker"] is not None and \
-                abs(a["gold_is_last_speaker"] - 0.5) > tol + 1e-9:
-            bad.append(f"{ck}: last-speaker {a['gold_is_last_speaker']:.3f}")
+                abs(a["gold_is_last_speaker"] - a["chance"]) > band:
+            bad.append(f"{ck}: last-speaker {a['gold_is_last_speaker']:.3f} vs chance "
+                       f"{a['chance']:.3f}")
         if not a["ownership_word_exempt"] and a["gold_in_last_line"] > 0:
             bad.append(f"{ck}: ownership-word {a['gold_in_last_line']:.3f}")
     return bad
@@ -905,12 +869,8 @@ def error_types(item: Item, pick: str) -> list[str]:
     t: list[str] = []
     if q["kind"] == "owner":
         o = q["obj"]
-        last = [ev for ev in explicit_events(spec) if ev["ev"] in TRANSFERS
-                and o in (ev.get("obj"), ev.get("a_obj"), ev.get("b_obj"))][-1]
-        parties = {"give": ("giver", "recipient"), "request": ("holder", "requester"),
-                   "swap": ("a", "b")}[last["ev"]]
-        pair = {last[parties[0]], last[parties[1]]}
-        if pick in pair and pick != item.gold:
+        moves = [ev for ev in explicit_events(spec) if ev["ev"] == "give" and ev["obj"] == o]
+        if moves and pick in (moves[-1]["giver"], moves[-1]["recipient"]) and pick != item.gold:
             t.append("speaker_confusion")
         if pick in set(hist[o][:-1]) - {item.gold}:
             t.append("previous_owner")

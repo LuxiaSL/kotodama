@@ -220,7 +220,7 @@ def battery() -> list[Item]:
 def test_default_sizes_and_cells():
     sizes = {f: len(items.family(f).CELLS) * items.family(f).DEFAULT_PER_CELL
              for f in items.FAMILY_NAMES}
-    assert sizes == {"attr": 1210, "codevar": 1200, "dialogue": 1200, "deixis": 1080}
+    assert sizes == {"attr": 1210, "codevar": 1200, "dialogue": 1200, "deixis": 900}
     assert (2, "middle") not in attr.CELLS and len(attr.CELLS) == 11
 
 
@@ -236,8 +236,9 @@ def test_generation_invariants(battery):
     # balanced cells
     for f in items.FAMILY_NAMES:
         keys = [it.cell_key for it in battery if it.family == f]
-        n_var = len(deixis.VARIANTS) if f == "deixis" else 1
-        assert len(keys) == 4 * n_var * len(items.family(f).CELLS)
+        n_var = (sum(len(deixis.variants(c)) for c in deixis.CELLS) if f == "deixis"
+                 else len(items.family(f).CELLS))
+        assert len(keys) == 4 * n_var
         assert len(set(keys)) == len(items.family(f).CELLS)
     # controls balanced where they are generated balanced
     last = [it for it in battery if it.family == "attr" and it.meta["qpos"] == "last"]
@@ -510,9 +511,10 @@ def test_lite_select_balanced(battery):
     sel = lite.select_items(battery, per_family=13, seed=1)
     for f in items.FAMILY_NAMES:
         sub = [it for it in sel if it.family == f]
-        if f == "deixis":   # 13 PAIRS, every variant of each
-            assert len(sub) == 13 * len(deixis.VARIANTS)
-            sub = [it for it in sub if it.meta["variant"] == "deictic"]
+        if f == "deixis":   # 13 PAIRS, every variant of each (no twin at P=2)
+            base = [it for it in sub if it.meta["variant"] == "deictic"]
+            assert len(sub) == sum(len(deixis.variants(it.cell)) for it in base)
+            sub = base
         assert len(sub) == 13
         counts = {k: [it.cell_key for it in sub].count(k) for k in {it.cell_key for it in sub}}
         assert max(counts.values()) - min(counts.values()) <= 1

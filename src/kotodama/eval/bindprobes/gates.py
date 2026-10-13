@@ -4,8 +4,9 @@ ruler for any arm until every gate passes on the validation set.
   V1 construction    every item's gold reproduces from the simulator and every
                      pronoun resolves uniquely (``items.validate`` incl. the surface
                      addressee-rule check), pairs link (``deixis.check_pairs``), the
-                     shortcut controls sit within ±5% per cell
-                     (``deixis.audit_failures``), every grid row's gold matches its
+                     shortcut controls sit within ±5% (or one item) of the cell's
+                     chance rate (``deixis.audit_failures``; v2's neutral target,
+                     inside the spec's "≤ 50% ± 5%"), every grid row's gold matches its
                      item, and no row carries a multi-token candidate.
   V2 chance          at the ``chance`` checkpoint (0.25B), deictic 3shot cc acc within
                      ±.05 of 0 on every query kind.
@@ -13,12 +14,25 @@ ruler for any arm until every gate passes on the validation set.
   V4 control order   third ≥ deictic − .03 (3shot cc) on every ``ge2b`` checkpoint
                      (default: every model in the grids except the chance one).
   V5 twin sanity     at the chance checkpoint, 3shot twin-pair joint accuracy ≤
-                     chance² + .03 (chance² = mean over pairs of (1/C_x)(1/C_twin)).
+                     chance² + .03 (chance² = mean over pairs of (1/C_x)(1/C_twin));
+                     v2: P = 3 pairs only (P = 2 items have no twin).
+
+PILOT GATE (v2 addendum §5, ``--pilot``): on the pilot battery (``gen --families
+deixis --per-cell deixis=10``: 150 base items) scored at A0* 0.25B and A0* 30B,
+V2 is read with the wider band |cc| ≤ .08 (the pilot's n) and the verdict is
+V1 ∧ V2 ∧ V3 (V1 = the construction is sound, a prerequisite for reading the
+other two; the addendum's decision rule is V2 ∧ V3). V4/V5 are printed for
+information only. Proceed to the full battery only on PILOT PASS; otherwise stop
+and report (no third design without Luxia).
+
+Every deixis item and grid row must be generation v2 (``deixis_version``); older
+ones are refused with an error (``deixis.check_version``), never read.
 
 Model names are arguments (the grid's ``model`` field); nothing is hardcoded.
 CLI: ``python -m kotodama.eval.bindprobes gates --grids DIR --items items.jsonl
---chance-model NAME --learn-model NAME [--ge2b A,B,...]`` — prints PASS/FAIL per
-gate, writes ``bindprobes_gates.json`` next to the grids, exits 1 if any gate fails.
+--chance-model NAME --learn-model NAME [--ge2b A,B,...] [--pilot]`` — prints
+PASS/FAIL per gate, writes ``bindprobes_gates.json`` next to the grids, exits 1 if
+the verdict fails (full: any gate; pilot: V1/V2/V3).
 """
 
 from __future__ import annotations
@@ -37,6 +51,8 @@ from kotodama.eval.riders.aggregate import MultiTokenCandidateError, check_rows,
 
 GATES_JSON = "bindprobes_gates.json"
 V2_TOL = 0.05
+PILOT_V2_TOL = 0.08
+PILOT_GATES = ("V1", "V2", "V3")
 V3_MIN = 0.20
 V4_SLACK = 0.03
 V5_SLACK = 0.03
@@ -90,16 +106,17 @@ def _missing(model: str, d: Mapping[str, Any], gate: str) -> Optional[GateResult
     return None
 
 
-def v2_chance(readouts: Mapping[str, Any], chance_model: str) -> GateResult:
+def v2_chance(readouts: Mapping[str, Any], chance_model: str, tol: float = V2_TOL
+              ) -> GateResult:
     miss = _missing(chance_model, readouts, "V2")
     if miss:
         return miss
     cc = readouts[chance_model]["cc"]
     vals = {k: cc["deictic"][PRIMARY][k] for k in deixis.QKINDS}
     info = {f"{v}/{k}": cc[v][PRIMARY][k] for v in ("third", "twin") for k in deixis.QKINDS}
-    ok = all(not math.isnan(v) and abs(v) <= V2_TOL for v in vals.values())
+    ok = all(not math.isnan(v) and abs(v) <= tol for v in vals.values())
     detail = f"{chance_model} deictic {PRIMARY} cc " + ", ".join(
-        f"{k} {v:+.3f}" for k, v in vals.items()) + f" (need |cc| ≤ {V2_TOL})"
+        f"{k} {v:+.3f}" for k, v in vals.items()) + f" (need |cc| ≤ {tol})"
     return GateResult("V2", ok, detail, {"deictic": vals, "info_other_variants": info})
 
 
@@ -145,9 +162,14 @@ def v5_twin(rows: Sequence[Row], chance_model: str) -> GateResult:
 
 
 def gates(rows: Sequence[Row], items: Sequence[Item], chance_model: str, learn_model: str,
-          ge2b_models: Optional[Sequence[str]] = None) -> list[GateResult]:
-    """V1–V5 over grid rows (any families; deixis is read) + the emitted items."""
+          ge2b_models: Optional[Sequence[str]] = None, pilot: bool = False
+          ) -> list[GateResult]:
+    """V1–V5 over grid rows (any families; deixis is read) + the emitted items.
+    ``pilot``: V2 at ``PILOT_V2_TOL``. Raises on non-v2 deixis items/rows."""
     rows = list(rows)
+    deixis.check_version([{**it.meta, "item_id": it.item_id} for it in items
+                          if it.family == DEIXIS], "items")
+    deixis.check_version([r for r in rows if r.get("family") == DEIXIS], "grid rows")
     out = [v1_construction(items, rows)]
     try:
         check_rows(rows)
@@ -157,7 +179,8 @@ def gates(rows: Sequence[Row], items: Sequence[Item], chance_model: str, learn_m
     readouts = deixis_readouts(drows) if drows else {}
     if ge2b_models is None:
         ge2b_models = sorted(m for m in readouts if m != chance_model)
-    out += [v2_chance(readouts, chance_model), v3_learnability(readouts, learn_model),
+    out += [v2_chance(readouts, chance_model, PILOT_V2_TOL if pilot else V2_TOL),
+            v3_learnability(readouts, learn_model),
             v4_control_order(readouts, ge2b_models), v5_twin(drows, chance_model)]
     return out
 
@@ -173,16 +196,27 @@ def _load_rows_lenient(grid_dir: Path) -> list[dict[str, Any]]:
         return rows
 
 
+def verdict(results: Sequence[GateResult], pilot: bool = False) -> bool:
+    """Full battery: every gate passes. Pilot: V1 ∧ V2 ∧ V3."""
+    return all(r.passed for r in results if not pilot or r.gate in PILOT_GATES)
+
+
 def write_gates(grid_dir: Path, items_path: Path, chance_model: str, learn_model: str,
-                ge2b_models: Optional[Sequence[str]] = None) -> tuple[bool, Path]:
+                ge2b_models: Optional[Sequence[str]] = None, pilot: bool = False
+                ) -> tuple[bool, Path]:
     results = gates(_load_rows_lenient(grid_dir), load_items(items_path), chance_model,
-                    learn_model, ge2b_models)
+                    learn_model, ge2b_models, pilot=pilot)
     for r in results:
-        print(f"{r.gate} {'PASS' if r.passed else 'FAIL'}  {r.detail}")
-    ok = all(r.passed for r in results)
-    print(f"deixis gates: {'ALL PASS' if ok else 'FAIL'}")
+        info = "  (info)" if pilot and r.gate not in PILOT_GATES else ""
+        print(f"{r.gate} {'PASS' if r.passed else 'FAIL'}  {r.detail}{info}")
+    ok = verdict(results, pilot)
+    if pilot:
+        print(f"PILOT GATE: {'PASS' if ok else 'FAIL'} (V1 ∧ V2 |cc| ≤ {PILOT_V2_TOL} at "
+              f"{chance_model} ∧ V3 third cc ≥ {V3_MIN} at {learn_model})")
+    else:
+        print(f"deixis gates: {'ALL PASS' if ok else 'FAIL'}")
     path = grid_dir / GATES_JSON
-    path.write_text(json.dumps({"passed": ok, "chance_model": chance_model,
+    path.write_text(json.dumps({"passed": ok, "pilot": pilot, "chance_model": chance_model,
                                 "learn_model": learn_model,
                                 "gates": [asdict(r) for r in results]}, indent=2, default=str))
     print(f"-> {path}")

@@ -127,6 +127,14 @@ def _gen_shot(fam: FamilyModule, srng: random.Random, cell: tuple[Any, ...], sho
     raise RuntimeError(f"{shot_id}: could not generate an exemplar: {last}")
 
 
+def generation_tag(name: str) -> str:
+    """The family's id/seed tag: ``name``, or ``name-v<VERSION>`` for a family with a
+    ``VERSION`` (deixis v2) — so a regenerated family never reuses an older
+    generation's item ids (a crash-safe grid resume would otherwise mix them)."""
+    ver = getattr(family(name), "VERSION", None)
+    return f"{name}-v{ver}" if ver is not None else name
+
+
 def generate_family(name: str, split: PoolSplit, per_cell: Optional[int] = None,
                     seed: int = DEFAULT_SEED) -> list[Item]:
     """Balanced items for one family: ``per_cell`` per cell (family default if None)."""
@@ -134,13 +142,14 @@ def generate_family(name: str, split: PoolSplit, per_cell: Optional[int] = None,
     per = fam.DEFAULT_PER_CELL if per_cell is None else per_cell
     if per < 1:
         raise ValueError(f"per_cell must be >= 1, got {per}")
-    rng = random.Random(f"bindprobes:{name}:{seed}")
+    tag = generation_tag(name)
+    rng = random.Random(f"bindprobes:{tag}:{seed}")
     items: list[Item] = []
     for cell in fam.CELLS:
         for k in range(per):
-            iid = f"{name}_{'-'.join(map(str, cell))}_{k:03d}"
+            iid = f"{tag}_{'-'.join(map(str, cell))}_{k:03d}"
             it = gen_with_shots(fam, rng, cell, split, iid, k, per,
-                                shot_seed=f"bindprobes:{name}:{seed}:{iid}:shots")
+                                shot_seed=f"bindprobes:{tag}:{seed}:{iid}:shots")
             for v in expand(fam, it):
                 validate(v, split)
                 items.append(v)
@@ -287,6 +296,7 @@ def emit(out_dir: Path, seed: int = DEFAULT_SEED, families: Sequence[str] = FAMI
         "per_cell": {f: (per_cell or {}).get(f, family(f).DEFAULT_PER_CELL) for f in families},
         "cells": {f: [list(c) for c in family(f).CELLS] for f in families},
         "conditions": list(CONDITIONS),
+        "versions": {f: getattr(family(f), "VERSION", None) for f in families},
         "n_items": {f: sum(it.family == f for it in items) for f in families},
         "shot_pool": {"names": list(split.shot.names), "objects": list(split.shot.objects),
                       "variables": list(split.shot.variables)},

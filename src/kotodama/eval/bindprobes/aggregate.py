@@ -20,7 +20,9 @@ cc acc per variant × condition × query kind, the DEIXIS PENALTY cc(third) −
 cc(deictic), TWIN CONSISTENCY (joint accuracy of x and twin(x); joint − product
 of marginals; chance² for reference), self − addressee asymmetry, collision gap
 per variant, and error-type shares per variant. Validity gates V1–V5:
-``bindprobes.gates``.
+``bindprobes.gates``. Deixis rows must carry ``deixis_version`` = the current
+generation (v2); older rows are refused (``deixis.check_version``), never pooled.
+P = 2 deixis pairs have no twin, so twin consistency reads the P = 3 pairs.
 
 Input: a directory of grid JSONLs (``grid.run_grid`` output, one per model);
 validated by the riders loader (hard-fails on multi-token candidates).
@@ -37,6 +39,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from kotodama.eval.bindprobes import deixis as deixis_family
 from kotodama.eval.bindprobes.base import cell_key
 from kotodama.eval.bindprobes.items import CONDITIONS, FAMILY_NAMES, family
 from kotodama.eval.riders.aggregate import cc_acc, cc_point, check_rows, load
@@ -202,6 +205,7 @@ def deixis_readouts(rows: Sequence[Row]) -> dict[str, Any]:
       collision_gap    [variant] = {acc, cc}: 3shot − 3shot_collide
       errors           [variant][cond] = primary error-type shares among wrong rows
     """
+    deixis_family.check_version([r for r in rows if r["family"] == DEIXIS], "grid rows")
     by: defaultdict[tuple[str, str, str], list[Row]] = defaultdict(list)
     for r in rows:
         if r["family"] != DEIXIS:

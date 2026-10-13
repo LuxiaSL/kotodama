@@ -34,7 +34,7 @@ ROW_CONTROLS: dict[str, tuple[str, ...]] = {
     "attr": ("qpos", "recency_control", "n_distractors"),
     "codevar": ("gold_is_last_literal", "n_stale", "n_reference"),
     "dialogue": ("qkind", "n_pronoun_ops", "gold_is_last_mention"),
-    "deixis": ("variant", "pair_id", "qkind", "gold_is_last_mention", "gold_is_last_speaker",
+    "deixis": ("deixis_version", "variant", "pair_id", "qkind", "gold_is_last_mention", "gold_is_last_speaker",
                "gold_in_last_line"),
 }
 

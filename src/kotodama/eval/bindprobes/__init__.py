@@ -15,14 +15,14 @@ of SHAPE, with the same judge-free closed-candidate logprob read:
             through it/them/he/him/she/her that resolve only by tracking;
             transfers ∈ {1,2,4}; query the holder of an object or the object of
             a holder.
-  deixis    non-assistant chat transcript (``Name: utterance``), 2–3 speakers;
-            ownership stated only through I/me/my/mine/you/your (P=3: vocatives
-            fix "you"); events declare/give/request+fulfil/swap, E ∈ {1,2,4};
-            query owner / self / addressee. Every base item is emitted as three
-            PAIRED variants (``deictic``; ``third`` = the same events narrated with
-            names; ``twin`` = two speakers transposed so the answer flips) — the
-            deixis penalty and twin consistency are read off the pairs; validity
-            gates V1–V5 in ``gates``.
+  deixis    (v2) non-assistant chat transcript (``Name: utterance``), 2–3
+            speakers; ownership stated only through I/me/my/mine/you/your (P=3:
+            vocatives fix "you"); events declare + give, E ∈ {1,2,3}; query owner
+            (P=3) / self / addressee, ≥ 3 candidates. Every base item is emitted as
+            PAIRED variants (``deictic``; ``third`` = the same events as
+            dialogue-style prose with names; ``twin`` (P=3) = two speakers
+            transposed so the answer flips) — the deixis penalty and twin
+            consistency are read off the pairs; validity + pilot gates in ``gates``.
 
 Every item carries its own 3 exemplars, so each is scored under three conditions:
 ``0shot``; ``3shot`` (exemplars from DISJOINT shot pools — collision-free by
