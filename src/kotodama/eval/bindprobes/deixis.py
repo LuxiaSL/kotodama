@@ -386,10 +386,21 @@ def _lead(spec: Spec) -> Segment:
     q = spec["query"]
     if q["kind"] == "owner":
         return _fill("Now the {o} is with", o=q["obj"])
+    form = q.get("form", "a")
+    if form not in QFORMS:
+        raise ValueError(f"unknown query form {form!r}")
     if spec["variant"] == "third":
+        if form == "b":
+            return _fill("Now the thing in {p}'s hand is the", p=q["person"])
         return _fill("Now {p} is holding the", p=q["person"])
     if q["kind"] == "self":
+        if form == "b":
+            return _fill("{s}: The thing in my hand right now is the", s=q["speaker"])
         return _fill("{s}: Right now I'm holding the", s=q["speaker"])
+    if form == "b":
+        if q.get("voc"):
+            return _fill("{s}: {v}, the thing in your hand right now is the", s=q["speaker"], v=q["voc"])
+        return _fill("{s}: The thing in your hand right now is the", s=q["speaker"])
     if q.get("voc"):
         return _fill("{s}: {v}, right now you're holding the", s=q["speaker"], v=q["voc"])
     return _fill("{s}: Right now you're holding the", s=q["speaker"])
@@ -476,6 +487,38 @@ def exempt_ownership_word(cell: Sequence[Any]) -> bool:
     """Owner E = 1 (spec) and every object cell (module doc: there the rule IS
     the recency control, scheduled at the neutral rate instead)."""
     return str(cell[2]) != "owner" or int(cell[1]) == 1
+
+
+# Query phrasings for self/addressee (owner has one form). "a" = "…holding the" (the v2
+# battery); "b" = "the thing in my/your/X's hand … is the" — a paired re-phrasing of the
+# SAME items (same events, same gold) to check that a result is not tied to one sentence.
+QFORMS: tuple[str, ...] = ("a", "b")
+
+
+def with_qform(item: Item, form: str) -> Item:
+    """The same item (and its exemplars) re-rendered with query phrasing ``form``; the
+    id gains ``-q<form>`` and the gold is re-derived from the simulator (must match)."""
+    if form not in QFORMS:
+        raise ValueError(f"unknown query form {form!r}")
+    if item.meta.get("qkind") == "owner" or form == "a":
+        return item
+    def one(it: Item, suffix: str) -> Item:
+        spec = dict(it.spec); spec["query"] = dict(spec["query"], form=form)
+        new = build(it.item_id + suffix, tuple(it.cell), spec, pair_id=(it.meta.get("pair_id") or it.item_id) + suffix)
+        if new.gold != it.gold:
+            raise ValueError(f"{it.item_id}: gold changed under query form {form!r}")
+        for k in ("audit", "slot"):
+            if k in it.meta:
+                new.meta[k] = it.meta[k]
+        return new
+    out = one(item, f"-q{form}")
+    out.meta["qform"] = form
+    out.shots = [one(Item.from_dict(sh), f"-q{form}").to_dict() for sh in item.shots]
+    out.collide_maps = list(item.collide_maps)
+    for k, v in item.meta.items():
+        out.meta.setdefault(k, v)
+    out.meta["pair_id"] = (item.meta.get("pair_id") or item.item_id) + f"-q{form}"
+    return out
 
 
 def build(item_id: str, cell: Cell, spec: Spec, pair_id: Optional[str] = None) -> Item:

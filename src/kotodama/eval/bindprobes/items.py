@@ -286,12 +286,16 @@ def check_tokens(items: Sequence[Item], tokenizer: Any) -> int:
 
 def emit(out_dir: Path, seed: int = DEFAULT_SEED, families: Sequence[str] = FAMILY_NAMES,
          per_cell: Optional[Mapping[str, int]] = None, names_path: Optional[Path] = None,
-         verify: bool = False) -> Path:
+         verify: bool = False, deixis_qform: str = "a") -> Path:
     """Write items.jsonl + emit_meta.json. ``verify`` loads the presets tokenizer and
     hard-fails on any multi-token pool string or over-long prompt."""
     split = load_pools(names_path)
     items = generate(split, seed, families, per_cell)
+    if deixis_qform != "a":
+        from kotodama.eval.bindprobes import deixis as _dx
+        items = [_dx.with_qform(it, deixis_qform) if it.family == "deixis" else it for it in items]
     meta: dict[str, Any] = {
+        "deixis_qform": deixis_qform,
         "seed": seed, "families": list(families), "names": split.source,
         "per_cell": {f: (per_cell or {}).get(f, family(f).DEFAULT_PER_CELL) for f in families},
         "cells": {f: [list(c) for c in family(f).CELLS] for f in families},

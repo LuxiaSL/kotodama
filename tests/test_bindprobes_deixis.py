@@ -563,3 +563,29 @@ def test_cli_gen_pilot_and_default(tmp_path, capsys):
     assert set(meta["n_items"]) == set(items.FAMILY_NAMES)
     assert meta["n_items"]["deixis"] == 2 * (2 * 15 + n_p3)
     assert meta["audit_failures"]["deixis"] == []
+
+
+def test_query_form_b_same_items_same_gold() -> None:
+    from kotodama.eval.bindprobes import deixis as dx
+    from kotodama.eval.bindprobes.items import generate
+    from kotodama.eval.bindprobes.pools import load_pools
+    items = [it for it in generate(load_pools(None), 11, ["deixis"], {"deixis": 2}) if it.family == "deixis"]
+    assert items
+    changed = 0
+    for it in items:
+        b = dx.with_qform(it, "b")
+        assert b.gold == it.gold
+        if it.meta["qkind"] == "owner":
+            assert b is it
+            continue
+        changed += 1
+        assert b.item_id == it.item_id + "-qb" and b.meta["qform"] == "b"
+        ta, tb = dx.render(it, False), dx.render(b, False)
+        assert ta.rsplit("\n", 1)[0].rsplit(". ", 1)[0] == tb.rsplit("\n", 1)[0].rsplit(". ", 1)[0]  # same body
+        assert "hand" in tb.splitlines()[-1] or "hand" in tb[-60:]
+        assert "holding" not in tb[-60:]
+        assert len(b.shots) == len(it.shots)
+        for sa, sb in zip(it.shot_items(), b.shot_items()):
+            assert sa.gold == sb.gold and "hand" in dx.render(sb, True)[-80:]
+        dx.check_surface(b)
+    assert changed > 0

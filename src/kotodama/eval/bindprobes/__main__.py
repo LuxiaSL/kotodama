@@ -71,6 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--verify", action="store_true",
                    help="load the presets tokenizer: hard-fail on multi-token pool "
                         "strings or prompts >= the length bound")
+    g.add_argument("--deixis-qform", default="a", choices=["a", "b"],
+                   help="deixis self/addressee query phrasing: a = '...holding the' (default), "
+                        "b = 'the thing in my/your/X\'s hand ... is the' (same items, ids -qb)")
 
     v = sub.add_parser("verify-names", help="re-verify the single-token name/object pools")
     v.add_argument("--out", required=True)
@@ -117,7 +120,8 @@ def main(argv: list[str] | None = None) -> int:
             for f in fams:
                 items.family(f)
             items.emit(Path(args.out), args.seed, fams, _per_cell(args.per_cell),
-                       Path(args.names) if args.names else None, verify=args.verify)
+                       Path(args.names) if args.names else None, verify=args.verify,
+                       deixis_qform=args.deixis_qform)
         elif args.cmd == "verify-names":
             keys = _csv(args.tokenizers) if args.tokenizers else list(pools.GRID_TOKENIZERS)
             pools.verify_names(Path(args.out), keys)
