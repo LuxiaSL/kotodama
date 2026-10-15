@@ -49,6 +49,7 @@ warnings.filterwarnings("ignore", message="Online softmax", module=r"torch\._ind
 # Project imports — launch from the luxia-base/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from kotodama.model.init_schemes import SCHEMES as _INIT_SCHEMES
 from kotodama.data.dataset import (
     MixedTokenDataset,
     RandomTokenDataset,
@@ -434,6 +435,12 @@ def train(args: argparse.Namespace) -> None:
     # broadcasts rank 0's params, so ranks agree either way.
     torch.manual_seed(args.seed)
     model = LuxiaBaseModel(config).to(device=device, dtype=torch.bfloat16)
+    init_scheme = getattr(args, "init_scheme", "standard")
+    if init_scheme != "standard":
+        from kotodama.model.init_schemes import apply_init_scheme
+        apply_init_scheme(model, init_scheme)
+        if is_main:
+            logger.info("Init scheme: %s (applied over the standard init)", init_scheme)
     param_count = sum(p.numel() for p in model.parameters())
 
     if is_main:
@@ -2069,6 +2076,10 @@ def parse_args() -> argparse.Namespace:
              "Uses flash_attn_varlen_func to prevent cross-document attention.",
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--init_scheme", type=str, default="standard",
+                   choices=list(_INIT_SCHEMES),
+                   help="Weight init applied over the standard init (kotodama.model.init_schemes; T29). "
+                        "'standard' = unchanged.")
     p.add_argument(
         "--attn_lr_scale", type=float, default=1.0,
         help="Multiply the attention projections' (q/k/v/o) Muon LR by this for the first "
