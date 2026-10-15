@@ -26,7 +26,7 @@ from typing import Any, Mapping, Optional, Sequence
 from kotodama.eval.bindprobes.aggregate import DEIXIS, cell_metrics, deixis_readouts
 from kotodama.eval.bindprobes.base import Item, cell_key
 from kotodama.eval.bindprobes.grid import build_payload_item
-from kotodama.eval.bindprobes.items import CONDITIONS, COND_NSHOTS, FAMILY_NAMES, family
+from kotodama.eval.bindprobes.items import CONDITIONS, COND_NSHOTS, CORE_FAMILY_NAMES, family
 
 DEFAULT_PER_FAMILY = 200
 DEFAULT_SEED = 0
@@ -52,7 +52,7 @@ def default_per_family(name: str) -> int:
 
 def select_items(items: Sequence[Item], per_family: Optional[int] = None,
                  seed: int = DEFAULT_SEED,
-                 families: Sequence[str] = FAMILY_NAMES) -> list[Item]:
+                 families: Sequence[str] = CORE_FAMILY_NAMES) -> list[Item]:
     """``per_family`` items per family (None: :func:`default_per_family`),
     round-robin over that family's cells (each cell shuffled with ``seed``);
     exhausted cells drop out. A paired family (deixis) counts PAIRS and returns

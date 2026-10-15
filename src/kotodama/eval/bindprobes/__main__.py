@@ -60,7 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = sub.add_parser("gen", help="emit items.jsonl (+ emit_meta.json)")
     g.add_argument("--out", required=True, help="output directory")
     g.add_argument("--seed", type=int, default=items.DEFAULT_SEED)
-    g.add_argument("--families", default=",".join(items.FAMILY_NAMES))
+    g.add_argument("--families", default=",".join(items.CORE_FAMILY_NAMES),
+                   help="default: the frozen core battery; v3 families by name (" + ",".join(items.V3_FAMILY_NAMES) + ")")
     g.add_argument("--per-cell", default=None,
                    help="N for every family, or 'attr=110,codevar=100,dialogue=100,deixis=60' "
                         "(default: each family's default; deixis counts BASE items per "

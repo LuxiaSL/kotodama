@@ -214,18 +214,18 @@ def test_dialogue_error_types_and_relabel():
 
 @pytest.fixture(scope="module")
 def battery() -> list[Item]:
-    return items.generate(SPLIT, seed=11, per_cell={f: 4 for f in items.FAMILY_NAMES})
+    return items.generate(SPLIT, seed=11, per_cell={f: 4 for f in items.CORE_FAMILY_NAMES})
 
 
 def test_default_sizes_and_cells():
     sizes = {f: len(items.family(f).CELLS) * items.family(f).DEFAULT_PER_CELL
-             for f in items.FAMILY_NAMES}
+             for f in items.CORE_FAMILY_NAMES}
     assert sizes == {"attr": 1210, "codevar": 1200, "dialogue": 1200, "deixis": 900}
     assert (2, "middle") not in attr.CELLS and len(attr.CELLS) == 11
 
 
 def test_generation_invariants(battery):
-    assert {it.family for it in battery} == set(items.FAMILY_NAMES)
+    assert {it.family for it in battery} == set(items.CORE_FAMILY_NAMES)
     for it in battery:
         items.validate(it, SPLIT)
         fam = items.family(it.family)
@@ -234,7 +234,7 @@ def test_generation_invariants(battery):
         for s in it.shot_items():
             assert s.cell == it.cell and fam.simulate(s) == s.gold
     # balanced cells
-    for f in items.FAMILY_NAMES:
+    for f in items.CORE_FAMILY_NAMES:
         keys = [it.cell_key for it in battery if it.family == f]
         n_var = (sum(len(deixis.variants(c)) for c in deixis.CELLS) if f == "deixis"
                  else len(items.family(f).CELLS))
@@ -405,7 +405,7 @@ def test_scorer_round_trip_in_process(tok, battery):
         else:
             assert row["error_type"] in items.family(it.family).ERROR_TYPES + ("tie",)
     m = lite.summarize(rows)
-    for f in items.FAMILY_NAMES:
+    for f in items.CORE_FAMILY_NAMES:
         assert m[f"bindprobes/{f}/3shot/n"] == 4.0
         assert f"bindprobes/{f}/collision_gap" in m and f"bindprobes/{f}/shot_gap" in m
 
@@ -449,7 +449,7 @@ def test_run_grid_over_fake_server_matches_in_process(tok, battery, tmp_path, mo
         assert r == json.loads(json.dumps(ref_rows[(r["item_id"], r["condition"])]))
     assert grid.run_grid("stub", sel, out, endpoint="http://bp.test") == 0
     md, summary = agg.aggregate(rows)
-    assert set(summary["summary"]) == {f"stub|{f}" for f in items.FAMILY_NAMES}
+    assert set(summary["summary"]) == {f"stub|{f}" for f in items.CORE_FAMILY_NAMES}
     assert md.startswith("# Bindprobes tables")
 
 
@@ -509,7 +509,7 @@ def test_aggregate_fake_grid(tmp_path, capsys):
 
 def test_lite_select_balanced(battery):
     sel = lite.select_items(battery, per_family=13, seed=1)
-    for f in items.FAMILY_NAMES:
+    for f in items.CORE_FAMILY_NAMES:
         sub = [it for it in sel if it.family == f]
         if f == "deixis":   # 13 PAIRS, every variant of each (no twin at P=2)
             base = [it for it in sub if it.meta["variant"] == "deictic"]

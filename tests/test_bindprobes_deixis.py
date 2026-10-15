@@ -560,7 +560,7 @@ def test_cli_gen_pilot_and_default(tmp_path, capsys):
     assert lite.default_per_family("deixis") == 150 and lite.default_per_family("attr") == 200
     assert cli_main(["gen", "--out", str(tmp_path), "--per-cell", "2"]) == 0
     meta = json.loads((tmp_path / "emit_meta.json").read_text())
-    assert set(meta["n_items"]) == set(items.FAMILY_NAMES)
+    assert set(meta["n_items"]) == set(items.CORE_FAMILY_NAMES)
     assert meta["n_items"]["deixis"] == 2 * (2 * 15 + n_p3)
     assert meta["audit_failures"]["deixis"] == []
 

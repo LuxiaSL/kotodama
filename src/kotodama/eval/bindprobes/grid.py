@@ -36,6 +36,13 @@ ROW_CONTROLS: dict[str, tuple[str, ...]] = {
     "dialogue": ("qkind", "n_pronoun_ops", "gold_is_last_mention"),
     "deixis": ("deixis_version", "variant", "pair_id", "qkind", "gold_is_last_mention", "gold_is_last_speaker",
                "gold_in_last_line"),
+    "setbind": ("setbind_version", "k", "gold_set", "layout", "last_in_set", "n_transfers"),
+    "answer": ("answer_version", "variant", "pair_id", "channel", "role", "holder",
+               "holder_is_last_recipient", "holder_is_last_speaker"),
+    "adjacency": ("adjacency_version", "variant", "pair_id", "gold_role", "critical",
+                  "gold_is_last_mention", "n_grant"),
+    "codevarmut": ("codevarmut_version", "trap", "depth", "gold_is_last_literal", "value_answer",
+                   "reference_answer"),
 }
 
 
