@@ -75,6 +75,22 @@ from kotodama.training.muon import HybridScheduler, build_hybrid_optimizer, deca
 logger = logging.getLogger(__name__)
 
 
+def mix_window_seqs(spec: str | None, tokens_per_seq_step: int) -> tuple[int, int] | None:
+    """'START:END' in global tokens -> [start, end) in per-rank sequence index (each rank emits one
+    sequence per ``tokens_per_seq_step`` = seq_len * dp_size global tokens). None/'' = no window."""
+    if not spec:
+        return None
+    try:
+        a, b = spec.split(":")
+    except ValueError as e:
+        raise ValueError(f"--mix_window {spec!r} is not START:END") from e
+    start = 0 if a.strip() in ("0", "") else parse_token_count(a)
+    end = parse_token_count(b)
+    if not 0 <= start < end:
+        raise ValueError(f"--mix_window {spec!r}: need 0 <= START < END")
+    return start // tokens_per_seq_step, end // tokens_per_seq_step
+
+
 # ── Scheduler metrics (lightweight, no dependency) ────────────────────────────
 
 _hm_client = None
@@ -809,15 +825,20 @@ def train(args: argparse.Namespace) -> None:
         )
         mix_fraction = float(getattr(args, "mix_fraction", 0.0) or 0.0)
         if getattr(args, "mix_data_path", None) and mix_fraction > 0.0:
+            window = mix_window_seqs(getattr(args, "mix_window", None), seq_len * dp_size)
             dataset = MixedTokenDataset(
                 dataset,
                 TokenizedDataset(path=args.mix_data_path, seq_len=seq_len, rank=dp_rank,
                                  world_size=dp_size, seed=data_seed, doc_masking=doc_masking),
                 mix_fraction,
+                window=window,
             )
             if is_main:
-                logger.info("Mixing %s at %.2f%% of tokens (token-debt interleave)",
-                            args.mix_data_path, 100 * mix_fraction)
+                logger.info("Mixing %s at %.2f%% of tokens (token-debt interleave)%s",
+                            args.mix_data_path, 100 * mix_fraction,
+                            f" inside tokens [{args.mix_window}) = per-rank sequences {window}" if window else "")
+        elif getattr(args, "mix_window", None):
+            raise ValueError("--mix_window needs --mix_data_path and --mix_fraction > 0")
 
     def _make_data_iter():
         collate_fn = collate_packed if doc_masking else None
@@ -2064,6 +2085,9 @@ def parse_args() -> argparse.Namespace:
                    help="Secondary token bin interleaved into --data_path (e.g. ladder A4 dyadic).")
     p.add_argument("--mix_fraction", type=float, default=0.0,
                    help="Exact token fraction of --mix_data_path (token-debt interleave).")
+    p.add_argument("--mix_window", type=str, default=None,
+                   help="Confine the mix to global tokens START:END (e.g. '0:2.5B', '2.5B:5B'); the "
+                        "fraction applies inside the window, the primary runs alone outside it.")
     p.add_argument(
         "--random_data",
         action="store_true",

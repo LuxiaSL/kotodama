@@ -291,23 +291,33 @@ class MixedTokenDataset(IterableDataset):
     Both streams must share seq_len and EOS (all sequences are full length, so the
     fraction by sequences IS the fraction by tokens). Each stream keeps its own
     rank partition and shuffle; ``state_dict`` covers both positions + the counters.
+
+    ``window = (start, end)`` confines the mix to sequences ``start <= n < end`` of this stream
+    (per-rank sequence index; the trainer converts global tokens). Inside the window the
+    secondary holds ``fraction`` of the window's sequences; outside it the primary runs alone.
+    ``None`` = the whole stream (identical to the unwindowed behaviour). After a resume from an
+    unmixed state the counters restart at the fork, so a window is measured from there.
     """
 
     def __init__(self, primary: TokenizedDataset, secondary: TokenizedDataset,
-                 fraction: float) -> None:
+                 fraction: float, window: tuple[int, int] | None = None) -> None:
         super().__init__()
         if not 0.0 < fraction < 1.0:
             raise ValueError(f"mix fraction must be in (0, 1), got {fraction}")
+        if window is not None and not 0 <= window[0] < window[1]:
+            raise ValueError(f"mix window must satisfy 0 <= start < end, got {window}")
         if primary.seq_len != secondary.seq_len:
             raise ValueError("primary and secondary streams must share seq_len")
         self.primary, self.secondary, self.fraction = primary, secondary, fraction
+        self.window = window
         self.seq_len = primary.seq_len
         self._n_total = 0
         self._n_secondary = 0
+        self._n_window = 0       # sequences emitted inside the window (== n_total when unwindowed)
 
     def state_dict(self) -> dict:
         return {"primary": self.primary.state_dict(), "secondary": self.secondary.state_dict(),
-                "n_total": self._n_total, "n_secondary": self._n_secondary}
+                "n_total": self._n_total, "n_secondary": self._n_secondary, "n_window": self._n_window}
 
     def load_state_dict(self, state: dict) -> None:
         if "primary" not in state:
@@ -320,18 +330,22 @@ class MixedTokenDataset(IterableDataset):
             self.primary.load_state_dict(state)
             self._n_total = 0
             self._n_secondary = 0
+            self._n_window = 0
             return
         self.primary.load_state_dict(state["primary"])
         self.secondary.load_state_dict(state["secondary"])
         self._n_total = int(state["n_total"])
         self._n_secondary = int(state["n_secondary"])
+        self._n_window = int(state.get("n_window", self._n_total))   # pre-window states: unwindowed
 
     def __iter__(self) -> Iterator[torch.Tensor | PackedSample]:
         it_p, it_s = iter(self.primary), iter(self.secondary)
         while True:
-            use_secondary = self._n_secondary < self.fraction * (self._n_total + 1)
+            in_win = self.window is None or self.window[0] <= self._n_total < self.window[1]
+            use_secondary = in_win and self._n_secondary < self.fraction * (self._n_window + 1)
             sample = next(it_s) if use_secondary else next(it_p)
             self._n_total += 1
+            self._n_window += int(in_win)
             self._n_secondary += int(use_secondary)
             yield sample
 
