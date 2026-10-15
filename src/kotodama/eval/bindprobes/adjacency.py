@@ -46,7 +46,7 @@ from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection
 FAMILY = "adjacency"
 VERSION = 1
 CELLS: list[Cell] = [(1, 1), (2, 1), (2, 2)]
-DEFAULT_PER_CELL = 96
+DEFAULT_PER_CELL = 150            # 450 base, 1350 with variants (V3-5: critical-subset paired SE ~.03)
 SEPARATOR = dx.SEPARATOR
 VARIANTS = ("adj", "voc", "third")
 N_PEOPLE = 3
