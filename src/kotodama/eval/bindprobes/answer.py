@@ -21,6 +21,11 @@ Paired variants of every base item (``meta.pair_id``):
          (candidates = the 4 names) — the lite/form-a query, i.e. the seam test partner
   third  the same events as dialogue-family prose with names (no pronouns), then the
          same Q-A tail -> the same gold as qa
+  null   CALIBRATION: the scene line + the same Q-A tail with the body HIDDEN (exemplars
+         unchanged) — no information about the holder. Its per-candidate logprobs are the
+         context prior of the tail ("it's with" -> " you"/" me" are frequent phrases);
+         the qa/third READ is argmax(logp(item) − logp(null)) (contextual calibration).
+         Its own "accuracy" is meaningless (gold = the qa gold, by construction).
 Gold ROLE schedule (cycled, per cell): me ¼, you ¼, other ½ (each name ¼) — every
 constant answer is at chance (1/4). Independently cycled: the holder is the last
 body line's recipient ¼ / its speaker ¼ / neither ½ (names-level recency + last-
@@ -43,13 +48,13 @@ from kotodama.eval.bindprobes import deixis as dx
 from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection
 
 FAMILY = "answer"
-VERSION = 1
+VERSION = 2                       # v2 = iteration 1 (SPEC-battery-v3 §6): + the null calibration variant
 ES = (1, 2)
 CHANNELS = ("novoc", "voc")
 CELLS: list[Cell] = [(e, ch) for e in ES for ch in CHANNELS]
 DEFAULT_PER_CELL = 160            # 16-cycle x 10 -> 640 base, 1920 with variants (V3-5: role-contrast SE ~.039)
 SEPARATOR = dx.SEPARATOR
-VARIANTS = ("qa", "narr", "third")
+VARIANTS = ("qa", "narr", "third", "null")
 N_PEOPLE = 4
 N_OBJECTS = (3, 4)
 ME, YOU = "me", "you"
@@ -172,6 +177,8 @@ def _rendered(spec: Spec) -> str:
         return " ".join(prose) + "\n" + "\n".join(_tail_lines(spec))
     lines = [f"A chat between {name_list(people)}."]
     lines += [dx._deictic_line(ev)[0] for ev in spec["events"]]
+    if spec["variant"] == "null":
+        return "\n".join([lines[0]] + _tail_lines(spec))
     if spec["variant"] == "narr":
         lines.append(f"Now the {spec['tail']['obj']} is with")
     else:
@@ -207,6 +214,8 @@ def check_surface(item: Item) -> None:
         return
     body = text.split("\n")[1:]
     body = body[:-1] if spec["variant"] == "narr" else body[:-2]
+    if spec["variant"] == "null" and body:
+        raise ValueError(f"{item.item_id}: the null variant must hide the body")
     for ln in body:
         m = re.match(r"^(\w+): (.*)$", ln)
         if not m or m.group(1) not in spec["people"]:
@@ -320,8 +329,8 @@ def gen_item(rng: random.Random, cell: Cell, pools: Any, item_id: str, k: int,
 def _variant_spec(spec: Spec, variant: str) -> Spec:
     if variant == "qa":
         return spec
-    if variant == "narr":
-        return {**spec, "variant": "narr"}
+    if variant in ("narr", "null"):
+        return {**spec, "variant": variant}
     return {**spec, "variant": "third", "events": explicit_events(spec)}
 
 
@@ -332,7 +341,9 @@ def expand(base: Item) -> list[Item]:
     for v in VARIANTS:
         it = build(f"{pid}_{v}", tuple(base.cell), _variant_spec(base.spec, v), pair_id=pid)  # type: ignore[arg-type]
         it.meta["shots_disjoint"] = base.meta.get("shots_disjoint")
-        it.shots = [build(f"{s.item_id}_{v}", tuple(s.cell), _variant_spec(s.spec, v),  # type: ignore[arg-type]
+        # null calibrates the qa context exactly: the SAME (qa) exemplars, only the test body hidden
+        sv = "qa" if v == "null" else v
+        it.shots = [build(f"{s.item_id}_{sv}", tuple(s.cell), _variant_spec(s.spec, sv),  # type: ignore[arg-type]
                           pair_id=s.item_id).to_dict() for s in shots]
         it.collide_maps = [dict(m) for m in base.collide_maps]
         out.append(it)
@@ -387,11 +398,16 @@ def check_family(items: Sequence[Item]) -> None:
     for pid, g in by.items():
         if set(g) != set(VARIANTS):
             raise ValueError(f"pair {pid}: variants {sorted(g)}")
-        q, n, t = g["qa"], g["narr"], g["third"]
-        if not (q.meta["holder"] == n.meta["holder"] == t.meta["holder"] == n.gold):
+        q, n, t, z = g["qa"], g["narr"], g["third"], g["null"]
+        if not (q.meta["holder"] == n.meta["holder"] == t.meta["holder"] == z.meta["holder"] == n.gold):
             raise ValueError(f"pair {pid}: holder differs across variants")
         if q.gold != t.gold or q.candidates != t.candidates:
             raise ValueError(f"pair {pid}: third changes the qa gold/candidates")
+        if z.gold != q.gold or z.candidates != q.candidates or z.spec["tail"] != q.spec["tail"]:
+            raise ValueError(f"pair {pid}: null is not the qa item with the body hidden")
+        if any(re.search(rf"\b{re.escape(o)}\b", render(z, False))
+               for o in z.spec["objects"] if o != z.spec["tail"]["obj"]):
+            raise ValueError(f"pair {pid}: null leaks a body object")
 
 
 def audit(items: Sequence[Item]) -> dict[str, dict[str, Any]]:

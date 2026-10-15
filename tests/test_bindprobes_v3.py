@@ -205,3 +205,17 @@ def test_v3_prompts_token_bound_and_single_token_candidates(generated):
         pytest.skip(f"tokenizer unavailable: {exc}")
     for fam, its in generated.items():
         assert items.check_tokens(its, t) < 1024
+
+
+def test_answer_null_calibration_variant(generated):
+    by = {}
+    for it in generated["answer"]:
+        by.setdefault(it.meta["pair_id"], {})[it.meta["variant"]] = it
+    for g in by.values():
+        z, q = g["null"], g["qa"]
+        text = answer.render(z, False)
+        assert text.count("\n") == 2                      # scene + question + answer lead only
+        assert z.spec["tail"] == q.spec["tail"] and z.candidates == q.candidates
+        assert [s["item_id"] for s in z.shots] == [s["item_id"] for s in q.shots]   # same qa exemplars
+        assert items.build_prompt(z, "3shot").rsplit(answer.SEPARATOR, 1)[0] == \
+            items.build_prompt(q, "3shot").rsplit(answer.SEPARATOR, 1)[0]
