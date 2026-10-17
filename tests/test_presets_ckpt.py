@@ -144,3 +144,12 @@ def test_1b_deep_matches_1b_budget():
     assert b[0] == 0 and list(b) == sorted(set(b)) and b[-1] < deep["num_layers"]
     nd, nb = n_params(deep, b), n_params(base, presets.DEFAULT_BOUNDARIES["1b"])
     assert abs(nd - nb) / nb < 0.01, (nd, nb)
+
+
+def test_serve_knows_1b_deep():
+    """The server can load T25 checkpoints: its 1b-deep config is the preset shape + the preset boundaries."""
+    from kotodama.serve import server
+    cfg = server.MODEL_CONFIGS["1b-deep"]
+    assert all(cfg[k] == v for k, v in presets.shape("1b-deep").items())
+    assert list(cfg["attn_res_boundaries"]) == list(presets.DEFAULT_BOUNDARIES["1b-deep"])
+    assert cfg["attn_res"] is True

@@ -139,7 +139,11 @@ CONFIG_3B = dict(
 # ladder arms trained with rope_fp32 — serve them with --rope_fp32.
 CONFIG_1B = dict(CONFIG_3B, **presets.shape("1b"))
 
-MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "1b": CONFIG_1B, "3b": CONFIG_3B}
+# T25 depth arm (presets "1b-deep": d1536 x 52 layers, the 1b's budget); DD-3B scaled to 52 layers.
+CONFIG_1B_DEEP = dict(CONFIG_3B, **presets.shape("1b-deep"),
+                      attn_res_boundaries=list(presets.DEFAULT_BOUNDARIES["1b-deep"]))
+
+MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "1b": CONFIG_1B, "1b-deep": CONFIG_1B_DEEP, "3b": CONFIG_3B}
 
 
 # ── Global state ────────────────────────────────────────────────────────────────
