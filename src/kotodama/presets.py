@@ -31,6 +31,10 @@ SHAPES: dict[str, dict[str, Any]] = {
     # at mb8 on 8xB200 (14.1h per 30B-token arm). DD-3B boundaries verbatim.
     "1b": dict(hidden_size=2048, num_layers=28, num_attention_heads=16,
                num_kv_heads=8, head_dim=128, intermediate_size=5632, **_COMMON),
+    # T25 depth arm: the 1b's parameter budget (1.4255B vs 1.4222B total, tied) spent on depth —
+    # d1536 x 52 layers (1.86x deeper), heads 12 / kv 6 at head_dim 128, FFN 4096 (~8/3 d).
+    "1b-deep": dict(hidden_size=1536, num_layers=52, num_attention_heads=12,
+                    num_kv_heads=6, head_dim=128, intermediate_size=4096, **_COMMON),
     # d1024 x 28 (~0.38B with tied embeddings) — the April "intermediate".
     "intermediate": dict(hidden_size=1024, num_layers=28, num_attention_heads=8,
                          num_kv_heads=4, head_dim=128, intermediate_size=2816, **_COMMON),
@@ -47,8 +51,10 @@ ALIASES: dict[str, str] = {"full": "3b", "model": "3b", "8b": "7b"}
 
 # The boundaries each shape was trained with, where there is a shipped model
 # (the 1b ladder runs DD-3B verbatim by design — same 28-layer block geometry).
+# 1b-deep: DD-3B's block starts scaled by 52/28 and rounded (same 7-block geometry, stretched over depth).
+DD3B_DEEP52: tuple[int, ...] = (0, 2, 6, 13, 28, 35, 45)
 DEFAULT_BOUNDARIES: dict[str, tuple[int, ...]] = {"3b": DD3B, "proxy": DDV1,
-                                                  "1b": DD3B}
+                                                  "1b": DD3B, "1b-deep": DD3B_DEEP52}
 
 
 def resolve(name: str) -> str:

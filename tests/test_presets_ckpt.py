@@ -127,3 +127,20 @@ def test_decompress_cached_does_not_collide_on_basename(tmp_path, monkeypatch):
     assert out_a != out_b
     assert torch.load(out_a)["model"]["w"][0].item() == 1.0
     assert torch.load(out_b)["model"]["w"][0].item() == 2.0
+
+
+def test_1b_deep_matches_1b_budget():
+    """T25 depth arm: same parameter budget as the 1b (within 1%), ~1.86x the depth, valid AttnRes boundaries."""
+    deep, base = presets.shape("1b-deep"), presets.shape("1b")
+    assert deep["num_layers"] == 52 and base["num_layers"] == 28
+    assert deep["hidden_size"] == deep["num_attention_heads"] * deep["head_dim"]
+    assert deep["num_attention_heads"] % deep["num_kv_heads"] == 0
+
+    def n_params(shape, bounds):
+        m = LuxiaBaseModel(LuxiaModelConfig(**shape, attn_res=True, attn_res_boundaries=list(bounds)))
+        return sum(p.numel() for p in m.parameters())
+
+    b = presets.DEFAULT_BOUNDARIES["1b-deep"]
+    assert b[0] == 0 and list(b) == sorted(set(b)) and b[-1] < deep["num_layers"]
+    nd, nb = n_params(deep, b), n_params(base, presets.DEFAULT_BOUNDARIES["1b"])
+    assert abs(nd - nb) / nb < 0.01, (nd, nb)

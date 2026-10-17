@@ -1,0 +1,11 @@
+# 1B formation ladder — T25 DEPTH arm: the A0 recipe (data, schedule, optimizer, cadence) with the parameter budget
+# spent on depth: model_size 1b-deep = d1536 x 52 layers (1.86x the 1b's 28), matched total params (1.4255B vs
+# 1.4222B, tied embeddings). AttnRes keeps DD-3B's 7-block geometry stretched over the 52 layers.
+# Launch exactly as ladder-a0.yaml (same CLI overrides), with this config.
+
+extends: ladder-a0.yaml
+
+model_size: 1b-deep
+# DD-3B block starts scaled by 52/28 (presets.DEFAULT_BOUNDARIES["1b-deep"]).
+attn_res_boundaries: "0,2,6,13,28,35,45"
+checkpoint_shm_dir: /dev/shm/luxia-ladder-a0-deep
