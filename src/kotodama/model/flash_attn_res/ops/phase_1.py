@@ -27,6 +27,11 @@ _P1_BWD_V2 = os.environ.get("KOTODAMA_P1_BWD_V2", "0") == "1"
 # torch for num_active >= MIN_S, v1 below. MIN_S=5 puts the crossover
 # between the measured S=3 (v1 wins) and S=7 (torch wins) points.
 _P1_BWD_TORCH = os.environ.get("KOTODAMA_P1_BWD_TORCH", "0") == "1"
+
+# Single-query forward with an online softmax over the sources (kernels.phase_1.phase_1_online_forward_kernel):
+# each source row is read once instead of the batched kernel holding the whole (sources, D) tile per token. Used
+# for one-query calls (the per-sublayer routing path) when enabled; default OFF until its parity gate passes.
+_P1_FWD_ONLINE = os.environ.get("KOTODAMA_P1_FWD_ONLINE", "0") == "1"
 _P1_BWD_TORCH_MIN_S = int(os.environ.get("KOTODAMA_P1_BWD_TORCH_MIN_S", "5"))
 
 
@@ -225,6 +230,25 @@ def _phase_1_batched_attention_forward_with_aux_triton_op(
         device=block_representations.device,
         dtype=torch.float32,
     )
+
+    if num_queries == 1 and _P1_FWD_ONLINE:
+        wrap_triton(phase_1.phase_1_online_forward_kernel)[
+            lambda META: (triton.cdiv(BT, META["BLOCK_BT"]),)
+        ](
+            block_representations,
+            pseudo_queries,
+            softmax_outputs,
+            lses,
+            inverse_rms_norms,
+            attention_logits,
+            eps,
+            num_active,
+            BT,
+            num_source_blocks,
+            D,
+            triton.next_power_of_2(D),
+        )
+        return softmax_outputs, lses, inverse_rms_norms, attention_logits
 
     wrap_triton(phase_1.phase_1_batched_attention_forward_kernel)[(BT,)](
         block_representations,

@@ -67,6 +67,17 @@ phase1_backward_v2_configs = [
 ]
 
 
+# Single-query online-softmax Phase-1 forward: one (BLOCK_BT, D) fp32 accumulator + the current source row live.
+phase1_online_forward_configs = [
+    triton.Config({"BLOCK_BT": 1}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_BT": 1}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_BT": 2}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_BT": 2}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_BT": 4}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_BT": 4}, num_warps=16, num_stages=2),
+]
+
+
 def set_autotune_configs(kernel, configs):
     kernel.configs = list(configs)
     kernel.cache.clear()

@@ -2,6 +2,7 @@ import triton
 import triton.language as tl
 from .configs import (
     forward_configs,
+    phase1_online_forward_configs,
     phase1_backward_configs,
     phase1_backward_v2_configs,
 )
@@ -524,3 +525,73 @@ def phase_1_batched_attention_backward_v2_kernel(
             ),
             mask=mask_src_3d,
         )
+
+
+@triton.autotune(
+    configs=phase1_online_forward_configs,
+    key=["NUM_SOURCE_BLOCKS", "HIDDEN_DIM"],
+)
+@triton.jit
+def phase_1_online_forward_kernel(
+    block_representations_ptr,
+    pseudo_query_ptr,
+    softmax_normalized_output_ptr,
+    lse_ptr,
+    inverse_rms_norm_ptr,
+    attention_logits_ptr,
+    eps,
+    num_active,
+    BT,
+    NUM_SOURCE_BLOCKS: tl.constexpr,
+    HIDDEN_DIM: tl.constexpr,
+    PADDED_HIDDEN: tl.constexpr,
+    BLOCK_BT: tl.constexpr,
+):
+    # Single-query Phase 1 with an online softmax over the sources: each source row is read once and folded into a
+    # running (max, sum, weighted accumulator), so only one (BLOCK_BT, D) fp32 accumulator and the current row are
+    # live — the batched kernel holds the whole (sources, D) tile per token. Same math as that kernel with one
+    # query (fp32 throughout, one bf16 round of the output); the softmax is accumulated in a different order.
+    bt_offsets = tl.program_id(0) * BLOCK_BT + tl.arange(0, BLOCK_BT)
+    valid_bt = bt_offsets < BT
+    d_range = tl.arange(0, PADDED_HIDDEN)
+    valid_d = d_range < HIDDEN_DIM
+    mask_2d = valid_bt[:, None] & valid_d[None, :]
+
+    pseudo_query_vector = tl.load(
+        pseudo_query_ptr + d_range, mask=valid_d, other=0.0, eviction_policy="evict_last",
+    ).to(tl.float32)
+
+    running_max = tl.full((BLOCK_BT,), float("-inf"), dtype=tl.float32)
+    running_sum = tl.zeros((BLOCK_BT,), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_BT, PADDED_HIDDEN), dtype=tl.float32)
+
+    for source in range(0, num_active):
+        source_values = tl.load(
+            block_representations_ptr
+            + source * (BT * HIDDEN_DIM)
+            + bt_offsets[:, None] * HIDDEN_DIM
+            + d_range[None, :],
+            mask=mask_2d,
+            other=0.0,
+        ).to(tl.float32)
+        inverse_rms_norm = tl.rsqrt(
+            tl.sum(source_values * source_values, axis=1) / float(HIDDEN_DIM) + eps
+        )
+        logit = tl.sum(source_values * pseudo_query_vector[None, :], axis=1) * inverse_rms_norm
+        tl.store(inverse_rms_norm_ptr + bt_offsets * NUM_SOURCE_BLOCKS + source, inverse_rms_norm, mask=valid_bt)
+        tl.store(attention_logits_ptr + bt_offsets * NUM_SOURCE_BLOCKS + source, logit, mask=valid_bt)
+
+        new_max = tl.maximum(running_max, logit)
+        rescale = tl.exp(running_max - new_max)
+        weight = tl.exp(logit - new_max)
+        accumulator = accumulator * rescale[:, None] + weight[:, None] * source_values
+        running_sum = running_sum * rescale + weight
+        running_max = new_max
+
+    normalized_output = (accumulator / running_sum[:, None]).to(tl.bfloat16)
+    tl.store(
+        softmax_normalized_output_ptr + bt_offsets[:, None] * HIDDEN_DIM + d_range[None, :],
+        normalized_output,
+        mask=mask_2d,
+    )
+    tl.store(lse_ptr + bt_offsets, running_max + tl.log(running_sum), mask=valid_bt)
