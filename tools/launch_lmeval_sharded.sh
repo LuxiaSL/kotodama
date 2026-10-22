@@ -8,7 +8,7 @@
 #
 # Usage:
 #   tools/launch_lmeval_sharded.sh <checkpoint.pt[.zst]> [gpus] [batch_size]
-#   tools/launch_lmeval_sharded.sh /models/kotodama-data/ckpt.pt.zst 4,5,6 32
+#   tools/launch_lmeval_sharded.sh "$KOTODAMA_DATA_ROOT"/ckpt.pt.zst 4,5,6 32
 #
 # Detached use: nohup tools/launch_lmeval_sharded.sh ... > logs/lmeval_sharded.log 2>&1 &
 #
@@ -43,12 +43,12 @@ fi
 mkdir -p "$ROOT/logs" "$SHARD_ROOT"
 
 # Pre-decompress .zst once so the three shards don't race on it (the loader
-# also handles this atomically now, but doing it here avoids 3x the work).
+# also handles this atomically, but doing it here avoids 3x the work).
 if [[ "$CKPT" == *.zst ]]; then
   export TMPDIR="${TMPDIR:-$KOTODAMA_DATA_ROOT/tmp}"
   DECOMP_DIR="$TMPDIR/kotodama_checkpoints"
   # Key the cache on the SOURCE path, not the basename: every ladder arm ends in
-  # step_00014304.pt.zst, and a basename key silently scored one model twice (ledger D7).
+  # step_00014304.pt.zst, and a basename key silently scores one model twice.
   SRC_KEY="$(readlink -f "$CKPT" | sha1sum | cut -c1-12)"
   DECOMP="$DECOMP_DIR/${SRC_KEY}-$(basename "${CKPT%.zst}")"
   if [ ! -f "$DECOMP" ] && [ ! -f "${CKPT%.zst}" ]; then
