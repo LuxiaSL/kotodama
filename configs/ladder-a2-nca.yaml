@@ -3,10 +3,9 @@
 # ladder-a1-nca.yaml (same seed-17 stream: A2 sees A1-NCA's first 0.75B tokens).
 # Phase 2 = configs/ladder-a2.yaml (resume_nca = this run's final checkpoint).
 #
-# Dose (Luxia 2026-10-02, changed from the registered ~150M before A2 trained — spec
-# L-P3/L-P10): 0.75B = A1-NCA's held-out-UNSEEN-RULE loss minimum, and the dose past
-# which its idle-MLP-unit pool starts forming (the weak-unit trap's precursor). 150M
-# stays available as A2b to complete the dose curve (150M / 0.75B / 2.82B).
+# Dose: 0.75B = A1-NCA's held-out-UNSEEN-RULE loss minimum, and the dose past which
+# its idle-MLP-unit pool starts forming (the weak-unit trap's precursor). A 150M arm
+# completes the dose curve (150M / 0.75B / 2.82B).
 #
 # Launch: tools/run_train.sh --config configs/ladder-a2-nca.yaml \
 #   --global_batch_tokens 2097152 --data_path <nca_3b_seed17_train.bin> \

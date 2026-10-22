@@ -1,9 +1,9 @@
 # 1B formation ladder — arm A0: no NCA (random init), 30B language tokens.
 # The NCA-free control; every other arm reads against it (and A0' = seed 43
-# sets the noise floor the pre-registered thresholds are relative to).
+# sets the seed-noise floor every arm comparison is read against).
 #
 # Launch (8 GPUs, one node, --max-retries 0; pass --global_batch_tokens on the
-# CLI too so heimdall derives the tokens axis):
+# CLI too so the scheduler telemetry derives the tokens axis):
 #   tools/run_train.sh --config configs/ladder-a0.yaml --global_batch_tokens 2097152 \
 #     --data_path <train.bin> --checkpoint_dir <ladder>/a0
 # Second seed (A0'): add --seed 43 and its own --checkpoint_dir + --checkpoint_shm_dir.
@@ -30,15 +30,15 @@ total_tokens: 30_000_000_000
 # ASSUMPTION: 500 steps (~1.05B tokens, 3.5% of the arm). The 3B's 2000-step
 # warmup was 4.2B tokens; scaling it by tokens would eat 14% of a 30B arm.
 warmup_steps: 500
-# Every arm ends annealed (ruling D12): the last 6B tokens decay — the 3B's
-# induction unlock took ~6B tokens of decay.
+# Every arm ends annealed: the last 6B tokens decay — the 3B's induction
+# unlock took ~6B tokens of decay.
 decay_start_pct: 0.80
 decay_type: cosine
 
 doc_masking: true
 seed: 42
 
-# Runtime: the benched 1B stack (582-590K tok/s @ clock 1552), bf16 (D9).
+# Runtime: the benched 1B stack (582-590K tok/s @ clock 1552), bf16.
 compile: true
 attn_impl: fa4
 use_liger: true
@@ -47,16 +47,16 @@ activation_checkpointing: false
 muon_distributed: true
 prefetch_batches: 2
 
-# Optimizer riders: norm gains excluded from weight decay (ruling D13).
+# Optimizer riders: norm gains excluded from weight decay.
 adamw_no_decay_norms: true
-# fp32 Muon masters + momentum (2026-09-28 audit): without them bf16 Muon weight
-# decay is a no-op and late/anneal updates round away (A0-old: 5.5% of q_proj frozen
-# through the anneal).
+# fp32 Muon masters + momentum: without them bf16 Muon weight decay is a no-op
+# and late/anneal updates round away (a bf16-master 1B run left 5.5% of q_proj
+# frozen through the anneal).
 muon_fp32_master: true
-# fp32 RoPE tables (audit A9; minor: ~10% less shift error).
+# fp32 RoPE tables (minor: ~10% less shift error).
 rope_fp32: true
 
-# Checkpoints: weights-only on the spec cadence (26 points, never pruned),
+# Checkpoints: weights-only on the save_schedule cadence (26 points, never pruned),
 # one protected full anchor at the branch fork, rolling fulls for resume.
 save_schedule: "250M:4B,1B:10B,5B:end"
 anchor_tokens: "10B"
@@ -68,7 +68,7 @@ async_checkpoint: true
 # A0' / branches override it on the CLI (e.g. /dev/shm/luxia-ladder-a0s43).
 checkpoint_shm_dir: /dev/shm/luxia-ladder-a0
 
-# Telemetry: geometric families + norm-gain families to heimdall.
+# Telemetry: geometric families + norm-gain families to the scheduler telemetry.
 geo_monitor: true
 geo_monitor_schedule: "0:50,2000:100,8000:200"
 norm_gain_every: 50

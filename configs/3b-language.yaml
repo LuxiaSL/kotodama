@@ -5,13 +5,13 @@
 # circuits preserved from NCA pre-pretraining.
 #
 # Boundaries MUST match the NCA checkpoint: DD-3B [0,1,3,7,15,19,24].
-# (CLAUDE.md references DD-v1 [0,3,7,12,21,25] — that is stale; Phase 3
-# re-derived boundaries from the actual 3B geometry.)
+# (DD-v1 [0,3,7,12,21,25] is the proxy's set; Phase 3 derived these from
+# the 3B's own geometry.)
 #
-# Launch via Scheduler:
+# Launch via the scheduler:
 #   scheduler submit "tools/run_train.sh --config configs/3b-language.yaml" \
 #     --name 3b-lang --gpus 8 --node gpu-host \
-#     --env WANDB_API_KEY=... --env WANDB_ENTITY=aethera --env HF_TOKEN=...
+#     --env WANDB_API_KEY=... --env WANDB_ENTITY=<entity> --env HF_TOKEN=...
 #
 # run_train.sh sets PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
 # On SIGTERM: blocking checkpoint + clean exit. load_latest() auto-resumes.
@@ -31,20 +31,20 @@ attn_res: true
 attn_res_boundaries: "0,1,3,7,15,19,24"
 
 # NCA → language transition
-resume_nca: /models/kotodama-data/nca-3b-phase3-BASE.pt.zst
+resume_nca: ${KOTODAMA_DATA_ROOT}/nca-3b-phase3-BASE.pt.zst
 
 # Data
-data_path: /models/kotodama-data/train.bin
+data_path: ${KOTODAMA_DATA_ROOT}/train.bin
 doc_masking: true
 seed: 42
 
 # Eval — disabled (no held-out split carved yet; can add mid-run)
-# eval_data_path: /models/kotodama-data/eval.bin
+# eval_data_path: ${KOTODAMA_DATA_ROOT}/eval.bin
 # eval_every: 200
 # eval_batches: 10
 
 # Checkpointing
-checkpoint_dir: /models/kotodama-data/checkpoints/3b-language
+checkpoint_dir: ${KOTODAMA_DATA_ROOT}/checkpoints/3b-language
 save_every: 200
 keep_checkpoints: 20
 

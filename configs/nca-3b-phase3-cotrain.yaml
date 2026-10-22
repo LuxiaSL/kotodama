@@ -24,16 +24,16 @@ attn_res: true
 attn_res_boundaries: "0,1,3,7,15,19,24"
 
 # Data — same NCA dataset as Phase 1
-data_path: /models/kotodama-data/nca_3b_seed17_train.bin
+data_path: ${KOTODAMA_DATA_ROOT}/nca_3b_seed17_train.bin
 seed: 17
 
 # Eval
-eval_data_path: /models/kotodama-data/nca_3b_seed17_eval.bin
+eval_data_path: ${KOTODAMA_DATA_ROOT}/nca_3b_seed17_eval.bin
 eval_every: 50
 eval_batches: 20
 
-# Checkpointing — to /models/ (root disk is tight)
-checkpoint_dir: /models/kotodama-data/checkpoints/nca-3b-phase3
+# Checkpointing — under the data root (the root disk is tight)
+checkpoint_dir: ${KOTODAMA_DATA_ROOT}/checkpoints/nca-3b-phase3
 save_every: 50
 keep_checkpoints: 80
 

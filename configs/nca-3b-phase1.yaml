@@ -14,11 +14,11 @@ warmup_steps: 500
 decay_start_pct: 1.0
 
 # Data
-data_path: /models/kotodama-data/nca_3b_seed17_train.bin
+data_path: ${KOTODAMA_DATA_ROOT}/nca_3b_seed17_train.bin
 seed: 17
 
 # Eval
-eval_data_path: /models/kotodama-data/nca_3b_seed17_eval.bin
+eval_data_path: ${KOTODAMA_DATA_ROOT}/nca_3b_seed17_eval.bin
 eval_every: 200
 eval_batches: 20
 

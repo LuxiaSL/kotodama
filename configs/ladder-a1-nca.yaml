@@ -2,14 +2,14 @@
 # replicating the shipped 3B's NCA recipe (nca-3b-phase3-cotrain.yaml) at 1B.
 # Phase 2 = configs/ladder-a1.yaml (language, resumes from this run's final).
 #
-# Dose (ruling D2: proportional to params): the 3B base = phase-3 step 3000 at
+# Dose (proportional to params): the 3B base = phase-3 step 3000 at
 # 1,966,080 tok/step = 5.90B NCA tokens on ~2.97B params; x (1.42B / 2.97B)
 # = 2.82B tokens here. The language phase's 30B comes ON TOP (arms are matched
 # on language tokens).
 #
 # Faithful to the 3B NCA phase: same seed-17 one-rule stream, AttnRes DD-3B
 # co-trained from scratch, constant LR after warmup (decay_start_pct 1.0), no
-# doc_masking (EOS=0 collides with the all-zero patch token — spec §5 F6).
+# doc_masking (the v1 stream's EOS=0 collides with the all-zero patch token).
 #
 # Launch: tools/run_train.sh --config configs/ladder-a1-nca.yaml \
 #   --global_batch_tokens 2097152 --data_path <nca_3b_seed17_train.bin> \
@@ -36,12 +36,10 @@ doc_masking: false
 seed: 17
 
 compile: true
-# auto (= FA2, else SDPA) as the 3B NCA phase ran it. History: chosen when fa4 +
-# compile still needed the doc_masking varlen path (ledger B4, the 2026-09-28
-# startup crash); B4 is fixed (455cf47 kotodama::fa4_dense, parity PASS), so fa4
-# would now run here (~+20% tok/s). Kept on FA2 for 3B faithfulness (and FA2's
-# deterministic backward, cf. B3) and so A1 / A1' stay a matched pair — change it
-# only for a new arm, never between A1 and A1'.
+# auto (= FA2, else SDPA) as the 3B NCA phase ran it. fa4 runs here too (the
+# dense kotodama::fa4_dense path, ~+20% tok/s), but FA2 is kept for 3B
+# faithfulness (and FA2's deterministic backward) and so A1 / A1' stay a matched
+# pair — change it only for a new arm, never between A1 and A1'.
 attn_impl: auto
 use_liger: true
 fp8: false
@@ -50,11 +48,11 @@ muon_distributed: true
 prefetch_batches: 2
 
 adamw_no_decay_norms: true
-# fp32 Muon masters + momentum (2026-09-28 audit): without them bf16 Muon weight
-# decay is a no-op and late/anneal updates round away (A0-old: 5.5% of q_proj frozen
-# through the anneal).
+# fp32 Muon masters + momentum: without them bf16 Muon weight decay is a no-op
+# and late/anneal updates round away (a bf16-master 1B run left 5.5% of q_proj
+# frozen through the anneal).
 muon_fp32_master: true
-# fp32 RoPE tables (audit A9; minor: ~10% less shift error).
+# fp32 RoPE tables (minor: ~10% less shift error).
 rope_fp32: true
 
 # Dense formation view of the NCA phase itself (13 points) + the final full.

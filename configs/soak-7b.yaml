@@ -1,17 +1,17 @@
-# Tier-3 proxy soak — 7B, ~2.4B tokens on the real 3B-mix data (SPEC-7B §5.3).
+# Tier-3 proxy soak — 7B, ~2.4B tokens on the real 3B-mix data.
 # Purpose: slow loss-curve divergence + geometric drift (RankMe, stable rank,
 # routing entropy/alphas) for Tier-C candidates vs the default stack.
 # Run as a PAIR (baseline + candidate) with identical seed/config; overlay
 # loss + geometry. Random-data canaries cannot see compounding format bias —
 # this is the gate that promotes a number-format change to production.
-# Usage (see SPEC Window-3):
+# Usage:
 #   baseline:  tools/run_train.sh --config configs/soak-7b.yaml \
-#                --checkpoint_dir /models/kotodama-data/soak-7b/baseline
+#                --checkpoint_dir ${KOTODAMA_DATA_ROOT}/soak-7b/baseline
 #   candidate: KOTODAMA_VENV=<venv with torchao cu128 build> \
 #              KOTODAMA_P1_BWD_TORCH=1 tools/run_train.sh \
 #                --config configs/soak-7b.yaml --attn_impl fa4 \
 #                --fp8_recipe mxfp8 \
-#                --checkpoint_dir /models/kotodama-data/soak-7b/candidate
+#                --checkpoint_dir ${KOTODAMA_DATA_ROOT}/soak-7b/candidate
 
 extends: base/7b-throughput.yaml
 
@@ -21,14 +21,14 @@ total_steps: 1150
 muon_distributed: true
 
 # Real data — the 3B training mix (same tokenizer/vocab)
-data_path: /models/kotodama-data/train.bin
+data_path: ${KOTODAMA_DATA_ROOT}/train.bin
 
 # Terminal checkpoint only (step 1149) for optional eval-BPB anchoring;
 # checkpoint_dir MUST be overridden per arm (never on /).
-checkpoint_dir: /models/kotodama-data/soak-7b/OVERRIDE-ME
+checkpoint_dir: ${KOTODAMA_DATA_ROOT}/soak-7b/OVERRIDE-ME
 save_every: 1149
 
-# Selective AC via Inductor budget (Window-2 default)
+# Selective AC via Inductor budget (the 7B default)
 activation_checkpointing: false
 ac_budget: 0.7
 

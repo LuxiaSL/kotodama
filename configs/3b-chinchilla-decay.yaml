@@ -10,7 +10,7 @@
 # Launch:
 #   scheduler submit "tools/run_train.sh --config configs/3b-chinchilla-decay.yaml" \
 #     --name 3b-chinchilla-decay --gpus 8 --node gpu-host \
-#     --env WANDB_API_KEY=... --env WANDB_ENTITY=aethera --env HF_TOKEN=...
+#     --env WANDB_API_KEY=... --env WANDB_ENTITY=<entity> --env HF_TOKEN=...
 
 # Shape, optimizer, optimization profile, async ckpt, logging — identical to
 # the main run (3b-language.yaml), via the shared 3B lineage base.
@@ -27,15 +27,15 @@ attn_res_boundaries: "0,1,3,7,15,19,24"
 
 # Warm resume from the Chinchilla-point checkpoint
 # UPDATE this path to the actual step number when ready:
-resume_warm: /models/kotodama-data/3b-chinchilla-base-step30600.pt.zst
+resume_warm: ${KOTODAMA_DATA_ROOT}/3b-chinchilla-base-step30600.pt.zst
 
 # Data — same as main run
-data_path: /models/kotodama-data/train.bin
+data_path: ${KOTODAMA_DATA_ROOT}/train.bin
 doc_masking: true
 seed: 42
 
 # Checkpointing — separate dir so it doesn't interfere with the main run
-checkpoint_dir: /models/kotodama-data/checkpoints/3b-chinchilla-decay
+checkpoint_dir: ${KOTODAMA_DATA_ROOT}/checkpoints/3b-chinchilla-decay
 save_every: 500
 keep_checkpoints: 10
 

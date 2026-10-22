@@ -1,8 +1,8 @@
 # 1B formation ladder — arm A2d, phase 1 of 2: the A2*-NCA recipe (0.75B tokens, seed 17,
 # warmup 60, AttnRes co-trained) on the DYADIC-v3 NCA corpus instead of NCA-v1 — isolates the
-# NCA corpus (spec §5 v3: token-level mix, episode separators + reserved EOS, overwrite
+# NCA corpus (v3: token-level mix, episode separators + reserved EOS, overwrite
 # semantics, mixed geometries). The v3 stream reserves EOS, so doc_masking is safe here
-# (the v1 stream's EOS=0 collides with the all-zero patch token — spec §5 F6).
+# (the v1 stream's EOS=0 collides with the all-zero patch token).
 # Phase 2 = configs/ladder-a2d.yaml (resume_nca = this run's final).
 #
 # Launch: tools/run_train.sh --config configs/ladder-a2d-nca.yaml \

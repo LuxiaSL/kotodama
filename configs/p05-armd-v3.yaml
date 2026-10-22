@@ -1,9 +1,8 @@
-# P0.5 — proxy re-run of ARM-D (dyadic NCA) on the v3 generator.
-# SPEC-1B-FORMATION-LADDER §2 P0.5 / §5; answers pre-registered L-P1: does the
+# Proxy re-run of ARM-D (dyadic NCA) on the v3 generator. Question: does the
 # ledger read leave the anti-copy floor (acc > chance 0.100 at >=1 checkpoint;
-# the Aug ARM-D-lite arms sat at 0.068-0.070)?
+# the ARM-D-lite arms on the earlier writer sat at 0.068-0.070)?
 #
-# Recipe = the Aug ARM-D-lite config (p5-ddv1.yaml, frozen snapshot) with ONLY
+# Recipe = the ARM-D-lite config (p5-ddv1.yaml, not in this repo) with ONLY
 # the v3 deltas: v3 bin, doc_masking on (v3 reserves EOS=0 and writes it
 # between every episode), dense checkpoints (the formation curve is the
 # product), a 6-GPU batch geometry. Everything else is copied, not tuned.
@@ -24,21 +23,21 @@ sequence_length: 4096
 # ASSUMPTION (batch): p5-ddv1.yaml ran 131,072 tok/step (4 GPU x mb 4 x
 # accum 2). 131,072 is not reachable on 6 ranks (32 seqs / 6), and train.py
 # silently FLOORS grad_accum, so this is 6 GPU x mb 6 x accum 1 = 147,456
-# tok/step (+12.5% vs Aug). Valid for EXACTLY 6 ranks: on 8 ranks the floor
+# tok/step (+12.5% vs p5-ddv1). Valid for EXACTLY 6 ranks: on 8 ranks the floor
 # gives 196,608/step. 5,086 steps total.
 micro_batch_size: 6
 global_batch_tokens: 147456
 
 total_tokens: 750_000_000
 # ASSUMPTION (schedule): copied verbatim from p5-ddv1.yaml (200 steps =
-# 29.5M tokens at this batch; Aug was 26.2M). Not re-tuned.
+# 29.5M tokens at this batch; p5-ddv1 was 26.2M). Not re-tuned.
 warmup_steps: 200
 decay_start_pct: 0.90
 decay_type: cosine
 
 # Data: v3 writer output (nca_v3.bin after --finalize). EOS=0 separates
 # episodes; dataset.py's eos_id default is 0 = the writer's EOS_ID.
-data_path: /models/kotodama-data/p05-dyadic-v3/nca_v3.bin
+data_path: ${KOTODAMA_DATA_ROOT}/p05-dyadic-v3/nca_v3.bin
 doc_masking: true
 seed: 42
 
@@ -52,7 +51,7 @@ activation_checkpointing: false
 # Checkpoints: every 340 steps = 50.1M tokens -> 14 periodic + the final
 # (step 5085) = 15 points on the formation curve. 340 is chosen so the
 # final save never lands on a periodic step. Keep all of them.
-checkpoint_dir: /models/kotodama-data/p05/armd-v3
+checkpoint_dir: ${KOTODAMA_DATA_ROOT}/p05/armd-v3
 save_every: 340
 keep_checkpoints: 100
 async_checkpoint: true

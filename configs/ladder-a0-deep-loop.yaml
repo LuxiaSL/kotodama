@@ -1,4 +1,4 @@
-# 1B formation ladder — T32-L LOOPED DEPTH arm: the T25 deep arm (d1536, 52 effective layers, DD-3B boundaries
+# 1B formation ladder — LOOPED DEPTH arm: the deep arm (ladder-a0-deep.yaml: d1536, 52 effective layers, DD-3B boundaries
 # scaled 52/28) with the middle 12 layers' attention + FFN weights reused 3x (8 prelude + 12x3 core + 8 coda = 28
 # unique layers, ~0.80B params). Same compute and serial depth as ladder-a0-deep; fewer unique parameters.
 # Per-position pre-norms and AttnRes routing stay unique. Launch exactly as ladder-a0-deep.yaml.

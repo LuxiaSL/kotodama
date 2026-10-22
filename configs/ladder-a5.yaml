@@ -1,5 +1,5 @@
 # 1B formation ladder — arm A5: A0 recipe with UNIFORM AttnRes blocks — same block
-# COUNT as DD-3B (7 boundaries), only the placement differs (ruling 2026-09-28).
+# COUNT as DD-3B (7 boundaries), only the placement differs.
 # Tests whether data-driven boundaries matter vs Kimi-K3-style uniform blocks, and
 # whether the block-boundary attention-entropy sawtooth moves with the boundaries.
 

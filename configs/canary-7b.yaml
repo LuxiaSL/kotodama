@@ -1,7 +1,7 @@
 # Canary throughput benchmark — 7B (8b dims @ 49K vocab = ~7.18B params)
-# Phase-1 baseline for the 7B throughput program (SPEC-7B-THROUGHPUT-2026-07-03).
+# Baseline for the 7B throughput configs.
 # AttnRes boundaries: 8 uniform blocks as a THROUGHPUT PLACEHOLDER only —
-# production boundaries will be re-derived from 7B geometry (DD-3B pattern).
+# not fit to 7B geometry (production boundaries come from a geometry fit).
 # Usage: torchrun --nproc_per_node=8 -m kotodama.training.train --config configs/canary-7b.yaml
 
 # 7B shape (mb 4), production optimizer recipe + optimization profile
@@ -11,9 +11,9 @@ extends: base/7b-throughput.yaml
 # 150 steps: ~50 warmup/compile, ~100 steady-state
 total_steps: 150
 
-# muon_distributed PROMOTED 2026-07-05: bitwise gloo proof (Phase 0) +
-# loss-overlay gate vs same-seed baseline (max |dloss| 0.0012 post-step-50,
-# no trend — SPEC Window-2). +3.5-4.5% measured.
+# muon_distributed: bitwise-equal to the single-rank update on gloo, and a
+# same-seed loss overlay stays within |dloss| 0.0012 past step 50 with no
+# trend; +3.5-4.5% throughput.
 muon_distributed: true
 
 # Data — random with doc masking so the varlen FA2 path (production) is exercised

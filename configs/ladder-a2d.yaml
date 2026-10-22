@@ -1,5 +1,6 @@
 # 1B formation ladder — arm A2d, phase 2 of 2: language from the dyadic-v3 NCA base, with the
-# handoff routing reset (= the F4 fix) — so A2d vs F4 differs only in the NCA corpus.
+# handoff routing reset (--reset_routing_layers) — so A2d differs from a routing-reset
+# NCA-v1 arm only in the NCA corpus.
 #
 # Launch: tools/run_train.sh --config configs/ladder-a2d.yaml \
 #   --global_batch_tokens 2097152 --data_path <train.bin> --checkpoint_dir <ladder>/a2d \

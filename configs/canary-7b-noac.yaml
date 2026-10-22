@@ -1,6 +1,6 @@
 # 7B ceiling probe — NO activation checkpointing, MB=2.
 # Measures the zero-recompute throughput ceiling: per-sublayer AC costs ~+33%
-# FLOPs; this run bounds what selective AC (spec B1) can recover.
+# FLOPs; this run bounds what selective AC (--ac_budget) can recover.
 # Usage: torchrun --nproc_per_node=8 -m kotodama.training.train --config configs/canary-7b-noac.yaml
 
 extends: base/7b-throughput.yaml

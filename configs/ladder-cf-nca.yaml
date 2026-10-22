@@ -1,5 +1,5 @@
 # 1B DD boundary re-fit — leg B, phase 1: a SAFE NCA dose without AttnRes. 0.75B tokens =
-# the held-out-unseen-rule loss minimum measured on A1-NCA (2026-10-01; past it the model
+# the held-out-unseen-rule loss minimum measured on A1-NCA (past it the model
 # specializes to training rules). Everything else = the A1-NCA recipe.
 # Phase 2 = configs/ladder-cf-nca-lang.yaml (resume_nca = this run's final).
 #

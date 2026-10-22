@@ -1837,8 +1837,35 @@ def _load_yaml_config(path: str | os.PathLike[str]) -> dict[str, Any]:
     override all parents. The ``extends`` key is consumed here and never
     reaches argparse. Raises ConfigError on cycles, missing parents, or a
     malformed file.
+
+    After merging, environment variables in string values (and in strings
+    inside list values) are expanded with ``os.path.expandvars``, so a config
+    can say ``data_path: ${KOTODAMA_DATA_ROOT}/train.bin`` and keep machine
+    paths in the site profile. A reference to an unset variable is left as
+    written (expandvars semantics) and logged as a warning, so the run then
+    fails on a path that names the missing variable.
     """
-    return _resolve_yaml_config(Path(path).resolve(), chain=())
+    merged = _resolve_yaml_config(Path(path).resolve(), chain=())
+    return {k: _expand_env(k, v, path) for k, v in merged.items()}
+
+
+_ENV_REF = re.compile(r"\$(\w+|\{[^}]*\})")
+
+
+def _expand_env(key: str, value: Any, path: str | os.PathLike[str]) -> Any:
+    """``value`` with environment variables expanded in every string it holds."""
+    if isinstance(value, list):
+        return [_expand_env(key, v, path) for v in value]
+    if not isinstance(value, str):
+        return value
+    expanded = os.path.expandvars(value)
+    unresolved = _ENV_REF.findall(expanded)
+    if unresolved:
+        logger.warning(
+            "Config %s: %s=%r references unset environment variable(s): %s",
+            path, key, value, ", ".join(sorted({u.strip("{}") for u in unresolved})),
+        )
+    return expanded
 
 
 def _resolve_yaml_config(path: Path, chain: tuple[Path, ...]) -> dict[str, Any]:

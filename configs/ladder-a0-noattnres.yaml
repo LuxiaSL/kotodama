@@ -1,5 +1,5 @@
-# 1B formation ladder — T32 AttnRes ablation arm (lab SPEC-T32-attnres-ablation-2026-10-18): 28L, NO AttnRes (plain residual stream) — the missing baseline.
-# Short protocol as T29/T25 (4B tokens, init 42 / data 42). Launch exactly as ladder-a0.yaml with this config.
+# 1B formation ladder — AttnRes ablation arm: 28L, NO AttnRes (plain residual stream) — the no-AttnRes baseline.
+# Short protocol (4B tokens, init seed 42 / data seed 42, set on the CLI). Launch exactly as ladder-a0.yaml with this config.
 
 extends: ladder-a0.yaml
 
