@@ -1,15 +1,15 @@
 """FA4 dense custom op (kotodama::fa4_dense) parity + compile check. GPU (SM100).
 
   (a) op fwd+bwd vs the raw flash_attn.cute.flash_attn_func(q, k, v, causal=True)
-      the dense path used to call — same kernel + args, so fwd should be bitwise;
+      the op wraps — same kernel + args, so fwd should be bitwise;
       grads bitwise or at the raw-vs-raw noise floor (the bwd dQ accumulates
       with atomics). Also vs torch SDPA (enable_gqa) as a semantics check.
   (b) torch.compile(model-like attention block using the op, fullgraph=True)
       vs the same block eager — loss + every grad finite and within tolerance.
-      (Values, not just execution: the 2026-07-09 NaN canary passed a run-only
-      compile check.)
+      (Values, not just execution: a run-only compile check passes on a
+      silently-NaN traced backward.)
   (c) LuxiaBaseModel(attn_impl='fa4', no doc masking) compiled vs eager — the
-      exact combination train.py used to refuse.
+      combination train.py runs for fa4 without doc masking.
 
 Default shape = the 1B ladder attention: hidden 2048, 16 q / 8 kv heads,
 head_dim 128, seq 4096, batch 2 (or --preset NAME to take it from presets.py).

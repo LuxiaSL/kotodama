@@ -6,7 +6,7 @@ with the on-GPU sampler, eager or compiled. Optionally profiles a window.
 
 Usage:
     KOTODAMA_NO_TRITON_ATTNRES=1 CUDA_VISIBLE_DEVICES=0 python scripts/benchmark/bench_engine.py \
-        --checkpoint /models/.../step_00000358.pt --compile --output outputs/profiles/engine_v1.json
+        --checkpoint <checkpoint.pt> --compile --output outputs/profiles/engine_v1.json
 """
 
 from __future__ import annotations

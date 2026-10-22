@@ -1,10 +1,9 @@
 """The geo-monitor probe draw must not advance the training stream.
 
-train.py builds the probe from the shared dataset on rank 0 only; before
-2026-09-27 that skipped rank 0 ahead of its peers, and resuming from the
-(rank-0) data position shifted every rank (the 3B's offset-1920 quirk).
-The fix snapshots dataset state around the draw — this pins the dataset
-behaviour that fix relies on."""
+train.py builds the probe from the shared dataset on rank 0 only; an
+unguarded draw skips rank 0 ahead of its peers, and resuming from the
+(rank-0) data position then shifts every rank. train.py snapshots dataset
+state around the draw — this pins the dataset behaviour that relies on."""
 from __future__ import annotations
 
 import numpy as np

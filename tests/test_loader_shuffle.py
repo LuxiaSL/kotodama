@@ -1,9 +1,9 @@
 """The loader must not undo the assembler's shuffle.
 
-curation/assemble_shuffle.py writes input chunk i to position perm[i] with
-perm = RandomState(seed).permutation(N). A single-rank TokenizedDataset that shuffled
-arange(N) with RandomState(seed + epoch) reproduced perm exactly at epoch 0 and read the
-corpus back in source order (1-GPU runs then memorized their stream; 2026-09-28)."""
+The corpus assembler writes input chunk i to position perm[i] with
+perm = RandomState(seed).permutation(N). A single-rank TokenizedDataset that shuffles
+arange(N) with RandomState(seed + epoch) reproduces perm exactly at epoch 0 and reads the
+corpus back in source order (a 1-GPU run then trains on an unshuffled stream)."""
 from __future__ import annotations
 
 import numpy as np

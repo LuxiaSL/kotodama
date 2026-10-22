@@ -1,6 +1,6 @@
 """MXFP8Linear smoke: numerics vs bf16 reference, compile check, micro-bench.
 
-Tier-C gate stage 1 (SPEC-7B §5.1) for the C2 lever. Tolerances are
+Kernel-level smoke for MXFP8 linears. Tolerances are
 DOCUMENTED expectations for an 8-bit format, not exactness claims: fwd
 output and input grads should land within a few percent relative error of
 bf16 on well-conditioned random inputs; weight grads slightly looser.
@@ -95,7 +95,7 @@ def main() -> int:
     def f(x):
         return (mx(x) * r_c).mean()
 
-    # VALUES under compile, not just execution (fa4 NaN lesson 2026-07-09):
+    # VALUES under compile, not just execution (a run-only check passes on NaN grads):
     # compiled loss/grads must match eager-MXFP8 and be finite.
     res = {}
     for mode, fn in [("eager", f), ("compiled", torch.compile(f))]:

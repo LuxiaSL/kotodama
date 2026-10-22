@@ -1,6 +1,6 @@
-"""CPU faithfulness gates for kotodama.model.capture — the G1/G2 analogs at raw
-level: the cached walker is bit-exact against the uncached one, prefill+continue
-matches the full forward, and the replay contract has the banking shapes."""
+"""CPU faithfulness gates for kotodama.model.capture at raw level: the cached walker
+is bit-exact against the uncached one, prefill+continue matches the full forward, a
+truncated prefix changes the reading, and the replay contract has the banking shapes."""
 
 from __future__ import annotations
 
@@ -112,7 +112,7 @@ def test_eager_prefill_plus_continuation_is_pure_windowing(model, ids):
 
 def test_parity_prefill_matches_eager_prefill_exactly(model, ids):
     """The production prefill (eager_nocapture) must put the cache on the
-    SAME fp trajectory as the eager capture path — this is G1's substrate.
+    SAME fp trajectory as the eager capture path — the substrate of the cached == full gate.
     Also asserts it banks nothing (that is its point: parity without the
     O(S²) memory)."""
     P = 25
@@ -154,14 +154,14 @@ def test_truncated_prefix_changes_the_reading(model, ids):
     full_logits, _, _ = cached_forward(model, ids, past=None, light=False)
     _, _, short = cached_forward(
         model, ids[:, P - 8 : P], past=None, light=False
-    )  # 8 tokens rotated at positions 0..7 — the G2 corruption
+    )  # 8 tokens rotated at positions 0..7 — a corrupted prefix
     cont_logits, _, _ = cached_forward(
         model, ids[:, P:], past=short, position_offset=P, light=False
     )
     d = (cont_logits.float() - full_logits[:, P:].float()).abs().max().item()
     assert d > 1e-2, (
         f"truncated prefix moved logits by only {d} — the cached path is not "
-        "actually reading its cache, which is the failure G2 exists to catch"
+        "actually reading its cache, which is the failure this gate exists to catch"
     )
 
 
@@ -199,7 +199,7 @@ def test_replay_functions_share_the_anamnesis_contract(model, ids):
         assert tags[-1] == "final"
         assert raw.attn_res_routing[-1][2].shape[0] == t
 
-    # G1 at raw level: eager prefill makes cached == full, field by field
+    # cached == full at raw level: eager prefill makes cached == full, field by field
     import numpy as np
 
     for i in range(t):

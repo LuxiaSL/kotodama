@@ -53,7 +53,7 @@ def test_dead_router_is_counted():
     m = _model()
     _backward(m)
     base = T._layer_health_metrics(m)["router/dead_sites"]
-    m.layers[2].mlp_res_query.grad.zero_()   # the E5 signature: exactly-zero gradient
+    m.layers[2].mlp_res_query.grad.zero_()   # the dead-router signature: exactly-zero gradient
     h = T._layer_health_metrics(m)
     assert h["router/layer_2/mlp/grad_norm"] == 0.0
     assert h["router/dead_sites"] == base + 1

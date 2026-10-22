@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Spike resilience read from heimdall telemetry: does rank recover after loss spikes?
 
-The 3B archaeology's gate: early loss spikes were followed by geo/rankme_last climbing
-back to its pre-spike level; from ~139K steps on it stopped recovering (the brittle
-era). For each spike in train/loss (or train/grad_norm) — a point more than --k robust
+The read: in a resilient run, a loss spike is followed by geo/rankme_last climbing
+back to its pre-spike level; a brittle run stops recovering (the shipped 3B did from
+~139K steps on). For each spike in train/loss (or train/grad_norm) — a point more than --k robust
 sigmas above the rolling median of the previous --window points — report the last
 RankMe probe before it, the lowest probe within --horizon steps after it, and the step
 at which RankMe first returns within --tol of the pre-spike value (None = never).

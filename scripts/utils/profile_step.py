@@ -6,13 +6,13 @@ torch.profiler. Outputs a breakdown of time spent in each operation.
 
 Usage:
     # Profile Muon on 8 GPUs
-    torchrun --nproc_per_node=8 scripts/profile_step.py --muon
+    torchrun --nproc_per_node=8 scripts/utils/profile_step.py --muon
 
     # Profile AdamW for comparison
-    torchrun --nproc_per_node=8 scripts/profile_step.py --adamw
+    torchrun --nproc_per_node=8 scripts/utils/profile_step.py --adamw
 
     # Profile Muon with 3 NS iterations
-    torchrun --nproc_per_node=8 scripts/profile_step.py --muon --ns_iter 3
+    torchrun --nproc_per_node=8 scripts/utils/profile_step.py --muon --ns_iter 3
 """
 
 import os

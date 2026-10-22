@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Validate the engine's Gumbel-max sampler against serve.py's softmax+multinomial.
+"""Validate the engine's Gumbel-max sampler against the server's softmax+multinomial.
 
 Model-free, seconds to run. Two gates:
   1. EXACT: the repetition-penalty + temperature transform matches
-     serve.py's sample_next_token math bitwise on fp32 logits.
+     the server's sample_next_token math on fp32 logits to a few ulps.
   2. DISTRIBUTIONAL: empirical token frequencies from Gumbel-max draws match
      multinomial draws from softmax of the SAME transformed logits
      (symmetric KL + max abs probability gap on union of top-100 tokens).
@@ -32,7 +32,7 @@ RP = 1.2
 
 
 def serve_transform(logits: torch.Tensor, presence: torch.Tensor, rp: float) -> torch.Tensor:
-    """serve.py sample_next_token penalty math (vectorized, fp32)."""
+    """the server's sample_next_token penalty math (vectorized, fp32)."""
     out = logits.clone()
     pen = torch.where(out > 0, out / rp, out * rp)
     return torch.where(presence, pen, out)
@@ -50,7 +50,7 @@ def main() -> None:
     presence = torch.zeros(VOCAB, dtype=torch.bool, device=device)
     presence[torch.randint(0, VOCAB, (300,), generator=g, device=device)] = True
 
-    # Gate 1: penalty math equality. Not bitwise: serve.py divides by a
+    # Gate 1: penalty math equality. Not bitwise: the server divides by a
     # python float (scalar routed via double), the engine by an fp32 0-dim
     # buffer — measured difference is exactly 1 ulp of fp32 (~5e-7 abs) on a
     # subset of penalized tokens. Gate at a few ulps.

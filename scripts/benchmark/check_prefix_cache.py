@@ -16,7 +16,7 @@ no error anywhere. Three parts:
 Usage:
     python scripts/benchmark/check_prefix_cache.py --unit-only          # anywhere
     CUDA_VISIBLE_DEVICES=0 python scripts/benchmark/check_prefix_cache.py \
-        --checkpoint /models/.../3b-language-FINAL-step195311.pt [--compile] [--seeds 5]
+        --checkpoint <checkpoint.pt> [--compile] [--seeds 5]
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ GATE_GREEDY_AGREE = 0.95       # aggregate free-greedy agreement (near-tie flips
 GATE_MAX_DELTA_SMALL = 1e-3
 # Tiny fp32 model, comparisons where the reused prefix contains STEP-written
 # KV rows: the decode step is a different kernel path than batch prefill
-# (round-1 equivalence class = bf16 noise floor, not exactness), and a
+# (its equivalence class is the bf16 noise floor, not exactness), and a
 # random-init model amplifies the mix chaotically through routing. This gate
 # only needs to catch gross breakage — a wrong rope offset / mask / position
 # produces O(1)+ errors, measured backend-mix noise here is ~2e-2.

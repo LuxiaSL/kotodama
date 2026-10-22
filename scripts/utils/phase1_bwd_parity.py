@@ -1,4 +1,4 @@
-"""Parity + micro-bench for the phase-1 backward v2 kernel (7B throughput program).
+"""Parity + micro-bench for the phase-1 backward v2 kernel (7B training shapes).
 
 Same gate structure as phase2_bwd_parity.py: v1~v2 tolerance (bitwise reported),
 v2 determinism, fp64 autograd reference, end-to-end dispatch check, CUDA-event
@@ -109,7 +109,7 @@ def main() -> int:
         e = rel_err(vt[0], v1[0])
         all_ok &= check("grad_blocks torch~v1", e < 2e-2, f"maxrel {e:.2e}")
         e = rel_err(vt[1], v1[1])
-        # 5e-3: bf16 GEMM-output rounding on the dots einsum (Tier-C envelope;
+        # 5e-3: bf16 GEMM-output rounding on the dots einsum (a loose envelope;
         # the canary loss overlay is the binding gate for this impl)
         all_ok &= check("grad_queries torch~v1", e < 5e-3, f"maxrel {e:.2e}")
         all_ok &= check("torch deterministic (blocks)", torch.equal(vt[0], vtb[0]))

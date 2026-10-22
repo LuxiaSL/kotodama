@@ -2,7 +2,7 @@
 Tokenize a HuggingFace dataset into a flat binary file for pretraining.
 
 Produces a flat file of uint16 token IDs (2 bytes per token) that can be
-memory-mapped by ``src.data.dataset.TokenizedDataset``.
+memory-mapped by ``kotodama.data.dataset.TokenizedDataset``.
 
 Uses batch tokenization for speed — the HuggingFace tokenizer's internal
 Rust implementation already parallelizes across CPU cores when given
@@ -11,7 +11,7 @@ batches of text.
 Usage::
 
     # Fast batch tokenization (~6B tokens)
-    python scripts/tokenize_data.py \
+    python scripts/utils/tokenize_data.py \
         --dataset HuggingFaceFW/fineweb-edu \
         --name sample-10BT \
         --split train \
@@ -20,7 +20,7 @@ Usage::
         --batch_size 5000
 
     # Verify the output
-    python scripts/tokenize_data.py --verify data/fineweb_edu_6b.bin
+    python scripts/utils/tokenize_data.py --verify data/fineweb_edu_6b.bin
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark harness for luxia-base serve.py.
+"""Benchmark harness for the kotodama inference server (kotodama.serve.server).
 
 Runs a fixed prompt pack against the server across decode modes and generation
 lengths, capturing latency, throughput, memory, and token-level reproducibility.
@@ -408,7 +408,7 @@ def format_summary(benchmark: dict[str, Any]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark luxia-base serve.py")
+    parser = argparse.ArgumentParser(description="Benchmark the kotodama inference server")
     parser.add_argument("--url", type=str, default="http://localhost:2222")
     parser.add_argument("--prompt-pack", type=Path, default=DEFAULT_PROMPT_PACK)
     parser.add_argument("--prompt-lengths", type=int, nargs="+", default=PROMPT_LENGTHS)

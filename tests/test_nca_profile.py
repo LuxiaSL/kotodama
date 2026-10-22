@@ -73,7 +73,7 @@ def test_profile_refuses_attnres_model():
         npf.extract_profile(_model(True), torch.randint(0, 10002, (2, 16)))
 
 
-# ── 2026-10-01 re-fit additions ───────────────────────────────────────────────
+# ── fit_boundaries (language re-fit) ──────────────────────────────────────────
 
 import argparse  # noqa: E402
 

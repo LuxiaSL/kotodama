@@ -1,4 +1,4 @@
-"""Rider grid (P0.6 battery): golden generation vs the frozen instrument, aggregate
+"""Rider grid (the p06 rider battery): golden generation vs the frozen instrument, aggregate
 tables on a synthetic grid, and /logprobs payloads against a mocked server."""
 
 from __future__ import annotations

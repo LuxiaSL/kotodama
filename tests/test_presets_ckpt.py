@@ -10,8 +10,8 @@ import torch
 from kotodama import ckpt, presets
 from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
 
-# The values the three pre-2026-09 tables (train.py MODEL_CONFIGS, serve.py
-# MODEL_CONFIGS, configs/model.yaml) all held. A change here is a model change.
+# The pinned shape values of these presets (existing checkpoints load against them).
+# A change here is a model change.
 HISTORICAL = {
     "3b": (3072, 28, 24, 8, 128, 8192),
     "7b": (4096, 32, 32, 8, 128, 14336),
@@ -130,7 +130,7 @@ def test_decompress_cached_does_not_collide_on_basename(tmp_path, monkeypatch):
 
 
 def test_1b_deep_matches_1b_budget():
-    """T25 depth arm: same parameter budget as the 1b (within 1%), ~1.86x the depth, valid AttnRes boundaries."""
+    """1b-deep: same parameter budget as the 1b (within 1%), ~1.86x the depth, valid AttnRes boundaries."""
     deep, base = presets.shape("1b-deep"), presets.shape("1b")
     assert deep["num_layers"] == 52 and base["num_layers"] == 28
     assert deep["hidden_size"] == deep["num_attention_heads"] * deep["head_dim"]
@@ -147,7 +147,7 @@ def test_1b_deep_matches_1b_budget():
 
 
 def test_serve_knows_1b_deep():
-    """The server can load T25 checkpoints: its 1b-deep config is the preset shape + the preset boundaries."""
+    """The server can load 1b-deep checkpoints: its 1b-deep config is the preset shape + the preset boundaries."""
     from kotodama.serve import server
     cfg = server.MODEL_CONFIGS["1b-deep"]
     assert all(cfg[k] == v for k, v in presets.shape("1b-deep").items())

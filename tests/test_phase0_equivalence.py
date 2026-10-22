@@ -1,6 +1,6 @@
 """Phase-0 throughput-patch equivalence tests (CPU, no GPU required).
 
-Every optimization in the 7B throughput program's Tier A must be exact-math.
+Every throughput patch tested here must be exact-math.
 These tests verify bitwise/allclose equivalence of:
   1. RoPE pre-gather (ndim==3 path) vs per-layer gather
   2. Vectorized position_ids vs the reference per-doc loop
@@ -8,7 +8,7 @@ These tests verify bitwise/allclose equivalence of:
   4. Muon distributed flag — no-op without an initialized process group
   5. _PrefetchIterator — identical batch stream + exact resume state
 
-Run: python tests/test_phase0_equivalence.py   (from pretraining/)
+Run: python tests/test_phase0_equivalence.py   (from the repo root)
 """
 
 from __future__ import annotations
@@ -137,7 +137,7 @@ def test_freeze_unused_attn_res() -> None:
             assert not missing, f"params without grads (breaks DDP static mode): {missing}"
         else:
             # Unfrozen: the unused params exist, require grad, and get none —
-            # this is exactly why find_unused_parameters was needed before
+            # without the freeze, DDP needs find_unused_parameters
             assert first.attn_res_query.requires_grad
             assert first.attn_res_query.grad is None
 
@@ -250,7 +250,7 @@ def test_doc_masked_forward_smoke() -> None:
     out["loss"].backward()
     assert torch.isfinite(out["loss"]), "non-finite loss"
 
-    # Non-AttnRes + AC + doc masking: previously dropped position_ids/cu_seqlens
+    # Non-AttnRes + AC + doc masking: position_ids/cu_seqlens must reach the checkpointed layers
     torch.manual_seed(0)
     model2 = LuxiaBaseModel(_smoke_config(attn_res=False, activation_checkpointing=True))
     model2.train()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SDPA backend matrix: isolate cuDNN plan-selection overhead.
 
-Tests decode with different SDP backends to determine whether the 300ms/tok
+Tests decode with different SDP backends to determine whether a slow (~300ms/tok)
 tail is cuDNN-specific. Also tests shape-cache priming and randomized order.
 
 Usage:

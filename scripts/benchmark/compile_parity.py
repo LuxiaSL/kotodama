@@ -79,7 +79,7 @@ def compare_logits(
 
     # Compiled prefill (same model, just to get matching KV cache)
     # Actually, we want to use eager prefill + compiled decode,
-    # matching the serve.py strategy
+    # matching the server's strategy
     compiled_kv = eager_kv  # same KV cache from eager prefill
 
     results = []

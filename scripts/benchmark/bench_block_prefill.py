@@ -15,7 +15,7 @@
 
 Usage (gpu-host):
     CUDA_VISIBLE_DEVICES=0 bash tools/run_py.sh scripts/benchmark/bench_block_prefill.py \
-        --checkpoint /models/kotodama-data/tmp/kotodama_checkpoints/3b-language-FINAL-step195311.pt
+        --checkpoint <checkpoint.pt>
 """
 
 from __future__ import annotations
@@ -40,10 +40,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from scripts.benchmark.decode_parity import load_model  # noqa: E402
 from kotodama.model.decode_engine import DecodeEngine  # noqa: E402
 
-NOISE_CEILING = 0.72     # round-1 parity gate (cross-kernel logit noise)
+NOISE_CEILING = 0.72     # decode parity gate (cross-kernel logit noise; parity_noise_floor.py)
 # KV gate is SELF-CALIBRATING against a same-run control, because this trunk
 # amplifies ANY kernel-schedule perturbation into multi-unit deep-layer KV
-# deltas (measured 2026-07-05: the two ESTABLISHED references — llama with
+# deltas (the two ESTABLISHED references — llama with
 # Triton vs eager routing — differ from each other by worst-rel up to 9.2 at
 # T=16, MORE than blocks differ from either; logit maxΔ R1-R2 0.297 vs
 # BLK-ref 0.14-0.26, all under the 0.72 gate). Fixed elementwise tolerances
@@ -54,7 +54,7 @@ NOISE_CEILING = 0.72     # round-1 parity gate (cross-kernel logit noise)
 # The KV screen is a LOOSE structural detector only (unwritten rows / rope
 # offsets = 10-100x control; measured multi-chunk dust compounding tops out
 # at ~3.7x control at T=512 because chunk N amplifies chunk N-1's dust).
-# The TIGHT gate is Gate 5: teacher-forced logit parity — the round-1
+# The TIGHT gate is Gate 5: teacher-forced logit parity — the decode_parity
 # standard, position-by-position, at the 0.72 noise ceiling.
 KV_CONTROL_FACTOR = 6.0
 KV_REL_FLOOR = 0.02      # mean-statistic floor: dust means ~1e-3, structural ~1
@@ -90,7 +90,7 @@ def snapshot_kv(engine: DecodeEngine, upto: int) -> list[torch.Tensor]:
 def rel_worst(a: list[torch.Tensor], b: list[torch.Tensor]) -> float:
     """Worst PER-POSITION MEAN relative delta across layers/k/v.
 
-    The house gate-design lesson (round-2 prefix cache): never gate the
+    Never gate the
     global max — the extreme tail is chaotic under KV perturbation and its
     max-statistic grows with sample count. A structural bug (unwritten row,
     rope offset) makes an ENTIRE position's row wrong -> per-position mean
@@ -269,7 +269,7 @@ def gate_extend_handoff(engine: DecodeEngine, device: torch.device) -> bool:
 def gate_forced_trace(engine: DecodeEngine, device: torch.device) -> bool:
     """Teacher-forced logit parity after block prefill vs reference prefill.
 
-    The round-1 methodology, position-by-position: force the SAME 32 tokens
+    The decode_parity methodology, position-by-position: force the SAME 32 tokens
     through the compiled decode step from each prefill's cache; per-step
     max|Δlogit| must stay under the 0.72 cross-kernel noise ceiling. A
     structural defect in ANY block-written cache row perturbs every

@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
 """Decode cost waterfall: where does each millisecond of a decode step go?
 
-Measures the serving decode loop the way serve.py runs it (eager, KV cat,
-CPU-in-loop) and decomposes per-token cost into:
+Measures the serving decode loop the way the server's reference path
+(kotodama.serve.server) runs it (eager, KV cat, CPU-in-loop) and decomposes per-token cost into:
 
   1. Wall-clock per token vs context length, two ways:
-       - "synced":  torch.cuda.synchronize per step (serve.py /generate style)
+       - "synced":  torch.cuda.synchronize per step (server /generate style)
        - "free":    no per-step sync, token stays on GPU (launch-bound floor)
   2. GPU-busy fraction: total kernel time vs unprofiled wall time
   3. Kernel buckets: GEMM/attention/routing/cat-copy/norm-elementwise/other,
      plus launch counts per decode step
   4. Prefill latency at several prompt lengths
-  5. Sampling-side microbench (serve.py sample_next_token cost vs seq len)
+  5. Sampling-side microbench (the server's sample_next_token cost vs seq len)
 
 Usage (gpu-host, scratch GPU):
-    source ~/workspace/.venv-shared/bin/activate
-    cd ~/workspace/kotodama
-
-    # Eager routing (selfsim-server parity)
+    # Eager routing
     KOTODAMA_NO_TRITON_ATTNRES=1 CUDA_VISIBLE_DEVICES=3 \
         python scripts/benchmark/decode_waterfall.py \
-        --checkpoint /models/kotodama-data/sft-selfsim/selfsim3b-lr1e-03-ep2/checkpoints/step_00000358.pt \
+        --checkpoint <checkpoint.pt> \
         --output outputs/profiles/waterfall_eager_routing.json
 
-    # Triton routing (gateway-fleet parity)
+    # Triton routing
     CUDA_VISIBLE_DEVICES=3 python scripts/benchmark/decode_waterfall.py \
         --checkpoint ... --output outputs/profiles/waterfall_triton_routing.json
 
@@ -178,7 +175,7 @@ def timed_prefill(model: LuxiaBaseModel, input_ids: torch.Tensor, device: torch.
 
 @torch.inference_mode()
 def decode_synced(model: LuxiaBaseModel, tok: torch.Tensor, past_kv: list, n_tokens: int, device: torch.device) -> float:
-    """serve.py /generate style: synchronize around every forward, .item() per step."""
+    """Server /generate style: synchronize around every forward, .item() per step."""
     t0 = time.perf_counter()
     for _ in range(n_tokens):
         torch.cuda.synchronize(device)
@@ -324,7 +321,7 @@ def profile_decode_window(
 
 
 def sample_next_token_cost(vocab_size: int, device: torch.device) -> dict[str, float]:
-    """Microbench serve.py's sample_next_token at several generated-ids lengths."""
+    """Microbench the server's sample_next_token at several generated-ids lengths."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
     from kotodama.serve.server import sample_next_token  # noqa: PLC0415
 
@@ -379,7 +376,7 @@ def main() -> None:
     model = build_model(args, device)
     vocab = model.config.vocab_size
 
-    # Match serve.py's backend toggle so SDPA picks the same kernels
+    # Match the server's backend toggle so SDPA picks the same kernels
     torch.backends.cuda.enable_cudnn_sdp(False)
 
     # ── Warmup: SDPA plan cache across lengths + general JIT ────────────────
@@ -446,11 +443,11 @@ def main() -> None:
     for k, v in summary.buckets_ms_per_step.items():
         logger.info("    %-28s %7.3f ms/step (%4.1f%%)  %5.0f launches", k, v, summary.buckets_pct_of_kernel_time.get(k, 0), summary.buckets_launches_per_step.get(k, 0))
 
-    # ── 4. Sampling microbench (serve.py parity) ────────────────────────────
+    # ── 4. Sampling microbench (server parity) ────────────────────────────
     try:
         results["sample_next_token"] = sample_next_token_cost(vocab, device)
         logger.info("sample_next_token: %s", results["sample_next_token"])
-    except Exception as exc:  # serve.py import can fail outside deploy dir
+    except Exception as exc:  # the server import needs its serving deps (fastapi, uvicorn)
         logger.warning("Sampling microbench skipped: %s", exc)
         results["sample_next_token"] = None
 

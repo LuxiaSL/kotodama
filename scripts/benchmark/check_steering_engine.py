@@ -5,8 +5,8 @@ CPU-only, tiny fp32 random-weight model — no checkpoint, no GPU, exact
 comparisons (fp32 + MATH SDPA, same trick as check_prefix_cache part 1).
 What it proves, per kotodama/serve/steering.py:
 
-  0. steer-points — compute_steer_points matches the reference persist
-     semantics of posttraining/taste/steer_inject.forward_inject (sublayer
+  0. steer-points — compute_steer_points matches the in-test reference
+     persist semantics (reference_steer_points: sublayer
      s = 2*layer; {site} + boundaries after it) for every site, incl. the
      production case (site 23, DD-3B boundaries -> [23, 24])
   1. off == absent — an engine built with steer_enabled=True but a zero
@@ -122,8 +122,9 @@ def expected_rows(
 # ────────────────────────── reference implementations ───────────────────────
 
 def reference_steer_points(site_layer: int, boundaries: list[int], n_layers: int) -> tuple[int, ...]:
-    """Direct port of steer_inject.forward_inject persist_points, translated
-    from sublayer indices (after-attn of layer L = sublayer 2*L)."""
+    """Reference block-persistent write points: the site plus every AttnRes
+    boundary after it, computed on sublayer indices (after-attn of layer L =
+    sublayer 2*L) and translated back to layers."""
     site_sub = 2 * site_layer
     points_sub = {site_sub}
     for bs in boundaries:

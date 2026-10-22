@@ -14,7 +14,7 @@ routing math the engine replicates.
 
 Usage:
     KOTODAMA_NO_TRITON_ATTNRES=1 CUDA_VISIBLE_DEVICES=0 python scripts/benchmark/decode_parity.py \
-        --checkpoint /models/.../step_00000358.pt --output outputs/profiles/parity_v1.json
+        --checkpoint <checkpoint.pt> --output outputs/profiles/parity_v1.json
 """
 
 from __future__ import annotations
@@ -113,11 +113,10 @@ def engine_forced(engine: DecodeEngine, input_ids: torch.Tensor, forced: list[in
     """Engine logits along a forced token trajectory.
 
     Prefill is PINNED to the reference path: this harness gates the DECODE
-    step from an identical starting cache (the round-1 design — engine
-    prefill used to copy reference KV exactly). The block prefill/extend
+    step from an identical starting cache. The block prefill/extend
     paths have their own battery (bench_block_prefill.py); letting them in
     here injects known-benign near-tie dust that trips the exact argmax gate
-    (observed 2026-07-05: 63/64 at plen=16).
+    (e.g. 63/64 at plen=16).
     """
     prefill_logits = engine.prefill_reference(input_ids)
     logits_list: list[torch.Tensor] = [prefill_logits[0].float().cpu()]

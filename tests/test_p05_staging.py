@@ -1,6 +1,6 @@
-"""P0.5 staging guards: the p05-armd-v3 run config + the gate-sweep runner.
+"""Staging guards: the p05-armd-v3 run config + the gate-sweep runner.
 
-The config tests pin the facts the fire sequence depends on (DD-v1 from the
+The config tests pin the facts the run depends on (DD-v1 from the
 preset table, the v3 EOS contract, the 6-rank batch geometry that train.py
 would otherwise floor silently, the checkpoint cadence). The sweep tests run
 scripts/eval/nca_gates_sweep.py end to end on CPU over a tiny real model
@@ -123,7 +123,7 @@ def test_summary_table_verdict_excludes_init():
     sweep = _sweep_module()
     rows = sweep.summarize([
         _stub_result(340, 50_135_040, 0.07, 0.06),
-        _stub_result(0, 0, 0.30, 0.30, init=True),   # init must not win L-P1
+        _stub_result(0, 0, 0.30, 0.30, init=True),   # init must not count toward the above-chance verdict
         _stub_result(680, 100_270_080, 0.09, 0.12),
     ])
     assert [r["step"] for r in rows] == [0, 340, 680]

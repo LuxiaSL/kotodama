@@ -1,6 +1,6 @@
 """Equivalence gate: diff a new lm-eval results.json against a banked one.
 
-Protocol (frozen with the eval-speed work, 2026-07-04): any harness change
+Protocol: any harness change
 (batching, sharding, kernels) must reproduce a banked row — same checkpoint,
 same task — before its numbers enter a comparison. Point metrics (acc,
 acc_norm, perplexity, ...) must match within --tol; stderr fields are

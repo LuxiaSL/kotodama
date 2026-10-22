@@ -2,7 +2,7 @@
 
 Reads tokenized uint16 .bin files (one per source), splits each into
 fixed-size blocks, shuffles blocks across sources, and writes a single
-concatenated binary compatible with ``src.data.dataset.TokenizedDataset``.
+concatenated binary compatible with ``kotodama.data.dataset.TokenizedDataset``.
 
 Also writes a provenance index so that any training sequence can be
 traced back to its source — useful for correlating gradient norm spikes
@@ -12,25 +12,25 @@ Usage::
 
     # Assemble all sources
     python scripts/utils/assemble_data.py \
-        --input-dir /models/kotodama-data/tokenized \
-        --output /models/kotodama-data/assembled/train.bin \
+        --input-dir $KOTODAMA_DATA_ROOT/tokenized \
+        --output $KOTODAMA_DATA_ROOT/assembled/train.bin \
         --seq-len 4096
 
     # Exclude specific sources
     python scripts/utils/assemble_data.py \
-        --input-dir /models/kotodama-data/tokenized \
-        --output /models/kotodama-data/assembled/train.bin \
+        --input-dir $KOTODAMA_DATA_ROOT/tokenized \
+        --output $KOTODAMA_DATA_ROOT/assembled/train.bin \
         --exclude stack_v1
 
     # Cap a source at N tokens
     python scripts/utils/assemble_data.py \
-        --input-dir /models/kotodama-data/tokenized \
-        --output /models/kotodama-data/assembled/train.bin \
+        --input-dir $KOTODAMA_DATA_ROOT/tokenized \
+        --output $KOTODAMA_DATA_ROOT/assembled/train.bin \
         --cap pesa2o:25000000000
 
     # Dry run (report sizes without writing)
     python scripts/utils/assemble_data.py \
-        --input-dir /models/kotodama-data/tokenized \
+        --input-dir $KOTODAMA_DATA_ROOT/tokenized \
         --output /dev/null --dry-run
 """
 

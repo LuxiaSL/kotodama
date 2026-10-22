@@ -109,7 +109,7 @@ SUMEOF
 }
 
 echo "============================================"
-echo "  luxia-base canary throughput benchmark"
+echo "  kotodama canary throughput benchmark"
 echo "  $(date)"
 echo "  Output: $CANARY_DIR"
 echo "============================================"

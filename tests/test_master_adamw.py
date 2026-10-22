@@ -1,11 +1,10 @@
 """Tests for MasterAdamW — the fp32-master fix for the bf16 norm-freeze bug.
 
-The bug (2026-09-27, the 3B archaeology): under pure-bf16 training, stock
-AdamW's ~6e-4 steps on RMSNorm gains at 1.0 round away against bf16's 0.0039
-spacing — every norm gain in the shipped 3B was bit-frozen at init for the
-entire run. These tests pin: the bug itself (so nobody "simplifies" the fix
-away), the fix's fp32-reference-exact trajectory, end-to-end norm movement on
-a real tiny model through build_hybrid_optimizer, resume exactness with fp32
+Under pure-bf16 training, stock AdamW's ~6e-4 steps on RMSNorm gains at 1.0
+round away against bf16's 0.0039 spacing, so every norm gain stays bit-frozen
+at init (the shipped 3B's norm gains never moved). These tests pin: the bug
+itself (so nobody "simplifies" the fix away), the fix's fp32-reference-exact
+trajectory, end-to-end norm movement on a real tiny model through build_hybrid_optimizer, resume exactness with fp32
 state preserved, and graceful legacy-state loading.
 """
 from __future__ import annotations
@@ -171,8 +170,8 @@ def test_no_decay_group_does_not_shrink_under_zero_grad():
 
 def test_resume_on_real_model_parameters():
     """Resume writes masters back into live nn.Parameters (requires_grad) —
-    the unit tensors above can't catch an autograd error there; the ladder
-    rehearsal's branch resume did (2026-09-27)."""
+    the unit tensors above can't catch an autograd error there; a resume on
+    real parameters does."""
     model = _tiny_attnres_model()
     _, opt = build_hybrid_optimizer(model, adamw_no_decay_norms=True)
     ids = torch.randint(0, 256, (2, 16))

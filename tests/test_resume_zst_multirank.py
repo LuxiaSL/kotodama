@@ -1,6 +1,6 @@
 """Multi-rank resume from a compressed (.pt.zst) checkpoint: every rank loads the same
-state, and the decompressed temp file is gone afterwards. (Each rank used to zstd -f
-into one shared path and unlink it — rank 1 died with FileNotFoundError.)"""
+state, and the decompressed temp file is gone afterwards. (Every rank decompressing
+with zstd -f into one shared path and unlinking it kills rank 1 with FileNotFoundError.)"""
 
 from __future__ import annotations
 

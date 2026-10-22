@@ -1,4 +1,4 @@
-"""T29 init schemes: determinism, shapes, norms, intended structure; 'standard' is a no-op."""
+"""Init schemes: determinism, shapes, norms, intended structure; 'standard' is a no-op."""
 
 from __future__ import annotations
 

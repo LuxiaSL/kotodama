@@ -1,4 +1,5 @@
-"""BUG-LEDGER D12: without TP each DDP rank must read its OWN data partition."""
+"""Without TP each DDP rank must read its OWN data partition (legacy_rank0 reproduces the
+every-rank-reads-rank-0 regime on purpose)."""
 
 from __future__ import annotations
 
