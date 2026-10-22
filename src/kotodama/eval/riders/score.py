@@ -98,6 +98,58 @@ def score_logprob_batch(logits_fn: LogitsFn, tokenizer: Any, items: Sequence[Any
     return results
 
 
+def score_token_nll_batch(logits_fn: LogitsFn, items: Sequence[Any],
+                          device: torch.device | str, vocab_size: Optional[int] = None,
+                          max_seq_len: Optional[int] = None,
+                          max_total_tokens: Optional[int] = LOGPROB_MAX_TOTAL_TOKENS,
+                          ) -> list[dict[str, Any]]:
+    """Teacher-forced NLL of exact token-id continuations: one forward per batch.
+
+    Items are ``{id, prompt_ids, completion_ids}`` (dicts or objects). Each row
+    is ``prompt_ids + completion_ids``, right-padded with id 0 (causal, so pads
+    never reach a scored position). Completion token t is scored by the logits
+    at position ``len(prompt_ids) + t - 1``, i.e. under the model's plain
+    distribution (temperature 1, no penalty, no truncation).
+
+    Result per item: ``{"id", "n_tokens", "sum_nll", "mean_nll"}`` (mean_nll is
+    None for an empty completion).
+    """
+    if not items:
+        return []
+    seqs = [list(_get(it, "prompt_ids")) + list(_get(it, "completion_ids")) for it in items]
+    plens = [len(_get(it, "prompt_ids")) for it in items]
+    if min(plens) < 1:
+        raise LogprobLimitError("empty prompt (0 tokens)")
+    lens = [len(x) for x in seqs]
+    if max_seq_len is not None and max(lens) > max_seq_len:
+        raise LogprobLimitError(f"sequence too long ({max(lens)} tokens, max {max_seq_len})")
+    if max_total_tokens is not None and sum(lens) > max_total_tokens:
+        raise LogprobLimitError(f"batch too large ({sum(lens)} total tokens, "
+                                f"max {max_total_tokens})")
+    if vocab_size is not None:
+        bad = [t for x in seqs for t in x if not 0 <= t < vocab_size]
+        if bad:
+            raise LogprobLimitError(f"token id out of range: {bad[0]} (vocab {vocab_size})")
+    batch = torch.zeros((len(seqs), max(lens)), dtype=torch.long)
+    for r, x in enumerate(seqs):
+        batch[r, : len(x)] = torch.tensor(x, dtype=torch.long)
+    logits = logits_fn(batch.to(device))
+
+    results: list[dict[str, Any]] = []
+    for r, it in enumerate(items):
+        n = lens[r] - plens[r]
+        if n == 0:
+            results.append({"id": _get(it, "id"), "n_tokens": 0, "sum_nll": 0.0, "mean_nll": None})
+            continue
+        rows = logits[r, plens[r] - 1: lens[r] - 1].float()          # (n, V)
+        targets = batch[r, plens[r]: lens[r]].to(rows.device)        # (n,)
+        nll = -torch.log_softmax(rows, dim=-1).gather(1, targets.view(-1, 1)).squeeze(1)
+        total = float(nll.sum())
+        results.append({"id": _get(it, "id"), "n_tokens": n, "sum_nll": total,
+                        "mean_nll": total / n})
+    return results
+
+
 def plan_batches(lengths: Sequence[int], max_batch: int = LOGPROB_MAX_BATCH,
                  max_total_tokens: int = LOGPROB_MAX_TOTAL_TOKENS) -> list[list[int]]:
     """Index batches over ``lengths``: sorted by length (less padding), each batch

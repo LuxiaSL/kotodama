@@ -181,6 +181,21 @@ _steer_loaded: bool = False
 _steer_bank: dict[str, tuple[int, "torch.Tensor"]] = {}
 _steer_meds: dict[int, float] = {}
 _steer_aliases: dict[str, tuple[str | None, float, str]] = {}
+# Server-wide default repetition penalty (CLI --default_repetition_penalty):
+# used by /generate when the field is absent and by the OpenAI routes when
+# frequency_penalty is absent.
+_default_repetition_penalty: float = DEFAULT_REPETITION_PENALTY
+
+
+def resolve_oai_repetition_penalty(frequency_penalty: float | None) -> float:
+    """OpenAI frequency_penalty -> kotodama repetition penalty.
+
+    Explicit v maps to 1 + v (0 = off); absent falls back to the server's
+    default (--default_repetition_penalty).
+    """
+    if frequency_penalty is not None:
+        return 1.0 + frequency_penalty
+    return _default_repetition_penalty
 
 
 def _engine_prefill(input_ids: "torch.Tensor") -> tuple["torch.Tensor", dict | None]:
@@ -473,7 +488,8 @@ class GenerateRequest(BaseModel):
     temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=0.0, le=2.0)
     top_k: int = Field(default=DEFAULT_TOP_K, ge=0)
     top_p: float = Field(default=DEFAULT_TOP_P, ge=0.0, le=1.0)
-    repetition_penalty: float = Field(default=DEFAULT_REPETITION_PENALTY, ge=1.0, le=2.0)
+    repetition_penalty: float = Field(
+        default_factory=lambda: _default_repetition_penalty, ge=1.0, le=2.0)
     stop_strings: list[str] = Field(default_factory=list)
     stream: bool = False
     # ── Residual steering (fast engine + --steer-npz only; else -> 400). ──
@@ -509,6 +525,7 @@ class ModelInfo(BaseModel):
     fast_engine: bool
     prefix_cache: bool = False
     steering: dict | None = None
+    default_repetition_penalty: float | None = None
 
 
 # ── /logprobs: batched prefill-only scoring (the four-register rider battery) ──
@@ -522,6 +539,7 @@ from kotodama.eval.riders.score import (  # noqa: E402
     LOGPROB_MAX_TOTAL_TOKENS,
     LogprobLimitError,
     score_logprob_batch,
+    score_token_nll_batch,
 )
 
 
@@ -542,6 +560,28 @@ def _score_logprobs(req: LogprobRequest) -> dict[str, Any]:
         results = score_logprob_batch(
             lambda batch: _model(batch)["logits"], _tokenizer, req.items, req.top_n,
             _device, max_seq_len=_max_seq_len, max_total_tokens=LOGPROB_MAX_TOTAL_TOKENS)
+    except LogprobLimitError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"results": results, "model": _model_name()}
+
+
+class TokenScoreItem(BaseModel):
+    id: str
+    prompt_ids: list[int] = Field(..., min_length=1)
+    completion_ids: list[int] = Field(default_factory=list)
+
+
+class TokenScoreRequest(BaseModel):
+    items: list[TokenScoreItem] = Field(..., min_length=1, max_length=LOGPROB_MAX_BATCH)
+
+
+@torch.inference_mode()
+def _score_tokens(req: TokenScoreRequest) -> dict[str, Any]:
+    try:
+        results = score_token_nll_batch(
+            lambda batch: _model(batch)["logits"], req.items, _device,
+            vocab_size=_model.config.vocab_size, max_seq_len=_max_seq_len,
+            max_total_tokens=LOGPROB_MAX_TOTAL_TOKENS)
     except LogprobLimitError as e:
         raise HTTPException(400, str(e)) from e
     return {"results": results, "model": _model_name()}
@@ -1232,6 +1272,7 @@ async def info():
         fast_engine=_engine is not None,
         prefix_cache=_prefix_cache,
         steering=steering,
+        default_repetition_penalty=_default_repetition_penalty,
     )
 
 
@@ -1254,6 +1295,16 @@ async def logprobs_endpoint(request: LogprobRequest):
     # Same dedicated thread as generation: the GPU is single-tenant per replica
     # and eager batch prefill must not interleave with engine activity.
     return await _run_generation(_score_logprobs, request)
+
+
+@app.post("/score_tokens")
+async def score_tokens_endpoint(request: TokenScoreRequest):
+    """Per-token NLL of exact token-id continuations under the plain model
+    (temperature 1, no penalty, no truncation) — the coherence read for
+    sampled text (ids as returned by /generate's completion_ids)."""
+    if _model is None or _tokenizer is None:
+        raise HTTPException(503, "Model not loaded")
+    return await _run_generation(_score_tokens, request)
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -1324,11 +1375,7 @@ async def oai_completions(request: OAICompletionRequest):
     elif isinstance(request.stop, list):
         stop_strings = request.stop
 
-    repetition_penalty = (
-        1.0 + request.frequency_penalty
-        if request.frequency_penalty is not None
-        else DEFAULT_REPETITION_PENALTY
-    )
+    repetition_penalty = resolve_oai_repetition_penalty(request.frequency_penalty)
 
     choices = []
     for i in range(request.n):
@@ -1442,11 +1489,7 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
     elif isinstance(request.stop, list):
         stop_strings = request.stop
 
-    repetition_penalty = (
-        1.0 + request.frequency_penalty
-        if request.frequency_penalty is not None
-        else DEFAULT_REPETITION_PENALTY
-    )
+    repetition_penalty = resolve_oai_repetition_penalty(request.frequency_penalty)
 
     if request.stream:
         gen_req = GenerateRequest(
@@ -1584,6 +1627,11 @@ if __name__ == "__main__":
                         help="Override boundaries, comma ints (proxy DD-v1: 0,3,7,12,21,25)")
     parser.add_argument("--rope_fp32", action="store_true",
                         help="Model config rope_fp32=True (the 1B ladder arms trained with it)")
+    parser.add_argument("--default_repetition_penalty", type=float,
+                        default=DEFAULT_REPETITION_PENALTY,
+                        help="Repetition penalty used when a request does not set one "
+                             "(/generate without repetition_penalty, OpenAI routes without "
+                             "frequency_penalty). 1.0 = off; range [1.0, 2.0]")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
@@ -1602,6 +1650,9 @@ if __name__ == "__main__":
     _max_seq_len_arg = args.max_seq_len
     _prefix_cache_arg = args.prefix_cache
     _warmup_sdpa_arg = args.warmup_sdpa
+    if not 1.0 <= args.default_repetition_penalty <= 2.0:
+        parser.error("--default_repetition_penalty must be in [1.0, 2.0]")
+    _default_repetition_penalty = args.default_repetition_penalty
     if _prefix_cache_arg and _engine_arg != "fast":
         logger.warning("--prefix-cache requires --engine fast; ignoring")
         _prefix_cache_arg = False
