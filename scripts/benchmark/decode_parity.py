@@ -20,7 +20,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import logging
 import os
@@ -41,6 +40,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from kotodama import ckpt
 from kotodama.model import llama as llama_mod
 from kotodama.model.decode_engine import DecodeEngine
 from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
@@ -56,22 +56,31 @@ CONFIG_3B = dict(
 )
 
 
-def load_model(checkpoint: str, device: torch.device) -> KotodamaModel:
-    config = KotodamaModelConfig(**CONFIG_3B)
-    model = KotodamaModel(config)
-    ckpt_path = Path(checkpoint)
-    logger.info("Loading checkpoint: %s", ckpt_path)
-    if ckpt_path.suffix == ".zst":
-        import zstandard as zstd
-        dctx = zstd.ZstdDecompressor()
-        with open(ckpt_path, "rb") as f_in:
-            decompressed = dctx.decompress(f_in.read())
-        ckpt = torch.load(io.BytesIO(decompressed), map_location="cpu", weights_only=False)
-        del decompressed
+def load_model(checkpoint: str, device: torch.device, model_size: str = "3b",
+               rope_fp32: bool = False) -> KotodamaModel:
+    """Build the served architecture for `model_size` (server.MODEL_CONFIGS — the serving table) and load."""
+    if model_size == "3b":
+        cfg = dict(CONFIG_3B)
     else:
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt.get("model", ckpt), strict=True)
+        from kotodama.serve.server import MODEL_CONFIGS
+        cfg = dict(MODEL_CONFIGS[model_size])
+    if rope_fp32:
+        cfg["rope_fp32"] = True
+    model = KotodamaModel(KotodamaModelConfig(**cfg))
+    logger.info("Loading checkpoint: %s (model_size=%s, rope_fp32=%s)", checkpoint, model_size, rope_fp32)
+    state = ckpt.load(checkpoint)
+    model.load_state_dict(state.get("model", state), strict=True)
+    del state
     return model.to(device).eval().bfloat16()
+
+
+@torch.inference_mode()
+def full_forward_argmax(model: KotodamaModel, input_ids: torch.Tensor, tokens: list[int],
+                        device: torch.device) -> list[int]:
+    """No-cache oracle: one full forward over prompt + trajectory; argmax at each generating position."""
+    seq = torch.cat([input_ids, torch.tensor([tokens], device=device)], dim=1)
+    logits = model(seq)["logits"][0]
+    return logits[input_ids.shape[1] - 1:-1].argmax(-1).tolist()
 
 
 @torch.inference_mode()
@@ -169,13 +178,16 @@ def main() -> None:
     parser.add_argument("--compile", action="store_true", help="Test the compiled engine step")
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--output", default=None)
+    parser.add_argument("--model_size", default="3b",
+                        help="Served architecture (kotodama.serve.server.MODEL_CONFIGS key, e.g. 1b-moonshot-loop)")
+    parser.add_argument("--rope_fp32", action="store_true", help="Model config rope_fp32 (the 1B ladder lineage)")
     args = parser.parse_args()
 
     device = torch.device(args.device)
     logger.info("Triton routing in reference: %s (want False for clean parity)",
                 llama_mod._TRITON_ATTN_RES_AVAILABLE)
 
-    model = load_model(args.checkpoint, device)
+    model = load_model(args.checkpoint, device, args.model_size, args.rope_fp32)
     engine = DecodeEngine(model)
     if args.compile:
         engine.compile_step(args.compile_mode)
@@ -189,6 +201,7 @@ def main() -> None:
 
     results: dict[str, Any] = {
         "checkpoint": args.checkpoint,
+        "model_size": args.model_size,
         "compiled": args.compile,
         "steps": args.steps,
         "prompts": {},
@@ -206,8 +219,18 @@ def main() -> None:
         eng_tokens = engine.generate_greedy(input_ids, args.steps)
         div = first_divergence(ref_tokens, eng_tokens, ref_logits)
 
+        # Full-forward oracle (no KV cache anywhere): does each cached path's greedy token equal the argmax of
+        # one full forward over prompt + that path's own trajectory?
+        ff_eng = full_forward_argmax(model, input_ids, eng_tokens, device)
+        ff_ref = full_forward_argmax(model, input_ids, ref_tokens, device)
+        full_fwd = {
+            "engine_vs_full_forward_match": round(sum(a == b for a, b in zip(eng_tokens, ff_eng)) / len(eng_tokens), 4),
+            "reference_vs_full_forward_match": round(sum(a == b for a, b in zip(ref_tokens, ff_ref)) / len(ref_tokens), 4),
+        }
+
         results["prompts"][str(plen)] = {
             "teacher_forced": forced_cmp,
+            "full_forward": full_fwd,
             "greedy_first_divergence": div,
             "greedy_match_steps": div["step"] if div["step"] is not None else args.steps,
         }
@@ -215,9 +238,11 @@ def main() -> None:
         if status != "PASS":
             all_pass = False
         logger.info(
-            "plen=%4d  forced: maxΔ=%.4f argmax=%.3f top32=%.3f | greedy diverges@%s (margin %s)  [%s]",
+            "plen=%4d  forced: maxΔ=%.4f argmax=%.3f top32=%.3f | greedy diverges@%s (margin %s) | "
+            "full-forward argmax match: engine %.3f, reference %.3f  [%s]",
             plen, forced_cmp["max_abs_logit_delta"], forced_cmp["argmax_agreement"],
-            forced_cmp["min_top32_overlap"], div["step"], div.get("ref_top1_top2_margin"), status,
+            forced_cmp["min_top32_overlap"], div["step"], div.get("ref_top1_top2_margin"),
+            full_fwd["engine_vs_full_forward_match"], full_fwd["reference_vs_full_forward_match"], status,
         )
 
     results["all_pass"] = all_pass
