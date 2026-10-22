@@ -20,7 +20,9 @@ def phase_2_online_softmax_merge_forward_kernel(
     merged_output_ptr,
     phase2_intrablock_logit_ptr,
     intrablock_inverse_rms_norm_ptr,
-    eps,
+    # constexpr: a runtime float scalar is typed fp64 when inductor launches this kernel inside a compiled
+    # graph (Triton's own launcher passes fp32), which promotes the rms, logits and softmax math to fp64.
+    eps: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
     PADDED_HIDDEN: tl.constexpr,
 ):

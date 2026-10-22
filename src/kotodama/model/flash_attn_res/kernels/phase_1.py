@@ -20,7 +20,9 @@ def phase_1_batched_attention_forward_kernel(
     lse_ptr,
     inverse_rms_norm_ptr,
     attention_logits_ptr,
-    eps,
+    # constexpr: a runtime float scalar is typed fp64 when inductor launches this kernel inside a compiled
+    # graph (Triton's own launcher passes fp32), which promotes the rms, logits and softmax math to fp64.
+    eps: tl.constexpr,
     num_active,
     NUM_SOURCE_BLOCKS: tl.constexpr,
     BT: tl.constexpr,
@@ -539,7 +541,9 @@ def phase_1_online_forward_kernel(
     lse_ptr,
     inverse_rms_norm_ptr,
     attention_logits_ptr,
-    eps,
+    # constexpr: a runtime float scalar is typed fp64 when inductor launches this kernel inside a compiled
+    # graph (Triton's own launcher passes fp32), which promotes the rms, logits and softmax math to fp64.
+    eps: tl.constexpr,
     num_active,
     BT,
     NUM_SOURCE_BLOCKS: tl.constexpr,
