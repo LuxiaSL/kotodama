@@ -247,9 +247,9 @@ def tok():
 
 
 def _tiny(seed: int = 0) -> torch.nn.Module:
-    from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+    from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
     torch.manual_seed(seed)
-    return LuxiaBaseModel(LuxiaModelConfig(
+    return KotodamaModel(KotodamaModelConfig(
         hidden_size=64, num_layers=2, num_attention_heads=2, num_kv_heads=1, head_dim=32,
         intermediate_size=128, vocab_size=VOCAB, max_position_embeddings=1024,
         attn_impl="sdpa", use_liger=False, attn_res=True, attn_res_boundaries=[0, 1])).eval()

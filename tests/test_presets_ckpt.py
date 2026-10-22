@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from kotodama import ckpt, presets
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 # The pinned shape values of these presets (existing checkpoints load against them).
 # A change here is a model change.
@@ -43,7 +43,7 @@ def test_shape_is_a_copy():
 
 
 def test_defaults_cover_the_rest():
-    cfg = LuxiaModelConfig(**presets.shape("3b"))
+    cfg = KotodamaModelConfig(**presets.shape("3b"))
     assert (cfg.rope_theta, cfg.norm_eps, cfg.qk_norm, cfg.tie_word_embeddings, cfg.z_loss_weight) == (
         500000.0, 1e-5, True, True, 1e-5)
 
@@ -51,7 +51,7 @@ def test_defaults_cover_the_rest():
 @pytest.fixture
 def tiny_ckpt(tmp_path):
     torch.manual_seed(0)
-    model = LuxiaBaseModel(LuxiaModelConfig(**presets.shape("smoke")))
+    model = KotodamaModel(KotodamaModelConfig(**presets.shape("smoke")))
     state = {f"_orig_mod.{k}": v for k, v in model.state_dict().items()}
     path = tmp_path / "step_00000010.pt"
     torch.save({"model": state, "step": 10, "tokens_consumed": 1234,
@@ -137,7 +137,7 @@ def test_1b_deep_matches_1b_budget():
     assert deep["num_attention_heads"] % deep["num_kv_heads"] == 0
 
     def n_params(shape, bounds):
-        m = LuxiaBaseModel(LuxiaModelConfig(**shape, attn_res=True, attn_res_boundaries=list(bounds)))
+        m = KotodamaModel(KotodamaModelConfig(**shape, attn_res=True, attn_res_boundaries=list(bounds)))
         return sum(p.numel() for p in m.parameters())
 
     b = presets.DEFAULT_BOUNDARIES["1b-deep"]

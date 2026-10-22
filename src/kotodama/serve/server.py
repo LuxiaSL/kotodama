@@ -66,7 +66,7 @@ from pydantic import BaseModel, Field
 from transformers import AutoTokenizer
 
 from kotodama import ckpt, presets
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 # Fast decode engine (static cache + compiled/CUDA-graphed step). Optional.
 try:
@@ -159,7 +159,7 @@ MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "1b": CONFIG_1B, "1b-deep": CONFIG_1B_DE
 
 # ── Global state ────────────────────────────────────────────────────────────────
 
-_model: LuxiaBaseModel | None = None
+_model: KotodamaModel | None = None
 _tokenizer: AutoTokenizer | None = None
 _attn_res_override: str = "config"   # config | on | off (CLI --attn_res)
 _attn_res_boundaries_override: str | None = None
@@ -231,7 +231,7 @@ async def _run_generation(fn: Callable[..., "GenerateResponse"], /, *args: Any, 
 
 
 @torch.inference_mode()
-def _warmup_sdpa_cache(model: LuxiaBaseModel, max_seq_len: int = 4096, step: int = 64) -> None:
+def _warmup_sdpa_cache(model: KotodamaModel, max_seq_len: int = 4096, step: int = 64) -> None:
     """Prime SDPA plan cache by decoding across representative KV lengths.
 
     cuDNN SDPA selects an algorithm per unique KV shape. Without warmup,
@@ -264,7 +264,7 @@ def _load_checkpoint(checkpoint_path: Path) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None) -> tuple[LuxiaBaseModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases
     _serve_mode = mode
@@ -291,7 +291,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             int(x) for x in _attn_res_boundaries_override.split(",")]
     if _rope_fp32_override:
         model_cfg["rope_fp32"] = True
-    config = LuxiaModelConfig(**model_cfg)
+    config = KotodamaModelConfig(**model_cfg)
     _max_seq_len = config.max_position_embeddings if max_seq_len is None else max_seq_len
     if not 16 <= _max_seq_len <= config.max_position_embeddings:
         raise ValueError(
@@ -300,7 +300,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     logger.info("Model config (%s): %dM params", model_size, config.param_count() // 1_000_000)
     logger.info("Serving context limit: %d tokens", _max_seq_len)
 
-    model = LuxiaBaseModel(config)
+    model = KotodamaModel(config)
 
     ckpt_path = Path(checkpoint_path)
     if not ckpt_path.exists():
@@ -673,7 +673,7 @@ def sample_next_token(
 # ── Model forward (fast or standard) ───────────────────────────────────────────
 
 @torch.inference_mode()
-def model_forward(model: LuxiaBaseModel, input_ids: torch.Tensor) -> torch.Tensor:
+def model_forward(model: KotodamaModel, input_ids: torch.Tensor) -> torch.Tensor:
     """Plain eager forward, returning logits (reference/debug path)."""
     return model(input_ids)["logits"]
 
@@ -682,7 +682,7 @@ def model_forward(model: LuxiaBaseModel, input_ids: torch.Tensor) -> torch.Tenso
 
 @torch.inference_mode()
 def generate(
-    model: LuxiaBaseModel,
+    model: KotodamaModel,
     tokenizer: AutoTokenizer,
     request: GenerateRequest,
 ) -> GenerateResponse:
@@ -1034,7 +1034,7 @@ async def engine_generate_stream(
 
 @torch.inference_mode()
 async def generate_stream(
-    model: LuxiaBaseModel,
+    model: KotodamaModel,
     tokenizer: AutoTokenizer,
     request: GenerateRequest,
     http_request: Request | None = None,
@@ -1343,7 +1343,7 @@ async def oai_completions(request: OAICompletionRequest):
     )
 
     return {
-        "id": f"cmpl-luxia-{int(time.time())}",
+        "id": f"cmpl-kotodama-{int(time.time())}",
         "object": "text_completion",
         "created": int(time.time()),
         "model": _model_name(),
@@ -1445,7 +1445,7 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
                 data = json.loads(chunk.removeprefix("data: ").strip())
                 if "token" in data:
                     oai_chunk = {
-                        "id": f"chatcmpl-luxia-{int(time.time())}",
+                        "id": f"chatcmpl-kotodama-{int(time.time())}",
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": _model_name(),
@@ -1458,7 +1458,7 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
                     yield f"data: {json.dumps(oai_chunk)}\n\n"
                 elif data.get("done"):
                     final_chunk = {
-                        "id": f"chatcmpl-luxia-{int(time.time())}",
+                        "id": f"chatcmpl-kotodama-{int(time.time())}",
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": _model_name(),
@@ -1503,7 +1503,7 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
     prompt_tokens = _tokenizer.encode(prompt_text, add_special_tokens=False, return_tensors="pt").shape[1]
 
     return {
-        "id": f"chatcmpl-luxia-{int(time.time())}",
+        "id": f"chatcmpl-kotodama-{int(time.time())}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": _model_name(),

@@ -7,4 +7,4 @@ extends: ladder-a0-deep.yaml
 
 model_size: 1b-deep-loopfit
 attn_res_boundaries: "0,1,7,9,17,19,39"
-checkpoint_shm_dir: /dev/shm/luxia-ladder-a0-deep-loopfit
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-a0-deep-loopfit

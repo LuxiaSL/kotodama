@@ -1,4 +1,4 @@
-"""Run lm-evaluation-harness benchmarks on LuxiaBaseModel checkpoints.
+"""Run lm-evaluation-harness benchmarks on KotodamaModel checkpoints.
 
 Usage:
     python -m scripts.eval.run_lm_eval --checkpoint path/to/step.pt.zst
@@ -33,7 +33,7 @@ DEFAULT_ATTN_RES_CONFIG = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run lm-eval benchmarks on LuxiaBaseModel checkpoints"
+        description="Run lm-eval benchmarks on KotodamaModel checkpoints"
     )
     parser.add_argument(
         "--checkpoint",
@@ -103,7 +103,7 @@ def parse_args() -> argparse.Namespace:
 def run_eval(args: argparse.Namespace) -> None:
     import lm_eval
 
-    from kotodama.eval.lm_eval_adapter import LuxiaEvalLM
+    from kotodama.eval.lm_eval_adapter import KotodamaEvalLM
 
     checkpoints = [p.strip() for p in args.checkpoint.split(",")]
     task_list = [t.strip() for t in args.tasks.split(",")]
@@ -128,7 +128,7 @@ def run_eval(args: argparse.Namespace) -> None:
 
         lm = None
         try:
-            lm = LuxiaEvalLM(
+            lm = KotodamaEvalLM(
                 checkpoint_path=ckpt_path,
                 config_path=args.config,
                 config_section=args.config_section,

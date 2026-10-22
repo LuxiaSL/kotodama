@@ -11,4 +11,4 @@
 
 extends: ladder-a0.yaml
 
-checkpoint_shm_dir: /dev/shm/luxia-ladder-a1
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-a1

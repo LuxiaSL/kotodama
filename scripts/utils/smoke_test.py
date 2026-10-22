@@ -11,7 +11,7 @@ import time
 import torch
 
 sys.path.insert(0, "src")
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.training.muon import build_hybrid_optimizer, HybridScheduler
 
 
@@ -22,7 +22,7 @@ def main() -> None:
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     # Tiny model for smoke test
-    config = LuxiaModelConfig(
+    config = KotodamaModelConfig(
         hidden_size=256,
         num_layers=4,
         num_attention_heads=4,
@@ -35,7 +35,7 @@ def main() -> None:
         z_loss_weight=1e-5,
     )
 
-    model = LuxiaBaseModel(config).to(device)
+    model = KotodamaModel(config).to(device)
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {param_count:,} ({param_count / 1e6:.1f}M)")
     print(f"Estimated from config: {config.param_count():,}")

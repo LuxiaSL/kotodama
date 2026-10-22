@@ -4,4 +4,4 @@
 extends: ladder-a0-deep.yaml
 
 attn_res_boundaries: "0,8,15,23,30,38,45"
-checkpoint_shm_dir: /dev/shm/luxia-ladder-a0-deep-uniform7
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-a0-deep-uniform7

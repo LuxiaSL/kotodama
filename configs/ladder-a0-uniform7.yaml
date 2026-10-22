@@ -4,4 +4,4 @@
 extends: ladder-a0.yaml
 
 attn_res_boundaries: "0,4,8,12,16,20,24"
-checkpoint_shm_dir: /dev/shm/luxia-ladder-a0-uniform7
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-a0-uniform7

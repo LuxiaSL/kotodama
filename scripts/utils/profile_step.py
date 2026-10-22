@@ -25,7 +25,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.profiler import profile, record_function, ProfilerActivity
 
 sys.path.insert(0, "src")
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.training.muon import Muon, build_hybrid_optimizer
 
 
@@ -50,12 +50,12 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
 
     # Proxy model
-    config = LuxiaModelConfig(
+    config = KotodamaModelConfig(
         hidden_size=512, num_layers=28, num_attention_heads=4,
         num_kv_heads=2, head_dim=128, intermediate_size=1408,
         vocab_size=49152, max_position_embeddings=4096,
     )
-    model = LuxiaBaseModel(config).to(device)
+    model = KotodamaModel(config).to(device)
 
     if args.compile:
         model = torch.compile(model)

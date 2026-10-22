@@ -190,7 +190,7 @@ def apply_tensor_parallelism(
     model: torch.nn.Module,
     tp_group: dist.ProcessGroup,
 ) -> None:
-    """Apply tensor parallelism to a LuxiaBaseModel.
+    """Apply tensor parallelism to a KotodamaModel.
 
     Shards projection weights in-place and sets TP metadata on modules.
     Linear layers remain nn.Linear — no custom subclasses — preserving

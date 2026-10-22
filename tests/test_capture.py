@@ -16,7 +16,7 @@ if os.environ.get("ANAMNESIS_PL_PATH") and os.environ["ANAMNESIS_PL_PATH"] not i
 import pytest
 import torch
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 from kotodama.model.capture import (
     instrumented_forward,
@@ -33,7 +33,7 @@ BOUNDARIES = [0, 1, 3]  # 3 committed blocks over 6 layers, DD-shape
 @pytest.fixture(scope="module")
 def model():
     torch.manual_seed(20260925)
-    cfg = LuxiaModelConfig(
+    cfg = KotodamaModelConfig(
         hidden_size=64,
         num_layers=6,
         num_attention_heads=4,
@@ -47,7 +47,7 @@ def model():
         attn_res_boundaries=BOUNDARIES,
         use_liger=False,
     )
-    m = LuxiaBaseModel(cfg)
+    m = KotodamaModel(cfg)
     m.eval()
     return m
 

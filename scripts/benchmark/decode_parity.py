@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from kotodama.model import llama as llama_mod
 from kotodama.model.decode_engine import DecodeEngine
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 DD3B_BOUNDARIES = [0, 1, 3, 7, 15, 19, 24]
 CONFIG_3B = dict(
@@ -56,9 +56,9 @@ CONFIG_3B = dict(
 )
 
 
-def load_model(checkpoint: str, device: torch.device) -> LuxiaBaseModel:
-    config = LuxiaModelConfig(**CONFIG_3B)
-    model = LuxiaBaseModel(config)
+def load_model(checkpoint: str, device: torch.device) -> KotodamaModel:
+    config = KotodamaModelConfig(**CONFIG_3B)
+    model = KotodamaModel(config)
     ckpt_path = Path(checkpoint)
     logger.info("Loading checkpoint: %s", ckpt_path)
     if ckpt_path.suffix == ".zst":
@@ -76,7 +76,7 @@ def load_model(checkpoint: str, device: torch.device) -> LuxiaBaseModel:
 
 @torch.inference_mode()
 def reference_greedy(
-    model: LuxiaBaseModel, input_ids: torch.Tensor, n_steps: int, device: torch.device
+    model: KotodamaModel, input_ids: torch.Tensor, n_steps: int, device: torch.device
 ) -> tuple[list[int], list[torch.Tensor]]:
     """Greedy decode with the reference cached path. Returns (tokens, per-step logits fp32 cpu)."""
     out = model(input_ids, use_cache=True)
@@ -95,7 +95,7 @@ def reference_greedy(
 
 @torch.inference_mode()
 def reference_forced(
-    model: LuxiaBaseModel, input_ids: torch.Tensor, forced: list[int], device: torch.device
+    model: KotodamaModel, input_ids: torch.Tensor, forced: list[int], device: torch.device
 ) -> list[torch.Tensor]:
     """Reference logits along a forced token trajectory."""
     out = model(input_ids, use_cache=True)

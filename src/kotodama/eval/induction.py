@@ -43,7 +43,7 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-# model(input_ids) -> {"logits": (B, S, V)} — the LuxiaBaseModel contract.
+# model(input_ids) -> {"logits": (B, S, V)} — the KotodamaModel contract.
 ModelFn = Callable[[torch.Tensor], dict[str, torch.Tensor]]
 
 

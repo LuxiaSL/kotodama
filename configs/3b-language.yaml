@@ -18,7 +18,7 @@
 
 # Shape (3B, 4096 ctx, mb 10, 2M-token batch), optimizer (Muon 0.02 + AdamW
 # 6e-4, clip 1.0), production profile (303K tok/s: compile/FA auto/fp8/Liger/AC),
-# async ckpt via /dev/shm, geo monitor on, wandb luxia-base, log_every 10.
+# async ckpt via /dev/shm, geo monitor on, wandb kotodama, log_every 10.
 extends: base/3b-lineage.yaml
 
 # Training — 384B tokens, ~183K steps

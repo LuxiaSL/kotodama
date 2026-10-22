@@ -11,7 +11,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from kotodama.model.llama import LuxiaBaseModel
+from kotodama.model.llama import KotodamaModel
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ DEFAULT_EOS_TOKENS = [0, 1, 2]
 
 @torch.inference_mode()
 def generate(
-    model: LuxiaBaseModel,
+    model: KotodamaModel,
     input_ids: torch.Tensor,
     max_new_tokens: int = 1024,
     temperature: float = 0.7,
@@ -101,7 +101,7 @@ def generate(
 
 
 def generate_text(
-    model: LuxiaBaseModel,
+    model: KotodamaModel,
     tokenizer: Any,
     prompt: str,
     max_new_tokens: int = 1024,

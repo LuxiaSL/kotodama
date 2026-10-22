@@ -18,7 +18,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig  # noqa: E402
 
 DEVICE = "cuda"
 B, T = 2, 512
@@ -51,15 +51,15 @@ def make_batch(seed: int = 0):
             cu_seqlens.to(DEVICE), max_seqlen)
 
 
-def build_model(attn_impl: str, state=None) -> LuxiaBaseModel:
+def build_model(attn_impl: str, state=None) -> KotodamaModel:
     torch.manual_seed(17)
-    cfg = LuxiaModelConfig(
+    cfg = KotodamaModelConfig(
         hidden_size=256, num_layers=4, num_attention_heads=4, num_kv_heads=2,
         head_dim=64, intermediate_size=512, vocab_size=1024,
         max_position_embeddings=2048, attn_res=True, attn_res_n_blocks=2,
         attn_impl=attn_impl, use_liger=False, activation_checkpointing=False,
     )
-    m = LuxiaBaseModel(cfg).to(DEVICE)
+    m = KotodamaModel(cfg).to(DEVICE)
     if state is not None:
         m.load_state_dict(state)
     return m

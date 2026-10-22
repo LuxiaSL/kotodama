@@ -138,7 +138,7 @@ def test_summary_table_verdict_excludes_init():
 def test_sweep_end_to_end_cpu(tmp_path, monkeypatch):
     """Tiny real model -> train.py-format checkpoints (plain + .zst) ->
     real v3 eval set -> sweep main() -> per-step JSONs + summary."""
-    from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+    from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
     from kotodama.nca.dyadic import (DyadicConfig, N_VALS, emit_ledger_items,
                                      token_map)
     from kotodama.nca.generator import NCAConfig, NCARule, sample_rule_config
@@ -175,7 +175,7 @@ def test_sweep_end_to_end_cpu(tmp_path, monkeypatch):
     # two checkpoints in train.py's format
     boundaries = [0, 2]
     torch.manual_seed(0)
-    model = LuxiaBaseModel(LuxiaModelConfig(
+    model = KotodamaModel(KotodamaModelConfig(
         **shape, qk_norm=True, attn_res=True, attn_res_boundaries=boundaries,
         attn_impl="sdpa"))
     muon, adamw = build_hybrid_optimizer(model)

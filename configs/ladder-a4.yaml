@@ -11,4 +11,4 @@ extends: ladder-a0.yaml
 
 mix_fraction: 0.03
 total_tokens: 30_927_835_052
-checkpoint_shm_dir: /dev/shm/luxia-ladder-a4
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-a4

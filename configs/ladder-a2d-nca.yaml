@@ -12,4 +12,4 @@
 extends: ladder-a2-nca.yaml
 
 doc_masking: true
-checkpoint_shm_dir: /dev/shm/luxia-ladder-a2d-nca
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-a2d-nca

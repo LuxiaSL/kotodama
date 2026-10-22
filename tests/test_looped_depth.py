@@ -17,7 +17,7 @@ import torch
 
 from kotodama import presets
 from kotodama.model.capture import hidden_rows, instrumented_forward
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 BASE = dict(hidden_size=64, num_layers=7, num_attention_heads=4, num_kv_heads=2, head_dim=16,
             intermediate_size=128, vocab_size=199, max_position_embeddings=96, attn_impl="sdpa",
@@ -26,9 +26,9 @@ LOOP = dict(loop_start=1, loop_len=2, loop_times=2)        # 1 prelude + 2x2 cor
 
 
 @pytest.fixture(scope="module")
-def looped() -> LuxiaBaseModel:
+def looped() -> KotodamaModel:
     torch.manual_seed(20261018)
-    m = LuxiaBaseModel(LuxiaModelConfig(**BASE, **LOOP)); m.eval()
+    m = KotodamaModel(KotodamaModelConfig(**BASE, **LOOP)); m.eval()
     return m
 
 
@@ -39,7 +39,7 @@ def ids() -> torch.Tensor:
 
 
 def test_layer_source_map():
-    cfg = LuxiaModelConfig(**BASE, **LOOP)
+    cfg = KotodamaModelConfig(**BASE, **LOOP)
     assert [cfg.layer_source(i) for i in range(7)] == [0, 1, 2, 1, 2, 5, 6]
     assert cfg.num_unique_layers == 5
 
@@ -49,7 +49,7 @@ def test_layer_source_map():
                                  dict(loop_start=0, loop_len=0, loop_times=2)])
 def test_bad_loop_spec_refuses(bad):
     with pytest.raises(ValueError):
-        LuxiaModelConfig(**BASE, **bad)
+        KotodamaModelConfig(**BASE, **bad)
 
 
 def test_heavy_modules_shared_small_ones_not(looped):
@@ -69,15 +69,15 @@ def test_optimizer_sees_each_shared_weight_once(looped):
 
 
 def test_param_count_matches_instantiated_model():
-    cfg = LuxiaModelConfig(**dict(BASE, attn_res=False), **LOOP)
-    m = LuxiaBaseModel(cfg)
+    cfg = KotodamaModelConfig(**dict(BASE, attn_res=False), **LOOP)
+    m = KotodamaModel(cfg)
     assert sum(p.numel() for p in m.parameters()) == cfg.param_count()
 
 
 def test_aliasing_equals_explicit_copies(looped, ids):
     """Loading the looped state_dict (which lists every position) into an UNLOOPED model of the same effective depth
     gives identical logits: weight sharing is exactly 'repeat the same weights', nothing more."""
-    flat = LuxiaBaseModel(LuxiaModelConfig(**BASE)); flat.eval()
+    flat = KotodamaModel(KotodamaModelConfig(**BASE)); flat.eval()
     flat.load_state_dict(looped.state_dict(), strict=True)
     with torch.no_grad():
         a = looped(ids)["logits"]; b = flat(ids)["logits"]
@@ -93,7 +93,7 @@ def test_capture_walker_matches_forward(looped, ids):
 
 
 def test_state_dict_roundtrip_keeps_tying(looped, ids):
-    fresh = LuxiaBaseModel(LuxiaModelConfig(**BASE, **LOOP)); fresh.eval()
+    fresh = KotodamaModel(KotodamaModelConfig(**BASE, **LOOP)); fresh.eval()
     fresh.load_state_dict(looped.state_dict(), strict=True)
     assert fresh.layers[3].attn is fresh.layers[1].attn
     with torch.no_grad():
@@ -102,7 +102,7 @@ def test_state_dict_roundtrip_keeps_tying(looped, ids):
 
 def test_backward_accumulates_into_shared_weights(ids):
     torch.manual_seed(0)
-    m = LuxiaBaseModel(LuxiaModelConfig(**BASE, **LOOP))
+    m = KotodamaModel(KotodamaModelConfig(**BASE, **LOOP))
     out = m(ids, labels=ids)
     out["loss"].backward()
     g = m.layers[1].attn.q_proj.weight.grad
@@ -114,7 +114,7 @@ def test_preset_1b_deep_loop():
     s, d = presets.shape("1b-deep-loop"), presets.shape("1b-deep")
     for k in ("hidden_size", "num_layers", "num_attention_heads", "num_kv_heads", "head_dim", "intermediate_size"):
         assert s[k] == d[k], k
-    cfg = LuxiaModelConfig(**s)
+    cfg = KotodamaModelConfig(**s)
     assert cfg.num_layers == 52 and cfg.num_unique_layers == 28
     assert presets.DEFAULT_BOUNDARIES["1b-deep-loop"] == presets.DEFAULT_BOUNDARIES["1b-deep"]
     assert 0.75e9 < cfg.param_count() < 0.85e9
@@ -131,7 +131,7 @@ def test_preset_1b_deep_loopfit():
     s, d = presets.shape("1b-deep-loopfit"), presets.shape("1b-deep")
     for k in ("hidden_size", "num_layers", "num_attention_heads", "num_kv_heads", "head_dim", "intermediate_size"):
         assert s[k] == d[k], k
-    cfg = LuxiaModelConfig(**s)
+    cfg = KotodamaModelConfig(**s)
     assert cfg.num_layers == 52 and cfg.num_unique_layers == 42
     b = presets.DEFAULT_BOUNDARIES["1b-deep-loopfit"]
     assert b == presets.CF52_FIT
@@ -151,14 +151,14 @@ def test_preset_1b_moonshot_loop():
     s, d = presets.shape("1b-moonshot-loop"), presets.shape("1b-deep")
     for k in ("hidden_size", "num_attention_heads", "num_kv_heads", "head_dim", "intermediate_size"):
         assert s[k] == d[k], k
-    cfg = LuxiaModelConfig(**s)
+    cfg = KotodamaModelConfig(**s)
     assert cfg.num_layers == 72 and cfg.num_unique_layers == 52
     b = presets.DEFAULT_BOUNDARIES["1b-moonshot-loop"]
     assert b == presets.MOONSHOT_LOOP
     starts = [s["loop_start"] + k * s["loop_len"] for k in range(s["loop_times"])]
     coda = s["loop_start"] + s["loop_len"] * s["loop_times"]
     assert all(x in b for x in starts) and coda in b
-    assert abs(cfg.param_count() - LuxiaModelConfig(**d).param_count()) / LuxiaModelConfig(**d).param_count() < 0.01
+    assert abs(cfg.param_count() - KotodamaModelConfig(**d).param_count()) / KotodamaModelConfig(**d).param_count() < 0.01
     from kotodama.serve import server
     c = server.MODEL_CONFIGS["1b-moonshot-loop"]
     assert c["num_layers"] == 72 and c["attn_res_boundaries"] == list(b)

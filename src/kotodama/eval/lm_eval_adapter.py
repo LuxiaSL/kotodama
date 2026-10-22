@@ -1,4 +1,4 @@
-"""lm-evaluation-harness adapter for LuxiaBaseModel.
+"""lm-evaluation-harness adapter for KotodamaModel.
 
 Wraps the existing model_loader and generate modules to provide
 the TemplateLM interface that lm-eval expects.
@@ -16,7 +16,7 @@ from lm_eval.api.instance import Instance
 from lm_eval.api.model import TemplateLM
 from transformers import AutoTokenizer
 
-from kotodama.eval.generate import generate as luxia_generate
+from kotodama.eval.generate import generate as kotodama_generate
 from kotodama.eval.model_loader import load_model
 
 logger = logging.getLogger(__name__)
@@ -28,8 +28,8 @@ DEFAULT_ATTN_RES_CONFIG: dict[str, Any] = {
 }
 
 
-class LuxiaEvalLM(TemplateLM):
-    """lm-eval adapter for LuxiaBaseModel checkpoints."""
+class KotodamaEvalLM(TemplateLM):
+    """lm-eval adapter for KotodamaModel checkpoints."""
 
     def __init__(
         self,
@@ -77,7 +77,7 @@ class LuxiaEvalLM(TemplateLM):
 
         param_count = sum(p.numel() for p in self.model.parameters())
         logger.info(
-            "LuxiaEvalLM ready: %s (%.1fM params, bs=%d, device=%s)",
+            "KotodamaEvalLM ready: %s (%.1fM params, bs=%d, device=%s)",
             self._checkpoint_name,
             param_count / 1e6,
             batch_size,
@@ -273,7 +273,7 @@ class LuxiaEvalLM(TemplateLM):
                 [ctx_ids], dtype=torch.long, device=self._device
             )
 
-            output_ids = luxia_generate(
+            output_ids = kotodama_generate(
                     self.model,
                     input_tensor,
                     max_new_tokens=max_gen,
@@ -290,3 +290,8 @@ class LuxiaEvalLM(TemplateLM):
             results.append(text)
 
         return results
+
+
+# Former names, kept so existing importers keep working.
+LuxiaEvalLM = KotodamaEvalLM
+luxia_generate = kotodama_generate

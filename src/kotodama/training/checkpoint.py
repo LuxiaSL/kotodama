@@ -342,7 +342,7 @@ class AsyncCheckpointManager(CheckpointManager):
         checkpoint_dir: str | Path,
         rank: int = 0,
         keep_last_n: int = 5,
-        shm_dir: str = "/dev/shm/luxia-base-ckpts",
+        shm_dir: str = "/dev/shm/kotodama-ckpts",
         compress: bool = True,
     ) -> None:
         super().__init__(checkpoint_dir, rank, keep_last_n)

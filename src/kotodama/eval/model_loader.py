@@ -15,7 +15,7 @@ import torch
 import yaml
 
 from kotodama import ckpt, presets
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ def load_model_config(
     config_path: Path | str | None = None,
     section: str = "proxy",
 ) -> dict[str, Any]:
-    """Model architecture kwargs for LuxiaModelConfig.
+    """Model architecture kwargs for KotodamaModelConfig.
 
     With no ``config_path``, ``section`` names a shape in ``kotodama.presets``
     (aliases like "model" -> "3b" accepted). A YAML path is still honoured for
@@ -61,7 +61,7 @@ def load_model(
     device: str = "cuda:0",
     meta: dict[str, Any] | None = None,
     overrides: dict[str, Any] | None = None,
-) -> LuxiaBaseModel:
+) -> KotodamaModel:
     """Load a model from a checkpoint file.
 
     Handles:
@@ -83,7 +83,7 @@ def load_model(
         device: Target device for the model.
         meta: If given, filled with the checkpoint's bookkeeping (``step``,
             ``tokens_consumed``; None when the file does not carry them).
-        overrides: Extra LuxiaModelConfig fields applied last, independent of
+        overrides: Extra KotodamaModelConfig fields applied last, independent of
             the AttnRes handling (e.g. ``{"rope_fp32": True}`` for the ladder arms).
 
     Returns:
@@ -123,11 +123,11 @@ def load_model(
         cfg.update(overrides)
         logger.info("Model config overrides: %s", overrides)
 
-    # Build model — filter out YAML keys that aren't LuxiaModelConfig fields
+    # Build model — filter out YAML keys that aren't KotodamaModelConfig fields
     import dataclasses
-    valid_fields = {f.name for f in dataclasses.fields(LuxiaModelConfig)}
+    valid_fields = {f.name for f in dataclasses.fields(KotodamaModelConfig)}
     cfg = {k: v for k, v in cfg.items() if k in valid_fields}
-    model = LuxiaBaseModel(LuxiaModelConfig(**cfg))
+    model = KotodamaModel(KotodamaModelConfig(**cfg))
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
 
     # Report key mismatches (filter out expected AttnRes key mismatches)

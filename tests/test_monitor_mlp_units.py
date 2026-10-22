@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.monitoring.geometric import GeometricMonitor, MonitorConfig
 
 INTER = 128
@@ -21,7 +21,7 @@ def test_dead_mlp_units_sees_killed_neurons(attn_res: bool):
               intermediate_size=INTER, vocab_size=256, max_position_embeddings=128, attn_impl="sdpa")
     if attn_res:
         kw.update(attn_res=True, attn_res_boundaries=[0, 1])
-    model = LuxiaBaseModel(LuxiaModelConfig(**kw))
+    model = KotodamaModel(KotodamaModelConfig(**kw))
     killed = [3, 17, 90]
     with torch.no_grad():
         for j in killed:

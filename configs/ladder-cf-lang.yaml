@@ -16,4 +16,4 @@ total_tokens: 5_000_000_000
 decay_start_pct: 1.0
 save_schedule: "250M:end"
 anchor_tokens: ""
-checkpoint_shm_dir: /dev/shm/luxia-ladder-cf-lang
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-cf-lang

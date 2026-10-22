@@ -267,17 +267,17 @@ def test_model_fa4_dense_compiles(cpu_reference_kernels) -> None:
 
     if not llama._init_fa4():
         pytest.skip("flash_attn.cute not importable — model can't select fa4")
-    from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+    from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
-    def build(impl: str, state=None) -> LuxiaBaseModel:
+    def build(impl: str, state=None) -> KotodamaModel:
         torch.manual_seed(17)
-        cfg = LuxiaModelConfig(
+        cfg = KotodamaModelConfig(
             hidden_size=64, num_layers=2, num_attention_heads=4, num_kv_heads=2,
             head_dim=16, intermediate_size=128, vocab_size=128,
             max_position_embeddings=64, attn_res=True, attn_res_n_blocks=2,
             attn_impl=impl, use_liger=False, activation_checkpointing=False,
         )
-        m = LuxiaBaseModel(cfg)
+        m = KotodamaModel(cfg)
         if state is not None:
             m.load_state_dict(state)
         return m

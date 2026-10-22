@@ -8,4 +8,4 @@
 
 extends: ladder-cf-lang.yaml
 
-checkpoint_shm_dir: /dev/shm/luxia-ladder-cf-nca-lang
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-cf-nca-lang

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import torch
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig, apply_rope
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig, apply_rope
 
 
-def _model(rope_fp32: bool) -> LuxiaBaseModel:
+def _model(rope_fp32: bool) -> KotodamaModel:
     torch.manual_seed(0)
-    return LuxiaBaseModel(LuxiaModelConfig(
+    return KotodamaModel(KotodamaModelConfig(
         hidden_size=64, num_layers=1, num_attention_heads=2, num_kv_heads=1, head_dim=32,
         intermediate_size=64, vocab_size=64, max_position_embeddings=4096, attn_impl="sdpa",
         rope_fp32=rope_fp32,
@@ -27,7 +27,7 @@ def test_rotation_keeps_activation_dtype():
     assert apply_rope(x, m.rope_cos[:16], m.rope_sin[:16]).dtype == torch.bfloat16
 
 
-def _shift_error(m: LuxiaBaseModel) -> float:
+def _shift_error(m: KotodamaModel) -> float:
     """|score(q@a, k@b) - score(q@a+s, k@b+s)| averaged: 0 for exact RoPE."""
     torch.manual_seed(1)
     q = torch.randn(64, 32).bfloat16()

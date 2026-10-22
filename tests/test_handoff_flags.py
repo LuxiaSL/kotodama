@@ -6,20 +6,20 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.training.train import _loop_end_step, parse_routing_spec
 
 N_LAYERS = 6
 
 
-def _model(seed: int) -> LuxiaBaseModel:
+def _model(seed: int) -> KotodamaModel:
     torch.manual_seed(seed)
-    cfg = LuxiaModelConfig(
+    cfg = KotodamaModelConfig(
         hidden_size=64, num_layers=N_LAYERS, num_attention_heads=4, num_kv_heads=2, head_dim=16,
         intermediate_size=128, vocab_size=199, max_position_embeddings=96, attn_impl="sdpa",
         attn_res=True, attn_res_boundaries=[0, 1, 3], use_liger=False,
     )
-    return LuxiaBaseModel(cfg)
+    return KotodamaModel(cfg)
 
 
 def test_parse_routing_spec():
@@ -56,7 +56,7 @@ def test_reset_routing_rejects_bad_input():
     m = _model(0)
     with pytest.raises(ValueError):
         m.reset_routing([N_LAYERS])
-    no_res = LuxiaBaseModel(LuxiaModelConfig(
+    no_res = KotodamaModel(KotodamaModelConfig(
         hidden_size=64, num_layers=2, num_attention_heads=4, num_kv_heads=2, head_dim=16,
         intermediate_size=128, vocab_size=199, max_position_embeddings=96, attn_impl="sdpa",
         attn_res=False, use_liger=False,

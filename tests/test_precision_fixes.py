@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.monitoring.geometric import GeometricMonitor, MonitorConfig
 from kotodama.training.muon import _batched_newton_schulz, newton_schulz_orthogonalize
 
@@ -31,7 +31,7 @@ def test_newton_schulz_is_scale_invariant_down_to_tiny_momentum():
 
 def test_sharpness_probe_restores_weights_exactly():
     torch.manual_seed(0)
-    model = LuxiaBaseModel(LuxiaModelConfig(
+    model = KotodamaModel(KotodamaModelConfig(
         hidden_size=64, num_layers=2, num_attention_heads=2, num_kv_heads=1, head_dim=32,
         intermediate_size=128, vocab_size=256, max_position_embeddings=128, attn_impl="sdpa",
     )).to(torch.bfloat16)

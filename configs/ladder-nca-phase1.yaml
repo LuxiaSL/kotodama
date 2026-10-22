@@ -13,4 +13,4 @@ extends: ladder-a1-nca.yaml
 attn_res: false
 # Denser than A1-NCA's 250M: the knee pick needs resolution (22 weights snapshots).
 save_schedule: "125M:end"
-checkpoint_shm_dir: /dev/shm/luxia-ladder-nca-phase1
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-nca-phase1

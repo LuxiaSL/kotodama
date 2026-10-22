@@ -46,7 +46,7 @@ class WandbLogger:
 
     def __init__(
         self,
-        project: str = "luxia-base",
+        project: str = "kotodama",
         run_name: Optional[str] = None,
         config: Optional[dict[str, Any]] = None,
         log_dir: str = "logs",
@@ -94,7 +94,7 @@ class WandbLogger:
                 project=project,
                 name=run_name,
                 config=config or {},
-                tags=tags or ["pretraining", "luxia-base"],
+                tags=tags or ["pretraining", "kotodama"],
                 resume="allow",
             )
             logger.info("Wandb initialized: %s", self._wandb_run.url or "offline")

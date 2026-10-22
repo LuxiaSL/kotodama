@@ -2,4 +2,4 @@
 # = ladder-a1.yaml with its own SHM dir; pass --resume_nca <ladder>/a2-nca/step_*.pt.zst.
 extends: ladder-a1.yaml
 
-checkpoint_shm_dir: /dev/shm/luxia-ladder-a2
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-a2

@@ -1,6 +1,6 @@
-"""Static-shape single-stream decode engine for LuxiaBaseModel (AttnRes).
+"""Static-shape single-stream decode engine for KotodamaModel (AttnRes).
 
-Serving-only fast path. Borrows weight tensors from a loaded LuxiaBaseModel —
+Serving-only fast path. Borrows weight tensors from a loaded KotodamaModel —
 llama.py remains the training/reference implementation and the parity oracle.
 
 Design notes
@@ -45,7 +45,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from kotodama.model.gemv_kernels import decode_gemv, use_custom_gemv
-from kotodama.model.llama import LuxiaBaseModel, apply_rope
+from kotodama.model.llama import KotodamaModel, apply_rope
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ class DecodeEngine(nn.Module):
 
     def __init__(
         self,
-        model: LuxiaBaseModel,
+        model: KotodamaModel,
         max_seq_len: Optional[int] = None,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.bfloat16,

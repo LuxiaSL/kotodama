@@ -13,4 +13,4 @@ attn_res: false
 total_tokens: 750_000_000
 # Same warmup FRACTION as the 3B / A1 NCA phases (1/6): 357 steps -> 60.
 warmup_steps: 60
-checkpoint_shm_dir: /dev/shm/luxia-ladder-cf-nca
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-cf-nca

@@ -9,7 +9,7 @@ import yaml
 
 from kotodama import presets
 from kotodama.eval.model_loader import load_model
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 TINY = dict(hidden_size=64, num_layers=2, num_attention_heads=2, num_kv_heads=1, head_dim=32,
             intermediate_size=128, vocab_size=256, max_position_embeddings=128, attn_impl="sdpa")
@@ -18,7 +18,7 @@ TINY = dict(hidden_size=64, num_layers=2, num_attention_heads=2, num_kv_heads=1,
 @pytest.fixture()
 def tiny_ckpt(tmp_path):
     torch.manual_seed(0)
-    model = LuxiaBaseModel(LuxiaModelConfig(**TINY, attn_res=True, attn_res_boundaries=[0, 1]))
+    model = KotodamaModel(KotodamaModelConfig(**TINY, attn_res=True, attn_res_boundaries=[0, 1]))
     ck = tmp_path / "tiny.pt"
     torch.save({"model": model.state_dict(), "step": 7}, ck)
     cfg = tmp_path / "tiny.yaml"

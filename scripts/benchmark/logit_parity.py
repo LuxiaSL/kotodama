@@ -39,7 +39,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 TOKENIZER_NAME = "HuggingFaceTB/SmolLM2-135M"
 DDV1_BOUNDARIES = [0, 3, 7, 12, 21, 25]
@@ -74,7 +74,7 @@ FULL_TEST_POSITIONS = [
 QUICK_TEST_POSITIONS = [1, 3, 7, 12, 25, 32, 128, 512, 1024, 2048]
 
 
-def load_checkpoint(checkpoint_path: str, device: torch.device) -> LuxiaBaseModel:
+def load_checkpoint(checkpoint_path: str, device: torch.device) -> KotodamaModel:
     """Load model from checkpoint, handling zstd compression."""
     ckpt_path = Path(checkpoint_path)
     if not ckpt_path.exists():
@@ -91,8 +91,8 @@ def load_checkpoint(checkpoint_path: str, device: torch.device) -> LuxiaBaseMode
     else:
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-    config = LuxiaModelConfig(**PROXY_CONFIG)
-    model = LuxiaBaseModel(config)
+    config = KotodamaModelConfig(**PROXY_CONFIG)
+    model = KotodamaModel(config)
 
     state_dict = ckpt.get("model", ckpt)
     model.load_state_dict(state_dict, strict=True)
@@ -117,7 +117,7 @@ class ParityResult:
 
 @torch.inference_mode()
 def compare_at_position(
-    model: LuxiaBaseModel,
+    model: KotodamaModel,
     input_ids: torch.Tensor,
     position: int,
     device: torch.device,
@@ -178,7 +178,7 @@ def compare_at_position(
 
 @torch.inference_mode()
 def run_extended_decode_test(
-    model: LuxiaBaseModel,
+    model: KotodamaModel,
     input_ids: torch.Tensor,
     num_decode_steps: int,
     device: torch.device,

@@ -9,7 +9,7 @@ import torch
 from kotodama import presets
 from kotodama.model import routing_read as rr
 from kotodama.model.capture import instrumented_forward
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 BOUNDARIES = [0, 1, 3]  # 6 layers: blocks L0 | L1-2 | L3-5
 
@@ -56,12 +56,12 @@ def test_split_sums_to_one_and_token_entropy_bounds():
 @pytest.fixture(scope="module")
 def model():
     torch.manual_seed(20260930)
-    cfg = LuxiaModelConfig(
+    cfg = KotodamaModelConfig(
         hidden_size=64, num_layers=6, num_attention_heads=4, num_kv_heads=2, head_dim=16,
         intermediate_size=128, vocab_size=199, max_position_embeddings=96, attn_impl="sdpa",
         attn_res=True, attn_res_boundaries=BOUNDARIES, use_liger=False,
     )
-    m = LuxiaBaseModel(cfg)
+    m = KotodamaModel(cfg)
     # random routing queries so the softmaxes are not uniform (init is zero)
     with torch.no_grad():
         for n, p in m.named_parameters():

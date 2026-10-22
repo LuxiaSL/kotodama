@@ -5,18 +5,18 @@ from __future__ import annotations
 
 import torch
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.training import train as T
 
 
-def _model() -> LuxiaBaseModel:
+def _model() -> KotodamaModel:
     torch.manual_seed(3)
-    cfg = LuxiaModelConfig(
+    cfg = KotodamaModelConfig(
         hidden_size=64, num_layers=4, num_attention_heads=4, num_kv_heads=2, head_dim=16,
         intermediate_size=128, vocab_size=99, max_position_embeddings=32, attn_impl="sdpa",
         attn_res=True, attn_res_boundaries=[0, 1, 3], use_liger=False,
     )
-    m = LuxiaBaseModel(cfg)
+    m = KotodamaModel(cfg)
     with torch.no_grad():
         for n, p in m.named_parameters():
             if "res_query" in n:
@@ -24,7 +24,7 @@ def _model() -> LuxiaBaseModel:
     return m
 
 
-def _backward(m: LuxiaBaseModel) -> None:
+def _backward(m: KotodamaModel) -> None:
     m.train()
     ids = torch.randint(3, 99, (2, 16))
     out = m(input_ids=ids, labels=ids)

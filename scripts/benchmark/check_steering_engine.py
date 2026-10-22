@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from kotodama.model.decode_engine import DecodeEngine, compute_steer_points  # noqa: E402
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig  # noqa: E402
 
 _FAILURES: list[str] = []
 
@@ -89,7 +89,7 @@ DD3B_BOUNDARIES = [0, 1, 3, 7, 15, 19, 24]
 
 def make_engine(device: torch.device, enabled: bool, max_seq_len: int = 128) -> DecodeEngine:
     torch.manual_seed(7)  # identical weights per construction
-    model = LuxiaBaseModel(LuxiaModelConfig(**TINY_CONFIG)).to(device).eval()
+    model = KotodamaModel(KotodamaModelConfig(**TINY_CONFIG)).to(device).eval()
     # fp32 + GQA has no flash/efficient kernel — MATH is exact, ideal for units.
     return DecodeEngine(
         model, max_seq_len=max_seq_len, dtype=torch.float32,

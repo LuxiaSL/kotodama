@@ -15,7 +15,7 @@ import pytest
 import torch
 from torch.optim import AdamW as StockAdamW
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.training.muon import MasterAdamW, build_hybrid_optimizer
 
 LR, WD = 6e-4, 0.1
@@ -65,7 +65,7 @@ def test_master_adamw_moves_and_tracks_fp32_reference():
 
 def test_hybrid_optimizer_trains_norms_on_real_model():
     torch.manual_seed(0)
-    model = LuxiaBaseModel(LuxiaModelConfig(
+    model = KotodamaModel(KotodamaModelConfig(
         hidden_size=64, num_layers=2, num_attention_heads=2, num_kv_heads=1,
         head_dim=32, intermediate_size=128, vocab_size=256,
         max_position_embeddings=128, attn_res=False, attn_impl="sdpa",
@@ -131,9 +131,9 @@ def test_legacy_stock_state_loads_gracefully():
     _grad_steps(opt, [p_new], [torch.full((16,), 1e-3)], 5)  # keeps running
 
 
-def _tiny_attnres_model() -> LuxiaBaseModel:
+def _tiny_attnres_model() -> KotodamaModel:
     torch.manual_seed(0)
-    return LuxiaBaseModel(LuxiaModelConfig(
+    return KotodamaModel(KotodamaModelConfig(
         hidden_size=64, num_layers=2, num_attention_heads=2, num_kv_heads=1,
         head_dim=32, intermediate_size=128, vocab_size=256,
         max_position_embeddings=128, attn_res=True, attn_res_boundaries=[0, 1],

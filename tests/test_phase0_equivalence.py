@@ -21,11 +21,11 @@ import torch
 
 
 from kotodama.data.dataset import TokenizedDataset, collate_packed, compute_doc_boundaries
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.training.muon import Muon
 
 
-def _smoke_config(**overrides) -> LuxiaModelConfig:
+def _smoke_config(**overrides) -> KotodamaModelConfig:
     base = dict(
         hidden_size=64,
         num_layers=4,
@@ -40,14 +40,14 @@ def _smoke_config(**overrides) -> LuxiaModelConfig:
         attn_impl="sdpa",  # "auto" picks flash-attn when installed, which has no CPU kernel
     )
     base.update(overrides)
-    return LuxiaModelConfig(**base)
+    return KotodamaModelConfig(**base)
 
 
 def test_rope_pregather_equivalence() -> None:
     """ndim==3 pre-gathered tables must match per-layer gather exactly."""
     torch.manual_seed(0)
     config = _smoke_config(attn_res=False)
-    model = LuxiaBaseModel(config)
+    model = KotodamaModel(config)
     attn = model.layers[0].attn
 
     B, S = 2, 32
@@ -118,7 +118,7 @@ def test_freeze_unused_attn_res() -> None:
     losses = []
     for freeze in (True, False):
         torch.manual_seed(0)
-        model = LuxiaBaseModel(_smoke_config(attn_res_freeze_unused=freeze))
+        model = KotodamaModel(_smoke_config(attn_res_freeze_unused=freeze))
         model.train()
         out = model(input_ids, labels=input_ids)
         out["loss"].backward()
@@ -225,7 +225,7 @@ def test_doc_masked_forward_smoke() -> None:
     fallback) runs forward+backward and the hoisted RoPE path is exercised."""
     torch.manual_seed(0)
     config = _smoke_config(activation_checkpointing=True)
-    model = LuxiaBaseModel(config)
+    model = KotodamaModel(config)
     model.train()
 
     B, S = 2, 64
@@ -252,7 +252,7 @@ def test_doc_masked_forward_smoke() -> None:
 
     # Non-AttnRes + AC + doc masking: position_ids/cu_seqlens must reach the checkpointed layers
     torch.manual_seed(0)
-    model2 = LuxiaBaseModel(_smoke_config(attn_res=False, activation_checkpointing=True))
+    model2 = KotodamaModel(_smoke_config(attn_res=False, activation_checkpointing=True))
     model2.train()
     out_ac = model2(
         batch["input_ids"], labels=batch["input_ids"],

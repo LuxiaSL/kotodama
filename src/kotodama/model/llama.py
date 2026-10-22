@@ -115,7 +115,7 @@ def _init_fa4() -> bool:
 
 
 @dataclass
-class LuxiaModelConfig:
+class KotodamaModelConfig:
     """Model configuration; named shapes live in kotodama.presets."""
 
     hidden_size: int = 3072
@@ -272,7 +272,7 @@ def apply_rope_fa2(
     return (x * cos + x_rotated * sin).to(x.dtype)
 
 
-def _select_norm_class(config: LuxiaModelConfig) -> type:
+def _select_norm_class(config: KotodamaModelConfig) -> type:
     """Select norm class: LigerRMSNorm when use_liger is enabled, else custom RMSNorm.
 
     NOT used for AttnRes norms — those always use custom RMSNorm because
@@ -385,7 +385,7 @@ def _route_keys(diag: dict[str, float], prefix: str, site: Any, weights: torch.T
     diag[f"{prefix}/token_entropy"] = rr.token_entropy(weights)
 
 
-def _resolve_attn_impl(config: LuxiaModelConfig) -> str:
+def _resolve_attn_impl(config: KotodamaModelConfig) -> str:
     """Resolve attention implementation: "auto" picks FA2 if available, else SDPA."""
     impl = config.attn_impl
     if impl == "fa4":
@@ -424,7 +424,7 @@ class GQAttention(nn.Module):
     (FA2/FA4 don't accept arbitrary attention masks).
     """
 
-    def __init__(self, config: LuxiaModelConfig) -> None:
+    def __init__(self, config: KotodamaModelConfig) -> None:
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_kv_heads
@@ -780,7 +780,7 @@ class GQAttention(nn.Module):
 class SwiGLUFFN(nn.Module):
     """SwiGLU Feed-Forward Network."""
 
-    def __init__(self, config: LuxiaModelConfig) -> None:
+    def __init__(self, config: KotodamaModelConfig) -> None:
         super().__init__()
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
@@ -808,7 +808,7 @@ class SwiGLUFFN(nn.Module):
 class TransformerBlock(nn.Module):
     """Standard pre-norm transformer block, with optional Block AttnRes."""
 
-    def __init__(self, config: LuxiaModelConfig) -> None:
+    def __init__(self, config: KotodamaModelConfig) -> None:
         super().__init__()
         NormClass = _select_norm_class(config)
         self.attn_norm = NormClass(config.hidden_size, eps=config.norm_eps)
@@ -849,7 +849,7 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class LuxiaBaseModel(nn.Module):
+class KotodamaModel(nn.Module):
     """
     kotodama: Llama-family transformer with QK-norm and z-loss.
 
@@ -859,7 +859,7 @@ class LuxiaBaseModel(nn.Module):
     - torch.compile compatibility (standard ops only)
     """
 
-    def __init__(self, config: LuxiaModelConfig) -> None:
+    def __init__(self, config: KotodamaModelConfig) -> None:
         super().__init__()
         self.config = config
         self._use_liger = config.use_liger and _LIGER_AVAILABLE
@@ -872,7 +872,7 @@ class LuxiaBaseModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_layers)])
-        # Looped depth: alias the heavy modules of loop repeats to their core position (see LuxiaModelConfig).
+        # Looped depth: alias the heavy modules of loop repeats to their core position (see KotodamaModelConfig).
         # Everything that walks self.layers (AttnRes, capture, decode, KV caches) sees one block per position;
         # named_parameters()/parameters() dedup the shared weights, so the optimizer steps each once.
         for i in range(config.num_layers):
@@ -1519,3 +1519,8 @@ class LuxiaBaseModel(nn.Module):
         nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=0.02)
         if self.lm_head is not None:
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
+
+
+# Former names, kept so existing importers keep working.
+LuxiaBaseModel = KotodamaModel
+LuxiaModelConfig = KotodamaModelConfig

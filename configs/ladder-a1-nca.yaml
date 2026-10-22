@@ -60,7 +60,7 @@ save_schedule: "250M:end"
 save_every: 400
 keep_checkpoints: 2
 async_checkpoint: true
-checkpoint_shm_dir: /dev/shm/luxia-ladder-a1-nca
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-a1-nca
 
 geo_monitor: true
 geo_monitor_schedule: "0:50"

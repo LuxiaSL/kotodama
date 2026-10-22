@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from kotodama.eval import uncheatable as U
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 V = 300  # stub vocab: byte b -> id b + 1, id 0 = BOS
 
@@ -213,9 +213,9 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
 
     torch.manual_seed(0)
     shape = presets.shape("smoke")
-    cfg = LuxiaModelConfig(**shape, attn_res=True, attn_res_boundaries=[0, 2],
+    cfg = KotodamaModelConfig(**shape, attn_res=True, attn_res_boundaries=[0, 2],
                            rope_fp32=True, attn_impl="sdpa")
-    model = LuxiaBaseModel(cfg).eval()
+    model = KotodamaModel(cfg).eval()
     ck = tmp_path / "run" / "step_00000050.pt"
     ck.parent.mkdir()
     torch.save({"model": model.state_dict(), "step": 123,

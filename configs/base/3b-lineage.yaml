@@ -12,10 +12,10 @@ global_batch_tokens: 2097152
 decay_type: cosine
 
 async_checkpoint: true
-checkpoint_shm_dir: /dev/shm/luxia-base-ckpts
+checkpoint_shm_dir: /dev/shm/kotodama-ckpts
 
 geo_monitor: true
 
 log_every: 10
 wandb: true
-wandb_project: luxia-base
+wandb_project: kotodama

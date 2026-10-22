@@ -13,7 +13,7 @@ import copy
 import pytest
 import torch
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.training.muon import Muon, build_hybrid_optimizer
 
 LR, WD = 0.02, 0.01
@@ -68,9 +68,9 @@ def test_fp32_master_tracks_fp32_reference():
     assert (q.float() - ref_p).abs().max().item() > 100 * (master - ref_p).abs().max().item()
 
 
-def _tiny() -> LuxiaBaseModel:
+def _tiny() -> KotodamaModel:
     torch.manual_seed(0)
-    return LuxiaBaseModel(LuxiaModelConfig(
+    return KotodamaModel(KotodamaModelConfig(
         hidden_size=64, num_layers=2, num_attention_heads=2, num_kv_heads=1, head_dim=32,
         intermediate_size=128, vocab_size=256, max_position_embeddings=128,
         attn_res=True, attn_res_boundaries=[0, 1], attn_impl="sdpa",

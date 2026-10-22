@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "eval"))
 import nca_profile as npf  # noqa: E402
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig  # noqa: E402
 
 
 def _archived_suggest():
@@ -45,13 +45,13 @@ def test_suggest_boundaries_is_the_archived_algorithm():
             assert npf.suggest_boundaries(prof, n, mbs, mxb) == archived(prof, n, mbs, mxb)
 
 
-def _model(attn_res: bool) -> LuxiaBaseModel:
+def _model(attn_res: bool) -> KotodamaModel:
     torch.manual_seed(0)
-    cfg = LuxiaModelConfig(hidden_size=64, num_layers=6, num_attention_heads=4, num_kv_heads=2,
+    cfg = KotodamaModelConfig(hidden_size=64, num_layers=6, num_attention_heads=4, num_kv_heads=2,
                            head_dim=16, intermediate_size=128, vocab_size=10010,
                            max_position_embeddings=64, attn_impl="sdpa", attn_res=attn_res,
                            attn_res_boundaries=[0, 1, 3] if attn_res else None, use_liger=False)
-    return LuxiaBaseModel(cfg).eval()
+    return KotodamaModel(cfg).eval()
 
 
 def test_profile_walk_both_rulers():

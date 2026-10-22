@@ -38,7 +38,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 TOKENIZER_NAME = "HuggingFaceTB/SmolLM2-135M"
 DDV1_BOUNDARIES = [0, 3, 7, 12, 21, 25]
@@ -64,7 +64,7 @@ PROXY_CONFIG = dict(
 )
 
 
-def load_checkpoint(checkpoint_path: str, device: torch.device) -> LuxiaBaseModel:
+def load_checkpoint(checkpoint_path: str, device: torch.device) -> KotodamaModel:
     ckpt_path = Path(checkpoint_path)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
@@ -80,8 +80,8 @@ def load_checkpoint(checkpoint_path: str, device: torch.device) -> LuxiaBaseMode
     else:
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-    config = LuxiaModelConfig(**PROXY_CONFIG)
-    model = LuxiaBaseModel(config)
+    config = KotodamaModelConfig(**PROXY_CONFIG)
+    model = KotodamaModel(config)
     state_dict = ckpt.get("model", ckpt)
     model.load_state_dict(state_dict, strict=True)
     logger.info("Loaded checkpoint step %s", ckpt.get("step", "?"))
@@ -90,7 +90,7 @@ def load_checkpoint(checkpoint_path: str, device: torch.device) -> LuxiaBaseMode
 
 @torch.inference_mode()
 def profile_generation(
-    model: LuxiaBaseModel,
+    model: KotodamaModel,
     input_ids: torch.Tensor,
     num_decode_tokens: int,
     device: torch.device,

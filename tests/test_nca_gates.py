@@ -1,7 +1,7 @@
 """Tests for kotodama.eval.nca_gates (the in-domain NCA gate scorer).
 
 Stub models pin the scoring math exactly (rank/acc accounting, SI direction);
-one integration test runs a real tiny LuxiaBaseModel over items emitted by
+one integration test runs a real tiny KotodamaModel over items emitted by
 the real v3 emitters, CPU-only.
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ VOCAB = V3_TM["VAL0"] + N_VALS + 8
 
 
 class PeakModel:
-    """Stub with the LuxiaBaseModel contract: every position's logits put a
+    """Stub with the KotodamaModel contract: every position's logits put a
     +10 peak on ``peak_id``, flat elsewhere."""
 
     def __init__(self, peak_id: int):
@@ -99,9 +99,9 @@ def test_resolve_token_map(tmp_path):
 
 
 def test_integration_real_model_real_items():
-    from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+    from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
     torch.manual_seed(0)
-    model = LuxiaBaseModel(LuxiaModelConfig(
+    model = KotodamaModel(KotodamaModelConfig(
         hidden_size=64, num_layers=2, num_attention_heads=2, num_kv_heads=1,
         head_dim=32, intermediate_size=128, vocab_size=VOCAB,
         max_position_embeddings=4096, attn_res=False,

@@ -55,10 +55,10 @@ checkpoint_dir: ${KOTODAMA_DATA_ROOT}/p05/armd-v3
 save_every: 340
 keep_checkpoints: 100
 async_checkpoint: true
-# Run-private SHM staging: the shared /dev/shm/luxia-base-ckpts is scanned
+# Run-private SHM staging: the shared /dev/shm/kotodama-ckpts is scanned
 # for step_*.pt by every async run on the node, and same-numbered steps from
 # a concurrent run would collide. The SHM copies persist after the run.
-checkpoint_shm_dir: /dev/shm/luxia-p05-armd-v3
+checkpoint_shm_dir: /dev/shm/kotodama-p05-armd-v3
 
 geo_monitor: false
 log_every: 50

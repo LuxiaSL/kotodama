@@ -4,4 +4,4 @@
 extends: ladder-a0.yaml
 
 attn_res: false
-checkpoint_shm_dir: /dev/shm/luxia-ladder-a0-noattnres
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-a0-noattnres

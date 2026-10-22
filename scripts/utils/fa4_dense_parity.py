@@ -8,7 +8,7 @@
       vs the same block eager — loss + every grad finite and within tolerance.
       (Values, not just execution: a run-only compile check passes on a
       silently-NaN traced backward.)
-  (c) LuxiaBaseModel(attn_impl='fa4', no doc masking) compiled vs eager — the
+  (c) KotodamaModel(attn_impl='fa4', no doc masking) compiled vs eager — the
       combination train.py runs for fa4 without doc masking.
 
 Default shape = the 1B ladder attention: hidden 2048, 16 q / 8 kv heads,
@@ -148,16 +148,16 @@ def compile_block(B: int, S: int, hidden: int, Hq: int, Hkv: int, D: int) -> boo
 
 
 def compile_model() -> bool:
-    from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+    from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
-    print("\n=== (c) LuxiaBaseModel fa4 (no doc masking): compiled vs eager ===")
+    print("\n=== (c) KotodamaModel fa4 (no doc masking): compiled vs eager ===")
     torch.manual_seed(17)
-    cfg = LuxiaModelConfig(
+    cfg = KotodamaModelConfig(
         **presets.shape("smoke"), attn_res=True, attn_res_n_blocks=2,
         attn_impl="fa4", use_liger=False, activation_checkpointing=False,
     )
-    ref = LuxiaBaseModel(cfg).to(DEVICE)
-    cm = LuxiaBaseModel(cfg).to(DEVICE)
+    ref = KotodamaModel(cfg).to(DEVICE)
+    cm = KotodamaModel(cfg).to(DEVICE)
     cm.load_state_dict(ref.state_dict())
     ids = torch.randint(0, cfg.vocab_size, (2, 512), device=DEVICE,
                         generator=torch.Generator(device=DEVICE).manual_seed(3))

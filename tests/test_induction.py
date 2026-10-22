@@ -2,7 +2,7 @@
 
 Stub models pin the math exactly (a perfect copier scores ~ln|V|, uniform
 logits score 0, per-position bookkeeping lands on the right index); tiny real
-LuxiaBaseModels (random init, sdpa, CPU) run the behavioral channel and the
+KotodamaModels (random init, sdpa, CPU) run the behavioral channel and the
 capture-backed prefix-matching read end to end.
 """
 from __future__ import annotations
@@ -137,10 +137,10 @@ def test_per_position_bookkeeping_exact():
 
 
 def _tiny(attn_res: bool) -> torch.nn.Module:
-    from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+    from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
     torch.manual_seed(0)
     kw = dict(attn_res=True, attn_res_boundaries=[0, 1]) if attn_res else {}
-    return LuxiaBaseModel(LuxiaModelConfig(
+    return KotodamaModel(KotodamaModelConfig(
         hidden_size=64, num_layers=2, num_attention_heads=2, num_kv_heads=1,
         head_dim=32, intermediate_size=128, vocab_size=VOCAB,
         max_position_embeddings=256, attn_impl="sdpa",  # "auto" -> no CPU kernel

@@ -57,7 +57,7 @@ from kotodama.data.dataset import (
     collate_packed,
 )
 from kotodama import presets
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.monitoring.geometric import GeometricMonitor, MonitorConfig, MonitorSchedule
 from kotodama.monitoring.wandb_callback import WandbLogger
 from kotodama.training.checkpoint import (
@@ -208,7 +208,7 @@ MODEL_CONFIGS: dict[str, dict[str, Any]] = {name: presets.shape(name) for name i
 
 def _model_flops_per_token(
     param_count: int,
-    config: LuxiaModelConfig,
+    config: KotodamaModelConfig,
     seq_len: int,
 ) -> float:
     """Analytic model FLOPs per token, forward + backward (PaLM-style 6N).
@@ -444,13 +444,13 @@ def train(args: argparse.Namespace) -> None:
     model_kwargs["attn_res_freeze_unused"] = getattr(args, "attn_res_freeze_unused", True)
     if args.attn_res_boundaries:
         model_kwargs["attn_res_boundaries"] = [int(x) for x in args.attn_res_boundaries.split(",")]
-    config = LuxiaModelConfig(**model_kwargs)
+    config = KotodamaModelConfig(**model_kwargs)
 
     # Seed the init: without this every run of the same config draws different
     # initial weights (data order is already seeded in the dataset). DDP then
     # broadcasts rank 0's params, so ranks agree either way.
     torch.manual_seed(args.seed)
-    model = LuxiaBaseModel(config).to(device=device, dtype=torch.bfloat16)
+    model = KotodamaModel(config).to(device=device, dtype=torch.bfloat16)
     init_scheme = getattr(args, "init_scheme", "standard")
     if init_scheme != "standard":
         from kotodama.model.init_schemes import apply_init_scheme
@@ -894,7 +894,7 @@ def train(args: argparse.Namespace) -> None:
             checkpoint_dir=args.checkpoint_dir,
             rank=rank,
             keep_last_n=args.keep_checkpoints,
-            shm_dir=getattr(args, "checkpoint_shm_dir", "/dev/shm/luxia-base-ckpts"),
+            shm_dir=getattr(args, "checkpoint_shm_dir", "/dev/shm/kotodama-ckpts"),
             compress=getattr(args, "checkpoint_compress", True),
         )
     else:
@@ -2224,7 +2224,7 @@ def parse_args() -> argparse.Namespace:
         help="Async checkpointing: CPU clone + background SHM write + zstd",
     )
     p.add_argument(
-        "--checkpoint_shm_dir", type=str, default="/dev/shm/luxia-base-ckpts",
+        "--checkpoint_shm_dir", type=str, default="/dev/shm/kotodama-ckpts",
         help="SHM directory for async checkpoint temp storage",
     )
     p.add_argument(
@@ -2409,7 +2409,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable wandb logging (rank 0 only)",
     )
-    p.add_argument("--wandb_project", type=str, default="luxia-base")
+    p.add_argument("--wandb_project", type=str, default="kotodama")
     p.add_argument("--wandb_run_name", type=str, default=None)
 
     # HuggingFace upload

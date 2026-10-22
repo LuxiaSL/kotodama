@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from kotodama.model import llama as llama_mod
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 DDV1_BOUNDARIES = [0, 3, 7, 12, 21, 25]
 DD3B_BOUNDARIES = [0, 1, 3, 7, 15, 19, 24]
@@ -121,9 +121,9 @@ class ProfileSummary:
     top_kernels: list[dict[str, Any]] = field(default_factory=list)
 
 
-def build_model(args: argparse.Namespace, device: torch.device) -> LuxiaBaseModel:
-    config = LuxiaModelConfig(**MODEL_CONFIGS[args.model_size])
-    model = LuxiaBaseModel(config)
+def build_model(args: argparse.Namespace, device: torch.device) -> KotodamaModel:
+    config = KotodamaModelConfig(**MODEL_CONFIGS[args.model_size])
+    model = KotodamaModel(config)
 
     if args.random_weights:
         logger.warning("Using RANDOM weights — timings valid, logits garbage")
@@ -156,13 +156,13 @@ def make_prompt_ids(n: int, vocab_size: int, device: torch.device) -> torch.Tens
 
 
 @torch.inference_mode()
-def prefill(model: LuxiaBaseModel, input_ids: torch.Tensor) -> tuple[torch.Tensor, list]:
+def prefill(model: KotodamaModel, input_ids: torch.Tensor) -> tuple[torch.Tensor, list]:
     out = model(input_ids, use_cache=True)
     return out["logits"][:, -1:].argmax(dim=-1), out["past_kv"]
 
 
 @torch.inference_mode()
-def timed_prefill(model: LuxiaBaseModel, input_ids: torch.Tensor, device: torch.device, n_repeats: int = 3) -> float:
+def timed_prefill(model: KotodamaModel, input_ids: torch.Tensor, device: torch.device, n_repeats: int = 3) -> float:
     torch.cuda.synchronize(device)
     best = float("inf")
     for _ in range(n_repeats):
@@ -174,7 +174,7 @@ def timed_prefill(model: LuxiaBaseModel, input_ids: torch.Tensor, device: torch.
 
 
 @torch.inference_mode()
-def decode_synced(model: LuxiaBaseModel, tok: torch.Tensor, past_kv: list, n_tokens: int, device: torch.device) -> float:
+def decode_synced(model: KotodamaModel, tok: torch.Tensor, past_kv: list, n_tokens: int, device: torch.device) -> float:
     """Server /generate style: synchronize around every forward, .item() per step."""
     t0 = time.perf_counter()
     for _ in range(n_tokens):
@@ -189,7 +189,7 @@ def decode_synced(model: LuxiaBaseModel, tok: torch.Tensor, past_kv: list, n_tok
 
 
 @torch.inference_mode()
-def decode_free(model: LuxiaBaseModel, tok: torch.Tensor, past_kv: list, n_tokens: int, device: torch.device) -> float:
+def decode_free(model: KotodamaModel, tok: torch.Tensor, past_kv: list, n_tokens: int, device: torch.device) -> float:
     """No CPU in the loop: token stays on GPU, single sync at the end.
 
     This is the floor for the CURRENT eager kernels — pure launch+kernel cost.
@@ -205,7 +205,7 @@ def decode_free(model: LuxiaBaseModel, tok: torch.Tensor, past_kv: list, n_token
 
 
 @torch.inference_mode()
-def grow_cache_to(model: LuxiaBaseModel, target_len: int, vocab: int, device: torch.device) -> tuple[torch.Tensor, list]:
+def grow_cache_to(model: KotodamaModel, target_len: int, vocab: int, device: torch.device) -> tuple[torch.Tensor, list]:
     """Prefill target_len tokens; return (next_token, past_kv) at that context.
 
     A prefilled cache is structurally identical to a decode-grown one (both are
@@ -235,7 +235,7 @@ def bucket_name(name: str) -> str:
 
 @torch.inference_mode()
 def profile_decode_window(
-    model: LuxiaBaseModel,
+    model: KotodamaModel,
     tok: torch.Tensor,
     past_kv: list,
     n_steps: int,

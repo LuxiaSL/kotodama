@@ -2,7 +2,7 @@
 
 Two layers, one convention:
 
-* ``instrumented_forward`` — a faithful mirror of ``LuxiaBaseModel._forward_attn_res``
+* ``instrumented_forward`` — a faithful mirror of ``KotodamaModel._forward_attn_res``
   (non-cached, eval) that runs attention eagerly and captures every surface:
   pre-RoPE keys/queries (k_norm/q_norm outputs), values, softmax weights, gate
   pre-activations, the running residual after each sublayer, committed block
@@ -170,7 +170,7 @@ def instrumented_forward(model, input_ids, light=False, routing_only=False):
 
 # ── the KV-cached extension ────────────────────────────────────────────────────
 #
-# Cached instrumented AttnRes forward for kotodama LuxiaBaseModel — the koto
+# Cached instrumented AttnRes forward for kotodama KotodamaModel — the koto
 # replay surface for signature capture.
 #
 # Extends `instrumented_forward` (the convention of record for

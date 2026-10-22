@@ -28,7 +28,7 @@ import torch.nn.functional as F
 torch.set_num_threads(2)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
 DDV1_BOUNDARIES = [0, 3, 7, 12, 21, 25]
 
@@ -42,7 +42,7 @@ PROXY_CONFIG = dict(
 )
 
 
-def load_model(checkpoint_path: str, device: torch.device) -> LuxiaBaseModel:
+def load_model(checkpoint_path: str, device: torch.device) -> KotodamaModel:
     ckpt_path = Path(checkpoint_path)
     if ckpt_path.suffix == ".zst":
         import zstandard as zstd
@@ -53,8 +53,8 @@ def load_model(checkpoint_path: str, device: torch.device) -> LuxiaBaseModel:
     else:
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-    config = LuxiaModelConfig(**PROXY_CONFIG)
-    model = LuxiaBaseModel(config)
+    config = KotodamaModelConfig(**PROXY_CONFIG)
+    model = KotodamaModel(config)
     model.load_state_dict(ckpt.get("model", ckpt), strict=True)
     print(f"Loaded step {ckpt.get('step', '?')}")
     return model.to(device).eval().bfloat16()
@@ -62,7 +62,7 @@ def load_model(checkpoint_path: str, device: torch.device) -> LuxiaBaseModel:
 
 @torch.inference_mode()
 def compare_logits(
-    model: LuxiaBaseModel,
+    model: KotodamaModel,
     compiled_model: torch.nn.Module,
     input_ids: torch.Tensor,
     prompt_len: int,

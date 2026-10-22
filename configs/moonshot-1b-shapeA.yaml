@@ -26,4 +26,4 @@ mix_fraction: 0.0067
 seed: 17
 data_seed: 42                    # the ladder's data order: curves compare 1:1 with every baseline
 inloop_evals: riders,induction
-checkpoint_shm_dir: /dev/shm/luxia-moonshot
+checkpoint_shm_dir: /dev/shm/kotodama-moonshot

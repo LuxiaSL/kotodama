@@ -8,14 +8,14 @@ import pytest
 import torch
 
 from kotodama.model.init_schemes import SCHEMES, apply_init_scheme, depth_gain
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.presets import SHAPES
 
 
-def _model(seed: int = 0) -> LuxiaBaseModel:
+def _model(seed: int = 0) -> KotodamaModel:
     torch.manual_seed(seed)
-    cfg = LuxiaModelConfig(**SHAPES["smoke"])
-    return LuxiaBaseModel(cfg)
+    cfg = KotodamaModelConfig(**SHAPES["smoke"])
+    return KotodamaModel(cfg)
 
 
 def _state(m: torch.nn.Module) -> dict[str, torch.Tensor]:

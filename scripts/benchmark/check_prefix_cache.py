@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from scripts.benchmark.decode_parity import CONFIG_3B, load_model  # noqa: E402
 from kotodama.model.decode_engine import DecodeEngine  # noqa: E402
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig  # noqa: E402
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig  # noqa: E402
 
 # Gates for the real-checkpoint soak. What distillation samples is the HEAD
 # of the distribution, so the noise-floor-class bound applies to the top-K
@@ -99,7 +99,7 @@ def small_engine(device: torch.device, max_seq_len: int = 128) -> DecodeEngine:
     from torch.nn.attention import SDPBackend
 
     torch.manual_seed(7)
-    model = LuxiaBaseModel(LuxiaModelConfig(**SMALL_CONFIG)).to(device).eval()
+    model = KotodamaModel(KotodamaModelConfig(**SMALL_CONFIG)).to(device).eval()
     # fp32 + GQA has no flash/efficient kernel — MATH is exact, ideal for units.
     return DecodeEngine(
         model, max_seq_len=max_seq_len, dtype=torch.float32,

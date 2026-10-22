@@ -65,8 +65,8 @@ keep_checkpoints: 2
 async_checkpoint: true
 # MUST be unique per arm AND per branch: resume scans this dir for step_*.pt,
 # so a shared one would resume A1 (or a branch) from A0's leftover SHM copies.
-# A0' / branches override it on the CLI (e.g. /dev/shm/luxia-ladder-a0s43).
-checkpoint_shm_dir: /dev/shm/luxia-ladder-a0
+# A0' / branches override it on the CLI (e.g. /dev/shm/kotodama-ladder-a0s43).
+checkpoint_shm_dir: /dev/shm/kotodama-ladder-a0
 
 # Telemetry: geometric families + norm-gain families to the scheduler telemetry.
 geo_monitor: true

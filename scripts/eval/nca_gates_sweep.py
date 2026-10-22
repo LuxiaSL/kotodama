@@ -71,9 +71,9 @@ def build_init(section: str, overrides: dict[str, Any], seed: int,
                device: str, config_path: Path | None = None) -> torch.nn.Module:
     """The run's step-0 weights: train.py seeds with --seed, then builds."""
     from kotodama.eval.model_loader import load_model_config
-    from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+    from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
     torch.manual_seed(seed)
-    model = LuxiaBaseModel(LuxiaModelConfig(
+    model = KotodamaModel(KotodamaModelConfig(
         **{**load_model_config(config_path, section), "qk_norm": True,
            **overrides})).eval().to(device)
     return model.bfloat16() if "cuda" in device else model

@@ -2,15 +2,15 @@
 import pytest
 import torch
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.training.muon import HybridScheduler, build_hybrid_optimizer
 
 
-def _tiny() -> LuxiaBaseModel:
-    cfg = LuxiaModelConfig(hidden_size=64, num_layers=2, num_attention_heads=4, num_kv_heads=2, head_dim=16,
+def _tiny() -> KotodamaModel:
+    cfg = KotodamaModelConfig(hidden_size=64, num_layers=2, num_attention_heads=4, num_kv_heads=2, head_dim=16,
                            intermediate_size=128, vocab_size=256, attn_impl="sdpa", use_liger=False)
     torch.manual_seed(0)
-    return LuxiaBaseModel(cfg)
+    return KotodamaModel(cfg)
 
 
 def test_default_is_one_group_unchanged() -> None:

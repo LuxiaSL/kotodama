@@ -1,7 +1,7 @@
 """Model shapes, AttnRes block boundaries, and the tokenizer: the one table.
 
 Everything else (rope theta, norm eps, QK-norm, tied embeddings, z-loss) is a
-``LuxiaModelConfig`` default. Training, serving, and eval all build their
+``KotodamaModelConfig`` default. Training, serving, and eval all build their
 configs from here, so a new model size is one entry below.
 """
 

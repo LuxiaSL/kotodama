@@ -38,7 +38,7 @@ from kotodama.nca.generator import NCAConfig
 
 logger = logging.getLogger(__name__)
 
-# A "model" here is anything with the LuxiaBaseModel calling convention:
+# A "model" here is anything with the KotodamaModel calling convention:
 # model(input_ids) -> {"logits": (B, S, V)}.
 ModelFn = Callable[[torch.Tensor], dict[str, torch.Tensor]]
 
@@ -220,7 +220,7 @@ def score_eval_dir(model: ModelFn, eval_dir: Path | str, tag: str,
 
 
 def model_overrides(device: str, rope_fp32: bool = False) -> dict[str, Any]:
-    """LuxiaModelConfig overrides for scoring: CPU has no flash-attn / Liger kernels, so
+    """KotodamaModelConfig overrides for scoring: CPU has no flash-attn / Liger kernels, so
     CPU runs use SDPA and plain norms/CE; ``rope_fp32`` matches models trained with fp32
     RoPE tables (the 1B ladder)."""
     ov: dict[str, Any] = {}

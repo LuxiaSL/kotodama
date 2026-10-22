@@ -7,20 +7,20 @@ import math
 import pytest
 import torch
 
-from kotodama.model.llama import LuxiaBaseModel, LuxiaModelConfig
+from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.monitoring.geometric import GeometricMonitor, MonitorConfig
 
 
-def _tiny(attn_res: bool = True) -> LuxiaBaseModel:
+def _tiny(attn_res: bool = True) -> KotodamaModel:
     torch.manual_seed(0)
     kw = dict(hidden_size=64, num_layers=2, num_attention_heads=2, num_kv_heads=1, head_dim=32,
               intermediate_size=128, vocab_size=256, max_position_embeddings=128, attn_impl="sdpa")
     if attn_res:
         kw.update(attn_res=True, attn_res_boundaries=[0, 1])
-    return LuxiaBaseModel(LuxiaModelConfig(**kw))
+    return KotodamaModel(KotodamaModelConfig(**kw))
 
 
-def _mon(model: LuxiaBaseModel) -> GeometricMonitor:
+def _mon(model: KotodamaModel) -> GeometricMonitor:
     return GeometricMonitor(model, MonitorConfig(tier1_sample_layers=[0, 1], tier2_twonn_layers=[0]))
 
 
