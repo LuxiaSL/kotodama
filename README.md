@@ -21,7 +21,7 @@ with DD-3B AttnRes boundaries `0,1,3,7,15,19,24`. Its architecture is frozen.
 - **Decoder:** grouped-query attention, RoPE (θ = 500K), RMSNorm with QK-norm,
   SwiGLU feed-forward, tied input/output embeddings, z-loss on the logits.
 - **Tokenizer:** SmolLM2 (`HuggingFaceTB/SmolLM2-135M`, vocabulary 49,152).
-- **Block Attention Residuals** (Moonshot AI, 2026): instead of one running
+- **Block Attention Residuals** ([Moonshot AI, 2026](https://arxiv.org/abs/2603.15031)): instead of one running
   residual sum, the layers are grouped into blocks; each sublayer reads a
   softmax-weighted mixture of the committed block outputs and the current
   block's partial sum, routed by a learned per-layer pseudo-query. Fused Triton
