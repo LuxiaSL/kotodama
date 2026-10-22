@@ -175,8 +175,15 @@ def chunk_nll(logits: torch.Tensor, ids: torch.Tensor,
 
 def doc_nll(logits_fn: LogitsFn, ids: Sequence[int], bos_id: int,
             chunk_size: int = CHUNK_SIZE, loss_precision: str = "bf16",
-            device: str | torch.device = "cpu") -> float:
-    """NLL of one document: ``[BOS] + chunk`` per ``chunk_size`` tokens."""
+            device: str | torch.device = "cpu", pad_to: int | None = None) -> float:
+    """NLL of one document: ``[BOS] + chunk`` per ``chunk_size`` tokens.
+
+    ``pad_to`` right-pads every chunk to one fixed length before the forward and
+    scores only the real positions. Attention is causal and AttnRes routing mixes
+    depth at a fixed position, so padding after a position cannot change its
+    logits; a single static shape keeps shape-specialized kernels (the Triton
+    AttnRes routing kernels) from recompiling for every document length.
+    """
     if len(ids) <= 1:
         # The original asserts this; an empty/1-token doc would skew bytes.
         raise ValueError(f"document too short ({len(ids)} tokens)")
@@ -186,7 +193,11 @@ def doc_nll(logits_fn: LogitsFn, ids: Sequence[int], bos_id: int,
     for begin in range(0, len(ids), chunk_size):
         chunk = torch.tensor([bos_id, *ids[begin:begin + chunk_size]],
                              dtype=torch.long, device=device)
-        logits = logits_fn(chunk.unsqueeze(0))
+        if pad_to is not None and pad_to > chunk.numel():
+            padded = torch.cat([chunk, chunk.new_full((pad_to - chunk.numel(),), bos_id)])
+            logits = logits_fn(padded.unsqueeze(0))[:chunk.numel()]
+        else:
+            logits = logits_fn(chunk.unsqueeze(0))
         total += chunk_nll(logits, chunk, loss_precision)
     return total
 
@@ -219,6 +230,7 @@ def eval_domain(logits_fn: LogitsFn, encode: EncodeFn, texts: Sequence[str],
                 max_tokens: int | None = None,
                 device: str | torch.device = "cpu",
                 progress: Callable[[Iterable[Any]], Iterable[Any]] | None = None,
+                pad_to: int | None = None,
                 ) -> DomainResult:
     t0 = time.time()
     token_ids = [encode(t) for t in texts]
@@ -229,7 +241,7 @@ def eval_domain(logits_fn: LogitsFn, encode: EncodeFn, texts: Sequence[str],
     nlls: list[float] = []
     for i in it:
         nlls.append(doc_nll(logits_fn, token_ids[i], bos_id, chunk_size,
-                            loss_precision, device))
+                            loss_precision, device, pad_to))
     kept = texts[:n]
     n_bytes = [len(t.encode("utf-8")) for t in kept]
     n_chars = [len(t) for t in kept]
@@ -263,6 +275,8 @@ class Settings:
     data_source: str
     device: str
     extra: dict[str, Any] = field(default_factory=dict)
+    # Pad every chunk to chunk_size + 1 (one static shape; identical NLL, see doc_nll).
+    static_shapes: bool = True
 
 
 def evaluate(logits_fn: LogitsFn, encode: EncodeFn,
@@ -279,7 +293,8 @@ def evaluate(logits_fn: LogitsFn, encode: EncodeFn,
                         settings.chunk_size, settings.loss_precision,
                         settings.max_docs_per_domain,
                         settings.max_tokens_per_domain,
-                        settings.device, progress)
+                        settings.device, progress,
+                        settings.chunk_size + 1 if settings.static_shapes else None)
         per[name] = asdict(r)
         logger.info("%-24s bpb %.6f  (%d/%d docs, %d tok, %.1fs)", name, r.bpb,
                     r.n_docs, r.n_docs_total, r.n_tokens, r.seconds)
@@ -358,6 +373,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--max-docs-per-domain", type=int, default=None)
     ap.add_argument("--max-tokens-per-domain", type=int, default=None)
     ap.add_argument("--chunk-size", type=int, default=CHUNK_SIZE)
+    ap.add_argument("--no-static-shapes", dest="static_shapes", action="store_false",
+                    help="forward each chunk at its own length instead of padding to "
+                         "chunk_size + 1 (recompiles shape-specialized kernels per length)")
     ap.add_argument("--loss-precision", choices=LOSS_PRECISIONS, default="bf16",
                     help="bf16 = the original runner's rounding (parity); "
                          "fp32 = exact")
@@ -432,6 +450,7 @@ def main(argv: list[str] | None = None) -> None:
         chunk_size=args.chunk_size, loss_precision=args.loss_precision,
         max_docs_per_domain=args.max_docs_per_domain,
         max_tokens_per_domain=args.max_tokens_per_domain,
+        static_shapes=args.static_shapes,
         data_source=str(args.data_dir), device=device,
         extra={"attn_impl": model.config.attn_impl,
                "dtype": str(next(model.parameters()).dtype),

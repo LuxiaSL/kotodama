@@ -284,3 +284,26 @@ def test_hm_backfill_uncheatable_mapping():
     merged = hm.merge_points(hm.uncheatable_to_points(res, step=340),
                              [{"step": 340, "metrics": {"gates/x": 1.0}}])
     assert set(merged[0]["metrics"]) >= {"gates/x", "uncheatable/mean"}
+
+
+def test_static_shape_padding_leaves_nll_unchanged():
+    """Right-padding each chunk to one fixed length (the default static-shape path) scores exactly
+    the unpadded NLL on a real causal AttnRes + looped-depth model: later positions cannot reach
+    earlier logits."""
+    from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
+    torch.manual_seed(7)
+    cfg = KotodamaModelConfig(hidden_size=64, num_layers=7, num_attention_heads=4, num_kv_heads=2,
+                              head_dim=16, intermediate_size=128, vocab_size=199,
+                              max_position_embeddings=96, attn_impl="sdpa", attn_res=True,
+                              attn_res_boundaries=[0, 2, 5], use_liger=False,
+                              loop_start=1, loop_len=2, loop_times=2)
+    model = KotodamaModel(cfg).eval()
+
+    @torch.no_grad()
+    def logits_fn(ids: torch.Tensor) -> torch.Tensor:
+        return model(input_ids=ids)["logits"][0]
+
+    ids = torch.randint(3, 199, (53,)).tolist()          # 53 tokens, chunk 20 → chunks of 21, 21, 14 (+BOS)
+    plain = U.doc_nll(logits_fn, ids, 0, chunk_size=20, loss_precision="fp32")
+    padded = U.doc_nll(logits_fn, ids, 0, chunk_size=20, loss_precision="fp32", pad_to=21)
+    assert padded == pytest.approx(plain, rel=1e-5, abs=1e-5)
