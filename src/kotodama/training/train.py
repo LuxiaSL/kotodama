@@ -676,9 +676,14 @@ def train(args: argparse.Namespace) -> None:
                 logger.info(
                     "Inductor activation_memory_budget=%.2f (partitioner-driven "
                     "selective recompute; manual AC off)", ac_budget)
-        if is_main:
-            logger.info("Compiling model with torch.compile (mode=%s)...", compile_mode)
-        model = torch.compile(model, mode=compile_mode)
+        if getattr(args, "compile_regional", False):
+            if is_main:
+                logger.info("Regional compile: per-layer attn/MLP sublayers (mode=%s)...", compile_mode)
+            model.compile_regions(mode=compile_mode)
+        else:
+            if is_main:
+                logger.info("Compiling model with torch.compile (mode=%s)...", compile_mode)
+            model = torch.compile(model, mode=compile_mode)
         if is_main:
             logger.info("Compilation registered (will compile on first forward)")
 
@@ -690,13 +695,10 @@ def train(args: argparse.Namespace) -> None:
         # boundary layer's pre-attn routing) have requires_grad=False, so DDP
         # can skip the per-iteration unused-param graph traversal entirely.
         ddp_find_unused = config.attn_res and not config.attn_res_freeze_unused
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            process_group=dp_group,
-            gradient_as_bucket_view=True,
-            find_unused_parameters=ddp_find_unused,
-        )
+        ddp_kwargs = ddp_options(args, find_unused=ddp_find_unused)
+        model = DDP(model, device_ids=[local_rank], process_group=dp_group, **ddp_kwargs)
+        if is_main:
+            logger.info("DDP %s", ddp_kwargs)
     else:
         if is_main:
             logger.info("Pure TP mode (TP=%d = world_size) — skipping DDP", tp_size)
@@ -798,6 +800,9 @@ def train(args: argparse.Namespace) -> None:
         logger.warning("--legacy_rank0_data: EVERY rank reads rank 0's data (the legacy "
                        "regime) — effective batch = 1/%d of the global batch", dp_size)
     doc_masking = getattr(args, "doc_masking", False)
+    varlen_dynamic = bool(getattr(args, "varlen_dynamic", False) and args.compile and doc_masking)
+    if is_main and getattr(args, "varlen_dynamic", False) and not varlen_dynamic:
+        logger.warning("--varlen_dynamic ignored: it needs --compile and --doc_masking")
     data_seed = training_data_seed(args)
     if is_main and data_seed != args.seed:
         logger.info("Data order seed %d (init seed %d)", data_seed, args.seed)
@@ -1212,6 +1217,13 @@ def train(args: argparse.Namespace) -> None:
                 cu_seqlens = batch["cu_seqlens"].to(device, non_blocking=True)
                 position_ids = batch["position_ids"].to(device, non_blocking=True)
                 max_seqlen_batch = batch["max_seqlen"]
+                if varlen_dynamic:
+                    # One dynamic compile instead of a static one plus a recompile per varying input: the doc
+                    # count is dynamic from the first trace, and max_seqlen is the static upper bound (exact for
+                    # the varlen kernels: scripts/utils/fa4_maxseqlen_parity.py) instead of a per-batch int whose
+                    # first new value recompiles each rank at a different step.
+                    torch._dynamo.maybe_mark_dynamic(cu_seqlens, 0)
+                    max_seqlen_batch = seq_len
             else:
                 input_ids = batch.to(device, non_blocking=True)
                 cu_seqlens = None
@@ -1950,6 +1962,22 @@ def training_data_seed(args: argparse.Namespace) -> int:
     return int(args.seed if ds is None else ds)
 
 
+def ddp_options(args: argparse.Namespace, find_unused: bool) -> dict[str, Any]:
+    """DistributedDataParallel keyword options from the run flags.
+
+    ``broadcast_buffers`` is off under ``--ddp_no_broadcast_buffers``: the model's buffers (RoPE tables, AttnRes
+    masks) are constants built identically on every rank, so the per-forward rank-0 broadcast is redundant.
+    ``bucket_cap_mb`` is set only when ``--ddp_bucket_cap_mb`` is given (else DDP's own default)."""
+    opts: dict[str, Any] = dict(
+        gradient_as_bucket_view=True,
+        find_unused_parameters=find_unused,
+        broadcast_buffers=not getattr(args, "ddp_no_broadcast_buffers", False),
+    )
+    if getattr(args, "ddp_bucket_cap_mb", None):
+        opts["bucket_cap_mb"] = float(args.ddp_bucket_cap_mb)
+    return opts
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="kotodama distributed training")
 
@@ -2390,6 +2418,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Set torch._dynamo.config.capture_scalar_outputs=True (kills the "
              "Liger FLCE .item() tail graph-break; bench arm)",
+    )
+    p.add_argument(
+        "--compile_regional",
+        action="store_true",
+        help="With --compile: compile each layer's attention / MLP sublayer (one compiled function shared by "
+             "every layer, KotodamaModel.compile_regions) instead of the whole model — a few small graphs "
+             "instead of the unrolled depth; AttnRes models only.",
+    )
+    p.add_argument(
+        "--ddp_bucket_cap_mb", type=float, default=None,
+        help="DDP gradient bucket size in MB (default: DDP's own, 25). Comm granularity only.",
+    )
+    p.add_argument(
+        "--ddp_no_broadcast_buffers", action="store_true",
+        help="DDP broadcast_buffers=False: skip the per-forward rank-0 broadcast of the model's constant buffers.",
+    )
+    p.add_argument(
+        "--varlen_dynamic",
+        action="store_true",
+        help="With --compile --doc_masking: mark cu_seqlens' length dynamic from the first trace and pass "
+             "max_seqlen = --sequence_length (an exact upper bound) — one compile at startup instead of "
+             "per-rank recompiles on the first new doc count / max doc length.",
     )
     p.add_argument(
         "--ac_budget",

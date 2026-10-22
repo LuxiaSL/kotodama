@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import types
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
@@ -848,6 +849,30 @@ class TransformerBlock(nn.Module):
             return x, new_kv
         return x
 
+    # The two AttnRes residual sublayers: ``partial + sublayer(norm(h))``, where h is the routed input and partial
+    # the block's running sum. Every effective position runs the same code object (looped repeats share attn/ffn),
+    # so compiling these two methods (KotodamaModel.compile_regions) traces two small graphs instead of the
+    # unrolled depth.
+    def attn_sublayer(
+        self,
+        h: torch.Tensor,
+        partial: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        block_mask=None,
+    ) -> torch.Tensor:
+        return partial + self.attn(
+            self.attn_norm(h), rope_cos, rope_sin, mask,
+            position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+            block_mask=block_mask)
+
+    def mlp_sublayer(self, h: torch.Tensor, partial: torch.Tensor) -> torch.Tensor:
+        return partial + self.ffn(self.ffn_norm(h))
+
 
 class KotodamaModel(nn.Module):
     """
@@ -999,6 +1024,31 @@ class KotodamaModel(nn.Module):
         if self.lm_head is not None:
             return self.lm_head.weight
         return self.embed_tokens.weight
+
+    def compile_regions(self, **compile_kwargs: Any) -> None:
+        """Regional compile: torch.compile each layer's attn_sublayer / mlp_sublayer in place of the whole model.
+
+        One compiled function per sublayer kind is bound to every layer, so dynamo traces each once (parameters are
+        graph inputs) and every effective position — looped repeats included — reuses it; routing, embedding and
+        the loss head run eagerly between regions. Same math as whole-model compile up to fusion boundaries.
+        Train mode only: in eval mode the sublayers run eagerly, as eval forwards on the unwrapped module do under
+        whole-model compile (in-loop evals, monitors). AttnRes path only (the non-AttnRes path calls
+        TransformerBlock.forward)."""
+        if not self.config.attn_res:
+            raise ValueError("compile_regions covers the AttnRes forward only; use torch.compile(model)")
+        eager_attn, eager_mlp = TransformerBlock.attn_sublayer, TransformerBlock.mlp_sublayer
+        compiled_attn = torch.compile(eager_attn, **compile_kwargs)
+        compiled_mlp = torch.compile(eager_mlp, **compile_kwargs)
+
+        def attn_sublayer(blk: TransformerBlock, *args: Any, **kwargs: Any) -> torch.Tensor:
+            return (compiled_attn if blk.training else eager_attn)(blk, *args, **kwargs)
+
+        def mlp_sublayer(blk: TransformerBlock, *args: Any, **kwargs: Any) -> torch.Tensor:
+            return (compiled_mlp if blk.training else eager_mlp)(blk, *args, **kwargs)
+
+        for lyr in self.layers:
+            lyr.attn_sublayer = types.MethodType(attn_sublayer, lyr)
+            lyr.mlp_sublayer = types.MethodType(mlp_sublayer, lyr)
 
     @staticmethod
     def _route_static(
@@ -1242,22 +1292,14 @@ class KotodamaModel(nn.Module):
 
                 # Attention
                 if use_ac:
-                    def _attn_fn(h_in: torch.Tensor, p_in: torch.Tensor,
-                                 _idx: int = i) -> torch.Tensor:
-                        return p_in + self.layers[_idx].attn(
-                            self.layers[_idx].attn_norm(h_in), rope_cos, rope_sin, mask,
-                            position_ids=position_ids,
-                            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                            block_mask=block_mask)
                     partial = torch_checkpoint(
-                        _attn_fn, h_attn, partial,
+                        lyr.attn_sublayer, h_attn, partial, rope_cos, rope_sin, mask,
+                        position_ids, cu_seqlens, max_seqlen, block_mask,
                         use_reentrant=False, preserve_rng_state=False)
                 else:
-                    partial = partial + lyr.attn(
-                        lyr.attn_norm(h_attn), rope_cos, rope_sin, mask,
-                        position_ids=position_ids,
-                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                        block_mask=block_mask)
+                    partial = lyr.attn_sublayer(
+                        h_attn, partial, rope_cos, rope_sin, mask,
+                        position_ids, cu_seqlens, max_seqlen, block_mask)
 
                 # Pre-MLP routing
                 if batch_p1:
@@ -1275,15 +1317,11 @@ class KotodamaModel(nn.Module):
 
                 # MLP
                 if use_ac:
-                    def _mlp_fn(h_in: torch.Tensor, p_in: torch.Tensor,
-                                _idx: int = i) -> torch.Tensor:
-                        return p_in + self.layers[_idx].ffn(
-                            self.layers[_idx].ffn_norm(h_in))
                     partial = torch_checkpoint(
-                        _mlp_fn, h_mlp, partial,
+                        lyr.mlp_sublayer, h_mlp, partial,
                         use_reentrant=False, preserve_rng_state=False)
                 else:
-                    partial = partial + lyr.ffn(lyr.ffn_norm(h_mlp))
+                    partial = lyr.mlp_sublayer(h_mlp, partial)
 
             # ── Carry Phase 1 output for next boundary's pre-attn ────
             if batch_p1:
