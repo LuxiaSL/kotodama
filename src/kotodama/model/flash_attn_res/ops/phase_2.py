@@ -5,7 +5,7 @@ import triton
 from torch.library import triton_op, wrap_triton
 
 from ..kernels import phase_2
-from ..kernels.configs import PHASE2_BWD_MIN_BLOCK_BT
+from ..kernels.configs import EPS_FP64_COMPAT, PHASE2_BWD_MIN_BLOCK_BT
 
 # v2 backward (bf16-native stores, deterministic pseudo-query reduce, no
 # atomics, pipelined configs). Same math as v1 — grads that v1 stored fp32
@@ -31,6 +31,7 @@ def phase_2_online_softmax_merge_triton_op(
             interblock_normalized_output,
             interblock_lse,
             eps,
+            EPS_FP64_COMPAT,  # an op input, so a compiled graph (and its cache key) carries the choice
         )
     )
     return merged_output
@@ -46,6 +47,7 @@ def _phase_2_online_softmax_merge_forward_with_aux_triton_op(
     interblock_normalized_output: torch.Tensor,
     interblock_lse: torch.Tensor,
     eps: float,
+    eps_fp64_compat: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, D = intrablock_partial_sum.shape
     BT = B * T
@@ -79,6 +81,8 @@ def _phase_2_online_softmax_merge_forward_with_aux_triton_op(
         eps,
         D,
         triton.next_power_of_2(D),
+        EPS_CONST=eps,
+        EPS_RUNTIME=eps_fp64_compat,
     )
 
     return merged_output, phase2_intrablock_logit, intrablock_inverse_rms_norm
@@ -272,6 +276,7 @@ def setup_context(ctx, inputs, output):
         interblock_normalized_output,
         interblock_lse,
         eps,
+        _eps_fp64_compat,
     ) = inputs
 
     (
@@ -384,7 +389,12 @@ def backward(
     )
 
 
+def _backward_with_flag_input(ctx, *grads):
+    # eps_fp64_compat is a flag input: no gradient.
+    return (*backward(ctx, *grads), None)
+
+
 _phase_2_online_softmax_merge_forward_with_aux_triton_op.register_autograd(
-    backward,
+    _backward_with_flag_input,
     setup_context=setup_context,
 )

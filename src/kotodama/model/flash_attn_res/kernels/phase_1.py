@@ -20,9 +20,7 @@ def phase_1_batched_attention_forward_kernel(
     lse_ptr,
     inverse_rms_norm_ptr,
     attention_logits_ptr,
-    # constexpr: a runtime float scalar is typed fp64 when inductor launches this kernel inside a compiled
-    # graph (Triton's own launcher passes fp32), which promotes the rms, logits and softmax math to fp64.
-    eps: tl.constexpr,
+    eps,
     num_active,
     NUM_SOURCE_BLOCKS: tl.constexpr,
     BT: tl.constexpr,
@@ -30,6 +28,11 @@ def phase_1_batched_attention_forward_kernel(
     NUM_QUERIES_PER_BLOCK: tl.constexpr,
     PADDED_SRC: tl.constexpr,
     PADDED_HIDDEN: tl.constexpr,
+    # The rms epsilon. EPS_CONST (constexpr) keeps the math fp32 under any launcher; inside a compiled graph inductor
+    # types the runtime `eps` as fp64, which promotes rms / logits / softmax to fp64. EPS_RUNTIME selects that
+    # runtime `eps` instead, reproducing runs trained before the constexpr existed (ops: KOTODAMA_ATTNRES_EPS_FP64_COMPAT).
+    EPS_CONST: tl.constexpr,
+    EPS_RUNTIME: tl.constexpr,
 ):
     batch_seq_idx = tl.program_id(0)
 
@@ -52,7 +55,7 @@ def phase_1_batched_attention_forward_kernel(
     ).to(tl.float32)
 
     squared_norm_sum = tl.sum(source_block_values * source_block_values, axis=1)
-    inverse_rms_norm = tl.rsqrt(squared_norm_sum / float(HIDDEN_DIM) + eps)
+    inverse_rms_norm = tl.rsqrt(squared_norm_sum / float(HIDDEN_DIM) + (eps if EPS_RUNTIME else EPS_CONST))
 
     source_block_range_1d = tl.arange(0, PADDED_SRC)
     source_block_range = source_block_range_1d[:, None]
@@ -541,15 +544,18 @@ def phase_1_online_forward_kernel(
     lse_ptr,
     inverse_rms_norm_ptr,
     attention_logits_ptr,
-    # constexpr: a runtime float scalar is typed fp64 when inductor launches this kernel inside a compiled
-    # graph (Triton's own launcher passes fp32), which promotes the rms, logits and softmax math to fp64.
-    eps: tl.constexpr,
+    eps,
     num_active,
     BT,
     NUM_SOURCE_BLOCKS: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
     PADDED_HIDDEN: tl.constexpr,
     BLOCK_BT: tl.constexpr,
+    # The rms epsilon. EPS_CONST (constexpr) keeps the math fp32 under any launcher; inside a compiled graph inductor
+    # types the runtime `eps` as fp64, which promotes rms / logits / softmax to fp64. EPS_RUNTIME selects that
+    # runtime `eps` instead, reproducing runs trained before the constexpr existed (ops: KOTODAMA_ATTNRES_EPS_FP64_COMPAT).
+    EPS_CONST: tl.constexpr,
+    EPS_RUNTIME: tl.constexpr,
 ):
     # Single-query Phase 1 with an online softmax over the sources: each source row is read once and folded into a
     # running (max, sum, weighted accumulator), so only one (BLOCK_BT, D) fp32 accumulator and the current row are
@@ -579,7 +585,7 @@ def phase_1_online_forward_kernel(
             other=0.0,
         ).to(tl.float32)
         inverse_rms_norm = tl.rsqrt(
-            tl.sum(source_values * source_values, axis=1) / float(HIDDEN_DIM) + eps
+            tl.sum(source_values * source_values, axis=1) / float(HIDDEN_DIM) + (eps if EPS_RUNTIME else EPS_CONST)
         )
         logit = tl.sum(source_values * pseudo_query_vector[None, :], axis=1) * inverse_rms_norm
         tl.store(inverse_rms_norm_ptr + bt_offsets * NUM_SOURCE_BLOCKS + source, inverse_rms_norm, mask=valid_bt)

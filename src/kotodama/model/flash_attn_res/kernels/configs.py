@@ -1,4 +1,11 @@
+import os
+
 import triton
+
+# KOTODAMA_ATTNRES_EPS_FP64_COMPAT=1: the forward kernels add the runtime eps (typed fp64 by inductor inside a
+# compiled graph, so the rms / logits / softmax run in fp64) instead of the constexpr one (fp32 under any launcher).
+# For continuing runs trained before the constexpr existed; eager launches are fp32 either way.
+EPS_FP64_COMPAT = os.environ.get("KOTODAMA_ATTNRES_EPS_FP64_COMPAT", "0") == "1"
 
 forward_configs = [
     triton.Config({}, num_warps=1, num_stages=2),

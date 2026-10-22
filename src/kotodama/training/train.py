@@ -799,6 +799,8 @@ def train(args: argparse.Namespace) -> None:
     if is_main and getattr(args, "legacy_rank0_data", False):
         logger.warning("--legacy_rank0_data: EVERY rank reads rank 0's data (the legacy "
                        "regime) — effective batch = 1/%d of the global batch", dp_size)
+    if apply_attnres_eps_compat(args) and is_main:
+        logger.info("AttnRes eps fp64 compat ON: forward routing runs in fp64 under torch.compile (pre-constexpr numerics)")
     doc_masking = getattr(args, "doc_masking", False)
     varlen_dynamic = bool(getattr(args, "varlen_dynamic", False) and args.compile and doc_masking)
     if is_main and getattr(args, "varlen_dynamic", False) and not varlen_dynamic:
@@ -1962,6 +1964,20 @@ def training_data_seed(args: argparse.Namespace) -> int:
     return int(args.seed if ds is None else ds)
 
 
+def apply_attnres_eps_compat(args: argparse.Namespace) -> bool:
+    """``--attnres_eps_fp64_compat``: the AttnRes forward kernels add the runtime eps, which inductor types as fp64
+    inside a compiled graph (rms / logits / softmax in fp64), instead of the constexpr one (fp32 under any launcher).
+    For continuing a lineage trained before the constexpr existed. Also enabled by
+    KOTODAMA_ATTNRES_EPS_FP64_COMPAT=1. Returns whether compat is on."""
+    from kotodama.model.flash_attn_res.ops import phase_1 as p1ops
+    from kotodama.model.flash_attn_res.ops import phase_2 as p2ops
+
+    if getattr(args, "attnres_eps_fp64_compat", False):
+        p1ops.EPS_FP64_COMPAT = True
+        p2ops.EPS_FP64_COMPAT = True
+    return bool(p1ops.EPS_FP64_COMPAT and p2ops.EPS_FP64_COMPAT)
+
+
 def ddp_options(args: argparse.Namespace, find_unused: bool) -> dict[str, Any]:
     """DistributedDataParallel keyword options from the run flags.
 
@@ -2425,6 +2441,15 @@ def parse_args() -> argparse.Namespace:
         help="With --compile: compile each layer's attention / MLP sublayer (one compiled function shared by "
              "every layer, KotodamaModel.compile_regions) instead of the whole model — a few small graphs "
              "instead of the unrolled depth; AttnRes models only.",
+    )
+    p.add_argument(
+        "--attnres_eps_fp64_compat", action="store_true",
+        help="AttnRes forward kernels use the runtime eps (fp64 inside a compiled graph) instead of the constexpr "
+             "(fp32): reproduces the routing numerics of runs trained before the constexpr existed.",
+    )
+    p.add_argument(
+        "--no_attnres_eps_fp64_compat", dest="attnres_eps_fp64_compat", action="store_false",
+        help="Turn off --attnres_eps_fp64_compat set by a config (fp32 AttnRes routing).",
     )
     p.add_argument(
         "--ddp_bucket_cap_mb", type=float, default=None,

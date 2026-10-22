@@ -20,11 +20,14 @@ def phase_2_online_softmax_merge_forward_kernel(
     merged_output_ptr,
     phase2_intrablock_logit_ptr,
     intrablock_inverse_rms_norm_ptr,
-    # constexpr: a runtime float scalar is typed fp64 when inductor launches this kernel inside a compiled
-    # graph (Triton's own launcher passes fp32), which promotes the rms, logits and softmax math to fp64.
-    eps: tl.constexpr,
+    eps,
     HIDDEN_DIM: tl.constexpr,
     PADDED_HIDDEN: tl.constexpr,
+    # The rms epsilon. EPS_CONST (constexpr) keeps the math fp32 under any launcher; inside a compiled graph inductor
+    # types the runtime `eps` as fp64, which promotes rms / logits / softmax to fp64. EPS_RUNTIME selects that
+    # runtime `eps` instead, reproducing runs trained before the constexpr existed (ops: KOTODAMA_ATTNRES_EPS_FP64_COMPAT).
+    EPS_CONST: tl.constexpr,
+    EPS_RUNTIME: tl.constexpr,
 ):
     batch_seq_idx = tl.program_id(0)
     hidden_dim_range = tl.arange(0, PADDED_HIDDEN)
@@ -47,7 +50,7 @@ def phase_2_online_softmax_merge_forward_kernel(
     ).to(tl.float32)
 
     squared_norm_sum = tl.sum(intrablock_partial_sum * intrablock_partial_sum)
-    inverse_rms_norm = tl.rsqrt(squared_norm_sum / float(HIDDEN_DIM) + eps)
+    inverse_rms_norm = tl.rsqrt(squared_norm_sum / float(HIDDEN_DIM) + (eps if EPS_RUNTIME else EPS_CONST))
 
     intrablock_logit = (
         tl.sum(intrablock_partial_sum * pseudo_query_vector) * inverse_rms_norm

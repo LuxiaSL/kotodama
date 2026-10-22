@@ -26,4 +26,7 @@ mix_fraction: 0.0067
 seed: 17
 data_seed: 42                    # the ladder's data order: curves compare 1:1 with every baseline
 inloop_evals: riders,induction
+# The trunk and its branches were trained with fp64 AttnRes routing (the forward kernels' eps was a runtime float,
+# which inductor types fp64); keep that lineage's numerics. New runs on this shape: --no_attnres_eps_fp64_compat.
+attnres_eps_fp64_compat: true
 checkpoint_shm_dir: /dev/shm/kotodama-moonshot

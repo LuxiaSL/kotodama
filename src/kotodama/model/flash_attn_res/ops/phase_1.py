@@ -5,7 +5,7 @@ import triton
 from torch.library import triton_op, wrap_triton
 
 from ..kernels import phase_1
-from ..kernels.configs import PHASE1_BWD_MIN_BLOCK_BT
+from ..kernels.configs import EPS_FP64_COMPAT, PHASE1_BWD_MIN_BLOCK_BT
 from ..kernels.reduce import reduce_grad_queries_kernel
 
 EPS = torch.finfo(torch.float32).eps
@@ -201,6 +201,7 @@ def _phase_1_batched_attention_forward_with_aux_triton_op(
     pseudo_queries: torch.Tensor,
     eps: float,
     num_active: int,
+    eps_fp64_compat: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_source_blocks = block_representations.shape[0]
     num_queries = pseudo_queries.shape[0]
@@ -247,6 +248,8 @@ def _phase_1_batched_attention_forward_with_aux_triton_op(
             num_source_blocks,
             D,
             triton.next_power_of_2(D),
+            EPS_CONST=eps,
+            EPS_RUNTIME=eps_fp64_compat,
         )
         return softmax_outputs, lses, inverse_rms_norms, attention_logits
 
@@ -265,6 +268,8 @@ def _phase_1_batched_attention_forward_with_aux_triton_op(
         num_queries,
         triton.next_power_of_2(num_source_blocks),
         triton.next_power_of_2(D),
+        EPS_CONST=eps,
+        EPS_RUNTIME=eps_fp64_compat,
     )
 
     return softmax_outputs, lses, inverse_rms_norms, attention_logits
@@ -284,6 +289,7 @@ def phase_1_batched_attention_triton_op(
             pseudo_queries,
             eps,
             num_active,
+            EPS_FP64_COMPAT,  # an op input, so a compiled graph (and its cache key) carries the choice
         )
     )
     return softmax_outputs, lses
@@ -410,7 +416,7 @@ def _batched_attention_backward_accumulate(
 
 
 def setup_context(ctx, inputs, output):
-    block_representations, pseudo_queries, eps, num_active = inputs
+    block_representations, pseudo_queries, eps, num_active, _eps_fp64_compat = inputs
     _softmax_outputs, lses, inverse_rms_norms, attention_logits = output
 
     ctx.save_for_backward(
@@ -543,7 +549,12 @@ def backward(
     )
 
 
+def _backward_with_flag_input(ctx, *grads):
+    # eps_fp64_compat is a flag input: no gradient.
+    return (*backward(ctx, *grads), None)
+
+
 _phase_1_batched_attention_forward_with_aux_triton_op.register_autograd(
-    backward,
+    _backward_with_flag_input,
     setup_context=setup_context,
 )
