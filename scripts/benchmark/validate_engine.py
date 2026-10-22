@@ -56,8 +56,10 @@ GATE_MAX_DELTA = 0.72
 GATE_TOP32_MIN = 0.88
 GATE_GREEDY_NEAR_TIE_MARGIN = 1.0
 
-# GPU host defaults — harmless elsewhere (dir is created if missing).
-DEFAULT_INDUCTOR_CACHE = "/models/kotodama-data/tmp/inductor_cache"
+# Inductor cache for the legs when TORCHINDUCTOR_CACHE_DIR is unset (tools/_env.sh sets it from
+# $KOTODAMA_CACHE_ROOT); the dir is created if missing.
+DEFAULT_INDUCTOR_CACHE = os.path.join(
+    os.environ.get("KOTODAMA_CACHE_ROOT", os.path.join(os.getcwd(), ".cache", "compile")), "inductor")
 LEG_TIMEOUT_S = 2400
 
 

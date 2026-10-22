@@ -1187,7 +1187,7 @@ def _model_name() -> str:
     return f"kotodama-{size_label}-{mode_label}"
 
 
-app = FastAPI(title="luxia DD-v1", lifespan=lifespan)
+app = FastAPI(title="kotodama", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
