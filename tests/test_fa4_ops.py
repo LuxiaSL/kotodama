@@ -261,9 +261,8 @@ def test_dense_compile_fullgraph(cpu_reference_kernels, backend: str) -> None:
 
 def test_model_fa4_dense_compiles(cpu_reference_kernels) -> None:
     """Model dispatch: attn_impl='fa4' without doc masking routes through
-    kotodama::fa4_dense and compiles (the restriction train.py used to
-    enforce). Loss/grads vs the SDPA model within bf16 noise (the fa4 path
-    casts q/k/v to bf16)."""
+    kotodama::fa4_dense and compiles. Loss/grads vs the SDPA model within
+    bf16 noise (the fa4 path casts q/k/v to bf16)."""
     from kotodama.model import llama
 
     if not llama._init_fa4():

@@ -1,7 +1,7 @@
 """The geometric monitor's dead-neuron ruler must be able to see a dead neuron.
 
-The old `dead_units` measured the residual stream (never dead) and read exactly 0.0 for a
-whole 30B-token run; the replacement hooks the SwiGLU output feeding down_proj.
+`dead_mlp_units` hooks the SwiGLU output feeding down_proj: the residual stream is never
+dead, so a ruler measured there reads exactly 0.0 for a whole run.
 """
 from __future__ import annotations
 

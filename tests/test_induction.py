@@ -1,4 +1,4 @@
-"""Tests for kotodama.eval.induction (the P0.4 induction / prefix-matching score).
+"""Tests for kotodama.eval.induction (the induction / prefix-matching score).
 
 Stub models pin the math exactly (a perfect copier scores ~ln|V|, uniform
 logits score 0, per-position bookkeeping lands on the right index); tiny real

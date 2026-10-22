@@ -1,8 +1,8 @@
 """Training-config inheritance (`extends:`) + the no-drift guard for configs/*.yaml.
 
-tests/data/config_snapshot.json was captured from the configs BEFORE they were
-refactored onto configs/base/*.yaml (the loader with no `extends` in play is
-byte-for-byte the old loader). Every config must keep resolving to exactly its
+tests/data/config_snapshot.json pins every config's effective values (configs
+share blocks through configs/base/*.yaml; with no `extends` in play the loader
+reads a flat YAML as-is). Every config must keep resolving to exactly its
 snapshot — both the flat dict the loader returns and the effective argparse
 namespace train.py ends up with. A diff here is a change to a run's config.
 

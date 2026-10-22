@@ -1,8 +1,8 @@
-"""Muon fp32_master: the fix for bf16 Muon weight decay being a no-op (2026-09-28).
+"""Muon fp32_master: the fix for bf16 Muon weight decay being a no-op.
 
-On a bf16 model, Muon applied `p.mul_(1 - lr*wd)` (0.9998 at lr 0.02, wd 0.01) and the
-update directly to the bf16 weights: the decay rounded back to 1.0 for every element, in
-every run, and late updates fell below the bf16 spacing of the (undecayed, grown) weights.
+Without it, Muon on a bf16 model applies `p.mul_(1 - lr*wd)` (0.9998 at lr 0.02, wd 0.01)
+and the update directly to the bf16 weights: the decay rounds back to 1.0 for every element,
+and late updates fall below the bf16 spacing of the (undecayed, grown) weights.
 These tests pin the bug, the fix's fp32-reference trajectory, resume on live parameters,
 dtype preservation across save/load, legacy loading, and legacy-path bit-identity.
 """

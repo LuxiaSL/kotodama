@@ -180,7 +180,7 @@ def test_dialogue_pronoun_chains():
       "obj_pron": "her"}],
     # giver does not hold the object
     [{"form": "give", "giver": "Anna", "recipient": "Tom", "objs": ["cup"]}],
-    # pronoun resolves to the previous GIVER, who no longer holds the object
+    # pronoun resolves to the previous GIVER, who has already given the object away
     [{"form": "give", "giver": "Tom", "recipient": "Lucy", "objs": ["lamp"]},
      {"form": "chain", "subj": "he", "pronoun": "it", "recipient": "Anna"}],
 ])

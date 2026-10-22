@@ -1,4 +1,4 @@
-"""Looped depth (T32-L): loop repeats alias their core position's attention + FFN, nothing else.
+"""Looped depth: loop repeats alias their core position's attention + FFN, nothing else.
 
 Gates: the aliasing is exactly "the same weights at every repeat" (a looped model's state_dict loaded into an
 UNLOOPED model of the same effective depth gives identical logits); per-position norms/routing stay unique; the
@@ -110,7 +110,7 @@ def test_backward_accumulates_into_shared_weights(ids):
 
 
 def test_preset_1b_deep_loop():
-    """The T32-L preset: 1b-deep's width and effective depth, 28 unique layers, deep's boundaries."""
+    """The 1b-deep-loop preset: 1b-deep's width and effective depth, 28 unique layers, deep's boundaries."""
     s, d = presets.shape("1b-deep-loop"), presets.shape("1b-deep")
     for k in ("hidden_size", "num_layers", "num_attention_heads", "num_kv_heads", "head_dim", "intermediate_size"):
         assert s[k] == d[k], k
@@ -127,7 +127,7 @@ def test_serve_knows_1b_deep_loop():
 
 
 def test_preset_1b_deep_loopfit():
-    """T32-L2: the loop sits wholly inside one CF52_FIT block (19→39), 42 unique layers, deep's width/depth."""
+    """1b-deep-loopfit: the loop sits wholly inside one CF52_FIT block (19→39), 42 unique layers, deep's width/depth."""
     s, d = presets.shape("1b-deep-loopfit"), presets.shape("1b-deep")
     for k in ("hidden_size", "num_layers", "num_attention_heads", "num_kv_heads", "head_dim", "intermediate_size"):
         assert s[k] == d[k], k
@@ -146,7 +146,7 @@ def test_preset_1b_deep_loopfit():
 
 
 def test_preset_1b_moonshot_loop():
-    """Moonshot Shape A: 52 unique (1b-deep's budget), 72 effective, the loop = the CF52_FIT long block 19–38 x2,
+    """1b-moonshot-loop (configs/moonshot-1b-shapeA.yaml): 52 unique (1b-deep's budget), 72 effective, the loop = the CF52_FIT long block 19–38 x2,
     a block boundary at every pass start and at the coda."""
     s, d = presets.shape("1b-moonshot-loop"), presets.shape("1b-deep")
     for k in ("hidden_size", "num_attention_heads", "num_kv_heads", "head_dim", "intermediate_size"):

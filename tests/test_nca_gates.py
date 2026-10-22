@@ -1,4 +1,4 @@
-"""Tests for kotodama.eval.nca_gates (the P0.6 in-domain gate scorer).
+"""Tests for kotodama.eval.nca_gates (the in-domain NCA gate scorer).
 
 Stub models pin the scoring math exactly (rank/acc accounting, SI direction);
 one integration test runs a real tiny LuxiaBaseModel over items emitted by

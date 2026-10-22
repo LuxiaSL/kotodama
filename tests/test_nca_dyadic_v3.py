@@ -1,9 +1,9 @@
-"""NCA-v3 generator tests (SPEC-1B-FORMATION-LADDER §5 requirements).
+"""NCA-v3 generator tests.
 
 CPU-only, tiny geometries. Covers: the v1 path staying byte-identical
 (offset=0 / default rng), the v3 alphabet shift + EOS reservation, the
-last-write-wins ledger (well-posedness — the ARM-D-lite ill-posedness
-regression test), anti-shortcut structure, marked/unmarked serialization,
+last-write-wins ledger (well-posedness: a query's gold is the last write to its
+tag), anti-shortcut structure, marked/unmarked serialization,
 token-level mix accounting + sidecar integrity in the writer, and full-run
 determinism with no global-RNG consumption.
 """
@@ -139,7 +139,7 @@ def test_counterfactual_twin_shares_prefix():
     assert not torch.equal(pert.frames[ps:], base.frames[ps:])
 
 
-# ── The writer (R1/R3/R4/R5) ──────────────────────────────────────────────────
+# ── The writer ──────────────────────────────────────────────────────────────
 
 def _writer_args(tmp_path: Path, **over):
     argv = ["--out", str(tmp_path), "--target-tokens", "60000",
@@ -160,7 +160,7 @@ def test_writer_token_mix_eos_and_sidecar(tmp_path):
     recs = [json.loads(l) for l in
             (tmp_path / "shard_0.sidecar.jsonl").read_text().splitlines()]
     assert len(recs) > 20
-    # R3: every episode followed by exactly one EOS at rec["end"]
+    # every episode followed by exactly one EOS at rec["end"]
     for r in recs:
         assert data[r["end"]] == gen.EOS_ID
         seg = data[r["start"]:r["end"]]
@@ -171,17 +171,17 @@ def test_writer_token_mix_eos_and_sidecar(tmp_path):
     for a, b in zip(recs, recs[1:]):
         assert b["start"] == a["end"] + 1
     assert recs[-1]["end"] + 1 == len(data)
-    # R1: token-level mix lands near target (debt scheduler)
+    # token-level mix lands near target (debt scheduler)
     orig_tok = sum(r["end"] - r["start"] + 1 for r in recs
                    if r["family"] == "orig")
     frac = orig_tok / len(data)
     assert 0.2 < frac < 0.4, f"orig token fraction {frac:.2%} off target 30%"
-    # R5: sidecar carries the design fields
+    # sidecar carries the design fields
     dy = [r for r in recs if r["family"] == "dyadic"]
     assert dy and all("p_tag_reuse" in r and "marked" in r
                       and r["rules"][0]["gzip"] > 0 for r in dy)
     assert any(r["marked"] for r in dy) and any(not r["marked"] for r in dy)
-    # R2 ramp: reuse grows across the stream
+    # ramp: reuse grows across the stream
     assert dy[0]["p_tag_reuse"] < dy[-1]["p_tag_reuse"]
 
 

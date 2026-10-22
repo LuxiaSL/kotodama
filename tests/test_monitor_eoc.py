@@ -1,4 +1,4 @@
-"""EoC ruler (2026-09-29 fixes): converged re-randomized power iteration, scale-free
+"""EoC ruler: converged re-randomized power iteration, scale-free
 relative gain, and the MLP sub-layer probed at its own (pre-MLP) routed input."""
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ def _mon(model: LuxiaBaseModel) -> GeometricMonitor:
 
 
 def test_rerandomized_power_iteration_converges():
-    """A re-randomized call must converge like a cold one (the old 5-iteration restart
-    under-read σ every 10th call: the sawtooth in every EoC series)."""
+    """A re-randomized call must converge like a cold one (a short 5-iteration restart
+    under-reads σ every 10th call: a sawtooth in every EoC series)."""
     mon = _mon(_tiny())
     scale = torch.tensor([2.0, 1.5] + [0.5] * 62)
     fn = lambda h: h * scale  # symmetric J: dominant |eigenvalue| = 2.0

@@ -1,9 +1,9 @@
-"""Precision fixes from the 2026-09-28 bf16-class audit.
+"""bf16-class precision guards.
 
-1. Newton-Schulz must be scale-invariant: tiny momentum (~1e-7) was cast to fp16 before
+1. Newton-Schulz must be scale-invariant: tiny momentum (~1e-7) cast to fp16 before
    normalization -> subnormals / flush-to-zero -> a distorted orthogonalized update.
-2. The sharpness probe must leave the weights bit-identical (it used to +e/-2e/+e in
-   place on bf16 weights, leaving a residual on rank 0 only -> DDP rank divergence).
+2. The sharpness probe must leave the weights bit-identical (an in-place +e/-2e/+e on
+   bf16 weights leaves a residual on rank 0 only -> DDP rank divergence).
 """
 from __future__ import annotations
 

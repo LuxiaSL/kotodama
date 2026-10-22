@@ -1,4 +1,4 @@
-"""Battery v3 families: setbind, answer, adjacency, codevarmut (SPEC-battery-v3).
+"""Battery v3 families: setbind, answer, adjacency, codevarmut.
 
 Generation + the shared validator (simulator gold, candidates, mention order, exemplar
 disjointness, collide re-labels, prompt bound), the per-family audits at the frozen
