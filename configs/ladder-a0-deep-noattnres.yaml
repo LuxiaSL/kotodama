@@ -1,0 +1,7 @@
+# 1B formation ladder — T32 AttnRes ablation arm (lab SPEC-T32-attnres-ablation-2026-10-18): 52L deep, NO AttnRes.
+# Short protocol as T29/T25 (4B tokens, init 42 / data 42). Launch exactly as ladder-a0-deep.yaml with this config.
+
+extends: ladder-a0-deep.yaml
+
+attn_res: false
+checkpoint_shm_dir: /dev/shm/luxia-ladder-a0-deep-noattnres

@@ -1,0 +1,29 @@
+# The 1B MOONSHOT trunk (lab SPEC-MOONSHOT-1B) — Shape A: 1b-deep's 52 unique layers (~1.42B) with the boundary-fitted
+# long block (19–38) run 2x → 72 effective layers, loop-aligned AttnRes boundaries (presets.MOONSHOT_LOOP), the A0
+# recipe (Muon 0.04, 2M-token batch, 4K ctx), rdlg2 mixed as one extra source at its natural share (~0.67%, no window).
+# The TRUNK NEVER DECAYS (WSD): constant LR to the token ceiling; cooldowns are branches forked from the anchors.
+#
+# Launch (8 GPUs; pass --global_batch_tokens on the CLI too so heimdall derives the tokens axis):
+#   tools/run_train.sh --config configs/moonshot-1b-shapeA.yaml --global_batch_tokens 2097152 \
+#     --data_path <train.bin> --mix_data_path <rdlg2.bin> --checkpoint_dir <dir> [--seed N]
+# Re-seed order on a failed formation check (spec §6): 17 → 7 → 11 → 101 → 313 → 727 → 1117.
+# Branch cooldown at an anchor A (step S): copy <dir>/anchors/step_S.pt into a fresh dir and resume with
+#   --total_steps S+1+K --decay_start_pct (S+1)/(S+1+K) --save_schedule 1B:end --anchor_tokens ""
+
+extends: ladder-a0.yaml
+
+model_size: 1b-moonshot-loop
+attn_res_boundaries: "0,1,7,9,17,19,39,59"
+muon_lr: 0.04
+
+total_tokens: 100_000_000_000   # ceiling only — the LR never decays on the trunk
+decay_start_pct: 1.0
+save_schedule: "250M:4B,1B:end"  # dense early window for the formation check, then 1B for the stage gauges
+anchor_tokens: "10B,20B,30B,40B,50B,60B,70B,80B,90B"
+keep_checkpoints: 2
+
+mix_fraction: 0.0067
+seed: 17
+data_seed: 42                    # the ladder's data order: curves compare 1:1 with every baseline
+inloop_evals: riders,induction
+checkpoint_shm_dir: /dev/shm/luxia-moonshot

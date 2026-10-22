@@ -143,7 +143,18 @@ CONFIG_1B = dict(CONFIG_3B, **presets.shape("1b"))
 CONFIG_1B_DEEP = dict(CONFIG_3B, **presets.shape("1b-deep"),
                       attn_res_boundaries=list(presets.DEFAULT_BOUNDARIES["1b-deep"]))
 
-MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "1b": CONFIG_1B, "1b-deep": CONFIG_1B_DEEP, "3b": CONFIG_3B}
+CONFIG_1B_DEEP_LOOP = dict(CONFIG_3B, **presets.shape("1b-deep-loop"),
+                           attn_res_boundaries=list(presets.DEFAULT_BOUNDARIES["1b-deep-loop"]))
+
+CONFIG_1B_DEEP_LOOPFIT = dict(CONFIG_3B, **presets.shape("1b-deep-loopfit"),
+                              attn_res_boundaries=list(presets.DEFAULT_BOUNDARIES["1b-deep-loopfit"]))
+
+CONFIG_1B_MOONSHOT_LOOP = dict(CONFIG_3B, **presets.shape("1b-moonshot-loop"),
+                               attn_res_boundaries=list(presets.DEFAULT_BOUNDARIES["1b-moonshot-loop"]))
+
+MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "1b": CONFIG_1B, "1b-deep": CONFIG_1B_DEEP,
+                 "1b-deep-loop": CONFIG_1B_DEEP_LOOP, "1b-deep-loopfit": CONFIG_1B_DEEP_LOOPFIT,
+                 "1b-moonshot-loop": CONFIG_1B_MOONSHOT_LOOP, "3b": CONFIG_3B}
 
 
 # ── Global state ────────────────────────────────────────────────────────────────

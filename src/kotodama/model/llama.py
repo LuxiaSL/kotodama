@@ -150,6 +150,30 @@ class LuxiaModelConfig:
     # find_unused_parameters=False. Disable only when resuming a checkpoint
     # saved with optimizer state from before 2026-07 (AdamW param-count mismatch).
     attn_res_freeze_unused: bool = True
+    # Looped depth (T32-L): effective positions [loop_start, loop_start + loop_len*loop_times) reuse the attention
+    # and FFN weights of the core [loop_start, loop_start + loop_len), run loop_times times. num_layers stays the
+    # EFFECTIVE depth (AttnRes masks/boundaries, KV caches and capture all see one layer per position); each
+    # position keeps its own pre-norms and AttnRes routing params (small), so every pass routes separately.
+    loop_start: Optional[int] = None
+    loop_len: int = 0
+    loop_times: int = 1
+
+    def __post_init__(self) -> None:
+        if self.loop_start is not None:
+            end = self.loop_start + self.loop_len * self.loop_times
+            if self.loop_start < 0 or self.loop_len < 1 or self.loop_times < 2 or end > self.num_layers:
+                raise ValueError(f"bad loop spec start={self.loop_start} len={self.loop_len} "
+                                 f"times={self.loop_times} for num_layers={self.num_layers}")
+
+    def layer_source(self, i: int) -> int:
+        """The effective position whose attn/FFN weights position i uses (i itself unless it is a loop repeat)."""
+        if self.loop_start is None or not (self.loop_start <= i < self.loop_start + self.loop_len * self.loop_times):
+            return i
+        return self.loop_start + (i - self.loop_start) % self.loop_len
+
+    @property
+    def num_unique_layers(self) -> int:
+        return len({self.layer_source(i) for i in range(self.num_layers)})
 
     @property
     def num_kv_groups(self) -> int:
@@ -169,7 +193,8 @@ class LuxiaModelConfig:
         norms = 2 * self.hidden_size  # 2 RMSNorm per layer
         qk_norms = 2 * self.head_dim if self.qk_norm else 0  # Q-norm + K-norm
         per_layer = attn + mlp + norms + qk_norms
-        total = embed + self.num_layers * per_layer
+        # loop repeats share attn/FFN (and qk-norms, which live in the attention); their pre-norms stay per position
+        total = embed + self.num_unique_layers * per_layer + (self.num_layers - self.num_unique_layers) * norms
         if not self.tie_word_embeddings:
             total += self.vocab_size * self.hidden_size
         total += self.hidden_size  # Final norm
@@ -847,6 +872,14 @@ class LuxiaBaseModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_layers)])
+        # Looped depth: alias the heavy modules of loop repeats to their core position (see LuxiaModelConfig).
+        # Everything that walks self.layers (AttnRes, capture, decode, KV caches) sees one block per position;
+        # named_parameters()/parameters() dedup the shared weights, so the optimizer steps each once.
+        for i in range(config.num_layers):
+            src = config.layer_source(i)
+            if src != i:
+                self.layers[i].attn = self.layers[src].attn
+                self.layers[i].ffn = self.layers[src].ffn
         NormClass = _select_norm_class(config)
         self.norm = NormClass(config.hidden_size, eps=config.norm_eps)
 

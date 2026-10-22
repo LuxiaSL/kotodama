@@ -1,0 +1,10 @@
+# 1B formation ladder — T32-L2 LOOP-ALIGNED arm: the deep arm's width and 52 effective layers, with the loop placed
+# inside the corrected-regime 52L fit's long block (presets CF52_FIT 0,1,7,9,17,19,39): 19 prelude + a 10-layer core
+# run 2x (positions 19–38) + 13 coda = 42 unique layers (~1.17B). Compare against ladder-a0-deep.yaml launched with
+# --attn_res_boundaries 0,1,7,9,17,19,39 (same geometry, no loop). Launch exactly as ladder-a0-deep.yaml.
+
+extends: ladder-a0-deep.yaml
+
+model_size: 1b-deep-loopfit
+attn_res_boundaries: "0,1,7,9,17,19,39"
+checkpoint_shm_dir: /dev/shm/luxia-ladder-a0-deep-loopfit
