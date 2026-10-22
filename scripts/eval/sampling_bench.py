@@ -462,12 +462,16 @@ def summarize_bind(rows: list[dict[str, Any]], items_by_id: dict[str, dict[str, 
         return {}
     acc: list[float] = []
     acc_by_file: dict[str, list[float]] = defaultdict(list)
+    acc_by_q: dict[str, list[float]] = defaultdict(list)
     for r in rows:
-        g = item_gold(items_by_id[r["item"]])
+        it = items_by_id[r["item"]]
+        g = item_gold(it)
         if g is not None:
             hit = float(r["read"] is not None and r["read"].lower() == g.lower())
             acc.append(hit)
             acc_by_file[r["file"]].append(hit)
+            if it.get("qkind"):
+                acc_by_q[str(it["qkind"])].append(hit)
     none = [float(r["read"] is None) for r in rows]
     # swap pairs: per (pair, sample)
     by_pair: dict[tuple[str, int], dict[str, Optional[str]]] = defaultdict(dict)
@@ -497,6 +501,8 @@ def summarize_bind(rows: list[dict[str, Any]], items_by_id: dict[str, dict[str, 
                            "shift_hi": shi, "n_pairs": len(shifts)}
     for f, v in sorted(acc_by_file.items()):
         out[f"acc_{f}"] = mean(v)
+    for q, v in sorted(acc_by_q.items()):
+        out[f"acc_q_{q}"] = mean(v)
     return out
 
 
@@ -585,6 +591,28 @@ def write_summary(out: Path, settings: list[Setting], items: list[dict[str, Any]
     lines += ["## Pareto front (loop ↓, nll ↓, binding acc ↑)", ""]
     lines += [f"- {r['setting']}: loop {_fmt(r['loop'])}, nll {_fmt(r['nll'])}, d2 {_fmt(r.get('d2', math.nan))}, "
               f"acc {_fmt(r['acc'])}, shift {_fmt(r.get('shift', math.nan))}" for r in front]
+    # Binding pooled over the penalty axis: the penalty never touches the first answer
+    # token, so (T, top_p) cells pool every rep value's samples (samples renumbered).
+    pooled: dict[tuple[float, float], list[dict[str, Any]]] = defaultdict(list)
+    for s in settings:
+        for r in store.load(s.tag):
+            if r["kind"] == "bind":
+                pooled[(s.temperature, s.top_p)].append(
+                    {**r, "sample": f"r{s.repetition_penalty:g}-{r['sample']}"})
+    if pooled:
+        lines += ["", "## Binding pooled over repetition penalty (per temperature, top_p)", "",
+                  "| T | top_p | reads | acc [95% CI] | none | shift [95% CI] | per-qkind acc |",
+                  "|---|---|---|---|---|---|---|"]
+        for (t, p), prow in sorted(pooled.items()):
+            b = summarize_bind(prow, items_by_id)
+            if not b:
+                continue
+            qk = ", ".join(f"{k[6:]} {_fmt(v, 2)}" for k, v in sorted(b.items()) if k.startswith("acc_q_"))
+            ptag = "off" if p in (0.0, 1.0) else f"{p:g}"
+            lines.append(f"| {t:g} | {ptag} | {b['n_bind']} "
+                         f"| {_fmt(b['acc'])} [{_fmt(b['acc_lo'], 2)},{_fmt(b['acc_hi'], 2)}] "
+                         f"| {_fmt(b['none'], 2)} | {_fmt(b['shift'])} [{_fmt(b['shift_lo'], 2)},"
+                         f"{_fmt(b['shift_hi'], 2)}] | {qk} |")
     lines += ["", "Reading: low loop with NLL near the ancestral reference is the target; NLL far "
               "below it with low loop usually means truncation (top_p / low T) is buying likelihood "
               "with diversity (watch d2/pd2); NLL far above it means the sampler is leaving the "
