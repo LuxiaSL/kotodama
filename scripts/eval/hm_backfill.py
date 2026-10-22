@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Post per-checkpoint eval results into heimdall's Telemetry workspace.
 
-The formation-viewing glue (SPEC-1B-FORMATION-LADDER §4 gates × heimdall's
-Telemetry pane): checkpoint sweeps (nca_gates_sweep, induction, batteries)
+The formation-viewing glue (per-checkpoint gates × heimdall's Telemetry
+pane): checkpoint sweeps (nca_gates_sweep, induction, batteries)
 produce per-step JSON; this posts them as metrics so formation curves sit
 next to loss on the tokens axis, with slices/Δ-heatmaps/comets over them.
 
 Two targets:
 - ATTACH: ``--job <training-job-id>`` — gates land at the training run's own
   steps, alongside its live telemetry (the ladder-arm case).
-- ARCHAEOLOGY: post-hoc trajectories with no live run (the archived 3B, old
-  proxies) get a zero-GPU container job first::
+- POST-HOC: trajectories with no live run (archived checkpoints) get a
+  zero-GPU container job first::
 
-      heimdall submit --gpus 0 --name 3b-formation-archaeology -- true
+      heimdall submit --gpus 0 --name <run-name> -- true
 
   then ``--job <that id>``. ``tokens_seen`` is posted with every point, so
   the workspace's tokens axis works even for synthetic runs.
@@ -29,7 +29,7 @@ Inputs (repeatable, mixable):
 
 Usage::
 
-  python scripts/eval/hm_backfill.py --job e94838f335aa \\
+  python scripts/eval/hm_backfill.py --job <job-id> \\
       --gates gates/summary.json --prefix gates \\
       --config arm=p05-armd-v3 --config generator=v3 \\
       --url http://<coordinator>:7000

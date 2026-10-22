@@ -1,4 +1,4 @@
-"""FlexAttention vs FA2-varlen parity smoke (C1 lever, SPEC-7B §5.1).
+"""FlexAttention vs FA2-varlen parity smoke (doc-masked attention kernel).
 
 Two copies of a small AttnRes model with identical weights process the same
 doc-masked batch — one through the FA2 varlen path, one through FlexAttention

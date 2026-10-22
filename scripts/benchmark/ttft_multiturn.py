@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-turn TTFT probe against a live serve.py/gateway endpoint.
+"""Multi-turn TTFT probe against a live server/gateway endpoint.
 
 Simulates a growing conversation (each turn appends the assistant's actual
 reply plus a new user paragraph) and measures per-turn time-to-first-chunk.

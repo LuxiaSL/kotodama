@@ -1,7 +1,7 @@
 """
 Smoke test: verify model + Muon + z-loss work end-to-end on a single GPU.
 
-Run: python scripts/smoke_test.py
+Run: python scripts/utils/smoke_test.py
 Expected: loss decreases over 50 steps, no crashes, Muon orthogonalization runs.
 """
 

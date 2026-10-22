@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Validate the engine's in-graph top-k/top-p against serve.py's sample_next_token.
+"""Validate the engine's in-graph top-k/top-p against the server's sample_next_token.
 
 Model-free, seconds to run. Two gates:
 
   1. EXACT (deterministic): over a grid of (top_k, top_p, temperature) x many
      random logit vectors (ties forced on a subset), the engine's masking math
      (sort -> kth-value threshold -> renormalized exclusive-cumsum cutoff ->
-     unsort) must produce the SAME survivor set as serve.py's sequential
+     unsort) must produce the SAME survivor set as the server's sequential
      masked_fill blocks, with surviving logit values equal to a few fp32 ulps
-     (0-dim-buffer vs python-scalar division, same tolerance as the round-1
-     penalty gate).
+     (0-dim-buffer vs python-scalar division, same tolerance as the
+     check_sampler_dist penalty gate).
   2. DISTRIBUTIONAL: Gumbel-max draws over the engine's final masked logits
-     match multinomial draws from serve.py's final softmax (symmetric KL +
+     match multinomial draws from the server's final softmax (symmetric KL +
      max abs probability gap on the union of top-100 tokens), for k100, p90,
      and the composed k100+p90 law.
 
@@ -37,7 +37,7 @@ CHUNK = 2048
 TEMP = 0.9
 RP = 1.2
 
-# (top_k, top_p) laws to gate. 0 / 0.0 = disabled (serve.py convention).
+# (top_k, top_p) laws to gate. 0 / 0.0 = disabled (server convention).
 EXACT_GRID = [
     (0, 0.9), (0, 0.95), (0, 0.5), (100, 0.0), (5, 0.0), (1, 0.0),
     (100, 0.9), (2000, 0.95), (0, 0.0), (0, 1.0), (VOCAB + 7, 0.0),
@@ -46,7 +46,7 @@ DIST_LAWS = [(100, 0.0), (0, 0.9), (100, 0.9)]
 
 
 def serve_mask(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
-    """Verbatim port of serve.py sample_next_token's truncation blocks.
+    """Verbatim port of the server's sample_next_token's truncation blocks.
 
     Input: temperature-scaled fp32 logits (V,). Returns masked logits.
     """
@@ -83,8 +83,8 @@ def to_buffers(top_k: int, top_p: float, device: torch.device) -> tuple[torch.Te
     """The engine's _sync_sampling_buffers mapping (disabled -> no-op values).
 
     Disabled p maps to 2.0, NOT 1.0: fp32 cumsum saturates to exactly 1.0 in
-    the distribution tail, so a 1.0 threshold spuriously masks it (caught by
-    this test on 2026-07-05: 11,337 of 49,152 tokens masked on a disabled law).
+    the distribution tail, so a 1.0 threshold spuriously masks it (a 1.0
+    threshold masks ~11k of 49,152 tokens on a disabled law).
     """
     k = top_k if top_k > 0 else VOCAB
     p = top_p if 0.0 < top_p < 1.0 else 2.0

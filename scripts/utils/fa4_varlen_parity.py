@@ -1,4 +1,4 @@
-"""FA4-varlen custom op vs FA2-varlen parity smoke (C1 lever, SPEC-7B §5.1).
+"""FA4-varlen custom op vs FA2-varlen parity smoke (doc-masked attention kernel).
 
 Same structure as flex_parity.py: identical-weight small AttnRes models,
 same doc-masked batch, FA2 reference vs FA4 varlen (kotodama::fa4_varlen).
@@ -101,9 +101,9 @@ def main() -> int:
         e = rel_err(a, b)
         all_ok &= check(f"op {nm} fa4~fa2", e < 2e-2, f"relnorm {e:.3e}")
 
-    # ── compile check: VALUES, not just execution. The 2026-07-09 NaN canary
-    # passed a run-only compile check — the traced backward was silently
-    # garbage. Compiled fwd/grads must match eager and be finite.
+    # ── compile check: VALUES, not just execution. A run-only compile check
+    # passes while the traced backward is silently garbage (NaN), so the
+    # compiled fwd/grads must match eager and be finite.
     r_w = torch.randn_like(q)  # elementwise weight -> contiguous, non-trivial grads
 
     def f(q_, k_, v_):

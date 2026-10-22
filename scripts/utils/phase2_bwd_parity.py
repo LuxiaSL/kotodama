@@ -1,6 +1,6 @@
-"""Parity + micro-bench for the phase-2 backward v2 kernel (7B throughput program).
+"""Parity + micro-bench for the phase-2 backward v2 kernel (7B training shapes).
 
-Gates (SPEC §4 Tier A):
+Gates:
   1. v1 vs v2 BITWISE on grad_intrablock, grad_p1_normalized (post-conversion
      dtypes identical: fp32-compute -> one bf16 round in both paths) and
      grad_lse (fp32 both).
@@ -12,9 +12,7 @@ Gates (SPEC §4 Tier A):
 
 Micro-bench: CUDA-event timing of v1 vs v2 backward ops at training shapes.
 
-Run on gpu-host (GPU required):
-  cd ~/workspace/kotodama && ~/workspace/.venv-shared/bin/python \
-      scripts/utils/phase2_bwd_parity.py
+Run on gpu-host (GPU required): tools/run_py.sh scripts/utils/phase2_bwd_parity.py
 """
 
 from __future__ import annotations

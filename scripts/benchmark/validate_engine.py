@@ -9,7 +9,7 @@ import time):
   2. decode_parity.py vs Triton-routing reference  (fleet config)      [skipped by --quick]
   3. bench_engine.py at ctx {512, 2048}                                [skipped by --skip-bench]
 
-Gates (derived from the round-1 measured noise floor, parity_noise_floor.py:
+Gates (derived from the measured noise floor, parity_noise_floor.py:
 reference flash-vs-efficient maxΔ 0.42-0.63, top32 ~0.94):
 
   * teacher-forced argmax agreement >= 0.99       (every prompt, every leg)
@@ -24,9 +24,8 @@ Prints one final line `VALIDATE_SUMMARY: {...}` for machine parsing; writes
 full JSON via --output. Exit 0 = PASS, 1 = gate FAIL, 2 = harness error.
 
 Canonical invocation (gpu-host):
-    source ~/workspace/.venv-shared/bin/activate
     CUDA_VISIBLE_DEVICES=0 python scripts/benchmark/validate_engine.py \
-        --checkpoint /models/kotodama-data/tmp/kotodama_checkpoints/3b-language-FINAL-step195311.pt
+        --checkpoint <checkpoint.pt>
 Inductor cache/CD-tuning env is set automatically if absent. Engine flags
 (e.g. KOTODAMA_CUSTOM_GEMV) are inherited by every leg — set them at the
 battery invocation to validate a variant.
@@ -149,7 +148,7 @@ def main() -> int:
     if args.quick:
         parity_args += ["--prompt-lens", "16", "256", "--steps", "32"]
 
-    # Leg 1: eager-routing reference (selfsim/distill server parity).
+    # Leg 1: eager-routing reference (KOTODAMA_NO_TRITON_ATTNRES=1 servers).
     legs: list[tuple[str, dict[str, str]]] = [
         ("parity_vs_eager_ref", {**base_env, "KOTODAMA_NO_TRITON_ATTNRES": "1"}),
     ]
@@ -172,7 +171,7 @@ def main() -> int:
         report["legs"][leg_name] = parity
         failures.extend(_gate_parity(leg_name, parity))
 
-    # Leg 3: block prefill/extend battery (2026-07-05 paths) — its own gates
+    # Leg 3: block prefill/extend battery — its own gates
     # (control-calibrated KV screen + teacher-forced 0.72 trace + near-tie
     # handoffs); decode_parity above deliberately pins prefill to reference.
     if not args.quick:

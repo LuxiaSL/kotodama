@@ -22,7 +22,7 @@ Usage:
       name1=path1.bin name2=path2.bin ...
   python scripts/utils/bigram_stats.py --selftest
 
-SPEC-1B-FORMATION-LADDER §2 P0.2. CPU-only; streams are flat uint16 bins.
+CPU-only; streams are flat uint16 bins.
 """
 from __future__ import annotations
 

@@ -12,7 +12,7 @@ Pairs only compare fairly at matched schedules (same warmup / LR at each step); 
 so in the read when they do not. ``--max-step`` clips to the span both runs share.
 
 Usage:
-  python scripts/eval/hm_geodiff.py --job <A> --job <B> --out-dir /tmp/claude-output/geodiff \
+  python scripts/eval/hm_geodiff.py --job <A> --job <B> --out-dir <out>/geodiff \
       [--max-step 300] [--family 'geo/layer_{i}/attn_entropy_mean' ...]
 """
 from __future__ import annotations

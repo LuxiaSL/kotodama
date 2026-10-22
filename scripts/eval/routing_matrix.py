@@ -26,9 +26,9 @@ Usage (a run's weights trajectory, CPU)::
     tools/run_py.sh scripts/eval/routing_matrix.py --run a0-fixed \\
         --checkpoint <run>/weights/step_00000119.pt --checkpoint <run>/weights/step_00001192.pt \\
         --config-section 1b --attn-res-boundaries dd3b --rope-fp32 --threads 24 \\
-        --out-dir /tmp/claude-output/routing-matrix
+        --out-dir <out>/routing-matrix
     # plots over finished JSONs (no model):
-    python scripts/eval/routing_matrix.py --plot --out-dir /tmp/claude-output/routing-matrix
+    python scripts/eval/routing_matrix.py --plot --out-dir <out>/routing-matrix
 """
 
 from __future__ import annotations

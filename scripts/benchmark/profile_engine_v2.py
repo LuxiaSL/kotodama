@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Step-0 serving profile: decode + prefill + extend, kernel-bucketed.
 
-Re-ranks the serving levers (SERVING-TRANSFER-kernel-findings-2026-07-05.md
-S1/S2/S3) by measuring, on one idle GPU:
+Ranks the serving cost centres by measuring, on one idle GPU:
 
-  1. DECODE (fast engine, compiled max-autotune like serve.py): free-running
+  1. DECODE (fast engine, compiled max-autotune like the server): free-running
      ms/token at ctx {512, 2048} with the fused sampled step, plus a
      torch.profiler window -> kernel-time sum vs wall (dispatch-gap metric)
      and a top-kernel bucket table.
@@ -13,17 +12,17 @@ S1/S2/S3) by measuring, on one idle GPU:
      prompt lengths + profiler bucket split {p1, restack/copy, sdpa, mm, other}.
   3. EXTEND (engine.prefill_cached): common=1024 with suffix {1, 16, 64} —
      the multi-turn / n-of-5 reroll shape SFT curation traffic lives on.
-  4. REFERENCE decode step (eager model forward w/ past_kv) — the path every
-     truncated-law (top_p/top_k) request falls back to today.
+  4. REFERENCE decode step (eager model forward w/ past_kv) — the server's
+     reference decode path.
   5. TOP-P COST microbench: full-vocab sort+softmax+cumsum+mask, the marginal
-     in-graph cost of un-cliffing truncated laws in the engine.
+     in-graph cost of truncated laws (top_p) in the engine.
 
 Emits PROFILE_SUMMARY: {...} on the last line for machine parsing; full JSON
-via --output. Read-only wrt serve.py — builds its own engine.
+via --output. Read-only wrt the server — builds its own engine.
 
 Canonical invocation (gpu-host, via run_py.sh for warm caches + unbuffered logs):
     CUDA_VISIBLE_DEVICES=0 bash tools/run_py.sh scripts/benchmark/profile_engine_v2.py \
-        --checkpoint /models/kotodama-data/tmp/kotodama_checkpoints/3b-language-FINAL-step195311.pt \
+        --checkpoint <checkpoint.pt> \
         --output scripts/benchmark/results/profiles/engine_v2_baseline.json
 """
 
@@ -42,7 +41,7 @@ from typing import Any
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-# Match serve.py's engine build env (round-1 deploy recipe).
+# Match the server's engine build env.
 os.environ.setdefault("TORCHINDUCTOR_COORDINATE_DESCENT_TUNING", "1")
 
 import torch
@@ -191,8 +190,8 @@ def bench_extend(engine: DecodeEngine, common: int, suffixes: list[int],
                  device: torch.device) -> dict[str, Any]:
     out: dict[str, Any] = {"common": common, "wall_ms": {}}
     base = rand_ids(common + max(suffixes), engine.config.vocab_size, device, seed=42)
-    # Warm both extend variants first (serve.py does this at startup): the
-    # cold suffix-1 path measured 54ms vs 3ms warmed (2026-07-05 probe).
+    # Warm both extend variants first (the server does this at startup): the
+    # cold suffix-1 path costs ~54ms vs ~3ms warmed.
     engine.prefill(base[:, :64])
     engine.prefill_cached(base[:, :96])   # multi-token extend
     engine.prefill_cached(base[:, :97])   # suffix-1 (regenerate) variant
@@ -239,7 +238,7 @@ def bench_reference_decode(model, ctx: int, device: torch.device, steps: int) ->
 
 @torch.inference_mode()
 def bench_top_p_cost(vocab: int, device: torch.device, iters: int = 50) -> dict[str, Any]:
-    """serve.py sample_next_token top-p math (lines ~638-641) on a (V,) tensor."""
+    """The server's sample_next_token top-p math on a (V,) tensor."""
     logits = torch.randn(vocab, device=device, dtype=torch.float32)
 
     def top_p_mask() -> tuple[torch.Tensor, torch.Tensor]:
@@ -284,7 +283,7 @@ def main() -> int:
     engine = DecodeEngine(model, max_seq_len=4096)
     if not args.no_compile:
         t0 = time.perf_counter()
-        engine.compile_step(mode="max-autotune")  # matches serve.py:464
+        engine.compile_step(mode="max-autotune")  # matches the server's engine build
         # Trigger the compile with one real step.
         engine.prefill(rand_ids(64, engine.config.vocab_size, device))
         tok = engine.sample_first(engine.prefill(rand_ids(64, engine.config.vocab_size, device)), RECIPE)

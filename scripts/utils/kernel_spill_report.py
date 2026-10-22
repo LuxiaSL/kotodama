@@ -1,4 +1,4 @@
-"""Register/spill report for AttnRes routing kernels (7B throughput program).
+"""Register/spill report for AttnRes routing kernels (7B training shapes).
 
 Runs each backward kernel once at training shape (populating the autotune
 cache), then introspects the compiled binaries for n_regs / n_spills /

@@ -1,7 +1,6 @@
 """Run lm-evaluation-harness benchmarks on LuxiaBaseModel checkpoints.
 
 Usage:
-    cd pretraining
     python -m scripts.eval.run_lm_eval --checkpoint path/to/step.pt.zst
     python -m scripts.eval.run_lm_eval --checkpoint ckpt1.pt,ckpt2.pt --tasks hellaswag,piqa --limit 100
 """

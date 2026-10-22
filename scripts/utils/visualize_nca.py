@@ -12,10 +12,10 @@ channel. Outputs PNG files showing:
 Usage::
 
     # Generate visualizations from fresh rules
-    python scripts/visualize_nca.py --device cuda:0
+    python scripts/utils/visualize_nca.py --device cuda:0
 
     # Visualize from existing trajectory data
-    python scripts/visualize_nca.py --from-data data/nca_trajectories.bin
+    python scripts/utils/visualize_nca.py --from-data data/nca_trajectories.bin
 """
 
 from __future__ import annotations

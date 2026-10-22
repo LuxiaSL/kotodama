@@ -8,7 +8,7 @@ i.e. the honest yardstick for judging DecodeEngine parity numbers.
 
 Usage:
     KOTODAMA_NO_TRITON_ATTNRES=1 CUDA_VISIBLE_DEVICES=0 python scripts/benchmark/parity_noise_floor.py \
-        --checkpoint /models/.../ckpt.pt
+        --checkpoint <checkpoint.pt>
 """
 
 from __future__ import annotations

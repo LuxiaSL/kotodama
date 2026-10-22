@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fit AttnRes block boundaries on a no-AttnRes run, snapshot by snapshot, until they settle.
 
-The 2026-10-01 re-fit (Luxia): boundaries are read where LANGUAGE circuits settle, on a
+Boundaries are read where LANGUAGE circuits settle, on a
 no-AttnRes counterfactual (``configs/ladder-cf-lang.yaml``; leg B adds a safe-dose NCA
 phase first), with the probe on held-out language text — not on NCA geometry with a
 random-token probe, as DD-3B was. Per snapshot, four fits:
@@ -14,7 +14,7 @@ random-token probe, as DD-3B was. Per snapshot, four fits:
 - ``rules_cka``: independent signal — 1 - linear CKA between adjacent layers' outputs,
   picked under the same rules;
 - ``*_nomid``: the rules fits without the middle-block rule (``--min-mid-block``: the
-  block holding the midpoint layer keeps >= K layers, Luxia's "contiguous middle"), to
+  block holding the midpoint layer keeps >= K layers, a contiguous middle), to
   show whether that rule binds or the data already agrees.
 
 Stop rule (``summary.json``): a fit is SETTLED at the first snapshot from which its boundaries
@@ -26,7 +26,7 @@ Usage::
 
     tools/run_py.sh scripts/eval/fit_boundaries.py --run cf-lang \\
         --checkpoint <ladder>/cf-lang/weights/step_*.pt --config-section 1b --rope-fp32 \\
-        --out-dir /tmp/claude-output/boundary-fit
+        --out-dir <out>/boundary-fit
     python scripts/eval/fit_boundaries.py --summarize --run cf-lang --out-dir ...
 """
 
@@ -68,8 +68,8 @@ def fits_for(profiles: dict[str, dict[str, list[float]]], cka_scores: list[float
 
 def settled_at(series: list[tuple[int, list[int]]], k: int, tol: int = 0) -> int | None:
     """First step from which the boundaries never change again through the LAST snapshot
-    (each boundary within tol), provided that holds for at least k snapshots. (Was: the first
-    k-in-a-row run — it fired early on fits that kept moving afterwards.)"""
+    (each boundary within tol), provided that holds for at least k snapshots. (A plain
+    k-in-a-row run is not enough: it fires early on fits that keep moving afterwards.)"""
     def same(a: list[int], b: list[int]) -> bool:
         return len(a) == len(b) and all(abs(x - y) <= tol for x, y in zip(a, b))
     last = series[-1][1] if series else None

@@ -18,8 +18,8 @@ layers the Spearman rank correlation of the final values (comet mode).
 
 Examples:
   python scripts/eval/hm_portrait.py --job <id> --x 'norm_gain/layer_{i}/q_norm' \
-      --y 'geo/layer_{i}/attn_entropy_mean' --out /tmp/claude-output/qgain-vs-entropy.png
-  python scripts/eval/hm_portrait.py --job <A0> --job <A1> --x ... --y ...   # side by side
+      --y 'geo/layer_{i}/attn_entropy_mean' --out <out>/qgain-vs-entropy.png
+  python scripts/eval/hm_portrait.py --job <A> --job <B> --x ... --y ...   # side by side
   python scripts/eval/hm_portrait.py --job <id> --x 'norm_gain/layer_{i}/q_norm' --out heat.png
 """
 from __future__ import annotations

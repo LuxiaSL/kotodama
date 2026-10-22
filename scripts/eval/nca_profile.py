@@ -7,9 +7,8 @@ The DD boundary method of record (how DD-3B ``0,1,3,7,15,19,24`` was derived):
     Phase 2  pick the knee checkpoint, run this script -> boundaries
     Phase 3  NCA co-train WITH AttnRes on the derived boundaries
 
-Restored from ``scripts/nca_profile.py`` at tag ``pre-consolidation-2026-09`` (dropped in
-the consolidation); ``suggest_boundaries`` is kept VERBATIM so a re-derivation at a new
-scale runs the same algorithm the 3B did. Two rulers for attention entropy:
+``suggest_boundaries`` is the archived algorithm kept VERBATIM (tests/test_nca_profile.py
+pins it) so a re-derivation at a new scale runs the same algorithm the 3B did. Two rulers for attention entropy:
 
 - ``legacy``: the archived computation — softmax(q kᵀ/√d) from the RAW q/k projections,
   no QK-norm, no RoPE. This is what DD-3B was fit on; kept for faithful replication.
@@ -25,7 +24,7 @@ Usage::
 
     tools/run_py.sh scripts/eval/nca_profile.py --checkpoint <phase1>/step_N.pt \\
         --config-section 1b --rope-fp32 --max-boundaries 7 --min-block-size 1 \\
-        --out /tmp/claude-output/nca-profile/step_N.json
+        --out <out>/nca-profile/step_N.json
 """
 
 from __future__ import annotations
@@ -256,7 +255,7 @@ def select_boundaries(scores: list[float], num_layers: int, min_block_size: int 
     - ``forced`` boundaries (``(1,)`` isolates the embedding layer L0);
     - ``min_last_block``: output cushion;
     - ``min_mid_block``: the block containing the midpoint layer keeps at least this many
-      layers (Luxia: middle layers build longer, more intricate circuits that develop and
+      layers (the rationale: middle layers build longer, more intricate circuits that develop and
       mutate representations toward the next response, so they want one contiguous block);
       a cut that would shrink it below the minimum is skipped for the next-best cut.
 

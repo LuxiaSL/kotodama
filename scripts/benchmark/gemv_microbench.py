@@ -8,7 +8,7 @@ would otherwise dominate 3-20 us kernels and because graph capture is exactly
 how the kernel runs in production (cudagraph trees).
 
 The integration bar is NOT F.linear eager: it is the CURRENT compiled build's
-fused per-kernel times (results/profiles/engine_round2_baseline.json):
+fused per-kernel times (per-kernel profile of the compiled DecodeEngine step, B200):
     qkv 19.5us (incl. fused norm) | o 7.1-31us | gate_up 15.6 | down 8.2 | lm_head 47.7
 
 Usage (gpu-host):
@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 logger = logging.getLogger(__name__)
 
 # (N, K) per decode GEMV site; calls/step; current fused-kernel us/call from
-# the round-2 baseline profile (the bar custom kernels must beat AFTER adding
+# that per-kernel profile (the bar custom kernels must beat AFTER adding
 # back the cost of any epilogue/prologue that un-fuses).
 SHAPES: dict[str, dict[str, Any]] = {
     "qkv":     {"N": 5120,  "K": 3072, "calls": 28, "current_us": 19.5},
