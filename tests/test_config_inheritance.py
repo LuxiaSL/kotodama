@@ -43,6 +43,9 @@ def _effective(path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 
 def _resolve_all(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    # The snapshot pins configs as written: ${KOTODAMA_DATA_ROOT} stays unexpanded, so a
+    # site profile that exports it (tools/_env.sh) must not leak machine paths into the pin.
+    monkeypatch.delenv("KOTODAMA_DATA_ROOT", raising=False)
     out: dict[str, Any] = {}
     for p in _training_configs():
         resolved = _load_yaml_config(p)
