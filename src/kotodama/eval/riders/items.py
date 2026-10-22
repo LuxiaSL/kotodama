@@ -1,7 +1,6 @@
 """Rider-grid items: one abstract generator, four renderers.
 
-The P0.6 four-register binding battery (prereg FROZEN 2026-08-02; the bars live
-there, not here). Harvested from the frozen ``gen_items.py``; generation is
+The four-register binding battery. The item set is fixed: generation is
 byte-identical for a given seed + name pool, so banked grids stay comparable.
 
 Renderers over the SAME abstract item:
@@ -69,8 +68,8 @@ GRID_TOKENIZERS: dict[str, str] = {
     "qwen25": "Qwen/Qwen2.5-3B-Instruct",              # base shares the vocab
 }
 
-# The pool ``verify_names`` produced on 2026-08-02 over GRID_TOKENIZERS (78/93;
-# banked ``verified_names.json``). Every banked P0.6 grid was generated from it.
+# The pool ``verify_names`` produced over GRID_TOKENIZERS (78/93 candidates
+# pass). Every banked rider grid is generated from it.
 BANKED_VERIFIED_NAMES: tuple[str, ...] = (
     "bell", "glass", "pen", "ring", "map", "key", "coin", "book", "apple",
     "stone", "cup", "brush", "candle", "shell", "thread", "button", "feather",
@@ -315,7 +314,7 @@ def chatml_render(messages: list[dict[str, str]], open_final: bool) -> str:
     open_final=True leaves the last (assistant) turn unclosed with its lead-in
     inline: ``render_chatml`` of the closed turns (whose trailing generation
     prompt IS the open assistant header) + the lead-in — byte-identical to the
-    frozen battery's hand-built string. open_final=False closes every turn and
+    battery's fixed hand-built string. open_final=False closes every turn and
     appends no generation prompt, which ``render_chatml`` cannot express.
     """
     if not open_final:
@@ -345,8 +344,8 @@ def build_prompt(item: Item, renderer: str, shots: list[Item],
             raise ValueError(f"unknown renderer {renderer!r}; choose from {RENDERERS}")
         rfn = _RAW_RENDERERS[renderer]
         blocks = [rfn(s, True) for s in shots] + [rfn(item, False)]
-        # "###" item delimiter: d0 gate v1 caught llama-3.2 blending narrative
-        # shot items into the query under bare "\n\n" (prereg §10 amendment).
+        # "###" item delimiter: under a bare "\n\n" llama-3.2 blends narrative
+        # shot items into the query (the d0 gate catches it).
         return {"prompt": "\n\n###\n\n".join(blocks)}
 
     shot_msgs = [m for s in shots for m in chat_messages(s, True)]

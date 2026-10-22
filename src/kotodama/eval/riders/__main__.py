@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     g = sub.add_parser("gen", help="emit items.jsonl + shots.json")
     g.add_argument("--out", required=True, help="output directory")
     g.add_argument("--names", default=None,
-                   help="verify-names JSON (default: the banked 2026-08-02 pool)")
+                   help="verify-names JSON (default: the banked pool)")
     g.add_argument("--per-cell", type=int, default=200)
     g.add_argument("--d0-count", type=int, default=200)
     g.add_argument("--seed", type=int, default=items.DEFAULT_SEED)

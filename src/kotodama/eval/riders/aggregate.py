@@ -1,6 +1,6 @@
 """Rider-grid aggregation: difficulty-0 gate + the four-register margin tables.
 
-Frozen bars (P0.6 prereg):
+Fixed bars:
   gate 1: d0 rank-1 rate >= 95% per (model x renderer), read at 3-shot; failing
           renderer cells are marked HARNESS-BUG and their std reads are printed
           struck-through (still computed, never trusted).

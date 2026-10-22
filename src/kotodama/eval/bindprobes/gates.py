@@ -1,29 +1,29 @@
-"""deixis validity gates V1–V5 (SPEC-bindprobes-deixis §5): the family is not a
-ruler for any arm until every gate passes on the validation set.
+"""deixis validity gates V1–V5: the family is not a ruler for any model until
+every gate passes on the validation set.
 
   V1 construction    every item's gold reproduces from the simulator and every
                      pronoun resolves uniquely (``items.validate`` incl. the surface
                      addressee-rule check), pairs link (``deixis.check_pairs``), the
                      shortcut controls sit within ±5% (or one item) of the cell's
                      chance rate (``deixis.audit_failures``; v2's neutral target,
-                     inside the spec's "≤ 50% ± 5%"), every grid row's gold matches its
+                     inside the outer "≤ 50% ± 5%" bound), every grid row's gold matches its
                      item, and no row carries a multi-token candidate.
   V2 chance          at the ``chance`` checkpoint (0.25B), deictic 3shot cc acc within
                      ±.05 of 0 on every query kind.
-  V3 learnability    at the ``learn`` checkpoint (A0* 30B), third 3shot cc ≥ .20.
+  V3 learnability    at the ``learn`` checkpoint (30B tokens), third 3shot cc ≥ .20.
   V4 control order   third ≥ deictic − .03 (3shot cc) on every ``ge2b`` checkpoint
                      (default: every model in the grids except the chance one).
   V5 twin sanity     at the chance checkpoint, 3shot twin-pair joint accuracy ≤
                      chance² + .03 (chance² = mean over pairs of (1/C_x)(1/C_twin));
                      v2: P = 3 pairs only (P = 2 items have no twin).
 
-PILOT GATE (v2 addendum §5, ``--pilot``): on the pilot battery (``gen --families
-deixis --per-cell deixis=10``: 150 base items) scored at A0* 0.25B and A0* 30B,
+PILOT GATE (``--pilot``): on the pilot battery (``gen --families
+deixis --per-cell deixis=10``: 150 base items) scored at 0.25B and 30B tokens of one run,
 V2 is read with the wider band |cc| ≤ .08 (the pilot's n) and the verdict is
 V1 ∧ V2 ∧ V3 (V1 = the construction is sound, a prerequisite for reading the
-other two; the addendum's decision rule is V2 ∧ V3). V4/V5 are printed for
-information only. Proceed to the full battery only on PILOT PASS; otherwise stop
-and report (no third design without Luxia).
+other two; the decision itself rests on V2 ∧ V3). V4/V5 are printed for
+information only. Proceed to the full battery only on PILOT PASS; a failed pilot
+means the design, not the threshold, is what changes.
 
 Every deixis item and grid row must be generation v2 (``deixis_version``); older
 ones are refused with an error (``deixis.check_version``), never read.

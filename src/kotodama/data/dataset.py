@@ -8,7 +8,7 @@ training, each rank gets a non-overlapping partition of the data.
 Data format:
     Flat binary file of np.uint16 token IDs (2 bytes per token).
     EOS token (id=0) separates documents within the stream.
-    Create with curation/tokenize_parallel.py.
+    Create with scripts/utils/tokenize_data.py.
 """
 
 from __future__ import annotations
@@ -275,7 +275,7 @@ class TokenizedDataset(IterableDataset):
         # Salted: train.bin is assembled with RandomState(seed).permutation(N), and a
         # single-rank loader shuffling arange(N) with the SAME seed reproduces that
         # permutation exactly — reading the corpus back in its original, unshuffled
-        # source order (found 2026-09-28: 1-GPU runs memorized their stream).
+        # source order (a 1-GPU run then memorizes its stream).
         rng = np.random.RandomState(
             np.random.SeedSequence([self.seed, epoch, _LOADER_SALT]).generate_state(1)[0])
         indices = np.arange(self.start_seq, self.end_seq)

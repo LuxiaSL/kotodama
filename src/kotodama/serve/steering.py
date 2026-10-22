@@ -9,7 +9,7 @@ boundary (block-persistent). Disabled => zero extra ops in the decode graph.
 
 Server flags: ``--steer-npz a.npz,b.npz`` loads banks; requests then pass
 ``steer_model`` (+ ``steer_alpha``) or ``vectors`` (a weighted stack, members may
-sit at different sites). Aliases below name the vectors of the 2026-07 rack;
+sit at different sites). Aliases below name the vectors of the steering rack;
 only aliases whose key is in a loaded bank are exposed; ``control`` is always
 available. Engine-level guarantees are pinned by
 scripts/benchmark/check_steering_engine.py (in the CPU test suite).
@@ -53,14 +53,14 @@ STEER_ALIAS_TABLE: tuple[tuple[str, str, float, str], ...] = (
      "Same sticks-to-the-conversation dial, but built fully automatically (no "
      "human labels). Nearly the same direction as bind; here for comparison."),
     ("bindport", "bind_proc_s46", 0.1,
-     "Leg-C conjugation-transport vector: koto's own binding-FAILURE axis, carried "
+     "Conjugation-transport vector: koto's own binding-FAILURE axis, carried "
      "into Llama-3.2-3B, purified there (echo/sycophancy/register stripped), and "
      "ported home to koto's L46 via the fitted reverse map g-inverse. + = toward "
      "failure (pro-binding would be its negation). Behaviorally sign-undetermined "
-     "with no reliable binding effect (P1-S box game + 2 conversation rounds, n=8)."),
+     "with no reliable binding effect (a box-game probe + 2 conversation rounds, n=8)."),
 )
 STEER_CONTROL_DESC = "unsteered baseline"
-# Stack members without an alias default fall back to this (sidecar parity).
+# Stack members without an alias default fall back to this.
 STEER_DEFAULT_ALPHA = 0.07
 
 
@@ -69,14 +69,14 @@ def load_steer_banks(
 ) -> tuple[dict[str, tuple[int, torch.Tensor]], dict[int, float], dict[str, tuple[str | None, float, str]]]:
     """Load unit steering vectors + per-site median norms from npz banks.
 
-    Key convention (posttraining/taste, see koto_steered_chat.py): vectors are
+    Key convention: vectors are
     UNIT vectors named like 'Alg_echo_base_s46'; per-site median completion-
     token residual norms are 'median_norm_s{sublayer}' keys. Sublayer indices
     count two per layer (after-attn of layer L = sublayer 2*L), so each key's
     site LAYER = suffix//2; odd suffixes (mlp sublayers) are fatal — the
     engine anchor is after-attn only. Multiple npz files compose one bank:
-    duplicate vector keys and median norms resolve FIRST-NPZ-WINS (sidecar
-    convention). Suffixless vector keys can't be placed and are skipped.
+    duplicate vector keys and median norms resolve FIRST-NPZ-WINS. Suffixless
+    vector keys can't be placed and are skipped.
 
     Returns (bank: key -> (site_layer, fp32 on-device unit vec),
              meds: site_layer -> median norm, aliases with descs).

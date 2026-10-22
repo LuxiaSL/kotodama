@@ -1,11 +1,11 @@
 """
-NCA trajectory generator for luxia-base pre-pre-training.
+NCA trajectory generator for kotodama pre-pre-training.
 
 Generates Neural Cellular Automata trajectories as tokenized sequences
 for training attention circuits before language pretraining.
 
-Adapted from Han et al. (arxiv.org/html/2603.10055v1) with extensions
-per the luxia-base design brief (spec Section 5.1):
+Adapted from Han et al. (arxiv.org/html/2603.10055v1) with these
+extensions:
 
 1. **Multi-channel parallel tracking** — n_groups channels evolve in
    parallel within each rule. Channels are serialized as sequential
@@ -17,7 +17,7 @@ per the luxia-base design brief (spec Section 5.1):
    (1-3 layers), identity biases (0.5-2.0), temperatures (0.3-1.0).
    The model sees diverse dynamics, not a single regime.
 
-3. **Larger grids** — 32×32 to 64×64 (spec says 32-64), producing
+3. **Larger grids** — 32×32 to 64×64, producing
    longer, richer spatial patterns than the reference's 12×12.
 
 4. **Class IV filtering** — gzip complexity in 0.4-0.7 targets
@@ -65,9 +65,9 @@ class NCAConfig:
     """Configuration for NCA trajectory generation."""
 
     # Grid parameters
-    grid_size: int = 32  # H × W grid (spec: 32-64)
+    grid_size: int = 32  # H × W grid (32-64)
     d_state: int = 10  # discrete cell states per channel
-    n_groups: int = 4  # parallel channels (spec: 4-8)
+    n_groups: int = 4  # parallel channels (4-8)
 
     # Rule network (these are defaults — overridden by mixed sampling)
     kernel_size: int = 3  # neighborhood size (3 or 5)
@@ -94,7 +94,7 @@ class NCAConfig:
     # Mixed complexity — if True, sample rule architecture per rule
     mixed_complexity: bool = True
 
-    # v3 alphabet (SPEC-1B-FORMATION-LADDER §5 R3): shift every token id +1 so
+    # v3 alphabet (gen_dyadic_data R3): shift every token id +1 so
     # id 0 is a reserved EOS episode separator, matching the EOS=0 doc-masking
     # contract in kotodama.data.dataset. False = the v1/3B layout, unchanged.
     reserve_eos: bool = False
@@ -207,7 +207,7 @@ def sample_rule_config(config: NCAConfig, rng: random.Random | None = None) -> d
 
     ``rng``: optional dedicated stream (v3 writers pass one so architecture
     sampling is reproducible independent of filter/global RNG consumption —
-    SPEC §5 R4). Default None = the module-global stream, byte-identical to
+    gen_dyadic_data R4). Default None = the module-global stream, byte-identical to
     the v1/3B path.
     """
     if not config.mixed_complexity:

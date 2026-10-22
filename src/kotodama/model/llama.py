@@ -1,5 +1,5 @@
 """
-luxia-base model definition.
+kotodama model definition.
 
 Standard Llama architecture with QK-norm and z-loss.
 Designed for clean interpretability tooling compatibility.
@@ -77,7 +77,7 @@ except ImportError:
     flash_attn_varlen_func = None  # type: ignore[assignment,misc]
 
 # ── Optional FlexAttention (torch-native, Inductor-fused) ────────────────────
-# C1 candidate (SPEC-7B): doc masking via BlockMask instead of FA2 varlen.
+# Doc masking via BlockMask instead of FA2 varlen.
 # Unlike FA2's opaque custom op, flex lowers through Inductor — the AC-budget
 # partitioner can see and schedule around attention. Same math as SDPA up to
 # fp reassociation. The BlockMask is built once per step in the train loop
@@ -116,7 +116,7 @@ def _init_fa4() -> bool:
 
 @dataclass
 class LuxiaModelConfig:
-    """Model configuration matching configs/model.yaml."""
+    """Model configuration; named shapes live in kotodama.presets."""
 
     hidden_size: int = 3072
     num_layers: int = 28
@@ -148,9 +148,9 @@ class LuxiaModelConfig:
     # Freeze the first boundary layer's pre-attn routing params (never used:
     # routing is skipped when no blocks are committed). Lets DDP run with
     # find_unused_parameters=False. Disable only when resuming a checkpoint
-    # saved with optimizer state from before 2026-07 (AdamW param-count mismatch).
+    # whose optimizer state was saved without this freeze (AdamW param-count mismatch).
     attn_res_freeze_unused: bool = True
-    # Looped depth (T32-L): effective positions [loop_start, loop_start + loop_len*loop_times) reuse the attention
+    # Looped depth: effective positions [loop_start, loop_start + loop_len*loop_times) reuse the attention
     # and FFN weights of the core [loop_start, loop_start + loop_len), run loop_times times. num_layers stays the
     # EFFECTIVE depth (AttnRes masks/boundaries, KV caches and capture all see one layer per position); each
     # position keeps its own pre-norms and AttnRes routing params (small), so every pass routes separately.
@@ -323,8 +323,8 @@ def _compute_attn_res_diagnostics(
 
     Note ``avg_alpha/block_b`` averages source index b over ALL sites: index b is
     block b-1's finished output where committed, and a site's own in-progress block
-    where it is the partial — so it mixes self-reads with later reads (kept as-is for
-    comparability with earlier runs; the route keys are the clean view)."""
+    where it is the partial — so it mixes self-reads with later reads (kept for
+    comparability with banked series; the route keys are the clean view)."""
     from kotodama.model import routing_read as rr
     diag: dict[str, float] = {}
     for i, c in enumerate(committed):
@@ -851,7 +851,7 @@ class TransformerBlock(nn.Module):
 
 class LuxiaBaseModel(nn.Module):
     """
-    luxia-base: Llama-family transformer with QK-norm and z-loss.
+    kotodama: Llama-family transformer with QK-norm and z-loss.
 
     Clean implementation designed for:
     - Anamnesis geometric monitoring (hook-friendly architecture)
@@ -1084,8 +1084,8 @@ class LuxiaBaseModel(nn.Module):
         if committed_stack is not None and committed_stack.is_cuda and _TRITON_ATTN_RES_AVAILABLE:
             # NOTE: use the module-level op bindings (imported at line ~60).
             # A runtime relative re-import here resolves through sys.modules
-            # and breaks when an embedding process (e.g. posttraining's
-            # _import_from_pretraining) has purged/replaced the src package.
+            # and breaks when an embedding process has purged/replaced the
+            # package in sys.modules (e.g. to import it from another source tree).
             p1_out, p1_lse = phase_1_batched_attention_triton_op(
                 committed_stack, qw.unsqueeze(0), eps, num_active=n_committed)
             return phase_2_online_softmax_merge_triton_op(
@@ -1151,7 +1151,7 @@ class LuxiaBaseModel(nn.Module):
         if position_ids is not None:
             # Gather per-token RoPE tables ONCE per forward. Attention paths
             # detect the pre-gathered (B, S, D) shape and skip their own gather
-            # — previously this ran per layer AND re-ran inside every AC
+            # — otherwise it would run per layer AND again inside every AC
             # region's recompute during backward.
             rope_cos = rope_cos[position_ids]
             rope_sin = rope_sin[position_ids]

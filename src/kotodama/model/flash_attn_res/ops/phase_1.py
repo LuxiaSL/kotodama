@@ -12,17 +12,16 @@ EPS = torch.finfo(torch.float32).eps
 
 # Chunked two-pass backward (register-spill fix, per-program query partials,
 # no reduce kernel). Default OFF until its parity gate passes; enable with
-# KOTODAMA_P1_BWD_V2=1. Same playbook as phase-2 v2 (2026-07-05).
+# KOTODAMA_P1_BWD_V2=1. Same design as phase-2 v2.
 _P1_BWD_V2 = os.environ.get("KOTODAMA_P1_BWD_V2", "0") == "1"
 
 # Torch-native backward: the whole gradient factors into batched GEMMs
 # (einsums) + tiny elementwise glue, so cuBLAS does the heavy lifting and
-# Inductor fuses the rest into the compiled backward graph. Written per the
-# Window-2 redesign brief (SPEC §"p1-bwd/fwd redesign notes") as the
-# baseline-to-beat before any further Triton work. Takes precedence over
+# Inductor fuses the rest into the compiled backward graph. It is the
+# baseline any further Triton work has to beat. Takes precedence over
 # _P1_BWD_V2 when both are set.
 #
-# Measured (2026-07-09, eager micro-bench): ~flat in S vs v1's superlinear
+# Eager micro-bench: ~flat in S vs v1's superlinear
 # spill blowup — 2.1x faster at S=7, 2.8x SLOWER at S=3. num_active is a
 # trace-time int (compile specializes per call site), so dispatch is hybrid:
 # torch for num_active >= MIN_S, v1 below. MIN_S=5 puts the crossover

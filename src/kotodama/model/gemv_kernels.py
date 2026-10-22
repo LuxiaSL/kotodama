@@ -1,8 +1,8 @@
 """Custom Triton GEMV for single-stream decode (M=1).
 
 Replaces inductor's prologue-fused reduction-mm at the decode shapes where
-its template choice runs far below HBM bandwidth. Measured (round-2 baseline
-profile, B200): qkv-proj fusion 20% BW, o-proj 8-33% BW — while the
+its template choice runs far below HBM bandwidth. Measured (B200 decode
+profile): qkv-proj fusion 20% BW, o-proj 8-33% BW — while the
 gate_up/down/lm_head fusions hit 77-84% and STAY on the inductor path
 (the custom kernel measured at-or-below them once un-fused epilogues are
 priced in; see scripts/benchmark/gemv_microbench.py).
@@ -29,9 +29,9 @@ import torch
 logger = logging.getLogger(__name__)
 
 # name -> ((N, K), (BLOCK_N, BLOCK_K, num_warps, num_stages))
-# Tuned on B200 via gemv_microbench.py full sweep (2026-06-11,
-# results/profiles/gemv_sweep_gpu3.json — rankings flat across num_stages and
-# stable across the top-5 per shape, so these are not noise winners).
+# Tuned on B200 via a full scripts/benchmark/gemv_microbench.py sweep (rankings
+# flat across num_stages and stable across the top-5 per shape, so these are
+# not noise winners).
 _SHAPES: dict[str, tuple[tuple[int, int], tuple[int, int, int, int]]] = {
     "qkv":     ((5120, 3072),  (8, 1024, 4, 3)),   # 5.7us vs 19.5us inductor norm+mm
     "o":       ((3072, 3072),  (4, 1024, 4, 2)),   # 4.4us vs 7.1-31us inductor mm

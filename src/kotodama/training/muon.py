@@ -1,12 +1,12 @@
 """
-Muon optimizer for luxia-base.
+Muon optimizer for kotodama.
 
 Muon (Momentum Orthogonalized by Newton-Schulz) performs steepest descent
 under the spectral norm by orthogonalizing the momentum matrix. This treats
 all singular directions of the weight space proportionally, resisting the
 low-rank collapse that Adam-family optimizers promote.
 
-For the luxia-base project, this is a deliberate choice: we hypothesize that
+Here this is a deliberate choice, on the hypothesis that
 Muon's balanced spectral updates produce richer representational geometry
 (more diverse dynamical motifs, higher shattering dimensionality).
 
@@ -133,7 +133,7 @@ def newton_schulz_orthogonalize(
     coeffs = _resolve_ns_coefficients(ns_coefficients, num_iterations)
     orig_dtype = M.dtype
     # Normalize in fp32 BEFORE the fp16 cast: momentum entries (~1e-7..1e-5) are
-    # fp16 subnormals, and up to ~12% flush to zero if cast first (2026-09-28).
+    # fp16 subnormals, and up to ~12% flush to zero if cast first.
     X = M.float()
     X = (X / X.norm().clamp_min(1e-30)).half()
 
@@ -582,13 +582,12 @@ def build_hybrid_optimizer(
 class MasterAdamW(Optimizer):
     """AdamW with fp32 master weights + fp32 moments for low-precision params.
 
-    THE BUG THIS EXISTS FOR (found 2026-09-27 by the 3B archaeology): under
-    pure-bf16 training, AdamW's ~6e-4 steps on RMSNorm/QK-norm gains sitting
-    at 1.0 round away entirely (bf16 spacing at 1.0 is 0.0039), so every norm
-    gain in the shipped 3B stayed BIT-FROZEN at its init for the whole run.
-    Here updates accumulate in an fp32 master; the (possibly bf16) module
-    param is refreshed from the master each step, so quantization can no
-    longer eat sub-spacing progress. The Muon side is unaffected by design:
+    THE BUG THIS EXISTS FOR: under pure-bf16 training, AdamW's ~6e-4 steps on
+    RMSNorm/QK-norm gains sitting at 1.0 round away entirely (bf16 spacing at
+    1.0 is 0.0039), so every norm gain stays BIT-FROZEN at its init for the
+    whole run (the shipped 3B's did). Here updates accumulate in an fp32
+    master; the (possibly bf16) module param is refreshed from the master each
+    step, so quantization cannot eat sub-spacing progress. The Muon side is unaffected by design:
     its orthogonalized updates are orders of magnitude above bf16 spacing
     (verified empirically — the 3B's matrices drifted on schedule).
 

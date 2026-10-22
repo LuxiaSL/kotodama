@@ -30,11 +30,11 @@ phase2_backward_configs = [
     triton.Config({"BLOCK_BT": 32}, num_warps=8, num_stages=1),
 ]
 
-# v2 backward: hidden-dim-CHUNKED two-pass kernel. The v1 kernel (and the
-# first v2 draft) held full 4096-wide rows in registers — (BLOCK_BT, 4096)
+# v2 backward: hidden-dim-CHUNKED two-pass kernel. The v1 kernel holds
+# full 4096-wide rows in registers — (BLOCK_BT, 4096)
 # fp32 tiles x ~6 live tensors = massive register spill to local memory,
-# which is why it ran at <900 GB/s effective on an 8 TB/s part (same disease
-# as the batched-P1 net-negative, 2026-05-17). BLOCK_D bounds the live tile
+# which is why it runs at <900 GB/s effective on an 8 TB/s part. BLOCK_D
+# bounds the live tile
 # to (BLOCK_BT, BLOCK_D). BLOCK_BT must stay >= PHASE2_BWD_MIN_BLOCK_BT (the
 # wrapper sizes the grad_pseudo_query partials buffer with it).
 PHASE2_BWD_MIN_BLOCK_BT = 8

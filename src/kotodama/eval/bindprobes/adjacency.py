@@ -14,8 +14,8 @@ REQUEST -> GRANT pairs whose grant carries NO vocative::
 v2's unambiguity law forbids a vocative-free "you" at P = 3 (no derivable gold); here
 the gold IS derivable — a grant answers the request in the line right before it, so
 "yours"/"take the o" = the requester (``check_surface`` enforces the adjacency). This is
-the structural channel the lineage never acquired (405B .22 shortcut-free on vocative-
-free addressee items, records/t19-readout §4).
+the structural channel the other families leave unread (405B: .22 shortcut-free on
+vocative-free addressee items).
 
 Cell = (E, n_grant): (1,1), (2,1), (2,2) — E transfers, n_grant of them grants (the
 rest v2 vocative gives, rotated surfaces).
@@ -46,7 +46,7 @@ from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection
 FAMILY = "adjacency"
 VERSION = 1
 CELLS: list[Cell] = [(1, 1), (2, 1), (2, 2)]
-DEFAULT_PER_CELL = 150            # 450 base, 1350 with variants (V3-5: critical-subset paired SE ~.03)
+DEFAULT_PER_CELL = 150            # 450 base, 1350 with variants (critical-subset paired SE ~.03)
 SEPARATOR = dx.SEPARATOR
 VARIANTS = ("adj", "voc", "third")
 N_PEOPLE = 3

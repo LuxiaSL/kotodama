@@ -1,5 +1,5 @@
 """
-Geometric health monitoring for luxia-base pretraining.
+Geometric health monitoring for kotodama pretraining.
 
 Metrics computed per monitoring step:
   - RankMe (effective rank) on probe batch hidden states
@@ -240,9 +240,9 @@ class GeometricMonitor:
         self.model.eval()
 
         metrics: dict[str, float] = {}
-        # Exact snapshot (CPU, so 7B rank 0 does not need 2x weight memory). The old
-        # in-place +e / -2e / +e adds on bf16 weights did not restore exactly and
-        # left a residual on rank 0 only -> DDP ranks silently diverged (2026-09-28).
+        # Exact snapshot (CPU, so 7B rank 0 does not need 2x weight memory). In-place
+        # +e / -2e / +e adds on bf16 weights do not restore exactly and would leave a
+        # residual on rank 0 only -> DDP ranks silently diverge.
         snapshot = [p.detach().to("cpu", copy=True) for p in params_with_grad]
         inv_norm = 1.0 / grad_norm
 
@@ -387,9 +387,9 @@ class GeometricMonitor:
 
         Re-randomizes the warm vector every 10 calls to avoid drifting onto a
         subdominant direction. A random start (cold OR re-randomized) gets
-        COLD_ITERS iterations: before 2026-09-29 re-randomized calls ran the warm
-        budget (5) from scratch, under-converged, and printed a sawtooth into
-        every σ series (a dip each 10th call, then a creep back up).
+        COLD_ITERS iterations: the warm budget (5) from scratch under-converges and
+        prints a sawtooth into every σ series (a dip each 10th call, then a creep
+        back up).
         Iteration stops early once σ is stable to EOC_REL_TOL.
         """
         cold_start = warm_key not in self._warm_vectors
@@ -864,8 +864,8 @@ class GeometricMonitor:
             hidden_states[last_layer_idx] = args[0].detach()
 
         # The MLP sub-layer reads its OWN routed input (pre-MLP AttnRes), not the
-        # pre-attn one; EoC must probe its Jacobian there (2026-09-29: probing the MLP at
-        # the pre-attn input put layer 0's MLP on the raw embedding it never sees).
+        # pre-attn one; EoC must probe its Jacobian there (probing the MLP at the
+        # pre-attn input puts layer 0's MLP on the raw embedding it never sees).
         def _make_ffn_norm_hook(layer_idx: int):
             def hook(_module: nn.Module, args: tuple) -> None:
                 self._mlp_inputs[layer_idx] = args[0].detach()

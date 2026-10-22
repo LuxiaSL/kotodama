@@ -1,5 +1,5 @@
 """
-Wandb integration for luxia-base training.
+Wandb integration for kotodama training.
 
 Logs training metrics (loss, LR, throughput) and geometric health
 metrics (from GeometricMonitor) to Weights & Biases. Also maintains
@@ -13,8 +13,6 @@ Usage in training loop::
     wb.log_geo(step, geo_metrics)
     # At end:
     wb.finish()
-
-Adapted from patterns in ~/projects/4p-sc/voice_wandb_callback.py.
 """
 
 from __future__ import annotations
@@ -89,7 +87,7 @@ class WandbLogger:
             if not api_key:
                 logger.warning(
                     "WANDB_API_KEY not set — wandb will run in offline mode. "
-                    "Set it from ~/projects/4p-sc/run_v2.1.sh or wandb login."
+                    "Export it or run `wandb login`."
                 )
 
             self._wandb_run = wandb.init(

@@ -1,16 +1,14 @@
 """In-domain NCA gate scorer — ledger + smoothing, on any koto checkpoint.
 
-Port of the frozen ``probes/p07/gate_score.py`` onto the kotodama package
-(SPEC-1B-FORMATION-LADDER P0.6): model loading via
-``kotodama.eval.model_loader`` (presets + ckpt registry + AttnRes handling),
-the v3 eval-set layout (``eval_ledger_unique`` / ``eval_ledger_overwrite``,
+Model loading via ``kotodama.eval.model_loader`` (presets + ckpt registry +
+AttnRes handling), the v3 eval-set layout (``eval_ledger_unique`` / ``eval_ledger_overwrite``,
 plus the legacy ``eval_ledger``), the v3 labels (post_overwrite /
 writes_before / marked) as reporting splits, no hard-coded paths, CPU-capable.
 
 Ledger: next-token logprob over the VAL alphabet at the query answer
 position; acc / median rank / mean gold logprob, split by committer side
 (bind_self vs bind_ctx in miniature), lag, first-vs-re-query, and
-unique-vs-post-overwrite (the ramp ruling's two regimes).
+unique-vs-post-overwrite (the two regimes of the writer's tag-reuse ramp).
 
 Smoothing: teacher-forced mean logprob of the true (perturbation-
 incorporating) next frame vs the counterfactual unperturbed frame;

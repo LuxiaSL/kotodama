@@ -332,7 +332,7 @@ def phase_1_batched_attention_backward_v2_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_BT: tl.constexpr,
 ):
-    # v1 rewrite, same math, register-spill cure (phase-2 v2 lesson: v1 holds
+    # Same math as v1, restructured to cure its register spill (v1 holds
     # a (PADDED_SRC, 4096) src tile PLUS a same-sized grad accumulator across
     # a NUM_QUERIES-long loop -> guaranteed spill).
     #

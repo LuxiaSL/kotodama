@@ -1,28 +1,26 @@
-"""NCA-v3 dataset writer — mixed aliveness + dyadic training bin, with the
-2026-09-26 fixes (SPEC-1B-FORMATION-LADDER §5; supersedes the ARM-D-lite
-writer, whose bins live on in git history / the frozen snapshot):
+"""NCA-v3 dataset writer — mixed aliveness + dyadic training bin:
 
   R1  token-level mix control — ``--orig-frac`` is a fraction of TOKENS,
-      enforced by a debt scheduler (the ARM-D-lite writer drew the mix per
-      TRAJECTORY: its "70% dyadic" stream was ~5-7% dyadic by tokens).
+      enforced by a debt scheduler (drawing the mix per TRAJECTORY instead
+      makes a nominal "70% dyadic" stream ~5-7% dyadic by tokens).
   R2  last-write-wins ledger + ``--tag-reuse-start/-end`` ramp (unique-tag
-      retrieval early → overwrite/state-update demand late; ruling 2026-09-26).
+      retrieval early → overwrite/state-update demand late).
   R3  every episode ends with the EOS 0 separator (``reserve_eos`` alphabet,
       ids shifted +1) — train with ``doc_masking: true`` and episodes stop
-      bleeding across windows; eval prefixes finally match training.
+      bleeding across windows; eval prefixes match training.
   R4  fully seeded: per-episode RNG streams for architecture/band/marking
       draws; global ``random`` is never consumed; two runs with the same args
       are byte-identical.
   R5  sidecar JSONL per shard — every episode's family, offsets, geometry,
       band, per-rule arch/dynamics/gzip, ramp value, marking, event counts.
-  R6  gzip band filtering applied to EVERY rule (both families — ARM-D-lite's
-      "Class-IV core" was never filtered), with band quotas via ``--bands``.
+  R6  gzip band filtering applied to EVERY rule (both families, the
+      aliveness family's "Class-IV core" included), with band quotas via ``--bands``.
   R9  mixed-geometry quotas for the aliveness family (``--geometries``) with
       visibility recorded (steps a 4096 window can see).
 
 Turn marking: ``--p-unmarked`` of dyadic episodes drop TURN tokens (handover
-must be detected from dynamics — ruling 2026-09-26; the marked/unmarked
-contrast is a free in-domain gate).
+must be detected from dynamics; the marked/unmarked contrast is a free
+in-domain gate).
 
 Usage (sharded across GPUs; CPU works for tests/small doses):
   for s in 0..5: CUDA_VISIBLE_DEVICES=$s python -m kotodama.nca.gen_dyadic_data \
@@ -285,8 +283,8 @@ def finalize(args) -> None:
                 rec["shard"] = s.stem
                 merged.write(json.dumps(rec) + "\n")
 
-    # eval sets: held-out banded rules, both ledger regimes (ruling: report
-    # unique vs overwrite separately) + smoothing pairs
+    # eval sets: held-out banded rules, both ledger regimes (unique and
+    # overwrite, reported separately) + smoothing pairs
     device = torch.device("cpu")
     band = parse_bands(args.bands)[0]
     rng = random.Random(args.seed + 999_983)
@@ -333,10 +331,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=1021)
     # mix (R1) — fraction of TOKENS
     ap.add_argument("--orig-frac", type=float, default=0.30)
-    # ledger ramp (R2, ruling: unique → overwrite)
+    # ledger ramp (R2: unique → overwrite)
     ap.add_argument("--tag-reuse-start", type=float, default=0.0)
     ap.add_argument("--tag-reuse-end", type=float, default=0.5)
-    # turn marking mix (ruling: ~half unmarked)
+    # turn marking mix (~half unmarked)
     ap.add_argument("--p-unmarked", type=float, default=0.5)
     # complexity bands (R6): "lo:hi[:weight],..."
     ap.add_argument("--bands", default="0.4:0.7")

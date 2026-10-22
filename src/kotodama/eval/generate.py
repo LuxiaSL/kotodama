@@ -1,7 +1,6 @@
 """Unified text generation for evaluation.
 
-Consolidates generation loops from eval_lang_full.py,
-eval_lang_full_multisample.py, and other eval scripts.
+One generation loop shared by the eval scripts.
 """
 
 from __future__ import annotations

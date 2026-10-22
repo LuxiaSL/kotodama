@@ -11,9 +11,9 @@ from ..kernels.configs import PHASE2_BWD_MIN_BLOCK_BT
 # atomics, pipelined configs). Same math as v1 — grads that v1 stored fp32
 # and then converted are rounded to the same bf16 values; grad_pseudo_query
 # changes summation ORDER only (v1's atomic order was nondeterministic).
-# Default ON since 2026-07-05: parity 31/31 x2, micro-bench 7.0-7.3x, canary
-# +10.6% tok/s, loss overlay reconverged to +-0.001 vs same-seed baseline
-# (SPEC Window-2 table). KOTODAMA_P2_BWD_V2=0 to fall back to v1.
+# Default ON: parity 31/31 x2, micro-bench 7.0-7.3x, canary +10.6% tok/s,
+# loss overlay within +-0.001 of the same-seed v1 baseline.
+# KOTODAMA_P2_BWD_V2=0 to fall back to v1.
 _P2_BWD_V2 = os.environ.get("KOTODAMA_P2_BWD_V2", "1") == "1"
 
 

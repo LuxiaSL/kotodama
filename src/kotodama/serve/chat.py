@@ -81,8 +81,8 @@ class Sampling:
     temperature: float = 0.9
     max_tokens: int = 256
     top_p: float = 0.0          # 0.0 = disabled — pure temperature (kotodama law)
-    top_k: int = 0              # 0 = no truncation (k50 ≡ none; SERVING-LAWS 2026-07-05)
-    rep_penalty: float = 1.2    # chat law (i-don't-know-collapse fix; gamut-confirmed 2026-07-09)
+    top_k: int = 0              # 0 = no truncation (k50 reads the same as none)
+    rep_penalty: float = 1.2    # chat law (clears the i-don't-know collapse)
     n: int = 1
     stop: list[str] = field(default_factory=list)
 
@@ -144,7 +144,7 @@ class KotodamaClient:
         return [m["id"] for m in d.get("data", []) if "id" in m]
 
     def info(self) -> dict:
-        """serve.py /info — model params/mode/checkpoint. Used by kotoagent `new`."""
+        """server.py /info — model params/mode/checkpoint."""
         return self._request("/info")
 
     def _payload(self, s: Sampling, prompt: Optional[str],

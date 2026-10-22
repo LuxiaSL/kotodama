@@ -8,12 +8,12 @@
     python -m kotodama.eval.bindprobes aggregate --grids bindprobes/grids
     python -m kotodama.eval.bindprobes gates --grids bindprobes/grids \
         --items bindprobes/items/items.jsonl --chance-model <0.25B ckpt> \
-        --learn-model <A0* 30B ckpt> [--ge2b m1,m2,...] [--pilot] # deixis V1–V5
-    # deixis v2 PILOT (addendum §5): 10 base items/cell = 150 base, 390 texts
+        --learn-model <30B-token ckpt> [--ge2b m1,m2,...] [--pilot] # deixis V1–V5
+    # deixis v2 PILOT: 10 base items/cell = 150 base, 390 texts
     python -m kotodama.eval.bindprobes gen --out bindprobes/pilot --families deixis \
         --per-cell deixis=10 --verify
     python -m kotodama.eval.bindprobes run --model <M> --items bindprobes/pilot/items.jsonl \
-        --out bindprobes/pilot-grids/<M>.jsonl --families deixis   # A0* 0.25B and A0* 30B
+        --out bindprobes/pilot-grids/<M>.jsonl --families deixis   # one run at 0.25B and 30B tokens
     python -m kotodama.eval.bindprobes gates --grids bindprobes/pilot-grids \
         --items bindprobes/pilot/items.jsonl --chance-model <0.25B> --learn-model <30B> --pilot
     python -m kotodama.eval.bindprobes verify-names --out bindprobes/verified_names.json [--tokenizers smollm2]
@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     gt.add_argument("--chance-model", required=True,
                     help="grid model name of the 0.25B checkpoint (V2, V5)")
     gt.add_argument("--learn-model", required=True,
-                    help="grid model name of the A0* 30B checkpoint (V3)")
+                    help="grid model name of the 30B-token checkpoint (V3)")
     gt.add_argument("--ge2b", default=None,
                     help="comma list of grid model names >= 2B (V4; default: every model "
                          "except --chance-model)")

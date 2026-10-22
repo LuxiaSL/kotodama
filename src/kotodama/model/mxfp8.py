@@ -1,4 +1,4 @@
-"""MXFP8 training linears (7B throughput program, SPEC §C2).
+"""MXFP8 training linears.
 
 torchao 0.17 removed the dense MXLinear module (only the MoE-training path
 kept a swap API), but the differentiable building block survived:
@@ -6,14 +6,15 @@ kept a swap API), but the differentiable building block survived:
 (block_size=32, e4m3, per-32-element block scales — the native B200 tensor
 core format) around all three GEMMs of a linear, with torch.compile support
 (`allow_in_graph` on the autograd.Function). This module is the thin
-nn.Linear wrapper torchao no longer ships.
+nn.Linear wrapper torchao >= 0.17 does not ship.
 
 Weights stay high-precision nn.Parameter (dynamic quantization per matmul),
 so Muon/DDP/checkpointing see the exact same state as bf16 or tensorwise
 Float8Linear training.
 
-Tier-C lever: any use is gated by the SPEC §5 validation protocol
-(smoke logits → canary loss overlay → proxy soak) before production.
+A number-format change: any use is gated by
+smoke logits (scripts/utils/mxfp8_smoke.py) → canary loss overlay → proxy soak
+(configs/soak-7b.yaml) before production.
 """
 
 from __future__ import annotations

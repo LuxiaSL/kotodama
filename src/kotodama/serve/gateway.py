@@ -1,9 +1,9 @@
 """
-Kotodama inference gateway — supervises a fleet of serve.py replicas and exposes
+Kotodama inference gateway — supervises a fleet of server.py replicas and exposes
 a single OpenAI-compatible port that routes/load-balances across them.
 
 What it does:
-  * Spawns N replicas (per the config: each (gpu, model) pair gets one serve.py;
+  * Spawns N replicas (per the config: each (gpu, model) pair gets one server.py;
     a model with a per-spec `gpus:` list is placed only on those GPUs, enabling
     length-aware bucketing — more replicas for verbose models, fewer for terse),
     waits for warmup, polls /health + /memory, and auto-restarts dead/wedged ones.
@@ -17,8 +17,8 @@ What it does:
   * Admission control: bounded global in-flight -> fast 503 when saturated.
 
 Usage:
-    python gateway.py --config configs/gateway.yaml
-    python gateway.py --config configs/gateway.yaml --gpus 0,1      # subset (testing)
+    python -m kotodama.serve.gateway --config configs/gateway.example.yaml
+    python -m kotodama.serve.gateway --config configs/gateway.example.yaml --gpus 0,1      # subset (testing)
 
 Requires: fastapi, uvicorn, httpx, pyyaml, pydantic
 """
@@ -64,8 +64,8 @@ class ModelSpec(BaseModel):
     model_size: str = "3b"
     # Optional per-model GPU placement. When set, this model's replicas spawn
     # only on the intersection of this list with the fleet's effective GPUs;
-    # when unset (default), the model spawns on EVERY effective GPU (the
-    # historical models x gpus behavior). This enables length-aware bucketing
+    # when unset (default), the model spawns on EVERY effective GPU (every
+    # model x every GPU). This enables length-aware bucketing
     # in ONE gateway: give verbose models (smoltalk ~6x decode time, instruct
     # ~5x) more replicas and terse models fewer, e.g.
     #     - {key: smoltalk, gpus: [0, 1, 2, 3, 4]}
@@ -99,7 +99,7 @@ class GatewayConfig(BaseModel):
     chat_pool: str = "instruct"            # which pool /v1/chat/completions targets
     completion_pool: str = "base"          # which pool /v1/completions targets
     # Cache-affinity routing: pin a conversation to one replica (rendezvous
-    # hash on a stable request-head identity) so serve.py's --prefix-cache
+    # hash on a stable request-head identity) so server.py's --prefix-cache
     # actually hits across turns. Pure hint: any routing outcome is CORRECT
     # (replicas token-exact-match their cache); affinity only tunes hit rate.
     cache_affinity: bool = True
@@ -174,7 +174,7 @@ def effective_gpus(cfg: GatewayConfig) -> list[int]:
 
 
 class Replica:
-    """One serve.py process: a single (gpu, model) backend."""
+    """One server.py process: a single (gpu, model) backend."""
 
     def __init__(self, spec: ModelSpec, gpu: int, port: int, log_path: Path) -> None:
         self.spec = spec
@@ -620,7 +620,7 @@ async def _proxy(request: Request, endpoint: str, path: str) -> Response:
 async def _stream_upstream(replica: Replica, path: str, body: dict[str, Any], t0: float):
     """Proxy an SSE stream. On downstream disconnect, StreamingResponse throws
     GeneratorExit here; exiting the `async with` closes the upstream connection,
-    which trips serve.py's is_disconnected() so the backend stops + frees."""
+    which trips server.py's is_disconnected() so the backend stops + frees."""
     outcome = "done"
     try:
         async with _http.stream("POST", f"{replica.url}{path}", json=body) as upstream:

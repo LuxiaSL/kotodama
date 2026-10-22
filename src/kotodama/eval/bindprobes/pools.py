@@ -58,7 +58,7 @@ MALE_CANDIDATES: tuple[str, ...] = (
     "Roger", "Neil", "Ross", "Roy", "Hal", "Jim", "Ken",
 )
 
-# The banked pool: ``verify_names`` over the candidates above, 2026-10-12 —
+# The banked pool: ``verify_names`` over the candidates above —
 # every candidate passed (" Name" is one token in SmolLM2, GPT-NeoX, Llama-3,
 # Qwen2.5). Names that FAILED SmolLM2 and were dropped before curation include
 # Mara, Theo, Nora, Lena (two tokens with a leading space).

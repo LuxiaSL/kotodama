@@ -39,7 +39,7 @@ Usage::
         --config-section 1b --attn-res-boundaries dd3b --rope-fp32 \\
         --max-docs-per-domain 64 --out bpb_step4000.json
 
-The JSON posts to heimdall with ``scripts/eval/hm_backfill.py --uncheatable``
+The JSON posts to the scheduler telemetry with ``scripts/eval/hm_backfill.py --uncheatable``
 as ``uncheatable/{domain}`` + ``uncheatable/mean``.
 """
 

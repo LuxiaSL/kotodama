@@ -48,11 +48,11 @@ from kotodama.eval.bindprobes import deixis as dx
 from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection
 
 FAMILY = "answer"
-VERSION = 2                       # v2 = iteration 1 (SPEC-battery-v3 §6): + the null calibration variant
+VERSION = 2                       # v2 adds the null calibration variant
 ES = (1, 2)
 CHANNELS = ("novoc", "voc")
 CELLS: list[Cell] = [(e, ch) for e in ES for ch in CHANNELS]
-DEFAULT_PER_CELL = 160            # 16-cycle x 10 -> 640 base, 1920 with variants (V3-5: role-contrast SE ~.039)
+DEFAULT_PER_CELL = 160            # 16-cycle x 10 -> 640 base, 1920 with variants (role-contrast SE ~.039)
 SEPARATOR = dx.SEPARATOR
 VARIANTS = ("qa", "narr", "third", "null")
 N_PEOPLE = 4

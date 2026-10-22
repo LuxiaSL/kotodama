@@ -6,7 +6,7 @@ Two op pairs, one import guard:
   - kotodama::fa4_dense / fa4_dense_bwd — full-causal (B, S, H, D), no
     cu_seqlens (the plain --attn_impl fa4 path).
 
-C1 candidate (SPEC-7B): flash_attn.cute kernels are Blackwell-native
+flash_attn.cute kernels are Blackwell-native
 (tcgen05/TMA) but expose no torch.library registration — calling them raw
 inside a compiled region is a hard incompatibility (dynamo can't trace CuTe
 JIT). This wrapper registers forward+backward as opaque custom ops so
@@ -15,10 +15,12 @@ torch.compile schedules around them, same as the FA2 varlen path.
 Kernels JIT-compile on first call per shape-class; run_train.sh sets
 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 so compiled kernels persist.
 
-Same math as FA2 varlen up to fp reassociation (Tier-C: gate with parity
-smoke + canary loss overlay before any production use).
+Same math as FA2 varlen up to fp reassociation (gate with
+scripts/utils/fa4_varlen_parity.py + a canary loss overlay before any
+production use).
 
-Return-arity: the installed flash_attn.cute (upstream 98024f9) returns
+Return-arity: the installed flash_attn.cute (upstream Dao-AILab/flash-attention
+98024f9) returns
 (out, lse) from _flash_attn_fwd; upstream head returns a longer tuple. Both
 wrappers take res[0], res[1] (and bwd res[0..2]) so either works.
 
@@ -60,8 +62,8 @@ def _require_varlen_stub() -> None:
     if not _FA4_VARLEN_STUB_OK:
         raise RuntimeError(
             "flash_attn.cute lacks SingleTileVarlenScheduler.producer_tail: this FA4 "
-            "install is missing the varlen stub (pinned upstream 98024f9 + stub; see the "
-            "lab note fa4-sm100-compile-review-2026-09-28). Re-apply the stub or use "
+            "install is missing the varlen stub (pinned upstream 98024f9 + a no-op "
+            "producer_tail stub). Re-apply the stub or use "
             "--attn_impl fa2 / the dense fa4 path (no doc masking)."
         )
 
@@ -114,7 +116,7 @@ def fa4_varlen_bwd_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward as its own opaque op — the registered autograd backward gets
     TRACED by AOTAutograd under compile; raw CuTe calls inside that trace are
-    undefined behavior (NaN grads, canary 2026-07-09). Same reason the
+    undefined behavior (NaN grads). Same reason the
     AttnRes phase kernels register backward as separate triton_ops.
     """
     res = _flash_attn_bwd(

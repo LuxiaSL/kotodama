@@ -19,7 +19,7 @@ The decode step is written to be torch.compile + CUDA-graph friendly:
     exactly, minus the padding/stacking — source counts per routing call
     site are compile-time constants, so every site unrolls into its own
     fused kernel). No buffer mutation → no functionalization blowups.
-  * Sampling: on-GPU, matching serve.py semantics — presence-based
+  * Sampling: on-GPU, matching server.py semantics — presence-based
     repetition penalty over GENERATED tokens only, pure temperature
     (top_k/top_p intentionally unsupported: prod runs 0/0).
   * Steering (optional, enabled at construction): a registered per-layer
@@ -61,14 +61,13 @@ class LayerSchedule:
 def compute_steer_points(steer_site: int, boundaries: set[int] | list[int], n_layers: int) -> tuple[int, ...]:
     """Layer indices that receive the block-persistent steering write.
 
-    The steering-pilot architectural result (RESULTS-steering-pilot-2026-07-21
-    §3): a single-site residual add is destroyed at the next DD-3B block
+    A single-site residual add is destroyed at the next DD-3B block
     boundary (commit-and-reset + routing recombination attenuate it ~100x, KL
     0.002 vs 0.78 nats persistent), so the koto write primitive re-asserts the
     vector at the first after-attn position of every block AFTER the site's.
 
-    Mirrors posttraining/taste/steer_inject.forward_inject persist semantics.
-    Sites there are SUBLAYER indices (after-attn of layer L = sublayer 2*L);
+    In the sublayer convention of the steering npz keys (``_s{sublayer}``),
+    sites are SUBLAYER indices (after-attn of layer L = sublayer 2*L);
     persist points {2*L} + {2*b : boundary b, 2*b > 2*L} reduce in layer terms
     to: the site layer itself + every boundary layer strictly after it.
     """
@@ -78,9 +77,9 @@ def compute_steer_points(steer_site: int, boundaries: set[int] | list[int], n_la
 
 
 class SamplingParams:
-    """serve.py sampling controls supported by the fast path.
+    """server.py sampling controls supported by the fast path.
 
-    top_k == 0 and top_p in {0.0, 1.0} mean "disabled" (serve.py convention).
+    top_k == 0 and top_p in {0.0, 1.0} mean "disabled" (server.py convention).
     Truncated sampling (top_k > 0 or 0 < top_p < 1) routes through a separate
     compiled sampler variant; the pure-temperature graph is untouched.
     """
@@ -203,12 +202,11 @@ class DecodeEngine(nn.Module):
         # PER-LAYER buffer (n_layers, hidden). Rows are populated at request
         # time by set_steer(): each write (site_layer, vec, scale) lands
         # scale*vec in the site row AND in every later block-entry row
-        # (compute_steer_points — now applied at CONTENT time, not trace
+        # (compute_steer_points — applied at CONTENT time, not trace
         # time), so multi-site stacks are just multiple populated rows.
         # DECODE STEPS ONLY — prefill/extend paths never inject, which gives
-        # the pilot's generated-positions-only semantics for free
-        # (re-prefilled prior turns are acceptably unsteered, the documented
-        # pilot choice).
+        # generated-positions-only semantics for free (re-prefilled prior
+        # turns stay unsteered, by design).
         #
         # COMPILE SAFETY: the buffer is created ONCE and only ever mutated
         # in-place (copy_/zero_) — torch.compile(max-autotune)/cudagraph trees
@@ -244,8 +242,8 @@ class DecodeEngine(nn.Module):
             self.register_buffer(f"w_gate_up_{li}", w_gate_up.contiguous(), persistent=False)
         self.w_qkvs = [getattr(self, f"w_qkv_{li}") for li in range(self.n_layers)]
         self.w_gate_ups = [getattr(self, f"w_gate_up_{li}") for li in range(self.n_layers)]
-        # NOTE (measured 2026-06-11): pre-transposing o_proj/down_proj and
-        # using x @ W_t regressed decode 394 → 348 tok/s — the NN orientation
+        # NOTE: pre-transposing o_proj/down_proj and using x @ W_t is slower
+        # (decode 394 → 348 tok/s) — the NN orientation
         # dispatches an even slower path than nvjet's 27%-BW TNN config.
         # The o/down GEMV inefficiency needs a custom kernel, not a layout dodge.
         self.q_dim = self.n_heads * self.head_dim
@@ -261,7 +259,7 @@ class DecodeEngine(nn.Module):
         # graph serves every (k, p): disabled values are algebraic no-ops
         # (k = vocab -> the kth threshold is the min logit, masks nothing;
         # p = 2.0 -> cumprob - prob >= 2.0 is never true, masks nothing) —
-        # exactly the branches serve.py skips. p MUST be 2.0, not 1.0: fp32
+        # exactly the branches server.py skips. p MUST be 2.0, not 1.0: fp32
         # cumsum saturates to exactly 1.0 partway through the tail (measured:
         # ~11k of 49k tokens masked at p=1.0), and inside a k-only law the
         # renormalized survivor cumsum can saturate the same way.
@@ -282,7 +280,7 @@ class DecodeEngine(nn.Module):
         self.block_buckets: tuple[int, ...] = (256, 64, 16)
         # Blocks attend the FULL max_seq_len cache under an additive mask
         # (MATH-class SDPA in-graph), so their cost scales with chunk COUNT,
-        # not span — measured 2026-07-05: 1.4-1.6x faster than eager below
+        # not span — 1.4-1.6x faster than eager below
         # ~768 tokens, 0.3-0.7x SLOWER above (eager gets causal flash within
         # T). Spans above this route to the eager paths. (Future exact fix:
         # rectangular-flash-to-prefix + causal-flash-within-chunk merged by
@@ -441,8 +439,8 @@ class DecodeEngine(nn.Module):
 
         DELIBERATELY NO STEERING WRITE: blocks forward PROMPT positions
         (prefill/extend), and the write is generated-positions-only. This is
-        also what keeps re-prefilled prior turns unsteered (documented pilot
-        choice) — see the steering block in __init__.
+        also what keeps re-prefilled prior turns unsteered (by design) — see
+        the steering block in __init__.
         """
         model = self.model
         S = tokens.shape[1]
@@ -558,8 +556,8 @@ class DecodeEngine(nn.Module):
 
         argmax(logits/T + Gumbel noise) is exact categorical sampling from
         softmax(logits/T) (Gumbel-max theorem) — identical distribution to
-        serve.py's softmax+multinomial, fused by inductor, philox RNG is
-        cudagraph-safe. Penalty math mirrors serve.py: fp32 cast first,
+        server.py's softmax+multinomial, fused by inductor, philox RNG is
+        cudagraph-safe. Penalty math mirrors server.py: fp32 cast first,
         >0 divide / else multiply, presence over generated ids only.
         rep_penalty == 1.0 passes through unchanged (identity by algebra),
         so no Python branch is needed.
@@ -582,7 +580,7 @@ class DecodeEngine(nn.Module):
     def _step_sampled_truncated(self, token: torch.Tensor) -> torch.Tensor:
         """Forward + top-k/top-p + Gumbel-max sampling, all in-graph.
 
-        Mirrors serve.py sample_next_token exactly: penalty -> temperature ->
+        Mirrors server.py sample_next_token exactly: penalty -> temperature ->
         top-k (kth-value threshold — ties with the kth logit survive) ->
         top-p over the RENORMALIZED survivor distribution (exclusive cumsum
         < p keeps the first token that crosses) -> categorical draw.
@@ -604,7 +602,7 @@ class DecodeEngine(nn.Module):
             sorted_logits < kth, torch.full_like(sorted_logits, float("-inf")), sorted_logits
         )
         # -inf suffix -> softmax renormalizes over the top-k survivors, which
-        # is what serve.py's second softmax sees.
+        # is what server.py's second softmax sees.
         probs = sorted_logits.softmax(dim=-1)
         cutoff = probs.cumsum(dim=-1) - probs >= self.top_p_val
         sorted_logits = torch.where(
@@ -620,11 +618,11 @@ class DecodeEngine(nn.Module):
         self.cur_token.copy_(next_token.view(1, 1))
         return self.cur_token
 
-    # ── Sampling (serve.py sample_next_token semantics, on-GPU) ─────────────
+    # ── Sampling (server.py sample_next_token semantics, on-GPU) ─────────────
 
     def _sample(self, logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
         """Sample from (1, 1, V) logits → (1, 1) token. Updates presence."""
-        logits = logits[0, -1].float()  # (V,) — serve.py casts to float first
+        logits = logits[0, -1].float()  # (V,) — server.py casts to float first
 
         rp = params.repetition_penalty
         if rp != 1.0:
@@ -670,7 +668,7 @@ class DecodeEngine(nn.Module):
             self.k_caches[li].zero_()
             self.v_caches[li].zero_()
         # NOTE: steer_buf is deliberately NOT cleared here — it is per-request
-        # state owned by the caller (serve.py engages it before prefill and
+        # state owned by the caller (server.py engages it before prefill and
         # clears it in a finally after every request).
 
     @torch.inference_mode()
@@ -908,11 +906,11 @@ class DecodeEngine(nn.Module):
                 "prefix_hit": True, "common_prefix": common, "suffix_len": 1,
             }
 
-        # Compiled block extend (2026-07-05): chunked block forwards replace
-        # the eager MATH-SDPA suffix path (measured 33-40ms launch floor ->
-        # block replays). Overlap chunks may rewind into the cached region;
-        # those tokens are present in input_ids, so re-forwarding writes
-        # identical K/V. Falls through to the eager path when uncompiled.
+        # Compiled block extend: chunked block forwards replace the eager
+        # MATH-SDPA suffix path (a 33-40ms launch floor -> block replays).
+        # Overlap chunks may rewind into the cached region; those tokens are
+        # present in input_ids, so re-forwarding writes identical K/V. Falls
+        # through to the eager path when uncompiled.
         if self._compiled_block is not None and suffix_len <= self.block_span_max:
             plan = self._chunk_plan(common, prompt_len)
             if plan is not None:
@@ -1007,7 +1005,7 @@ class DecodeEngine(nn.Module):
             self._cur_rp = params.repetition_penalty
         if params.top_k != self._cur_top_k:
             # 0 (disabled) -> vocab_size: the kth threshold becomes the min
-            # logit and masks nothing (serve.py skips the block entirely).
+            # logit and masks nothing (server.py skips the block entirely).
             k = params.top_k if params.top_k > 0 else self.config.vocab_size
             self.top_k_eff.fill_(min(k, self.config.vocab_size))
             self._cur_top_k = params.top_k
@@ -1030,7 +1028,7 @@ class DecodeEngine(nn.Module):
         # Fully-fused path (forward + sampler in one graph) for T > 0.
         # Truncated laws (top-k/top-p) use their own compiled variant; the
         # pure-temperature graph is byte-identical to before they existed.
-        # (At temperature 0 serve.py argmaxes BEFORE truncation, so truncation
+        # (At temperature 0 server.py argmaxes BEFORE truncation, so truncation
         # is a no-op there — the greedy path below is correct for all laws.)
         if params.temperature > 0.0:
             fused = (
@@ -1096,7 +1094,7 @@ class DecodeEngine(nn.Module):
         """Raw-argmax generation helper for PARITY TESTING ONLY.
 
         Not a serving surrogate: applies no repetition penalty and no stop
-        tokens (serve.py at temperature 0 still penalizes and stops).
+        tokens (server.py at temperature 0 still penalizes and stops).
         Prefill pinned to the reference path — parity harnesses gate the
         decode step from an identical cache; blocks have their own battery.
         """

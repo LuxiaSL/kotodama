@@ -1,7 +1,7 @@
 """Induction / prefix-matching score for any koto checkpoint.
 
-SPEC-1B-FORMATION-LADDER P0.4 (retro-fit on the p2x2 arms) and the §4
-per-checkpoint ladder gate. Two channels:
+Scored per checkpoint, offline or in-loop (``train.py --inloop_evals
+induction``). Two channels:
 
 Behavioral (primary): sequences ``[prepend?][A][A]`` with ``A`` = ``prefix_len``
 uniform-random token ids (special ids excluded). Per-token CE on the second

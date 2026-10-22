@@ -1,4 +1,4 @@
-"""The rider grid: the P0.6 four-register entity-state binding battery.
+"""The rider grid: the four-register entity-state binding battery.
 
 Judge-free and logprob-only. ``items`` generates N-boxes × M-updates binding
 items (plus difficulty-0 gate items) and renders them in four registers (code,

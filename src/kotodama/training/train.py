@@ -1,5 +1,5 @@
 """
-Distributed training script for luxia-base.
+Distributed training script for kotodama.
 
 Launch with torchrun::
 
@@ -46,7 +46,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # subgraph and floods logs.  Must be AFTER `import torch` (torch resets filters).
 warnings.filterwarnings("ignore", message="Online softmax", module=r"torch\._inductor")
 
-# Project imports — launch from the luxia-base/ directory
+# Project imports — put src/ on sys.path so a direct script launch resolves `kotodama`
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from kotodama.model.init_schemes import SCHEMES as _INIT_SCHEMES
@@ -128,10 +128,10 @@ def data_parallel_rank(rank: int, dp_group: Any, legacy_rank0: bool = False) -> 
 
     Under TP, TP peers must share data, so the rank inside the DP group is used. Without TP
     (``dp_group is None``) every DDP rank is its own data-parallel replica: its global rank.
-    BUG-LEDGER D12: from 4909ffc (2026-04-27) to 2026-10-02 this fell back to 0, so every rank
-    read rank 0's slice — an effective batch of 1/world_size of the global batch, computed
-    world_size times. ``legacy_rank0=True`` reproduces that regime on purpose (pairing a new
-    seed with a ladder arm trained under it); never use it for new science."""
+    ``legacy_rank0=True`` returns 0 for every rank, so every rank reads rank 0's slice — an
+    effective batch of 1/world_size of the global batch, computed world_size times. It exists
+    only to reproduce runs trained under that regime (pairing a new seed with a ladder arm
+    trained under it); never use it for new science."""
     if dp_group is not None:
         return dist.get_rank(dp_group)
     return 0 if legacy_rank0 else rank
@@ -200,7 +200,7 @@ def _upload_checkpoint_to_hf(
 
 
 # =============================================================================
-# Model configs — matches configs/model.yaml
+# Model configs — one per kotodama.presets shape
 # =============================================================================
 
 MODEL_CONFIGS: dict[str, dict[str, Any]] = {name: presets.shape(name) for name in presets.names()}
@@ -587,7 +587,7 @@ def train(args: argparse.Namespace) -> None:
             )
         model.reinit_embeddings(new_vocab_size=config.vocab_size)
 
-        # Optionally return named routing points to fresh init (handoff fix arm)
+        # Optionally return named routing points to fresh init (--reset_routing_layers)
         if args.reset_routing_layers:
             _rr_layers, _rr_final = parse_routing_spec(args.reset_routing_layers, config.num_layers)
             _rr_names = model.reset_routing(_rr_layers, final=_rr_final)
@@ -625,8 +625,8 @@ def train(args: argparse.Namespace) -> None:
     if getattr(args, "fp8", False):
         fp8_recipe = getattr(args, "fp8_recipe", "tensorwise")
         if fp8_recipe == "mxfp8":
-            # Tier-C lever (SPEC-7B C2): per-32-element block scales, native
-            # B200 format. Gated by the SPEC §5 validation protocol.
+            # Per-32-element block scales, native B200 format. Gated like any
+            # number-format change (see kotodama.model.mxfp8).
             from ..model.mxfp8 import convert_to_mxfp8_training
 
             convert_to_mxfp8_training(model)
@@ -652,7 +652,7 @@ def train(args: argparse.Namespace) -> None:
         compile_mode = getattr(args, "compile_mode", None)
         if getattr(args, "capture_scalar_outputs", False):
             # Lets dynamo trace through the Liger FLCE .item() call — the one
-            # remaining graph-break site (Phase-1 diag, 2026-07-04).
+            # remaining graph-break site.
             torch._dynamo.config.capture_scalar_outputs = True
             if is_main:
                 logger.info("dynamo capture_scalar_outputs=True (FLCE tail-break fix)")
@@ -660,7 +660,7 @@ def train(args: argparse.Namespace) -> None:
         if ac_budget and ac_budget > 0.0:
             # Inductor min-cut partitioner with a memory budget: recompute is
             # chosen optimally per-graph instead of the manual every-sublayer
-            # AC policy. Math-identical (recompute-schedule-only, SPEC Tier B).
+            # AC policy. Math-identical (recompute-schedule-only).
             # Use with --no_activation_checkpointing — combining both would
             # nest recompute regions.
             if config.activation_checkpointing:
@@ -707,7 +707,7 @@ def train(args: argparse.Namespace) -> None:
     if args.adamw_only:
         # Pure AdamW baseline (no Muon) — all params in one optimizer.
         # MasterAdamW keeps fp32 masters: stock AdamW on a bf16 model freezes
-        # every RMSNorm gain at 1.0 (the 3B norm-freeze bug, 2026-09-27).
+        # every RMSNorm gain at 1.0.
         from kotodama.training.muon import MasterAdamW as TorchAdamW
 
         all_params = [p for p in raw_model.parameters() if p.requires_grad]
@@ -795,8 +795,8 @@ def train(args: argparse.Namespace) -> None:
     dp_rank = data_parallel_rank(rank, dp_group,
                                  legacy_rank0=getattr(args, "legacy_rank0_data", False))
     if is_main and getattr(args, "legacy_rank0_data", False):
-        logger.warning("--legacy_rank0_data: EVERY rank reads rank 0's data (the pre-2026-10-02 "
-                       "regime, BUG-LEDGER D12) — effective batch = 1/%d of the global batch", dp_size)
+        logger.warning("--legacy_rank0_data: EVERY rank reads rank 0's data (the legacy "
+                       "regime) — effective batch = 1/%d of the global batch", dp_size)
     doc_masking = getattr(args, "doc_masking", False)
     data_seed = training_data_seed(args)
     if is_main and data_seed != args.seed:
@@ -1118,7 +1118,7 @@ def train(args: argparse.Namespace) -> None:
             return prefetcher.consumed_state
         return dataset.state_dict() if hasattr(dataset, "state_dict") else None
 
-    # -- FlexAttention doc-mask builder (C1) --------------------------------------
+    # -- FlexAttention doc-mask builder -------------------------------------------
     flex_mask_builder: Optional[_FlexBlockMaskBuilder] = None
     if getattr(args, "attn_impl", "auto") == "flex" and doc_masking:
         flex_mask_builder = _FlexBlockMaskBuilder(device)
@@ -1534,8 +1534,8 @@ def train(args: argparse.Namespace) -> None:
     # -- Final -----------------------------------------------------------------
     # All ranks must participate in save (it contains a barrier).
     # save_every <= 0 disables ALL saves (benchmark/canary runs): a 7B final
-    # checkpoint is ~30GB+ and gpu-host's / has ~16GB free — writing it there
-    # ENOSPC-crashed a completed run (2026-07-04).
+    # checkpoint is ~30GB+, more than a small root filesystem holds, and an
+    # ENOSPC on that final save crashes a run that already completed.
     if not sigterm.received and args.save_every <= 0:
         if is_main:
             logger.info(
@@ -1689,8 +1689,8 @@ def _compute_grad_norm(params: Any) -> torch.Tensor:
 
 def param_checksum_spread(model: torch.nn.Module) -> float:
     """max - min over ranks of a float64 weight checksum. DDP replicas must be
-    bitwise identical, so anything but 0.0 is a silent rank desync (the old
-    sharpness probe caused one). 0.0 when not distributed. Collective: every
+    bitwise identical, so anything but 0.0 is a silent rank desync (e.g. an
+    in-place weight perturbation that does not restore exactly). 0.0 when not distributed. Collective: every
     rank must call it."""
     total = torch.zeros((), dtype=torch.float64)
     for p in model.parameters():
@@ -1709,7 +1709,7 @@ _LAYER_RE = re.compile(r"layers\.(\d+)\.")
 
 
 def _norm_gain_metrics(model: torch.nn.Module) -> dict[str, float]:
-    """Mean/std of every RMSNorm/QK-norm gain, as heimdall layer families:
+    """Mean/std of every RMSNorm/QK-norm gain, as telemetry layer families:
     ``norm_gain/layer_{i}/{kind}`` (mean) and ``norm_gain_std/layer_{i}/{kind}``.
     Non-layer norms land under ``norm_gain/{kind}``. One host sync."""
     keys: list[str] = []
@@ -1735,12 +1735,12 @@ def _layer_health_metrics(model: torch.nn.Module) -> dict[str, float]:
 
     - ``weight_rms/layer_{i}/{q,k,v,o,gate,up,down}_proj`` (+ ``weight_rms/embed``): the
       Muon weight-decay equilibrium read (without live WD, weights grow and act as an
-      implicit LR anneal — ledger D-class).
+      implicit LR anneal).
     - ``grad/layer_{i}/{attn,mlp}``: grad norm of the sublayer's projection matrices
       (post-clip; the routing queries are counted under ``router/``, not here).
     - ``router/layer_{i}/{attn,mlp}/{query_norm,grad_norm}`` and ``router/final/…``:
-      the AttnRes routing queries. ``grad_norm == 0`` exactly is the dead-router signature
-      (ledger E5); ``router/dead_sites`` counts them (queries with no ``.grad`` — frozen or
+      the AttnRes routing queries. ``grad_norm == 0`` exactly is the dead-router signature;
+      ``router/dead_sites`` counts them (queries with no ``.grad`` — frozen or
       structurally unused, like layer 0's pre-attn — are not sites).
     """
     keys: list[str] = []
@@ -1945,13 +1945,13 @@ def _attn_lr_scaled(args: argparse.Namespace) -> bool:
 
 
 def training_data_seed(args: argparse.Namespace) -> int:
-    """The training-data order seed: ``--data_seed`` if given, else ``--seed`` (the historical tie)."""
+    """The training-data order seed: ``--data_seed`` if given, else ``--seed`` (tied by default)."""
     ds = getattr(args, "data_seed", None)
     return int(args.seed if ds is None else ds)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="luxia-base distributed training")
+    p = argparse.ArgumentParser(description="kotodama distributed training")
 
     # Config file (YAML defaults, CLI overrides)
     p.add_argument(
@@ -2005,8 +2005,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--no_attn_res_freeze_unused", dest="attn_res_freeze_unused", action="store_false",
-        help="Disable routing-param freeze — required when resuming pre-2026-07 "
-             "checkpoints WITH optimizer state (AdamW param-count mismatch otherwise)",
+        help="Disable routing-param freeze — required when resuming a checkpoint whose "
+             "optimizer state was saved without it (AdamW param-count mismatch otherwise)",
     )
 
     # Training scale
@@ -2034,7 +2034,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--gradient_clip", type=float, default=1.0)
 
-    # Batch size ramp (spec: 512K → 2M over first 5%)
+    # Batch size ramp (e.g. 512K → 2M over the first 5%)
     p.add_argument(
         "--batch_ramp_initial",
         type=float,
@@ -2082,7 +2082,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--adamw_weight_decay", type=float, default=0.1)
     p.add_argument(
         "--norm_gain_every", type=int, default=0,
-        help="Log RMSNorm/QK-norm gain mean/std per layer to heimdall every N "
+        help="Log RMSNorm/QK-norm gain mean/std per layer to the scheduler telemetry every N "
              "steps (checked on log steps; 0 = off).",
     )
     p.add_argument(
@@ -2109,7 +2109,8 @@ def parse_args() -> argparse.Namespace:
     # Data
     p.add_argument("--data_path", type=str, default="")
     p.add_argument("--mix_data_path", type=str, default=None,
-                   help="Secondary token bin interleaved into --data_path (e.g. ladder A4 dyadic).")
+                   help="Secondary token bin interleaved into --data_path "
+                        "(e.g. the dyadic bin of configs/ladder-a4.yaml).")
     p.add_argument("--mix_fraction", type=float, default=0.0,
                    help="Exact token fraction of --mix_data_path (token-debt interleave).")
     p.add_argument("--mix_window", type=str, default=None,
@@ -2129,7 +2130,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--init_scheme", type=str, default="standard",
                    choices=list(_INIT_SCHEMES),
-                   help="Weight init applied over the standard init (kotodama.model.init_schemes; T29). "
+                   help="Weight init applied over the standard init (kotodama.model.init_schemes). "
                         "'standard' = unchanged.")
     p.add_argument(
         "--attn_lr_scale", type=float, default=1.0,
@@ -2144,7 +2145,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--data_seed", type=int, default=None,
         help="Seed for the training-data order (shuffle) only; default = --seed. Lets init and data order vary "
-             "independently (init x data-order studies); --seed alone keeps both tied, as every earlier run was.",
+             "independently (init x data-order studies); --seed alone keeps both tied.",
     )
 
     # Eval (held-out data for overfit detection)
@@ -2313,8 +2314,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to checkpoint — loads model weights and resets step counter, tokens "
-             "consumed, data position, and scheduler. Optimizer moments start FRESH (this "
-             "has always been so; the old help promised warm momentum it never loaded).",
+             "consumed, data position, and scheduler. Optimizer moments start FRESH (weights "
+             "only; no optimizer state is restored).",
     )
     p.add_argument(
         "--reinit_mlps",
@@ -2334,7 +2335,7 @@ def parse_args() -> argparse.Namespace:
         default="tensorwise",
         choices=["tensorwise", "mxfp8"],
         help="FP8 scaling recipe: tensorwise (Float8Linear, production) or "
-        "mxfp8 (per-32-block scales, B200-native; Tier-C validation gate)",
+        "mxfp8 (per-32-block scales, B200-native; validate before production use)",
     )
 
     # Liger fused kernels
@@ -2354,12 +2355,12 @@ def parse_args() -> argparse.Namespace:
              "'sdpa': PyTorch SDPA.",
     )
 
-    # Data-parallel partitioning (BUG-LEDGER D12)
+    # Data-parallel partitioning
     p.add_argument(
         "--legacy_rank0_data",
         action="store_true",
         default=False,
-        help="Reproduce the pre-2026-10-02 bug: every DDP rank reads rank 0's data (effective "
+        help="Reproduce the legacy rank-0-data regime: every DDP rank reads rank 0's data (effective "
              "batch = global/world_size). ONLY for replicating ladder arms trained under it.",
     )
 
@@ -2396,7 +2397,7 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help=(
             "Inductor activation_memory_budget in (0,1]: partitioner-driven "
-            "selective recompute (SPEC B1a). Requires --compile and manual AC "
+            "selective recompute. Requires --compile and manual AC "
             "off. 0 = disabled (default). 1.0 = save everything eligible; "
             "lower = recompute more."
         ),
@@ -2414,7 +2415,7 @@ def parse_args() -> argparse.Namespace:
     # HuggingFace upload
     p.add_argument(
         "--hf_upload_repo", type=str, default=None,
-        help="HF repo (e.g. 'aethera-gp/model-name') — upload final checkpoint on completion",
+        help="HF repo (e.g. '<org>/model-name') — upload final checkpoint on completion",
     )
 
     # First parse to check for --config

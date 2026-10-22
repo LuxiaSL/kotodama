@@ -13,11 +13,8 @@ Two layers, one convention:
   the uncached walker (``tests/test_capture.py``).
 
 The ``replay_extract_*`` adapters at the bottom speak the anamnesis banking
-convention and import anamnesis lazily; the rest is pure torch.
-
-Moved here in the 2026-09 consolidation from posttraining/taste/
-koto_capture_smoke.py + koto_capture_cached.py (history: tag
-pre-consolidation-2026-09). Cached-module notes follow.
+convention and import anamnesis lazily; the rest is pure torch. Notes on the
+cached extension sit above ``KotoKVCache``.
 """
 
 from __future__ import annotations
@@ -61,7 +58,7 @@ def _eager_attention(attn, x_normed, rope_cos, rope_sin):
     v = attn.v_proj(x_normed).view(B, S, nkv, hd).transpose(1, 2)
     if attn.qk_norm:
         q = attn.q_norm(q)
-        k = attn.k_norm(k)                                                # operative pre-RoPE key (§9a)
+        k = attn.k_norm(k)                                                # operative pre-RoPE key
     cap_k, cap_v, cap_q = k.detach(), v.detach(), q.detach()
     cos, sin = rope_cos[:S], rope_sin[:S]
     qr, kr = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
@@ -174,27 +171,26 @@ def instrumented_forward(model, input_ids, light=False, routing_only=False):
 # ── the KV-cached extension ────────────────────────────────────────────────────
 #
 # Cached instrumented AttnRes forward for kotodama LuxiaBaseModel — the koto
-# replay surface for the RESPONSE battery (SPEC-RESPONSE-KOTO-2026-09-25).
+# replay surface for signature capture.
 #
 # Extends `instrumented_forward` (the convention of record for
-# every banked koto signature) with the two things the palimpsest battery needs
-# and the smoke deliberately did not have:
+# every banked koto signature) with the two things a replay battery needs
+# beyond the uncached walker:
 #
 #   1. **KV-cached teacher-forced continuation** — prefill a prefix (no capture),
 #      then run the continuation tokens in ONE forward that attends over the
 #      cache, capturing every surface for the continuation positions only. This
 #      mirrors `anamnesis.extraction.replay_cached.replay_extract_cached`'s
 #      banking contract exactly (T = n-1 steps, positions offset..offset+n-2),
-#      which is what sigbridge's G1 (cached == full) and G2 (truncated prefix
-#      MUST differ) gate.
+#      which is what the cached-vs-full gate (cached == full) and the
+#      truncated-prefix gate (a truncated prefix MUST differ) check.
 #   2. **HF-layout generation** (`generate_light`) — the light/SDPA path driving
-#      a sampling loop and returning `hidden_states` shaped the way
-#      `palimpsest.calibrate.run_calibration` consumes them (prefill tuple +
-#      one per-step tuple), so the koto positional-means calibration runs the
-#      banked recipe through the unchanged calibrate code.
+#      a sampling loop and returning `hidden_states` in the HF generate layout
+#      (prefill tuple + one per-step tuple), so a positional-means calibration
+#      written against HF models runs on koto checkpoints unchanged.
 #
 # WHAT "HIDDEN STATE" MEANS HERE — the koto convention of record
-# (`koto_extract_e2e._hidden_states`): index 0 = the embedding; index l+1 = the
+# (`hidden_rows`): index 0 = the embedding; index l+1 = the
 # post-MLP running `partial` of layer l. AttnRes RESETS the partial at committed
 # block boundaries, so this is NOT a monotone global residual; every koto
 # signature and the koto calibration share this convention, which is what makes
@@ -209,24 +205,23 @@ def instrumented_forward(model, input_ids, light=False, routing_only=False):
 #
 # CAPTURED SURFACES per continuation position (capture=True):
 #   keys/queries  k_norm/q_norm output, PRE-RoPE, per-head  (operative content
-#                 key, smoke §9a — a raw k_proj hook would read pre-norm keys)
+#                 key — a raw k_proj hook would read pre-norm keys)
 #   values        v_proj output, per-KV-head
 #   attn          eager softmax(QKᵀ/√d) rows over cache+self, fp32 softmax
 #   gate          ffn.gate_proj output (pre-SiLU)
 #   attn_out      o_proj output (the attention sublayer's residual contribution)
-#                 — NEW vs the smoke; anamnesis's `attn_outputs` family reads it
+#                 — anamnesis's `attn_outputs` family reads it
 #   residual      running partial after EACH sublayer + committed snapshots
 #   routing       per-token AttnRes routing softmax at every routing point
 #
 # Faithfulness gates (tests/test_capture.py, CPU, tiny config):
 # cached-with-empty-cache == `instrumented_forward` bit-for-bit surfaces;
 # prefill+continue logits == full-forward logits at the continuation positions;
-# and the same equality for every captured surface. The G-gate analog runs
-# again on the real checkpoint node-side before any priced cell (spec §2).
+# and the same equality for every captured surface. The same equalities are
+# re-checked on the real checkpoint and GPU before a capture run is used.
 #
-# Determinism (spec §1.6): every capture entry point asserts
-# `CUBLAS_WORKSPACE_CONFIG` is set — an unset workspace is a build/device
-# default, not a pinnable identity (palimpsest notes/204 §11-12).
+# Determinism: every capture entry point asserts `CUBLAS_WORKSPACE_CONFIG` is
+# set — an unset workspace is a build/device default, not a pinnable identity.
 #
 
 
@@ -235,7 +230,7 @@ class KotoCaptureError(RuntimeError):
 
 
 def assert_lane_pinned() -> dict[str, str]:
-    """Refuse to capture under an unpinned arithmetic lane (spec §1.6).
+    """Refuse to capture under an unpinned arithmetic lane.
 
     Returns the lane identity to be recorded in provenance: torch version,
     CUDA version, device capability, and the workspace pin.
@@ -246,7 +241,7 @@ def assert_lane_pinned() -> dict[str, str]:
             "CUBLAS_WORKSPACE_CONFIG is not set. An unset workspace is a "
             "build/device default, not a pinnable identity, and on this "
             "hardware the two known values differ by more than any tolerance "
-            "anyone will set (palimpsest notes/204 §11-12). Export "
+            "anyone will set. Export "
             "CUBLAS_WORKSPACE_CONFIG=:16:8 (the standing pin) before any "
             "capture."
         )
@@ -264,7 +259,7 @@ class KotoKVCache:
     """Per-layer (k, v): k post-QK-norm AND rotated, v raw, (B, n_kv, S, hd).
 
     The model's own cache convention. `length` is the one thing the
-    palimpsest replay contract reads (`cache_length`).
+    replay contract reads (`cache_length`).
     """
 
     layers: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
@@ -329,13 +324,14 @@ def _attn_cached(
     `keep_caps=False`) and otherwise (k_pre_rope, v, q_pre_rope, weights)
     for the NEW positions only.
 
-    Mirrors `_forward_sdpa`'s math (QK-norm -> RoPE -> concat cache) and the
-    smoke's `_eager_attention` capture semantics (pre-RoPE post-norm k/q,
+    Mirrors `_forward_sdpa`'s math (QK-norm -> RoPE -> concat cache) and
+    `instrumented_forward`'s eager capture semantics (pre-RoPE post-norm k/q,
     fp32 softmax weights).
 
     `eager=True, keep_caps=False` is the PARITY mode: eager arithmetic
     (identical to the full-replay reference, so a prefill built this way
-    keeps deep-layer k/v on the same fp trajectory — the G1 requirement),
+    keeps deep-layer k/v on the same fp trajectory — what the cached-vs-full
+    gate requires),
     with the O(S²) weights discarded immediately instead of banked.
     """
     B, S, _ = x_normed.shape
@@ -404,10 +400,10 @@ def cached_forward(
     `instrumented_forward` plus the cache/attn_out additions — the equality is
     asserted by the tests, not assumed.
 
-    `eager_nocapture=True` is the PARITY-PREFILL mode (the G1 lesson,
-    2026-09-25: the first gate run failed G1 at maxrel 1.96 on a tier-3 PCA
-    feature because an SDPA prefill puts deep-layer k/v on a different fp
-    trajectory than the eager full-replay reference): eager arithmetic
+    `eager_nocapture=True` is the PARITY-PREFILL mode (an SDPA prefill puts
+    deep-layer k/v on a different fp trajectory than the eager full-replay
+    reference, far enough to fail the cached-vs-full gate on deep PCA
+    features): eager arithmetic
     identical to the capture path, per-token caps skipped and the O(S²)
     weights freed per layer, so a cache built this way is on the SAME fp
     trajectory as `replay_extract_koto`'s forward. `light` must be False
@@ -426,8 +422,8 @@ def cached_forward(
         raise KotoCaptureError(
             f"position_offset {position_offset} < cache length {past.length}: "
             "continuation positions would overlap the cache. (offset > length "
-            "is ALLOWED, mirroring anamnesis — it is exactly what sigbridge's "
-            "G2 truncated-prefix gate injects, and the whole point of that "
+            "is ALLOWED, mirroring anamnesis — it is exactly what the "
+            "truncated-prefix gate injects, and the whole point of that "
             "gate is that such a cache must change the reading, not refuse.)"
         )
     capture = (not light) and (not eager_nocapture)
@@ -520,7 +516,7 @@ def cached_forward(
 
 def hidden_rows(cap: dict, num_layers: int) -> list[torch.Tensor]:
     """[L+1] tensors of (B, S, H): embed + post-MLP partial per layer — the
-    koto hidden-state convention of record (`koto_extract_e2e._hidden_states`).
+    koto hidden-state convention of record.
     """
     rp = cap["residual_partial"]
     if len(rp) != 2 * num_layers:
@@ -629,7 +625,7 @@ def generate_light(
     return _GenOut(sequences=seqs, hidden_states=all_hidden if output_hidden_states else None)
 
 
-# ── palimpsest replay contract ────────────────────────────────────────────────
+# ── replay contract (anamnesis banking convention) ──────────────────────────
 
 def replay_extract_koto(
     model,
@@ -641,12 +637,12 @@ def replay_extract_koto(
     banking convention: T = N-1 steps at positions P..P+N-2 (the state AT
     generated token g_i, whose logits predict g_{i+1}).
 
-    NOTE this is deliberately NOT the historical `koto_extract_e2e` slice
-    (which banked from P-1, including the prompt-boundary state): sigbridge's
-    G1 compares this function's output against the cached path, and both must
-    live on the anamnesis convention or the gate compares different steps.
-    The e2e convention remains what the BANKED taste-era signatures used;
-    cross-era comparisons must say which slice they are on.
+    NOTE this is deliberately NOT the P-1 slice (which starts one step
+    earlier, at the prompt-boundary state): the cached-vs-full gate compares
+    this function's output against the cached path, and both must live on the
+    anamnesis convention or the gate compares different steps. Signatures
+    banked on the P-1 slice are not step-aligned with these; a comparison
+    across the two must say which slice each side is on.
     """
     import numpy as np
 
@@ -729,9 +725,8 @@ def replay_extract_cached_koto(
     `RawGenerationData` on the anamnesis banking contract, plus the
     kotodama-native AttnRes fields.
 
-    The contract, mirrored from `anamnesis.extraction.replay.cached` (formerly `replay_cached`) at
-    source (sha 4282447d... state_extractor / bfb27e09... pipeline, cluster
-    deploy): T = n-1 steps for n continuation tokens; `logits[i]` is the
+    The contract, mirrored from `anamnesis.extraction.replay.cached`:
+    T = n-1 steps for n continuation tokens; `logits[i]` is the
     distribution produced AT continuation index i (abs position offset+i);
     `chosen_token_ids = cont[1:n]`; attention row i keeps columns
     0..cache_len+i; `prompt_length = cache_len`. Positional means are
@@ -740,9 +735,9 @@ def replay_extract_cached_koto(
     """
     import numpy as np
 
-    try:  # anamnesis >= 2026-10 layout
+    try:  # current anamnesis layout
         from anamnesis.extraction.replay.cached import remap_positional_means
-    except ImportError:  # older layout (e.g. the pleroma-public tree)
+    except ImportError:  # older layout: anamnesis.extraction.replay_cached
         from anamnesis.extraction.replay_cached import remap_positional_means
     from anamnesis.extraction.state_extractor import RawGenerationData
 

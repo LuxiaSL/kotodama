@@ -2,13 +2,13 @@
 
 top_k 0 and top_p 0 mean "off": kotodama models sample best with pure temperature
 (top-p degrades them; temperature is the anti-loop dial — never go to 0.7 for chat).
-Measured per model family in 2026-06/07; see the lab's SERVING-LAWS record.
+Each law is measured per model family.
 """
 
 from __future__ import annotations
 
 LAWS: dict[str, dict[str, float]] = {
-    # Conversation with the post-trained models (gamut-confirmed 2026-07-09).
+    # Conversation with the post-trained models.
     "chat": {"temperature": 0.9, "top_k": 0, "top_p": 0.0, "repetition_penalty": 1.2},
     # The base model: raw base loops without strong anti-repetition.
     "base": {"temperature": 0.9, "top_k": 0, "top_p": 0.0, "repetition_penalty": 1.35},

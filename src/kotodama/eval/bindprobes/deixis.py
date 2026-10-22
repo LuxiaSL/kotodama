@@ -13,14 +13,14 @@ speaker-relative reference::
     Now the cup is with
     -> " Rosa"
 
-v2 (SPEC-bindprobes-deixis v2 addendum, after v1 failed V2/V3/V4): declarations +
-GIVE only, ≥ 3 candidates, a dialogue-worded third-person control. Items carry
+Version 2 design: declarations + GIVE only, ≥ 3 candidates, a dialogue-worded
+third-person control. Items carry
 ``meta.deixis_version = VERSION``; ``items`` ids/seeds carry ``-v2``; aggregate and
 gates refuse deixis rows/items of any other version (:func:`check_version`).
 
 Addressee rule (the unambiguity law): P = 2 -> "you" is the other speaker and no
-utterance carries a vocative (the addendum's "P=2 may drop the vocative" — v2
-always drops it, as v1 did); P = 3 -> EVERY utterance containing you/your/yours or
+utterance carries a vocative (two speakers need none, so v2 always drops it);
+P = 3 -> EVERY utterance containing you/your/yours or
 an imperative opens with a vocative naming the addressee (``Here, Ben, take ...``
 counts: the vocative follows the interjection). ``resolve_addressee`` is the one
 place pronoun semantics live; :func:`explicit_events` raises on any unresolvable
@@ -66,14 +66,14 @@ Paired variants — every base item ``x`` is emitted as linked variants
            Its ``3shot_collide`` maps are sigma∘(the base maps).
            P = 2 object cells have NO twin: with ≥ 3 objects and 2 people the
            partner holds ≥ 2 objects, so the transposed query has no single gold
-           (the addendum's "candidates ≥ 3" and "queried speaker holds exactly one"
-           cannot both hold for a P = 2 twin). Their pairs are (deictic, third).
+           ("candidates ≥ 3" and "queried speaker holds exactly one" cannot both
+           hold for a P = 2 twin). Their pairs are (deictic, third).
 
 Shortcut controls (scheduled per cell on the deictic items; third mirrors them,
 the twin only audits; every variant records them in ``meta``). v2 schedules them
-at the SHORTCUT-NEUTRAL rate (= chance 1/C) rather than v1's 50%: with ≥ 3
+at the SHORTCUT-NEUTRAL rate (= chance 1/C) rather than 50%: with ≥ 3
 candidates a 50% "gold = last mention" rate is itself a recency shortcut worth
-cc ≈ .25–.33, and the spec bound is "≤ 50% ± 5%":
+cc ≈ .25–.33, and the outer bound is "≤ 50% ± 5%":
   gold_is_last_mention  gold is the last-mentioned candidate-type string.
                         owner: 1/3; object cells: 1/3 of the 3-object items and
                         1/4 of the 4-object items (n_objects is scheduled too).
@@ -83,7 +83,7 @@ cc ≈ .25–.33, and the spec bound is "≤ 50% ± 5%":
                         recipient / giver / bystander — the bystander is gold 1/3.)
   gold_in_last_line     the ownership-word rule: the gold object (owner: the
                         queried object) is NOT in the line before the query.
-                        Enforced for owner E ≥ 2. Exempt: owner E = 1 (spec) and
+                        Enforced for owner E ≥ 2. Exempt: owner E = 1 (by design) and
                         every self/addressee cell — with give-only events every
                         line names exactly one object and the query line none, so
                         for object queries this IS gold_is_last_mention; enforcing
@@ -126,16 +126,16 @@ OBJECT_KINDS = ("self", "addressee")
 CELLS: list[Cell] = [(p, e, q) for p in PS for e in ES for q in QKINDS
                      if q != "owner" or p == 3]
 DEFAULT_PER_CELL = 60             # 15 cells -> 900 base items
-PILOT_PER_CELL = 10               # addendum §5 pilot: --per-cell deixis=10 (150 base)
+PILOT_PER_CELL = 10               # pilot battery: --per-cell deixis=10 (150 base)
 LITE_PER_CELL = 10                # lite slice: 10 base items (+ variants) per cell
 SEPARATOR = "\n\n* * *\n\n"
 VARIANTS = ("deictic", "third", "twin")
 ERROR_TYPES = ("speaker_confusion", "previous_owner", "other_participant", "other_object")
-MAX_PROMPT_TOKENS = 1024          # spec: prompts < 1024 tokens (checked with the tokenizer)
-MIN_CANDIDATES = 3                # addendum §2: chance ≤ 1/3
+MAX_PROMPT_TOKENS = 1024          # prompts < 1024 tokens (checked with the tokenizer)
+MIN_CANDIDATES = 3                # chance ≤ 1/3
 N_OBJECTS_OWNER = (2, 3, 4)
 N_OBJECTS_HELD = (3, 4)           # self/addressee: 3–4 objects in play
-BALANCE_TOL = 0.05                # spec: ± 5% per cell
+BALANCE_TOL = 0.05                # ± 5% per cell
 
 TRANSFERS = ("give",)
 GIVE_ORDER = ("giving", "here", "yours")
@@ -484,7 +484,7 @@ def objects(item: Item) -> set[str]:
 
 
 def exempt_ownership_word(cell: Sequence[Any]) -> bool:
-    """Owner E = 1 (spec) and every object cell (module doc: there the rule IS
+    """Owner E = 1 (by design) and every object cell (module doc: there the rule IS
     the recency control, scheduled at the neutral rate instead)."""
     return str(cell[2]) != "owner" or int(cell[1]) == 1
 
@@ -863,9 +863,9 @@ def audit(items: Sequence[Item]) -> dict[str, dict[str, dict[str, Any]]]:
 
 def audit_failures(aud: Mapping[str, Mapping[str, Mapping[str, Any]]],
                    tol: float = BALANCE_TOL) -> list[str]:
-    """§2 controls on the deictic items: recency and (owner) last-speaker within
+    """Shortcut controls on the deictic items: recency and (owner) last-speaker within
     max(tol, 1/n) of the cell's chance rate (the shortcut-neutral target; always
-    inside the spec's "≤ 50% ± 5%"); the ownership-word rule never violated outside
+    inside the outer "≤ 50% ± 5%" bound); the ownership-word rule never violated outside
     the exempt cells."""
     bad: list[str] = []
     for ck, per in aud.items():

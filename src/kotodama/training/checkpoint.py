@@ -504,9 +504,9 @@ class AsyncCheckpointManager(CheckpointManager):
                     f"Checkpoint {latest} is zstd-compressed but zstd CLI not found"
                 )
             # Rank 0 alone decompresses (tmp + rename); every rank loads the
-            # same file between barriers; rank 0 removes it. (Each rank used to
-            # zstd -f into one shared path and unlink it — a multi-rank resume
-            # from a compressed checkpoint died on the first unlink.)
+            # same file between barriers; rank 0 removes it. (If every rank ran
+            # zstd -f into one shared path and unlinked it, a multi-rank resume
+            # from a compressed checkpoint would die on the first unlink.)
             decompressed = latest.with_name(latest.name.replace(".pt.zst", ".pt.decomp"))
             distributed = dist.is_initialized() and dist.get_world_size() > 1
             if self.rank == 0:

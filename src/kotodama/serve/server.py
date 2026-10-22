@@ -2,10 +2,10 @@
 Inference server for kotodama models (3B-first; one replica = one model on one GPU).
 
 Usage:
-    python serve.py --checkpoint /path/to/model.pt [--prefix-cache]
-    python serve.py --checkpoint /path/to/instruct.pt --mode chat   # mode auto-detected
+    python -m kotodama.serve.server --checkpoint /path/to/model.pt [--prefix-cache]
+    python -m kotodama.serve.server --checkpoint /path/to/instruct.pt --mode chat   # mode auto-detected
                                                                     # from 'instruct' in path
-    python serve.py --checkpoint ... --steer-npz algebra.npz,reppen.npz,binding.npz
+    python -m kotodama.serve.server --checkpoint ... --steer-npz algebra.npz,reppen.npz,binding.npz
                                         # per-request MULTI-SITE residual steering in the
                                         # fast path (per-key site from the _s{sublayer}
                                         # suffix; block-persistent; kotodama/serve/steering.py)
@@ -19,7 +19,7 @@ Two decode paths, deliberately only two:
   * reference       — plain eager llama.py loop. The parity oracle and debug
     path (~10x slower); NOT for production traffic.
 
-The fleet story (gateway.py) runs many single-GPU replicas of this server;
+The fleet story (kotodama.serve.gateway) runs many single-GPU replicas of this server;
 concurrency comes from the fleet, not from batching within a replica.
 
 Requires: fastapi, uvicorn, transformers (tokenizer only), torch
@@ -104,7 +104,7 @@ DEFAULT_TOP_K = 0
 DEFAULT_TOP_P = 0.0
 DEFAULT_REPETITION_PENALTY = 1.2
 
-# Architecture-size label used to build the served model id
+# Architecture-size label that goes into the served model id
 # (e.g. "kotodama-3b-instruct"). Falls back to the raw --model_size string.
 SIZE_LABELS = {"proxy": "108m", "1b": "1b", "3b": "3b"}
 
@@ -139,7 +139,7 @@ CONFIG_3B = dict(
 # ladder arms trained with rope_fp32 — serve them with --rope_fp32.
 CONFIG_1B = dict(CONFIG_3B, **presets.shape("1b"))
 
-# T25 depth arm (presets "1b-deep": d1536 x 52 layers, the 1b's budget); DD-3B scaled to 52 layers.
+# Depth arm (presets "1b-deep": d1536 x 52 layers, the 1b's budget); DD-3B scaled to 52 layers.
 CONFIG_1B_DEEP = dict(CONFIG_3B, **presets.shape("1b-deep"),
                       attn_res_boundaries=list(presets.DEFAULT_BOUNDARIES["1b-deep"]))
 
@@ -202,14 +202,14 @@ _stream_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_STREAMS)
 
 # Non-streaming generation is a fully synchronous CUDA decode loop; run directly
 # on the event loop thread it starves /health + /memory for the whole generation
-# (2026-07-04 incident: under saturation the gateway's health checker saw >15s
-# probe silence and restarted busy replicas). Offload it to ONE dedicated worker
-# thread: the loop stays responsive, while max_workers=1 preserves the exact
-# serialization the loop-thread execution used to provide (the engine's static
+# (under saturation the gateway's health checker sees >15s probe silence and
+# restarts busy replicas). Offload it to ONE dedicated worker thread: the loop
+# stays responsive, while max_workers=1 keeps generations strictly serialized
+# (the engine's static
 # KV cache and the compiled decode path are stateful — never run two generations
 # concurrently in this process; each replica owns a single GPU anyway).
 #
-# HARD INVARIANT (2026-07-04 follow-up regression): with --engine fast, ALL
+# HARD INVARIANT: with --engine fast, ALL
 # fast-engine activity — compile/cudagraph capture at startup warmup, replay,
 # and every prefill/sample/step (streaming included) — must run on THIS thread.
 # Inductor's cudagraph_trees keeps its tree-manager containers in THREAD-LOCAL
@@ -278,8 +278,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     model_cfg = MODEL_CONFIGS.get(model_size)
     if model_cfg is None:
         raise ValueError(f"Unknown model_size {model_size!r}; choose from {sorted(MODEL_CONFIGS)}")
-    # P0.6/2x2 battery support: serve non-AttnRes checkpoints (proxy matrix
-    # arms) without editing MODEL_CONFIGS — override via --attn_res off /
+    # Serve non-AttnRes checkpoints (e.g. proxy ablation arms) without
+    # editing MODEL_CONFIGS — override via --attn_res off /
     # --attn_res_boundaries "0,3,7,12,21,25".
     model_cfg = dict(model_cfg)
     if _attn_res_override == "off":
@@ -406,8 +406,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         # cudagraph_trees, whose tree-manager containers live in THREAD-LOCAL
         # storage: a graph captured here on the main thread asserts
         # (torch._C._is_key_in_tls) the moment the worker thread replays it
-        # (2026-07-04 production regression — 28ms 500s on every non-stream
-        # request of warmed-at-startup replicas). load_model is sync (called
+        # (a 28ms 500 on every non-stream request of a warmed-at-startup
+        # replica). load_model is sync (called
         # from lifespan before serving starts), so block on the future.
         _engine = _generate_executor.submit(_build_and_warm_engine).result()
         # Disable cuDNN SDPA only AFTER the engine compiled: the captured
@@ -458,8 +458,8 @@ class ChatMessage(BaseModel):
 
 
 class SteerVectorSpec(BaseModel):
-    """One member of a per-request steering stack (sidecar /generate dialect:
-    {"name": alias-or-raw-npz-key, "alpha": dose}). alpha omitted -> the
+    """One member of a per-request steering stack ({"name": alias-or-raw-npz-key,
+    "alpha": dose}). alpha omitted -> the
     alias default (or STEER_DEFAULT_ALPHA for raw keys)."""
 
     name: str
@@ -477,7 +477,6 @@ class GenerateRequest(BaseModel):
     stop_strings: list[str] = Field(default_factory=list)
     stream: bool = False
     # ── Residual steering (fast engine + --steer-npz only; else -> 400). ──
-    # Composition mirrors the sidecar steering rack (koto_steered_chat.py):
     # 'vectors' composes a weighted stack — each member scaled by alpha * ITS
     # OWN site's median norm; members may live at DIFFERENT sites (v2 multi-
     # site). 'steer_model' (+ optional 'steer_alpha') is single-vector use.
@@ -492,7 +491,7 @@ class GenerateResponse(BaseModel):
     completion_tokens: int
     tokens_per_second: float
     timing: dict[str, float] | None = None
-    # exact token IDs for offline replay (anamnesis taste discriminator) —
+    # exact token IDs for offline replay (e.g. signature capture) —
     # always populated (cheap, already in hand); surfaced in the OAI response
     # only when the request sets return_token_ids
     prompt_ids: list[int] | None = None
@@ -512,7 +511,7 @@ class ModelInfo(BaseModel):
     steering: dict | None = None
 
 
-# ── /logprobs: batched prefill-only scoring (P0.6 four-register battery) ────────
+# ── /logprobs: batched prefill-only scoring (the four-register rider battery) ──
 # One forward per BATCH, no decode loop (the computation lives in
 # kotodama.eval.riders.score, shared with the training loop's in-loop riders).
 # This is the fast path for logprob evals; the decode engine is irrelevant here
@@ -595,8 +594,8 @@ def _compose_steer_writes(request: GenerateRequest) -> "list[tuple[int, torch.Te
     'control'), else [(site_layer, unit_vec, alpha * that site's median
     norm), ...] — one write per resolved stack member; members at the same
     site simply sum row-wise inside engine.set_steer. Dose math per member is
-    exactly the sidecar rack's (alpha * median_norm * unit), now with each
-    member scaled by ITS OWN site's median norm. Raises HTTPException(400)
+    alpha * median_norm * unit, with each member scaled by ITS OWN site's
+    median norm. Raises HTTPException(400)
     for steering use without --steer-npz, unknown names, or conflicting
     fields.
     """
@@ -818,8 +817,8 @@ def _engine_compatible(request: GenerateRequest) -> bool:
     """Engine handles the full law surface: temperature + rep penalty + top-k/top-p.
 
     Truncated laws (top_k > 0 or 0 < top_p < 1) run the engine's dedicated
-    compiled sampler variant (2026-07-05) — they used to fall back to the
-    reference path at a ~10x decode penalty (the SERVING-LAWS p90/k100 cliff).
+    compiled sampler variant rather than the reference path (which costs ~10x
+    in decode).
     """
     return _engine is not None
 
@@ -909,7 +908,7 @@ async def engine_generate_stream(
     """Streaming generation on the fast engine.
 
     Emits text via windowed incremental detokenization: pending token ids are
-    decoded together and flushed once the text no longer ends in an incomplete
+    decoded together and flushed as soon as the text does not end in an incomplete
     UTF-8 sequence (U+FFFD) — O(window) per step instead of O(n) full redecode.
 
     THREADING: every engine call below is dispatched to _generate_executor —
@@ -1549,7 +1548,7 @@ if __name__ == "__main__":
                              "sweep at startup instead of ~300ms per novel shape at runtime")
     parser.add_argument("--steer-npz", default=None,
                         help="COMMA-SEPARATED npz banks of unit steering vectors + per-site "
-                             "median norms (posttraining/taste convention: vector keys like "
+                             "median norms (vector keys like "
                              "'Alg_echo_base_s46' + 'median_norm_s46'; per-key site from the "
                              "_s{sublayer} suffix, sublayer = 2*layer after-attn). Enables "
                              "per-request multi-site residual steering on the fast engine. "

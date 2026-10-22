@@ -1,25 +1,22 @@
 """Dyadic NCA — the "world that answers back" generating family, v3.
 
-Spec: lab DRAFT-SPEC-dyadic-nca-2026-08-03 (three clauses: model-the-other /
-honor-the-ledger / orient-to-the-surprise), absorbed by
-SPEC-1B-FORMATION-LADDER-2026-09-26 §5 (v3 requirements + rulings). Builds on
-the original generator's primitives (NCARule, simulate step, patch tokenizer);
+Three design clauses: model-the-other / honor-the-ledger /
+orient-to-the-surprise. Builds on the original generator's primitives (NCARule, simulate step, patch tokenizer);
 this module adds the sequence families the original could not express:
 
   A. COUPLED ASYMMETRIC GENERATORS — two rules alternate control of ONE grid
      in variable-length turns. Both rules act on the shared state: each
      inherits the other's writes. Per-side dynamics (identity_bias /
      temperature) supported. ``mark_turns=False`` drops the TURN tokens: the
-     handover must be detected from the dynamics alone (ruling 2026-09-26 —
-     the in-domain ancestor of the RESPONSE seam sensor; mix marked and
-     unmarked episodes ~half/half at the writer).
+     handover must be detected from the dynamics alone (the writer mixes
+     marked and unmarked episodes ~half/half).
   B. COMMITMENTS + QUERIES, LAST-WRITE-WINS (v3) — [COMMIT, TAG_k, VAL_v]
      events write a tagged association; [QUERY, TAG_k] must be answered by
      the value of the MOST RECENT commit to that tag — well-posed by
-     construction (the v1/v2 gold-=-sampled-commit ill-posedness is dead).
+     construction (an overwritten commit is never the gold).
      ``p_tag_reuse`` dials how often commits overwrite a live tag: 0.0 =
      unique-tag pure retrieval, 1.0 = heavy state-update demand. The writer
-     ramps it across the stream (ruling: unique → overwrite). VALs are
+     ramps it across the stream (unique → overwrite). VALs are
      distinct within an episode, so the ANTI-SHORTCUT LAW holds structurally:
      a gold value's token appears exactly at its own commit and at queries it
      answers, nowhere else.
@@ -28,8 +25,7 @@ this module adds the sequence families the original could not express:
      each perturbed rollout with its counterfactual unperturbed twin.
 
 Token map (d=10, ps=2):
-  v1 layout (``reserve_eos=False`` — the ARM-D-lite era, kept readable for
-  replaying old bins):  0..9999 patches · 10000 START · 10001 END ·
+  v1 layout (``reserve_eos=False``, kept readable for replaying v1 bins):  0..9999 patches · 10000 START · 10001 END ·
   10002/10003 TURN_SELF/OTHER · 10004 COMMIT · 10005 QUERY · 10006 PERTURB ·
   10007..10022 TAG0-15 · 10023..10032 VAL0-9.
   v3 layout (``reserve_eos=True``): every id above shifted +1; **id 0 = EOS
@@ -131,9 +127,8 @@ def simulate_dyadic(cfg: DyadicConfig, rule_self: NCARule, rule_other: NCARule,
     perturbation itself uses an INDEPENDENT generator.
 
     dyn_self / dyn_other: optional per-side dynamics dicts with
-    ``identity_bias`` / ``temperature`` keys (the sampled rule params — the
-    ARM-D-lite era discarded these and ran every rule at the config defaults,
-    inventory finding F2). Default None = cfg.nca values.
+    ``identity_bias`` / ``temperature`` keys (the sampled rule params; without
+    them every rule runs at the config defaults). Default None = cfg.nca values.
     """
     n = cfg.nca
     rng = random.Random(seed)
@@ -211,7 +206,7 @@ def simulate_dyadic(cfg: DyadicConfig, rule_self: NCARule, rule_other: NCARule,
         ps_step = rng.randint(T // 4, 3 * T // 4)
         pgen = torch.Generator(device="cpu").manual_seed(seed ^ 0x5F5F5F)
         # a perturbation is a PATCH: never larger than half the grid (small
-        # grids with the default patch size used to hit an empty randrange)
+        # grids with the default patch size would hit an empty randrange)
         pp = min(cfg.perturb_patch, n.grid_size // 2)
         px = rng.randrange(n.grid_size - pp)
         py = rng.randrange(n.grid_size - pp)
@@ -322,8 +317,8 @@ def emit_ledger_items(cfg: DyadicConfig, rules: list[RulePair],
     """Ledger-gate items: prefix ends right after [QUERY, TAG]; gold = VAL of
     the LAST write to that tag (well-posed); candidates = the VAL alphabet.
     Labels carried per item: committer side, lag from the gold write,
-    writes_before / post_overwrite (the unique-vs-overwrite eval split,
-    ruling 2026-09-26), is_requery, marked."""
+    writes_before / post_overwrite (the unique-vs-overwrite eval split),
+    is_requery, marked."""
     tm = token_map(cfg.nca)
     items = []
     s = seed0
@@ -358,12 +353,12 @@ def emit_ledger_items(cfg: DyadicConfig, rules: list[RulePair],
 
 def emit_smoothing_pairs(cfg: DyadicConfig, rules: list[RulePair],
                          n_pairs: int, seed0: int) -> list[dict[str, Any]]:
-    """Smoothing-gate items, v2 (2026-08-03 fix): the scored object is the
-    PROPAGATION timestep (t+1), not the perturbed frame itself — the injected
-    patch is unpredictable noise by construction (v1's SI 0.78 was this
-    artifact). Prefix = perturbed stream THROUGH timestep t (patch visible in
-    context); true = timestep t+1 of the perturbed rollout (dynamics carry
-    the patch forward); counterfactual = timestep t+1 of the unperturbed twin
+    """Smoothing-gate items: the scored object is the PROPAGATION timestep
+    (t+1), not the perturbed frame itself — the injected patch is unpredictable
+    noise by construction, and scoring it reads a spurious high SI (~0.78).
+    Prefix = perturbed stream THROUGH timestep t (patch visible in context);
+    true = timestep t+1 of the perturbed rollout (dynamics carry the patch
+    forward); counterfactual = timestep t+1 of the unperturbed twin
     (rule-consistent with pre-perturbation state). Frame slices located by
     START-token ordinals so interleaved commit/query events can't shift them."""
     tm = token_map(cfg.nca)
