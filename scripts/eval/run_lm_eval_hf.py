@@ -20,6 +20,8 @@ weights.
 Usage:
     tools/run_py.sh -m scripts.eval.run_lm_eval_hf --model EleutherAI/pythia-1.4b \\
         --revision step14000 --output-dir out/pythia-1.4b-step14000
+    tools/run_py.sh -m scripts.eval.run_lm_eval_hf --model /path/to/local/model \\
+        --output-dir out/local-model
 """
 
 from __future__ import annotations
@@ -127,7 +129,7 @@ def weight_fingerprint(model: torch.nn.Module) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--model", required=True, help="HF repo id")
+    p.add_argument("--model", required=True, help="HF repo id, or a local model directory")
     p.add_argument("--revision", default="main")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--tasks", default=DEFAULT_TASKS)
@@ -157,11 +159,17 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        commit = HfApi().model_info(args.model, revision=args.revision).sha
-    except Exception as exc:  # metadata only; the load below is authoritative
-        logger.warning("could not resolve commit for %s@%s: %s", args.model, args.revision, exc)
-        commit = None
+    local = Path(args.model).is_dir()
+    if local:
+        # A hub-cache snapshot dir is named by its commit; a plain local copy has none.
+        parent = Path(args.model).resolve().parent
+        commit = Path(args.model).resolve().name if parent.name == "snapshots" else None
+    else:
+        try:
+            commit = HfApi().model_info(args.model, revision=args.revision).sha
+        except Exception as exc:  # metadata only; the load below is authoritative
+            logger.warning("could not resolve commit for %s@%s: %s", args.model, args.revision, exc)
+            commit = None
 
     use_st = {"auto": None, "safetensors": True, "bin": False}[args.weights]
     model = AutoModelForCausalLM.from_pretrained(
@@ -205,7 +213,8 @@ def main() -> None:
         json.dump(serializable, f, indent=2, default=str)
     meta = {
         "model": args.model,
-        "revision": args.revision,
+        "revision": None if local else args.revision,
+        "local": local,
         "commit": commit,
         "tokenizer_revision": tok_rev,
         "weights": args.weights,
