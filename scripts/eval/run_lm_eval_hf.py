@@ -127,6 +127,59 @@ def weight_fingerprint(model: torch.nn.Module) -> dict[str, Any]:
     return {"sha256": h.hexdigest(), "sum": total, "abs_sum": total_abs}
 
 
+def load_hf_model(
+    model_id: str, revision: str, cache_dir: str | None, weights: str, device: str
+) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
+    """An HF causal LM in bf16 on ``device``, its tokenizer, and provenance.
+
+    ``model_id`` is a hub repo id or a local directory. The provenance dict
+    carries ``local``, ``commit`` (None for a plain local copy), the tokenizer's
+    revision, ``context`` (max positions), ``n_params`` and the weight fingerprint.
+    """
+    from huggingface_hub import HfApi
+    from transformers import AutoModelForCausalLM
+
+    local = Path(model_id).is_dir()
+    if local:
+        # A hub-cache snapshot dir is named by its commit; a plain local copy has none.
+        resolved = Path(model_id).resolve()
+        commit = resolved.name if resolved.parent.name == "snapshots" else None
+    else:
+        try:
+            commit = HfApi().model_info(model_id, revision=revision).sha
+        except Exception as exc:  # metadata only; the load below is authoritative
+            logger.warning("could not resolve commit for %s@%s: %s", model_id, revision, exc)
+            commit = None
+
+    use_st = {"auto": None, "safetensors": True, "bin": False}[weights]
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        revision=revision,
+        cache_dir=cache_dir,
+        dtype=torch.bfloat16,
+        use_safetensors=use_st,
+    )
+    model.eval().to(device)
+    model.config.use_cache = False  # scoring only; no KV cache per forward
+    tokenizer, tok_rev = load_tokenizer(model_id, revision, cache_dir)
+
+    ctx = getattr(model.config, "max_position_embeddings", None) or REFERENCE_MAX_LENGTH
+    fingerprint = weight_fingerprint(model)
+    n_params = sum(p.numel() for p in model.parameters())
+    logger.info(
+        "%s@%s (commit %s): %.1fM params, context %d, fingerprint %s",
+        model_id, revision, commit, n_params / 1e6, int(ctx), fingerprint["sha256"][:16],
+    )
+    return model, tokenizer, {
+        "local": local,
+        "commit": commit,
+        "tokenizer_revision": tok_rev,
+        "context": int(ctx),
+        "n_params": n_params,
+        "weight_fingerprint": fingerprint,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--model", required=True, help="HF repo id, or a local model directory")
@@ -153,45 +206,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     import lm_eval
-    from huggingface_hub import HfApi
-    from transformers import AutoModelForCausalLM
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    local = Path(args.model).is_dir()
-    if local:
-        # A hub-cache snapshot dir is named by its commit; a plain local copy has none.
-        parent = Path(args.model).resolve().parent
-        commit = Path(args.model).resolve().name if parent.name == "snapshots" else None
-    else:
-        try:
-            commit = HfApi().model_info(args.model, revision=args.revision).sha
-        except Exception as exc:  # metadata only; the load below is authoritative
-            logger.warning("could not resolve commit for %s@%s: %s", args.model, args.revision, exc)
-            commit = None
-
-    use_st = {"auto": None, "safetensors": True, "bin": False}[args.weights]
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        revision=args.revision,
-        cache_dir=args.cache_dir,
-        dtype=torch.bfloat16,
-        use_safetensors=use_st,
+    model, tokenizer, info = load_hf_model(
+        args.model, args.revision, args.cache_dir, args.weights, args.device
     )
-    model.eval().to(args.device)
-    model.config.use_cache = False  # scoring only; no KV cache per forward
-    tokenizer, tok_rev = load_tokenizer(args.model, args.revision, args.cache_dir)
-
-    ctx = getattr(model.config, "max_position_embeddings", None) or REFERENCE_MAX_LENGTH
-    max_length = min(REFERENCE_MAX_LENGTH, int(ctx))
-    fingerprint = weight_fingerprint(model)
-    n_params = sum(p.numel() for p in model.parameters())
-    logger.info(
-        "%s@%s (commit %s): %.1fM params, window %d, fingerprint %s",
-        args.model, args.revision, commit, n_params / 1e6, max_length,
-        fingerprint["sha256"][:16],
-    )
+    local, commit, tok_rev = info["local"], info["commit"], info["tokenizer_revision"]
+    fingerprint, n_params = info["weight_fingerprint"], info["n_params"]
+    max_length = min(REFERENCE_MAX_LENGTH, info["context"])
 
     lm = make_hf_eval_lm(
         model, tokenizer, args.device, args.batch_size, max_length,
