@@ -221,15 +221,17 @@ def phase_2_online_softmax_merge_backward_kernel(
 
         grad_intrablock_partial_sum += prev_grad_intrablock
 
+    # Both stored in their buffer's dtype: a bf16 buffer gets the same single round-to-nearest-even as an fp32 store
+    # + torch .to(bf16), without the fp32 round trip through memory.
     tl.store(
         grad_intrablock_ptr,
-        grad_intrablock_partial_sum,
+        grad_intrablock_partial_sum.to(grad_intrablock_partial_sum_accumulator_ptr.dtype.element_ty),
         mask=mask_2d,
     )
 
     tl.store(
         grad_phase1_interblock_normalized_output_ptr + offsets_2d,
-        grad_phase1_interblock_normalized_output,
+        grad_phase1_interblock_normalized_output.to(grad_phase1_interblock_normalized_output_ptr.dtype.element_ty),
         mask=mask_2d,
     )
 

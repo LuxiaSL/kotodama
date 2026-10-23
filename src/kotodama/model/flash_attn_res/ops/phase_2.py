@@ -104,10 +104,11 @@ def _online_softmax_merge_backward_triton_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, D = intrablock_partial_sum.shape
 
+    # The kernel rounds these two once, into the input dtype (bitwise an fp32 buffer + .to()).
     grad_intrablock_partial_sum = torch.empty(
         (B, T, D),
         device=intrablock_partial_sum.device,
-        dtype=torch.float32,
+        dtype=intrablock_partial_sum.dtype,
     )
 
     grad_pseudo_query = torch.zeros(
@@ -119,7 +120,7 @@ def _online_softmax_merge_backward_triton_op(
     grad_phase1_interblock_normalized_output = torch.empty(
         (B, T, D),
         device=phase1_interblock_normalized_output.device,
-        dtype=torch.float32,
+        dtype=phase1_interblock_normalized_output.dtype,
     )
 
     grad_phase1_interblock_logsumexp = torch.empty(

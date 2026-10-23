@@ -315,10 +315,11 @@ def _batched_attention_backward_triton_op(
     num_queries = pseudo_queries.shape[0]
     B, T, D = block_representations.shape[1:]
 
+    # The kernel rounds the fp32 per-token gradient once, into the input dtype (bitwise the old fp32 buffer + .to()).
     grad_block_representations = torch.empty(
         (num_source_blocks, B, T, D),
         device=block_representations.device,
-        dtype=torch.float32,
+        dtype=block_representations.dtype,
     )
 
     grad_pseudo_queries = torch.zeros(

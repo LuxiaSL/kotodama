@@ -298,9 +298,11 @@ def phase_1_batched_attention_backward_kernel(
 
         grad_source_accumulator += prev_grad_block
 
+    # Stored in the accumulator's dtype: a bf16 buffer gets the same single round-to-nearest-even as the fp32 store +
+    # torch .to(bf16) it replaces, without the fp32 round trip through memory.
     tl.store(
         grad_block_ptr,
-        grad_source_accumulator,
+        grad_source_accumulator.to(grad_block_representations_accumulator_ptr.dtype.element_ty),
         mask=load_mask_2d,
     )
 
