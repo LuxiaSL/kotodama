@@ -1,11 +1,15 @@
 import os
+from typing import Optional
 
 import torch
 import triton
 from torch.library import triton_op, wrap_triton
 
 from ..kernels import phase_1
-from ..kernels.configs import EPS_FP64_COMPAT, PHASE1_BWD_MIN_BLOCK_BT
+from ..kernels.configs import (
+    EPS_FP64_COMPAT,
+    PHASE1_BWD_MIN_BLOCK_BT,
+)
 from ..kernels.reduce import reduce_grad_queries_kernel
 
 EPS = torch.finfo(torch.float32).eps
@@ -33,6 +37,7 @@ _P1_BWD_TORCH = os.environ.get("KOTODAMA_P1_BWD_TORCH", "0") == "1"
 # for one-query calls (the per-sublayer routing path) when enabled; default OFF until its parity gate passes.
 _P1_FWD_ONLINE = os.environ.get("KOTODAMA_P1_FWD_ONLINE", "0") == "1"
 _P1_BWD_TORCH_MIN_S = int(os.environ.get("KOTODAMA_P1_BWD_TORCH_MIN_S", "5"))
+_CHAIN_D_MULTIPLE = 512  # every chained-backward autotune config's BLOCK_D divides this
 
 
 def _batched_attention_backward_torch(
@@ -353,6 +358,67 @@ def _batched_attention_backward_triton_op(
     return grad_block_representations, grad_pseudo_queries
 
 
+@triton_op(
+    "flash_attn_res::_phase_1_batched_attention_backward_chained",
+    mutates_args={},
+)
+def _batched_attention_backward_chained_triton_op(
+    block_representations: torch.Tensor,
+    pseudo_queries: torch.Tensor,
+    lses: torch.Tensor,
+    inverse_rms_norms: torch.Tensor,
+    attention_logits: torch.Tensor,
+    grad_softmax_outputs: torch.Tensor,
+    grad_lses: torch.Tensor,
+    has_grad_lses: bool,
+    eps: float,
+    num_active: int,
+    grad_block_representations_prev: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-query backward over the whole stack (kernels.phase_1.phase_1_route_chained_backward_kernel) that returns
+    `grad_block_representations_prev + this route's stack gradient` (or just its own when prev is None), summed in
+    fp32 in-kernel and rounded once into the input dtype, plus the fp32 query gradient (1, D)."""
+    num_source_blocks = block_representations.shape[0]
+    B, T, D = block_representations.shape[1:]
+    BT = B * T
+    if pseudo_queries.shape[0] != 1 or num_active != num_source_blocks:
+        raise ValueError(
+            f"chained phase-1 backward is single-query over the whole stack; got {pseudo_queries.shape[0]} queries, "
+            f"num_active={num_active} of {num_source_blocks}")
+    if D % _CHAIN_D_MULTIPLE or num_source_blocks * BT * D >= 2**31:
+        raise ValueError(f"chained phase-1 backward needs D % {_CHAIN_D_MULTIPLE} == 0 and S*B*T*D < 2^31 (int32 plane "
+                         f"offsets); got S={num_source_blocks} BT={BT} D={D}")
+
+    block_representations = block_representations.contiguous()
+    grad_block_representations = torch.empty_like(block_representations)
+    has_prev = grad_block_representations_prev is not None
+    padded_src = triton.next_power_of_2(num_source_blocks)
+    # Per-token coefficients ([dots | p | a | c] x padded_src) and query-grad partials: one row per token, all written.
+    scratch = torch.empty((BT * 4 * padded_src,), device=block_representations.device, dtype=torch.float32)
+    partials = torch.empty((BT, D), device=pseudo_queries.device, dtype=torch.float32)
+    wrap_triton(phase_1.phase_1_route_chained_backward_kernel)[(BT,)](
+        block_representations,
+        pseudo_queries.contiguous(),
+        lses.contiguous(),
+        inverse_rms_norms.contiguous(),
+        attention_logits.contiguous(),
+        grad_softmax_outputs.contiguous(),
+        grad_lses.contiguous(),
+        grad_block_representations,
+        # Unused (never read) without a running gradient; any valid pointer will do.
+        grad_block_representations_prev.contiguous() if has_prev else grad_block_representations,
+        partials,
+        scratch,
+        BT,
+        num_source_blocks,
+        D,
+        padded_src,
+        has_grad_lses,
+        has_prev,
+    )
+    return grad_block_representations, partials.sum(dim=0, keepdim=True)
+
+
 def _batched_attention_backward_accumulate(
     block_representations,
     pseudo_queries,
@@ -559,3 +625,67 @@ _phase_1_batched_attention_forward_with_aux_triton_op.register_autograd(
     _backward_with_flag_input,
     setup_context=setup_context,
 )
+
+
+class _Phase1RouteChained(torch.autograd.Function):
+    """One single-query route over a committed stack, with the stack gradient carried through a `link` instead of
+    returned to the stack.
+
+    Every sublayer route in an AttnRes block reads the same committed stack. Returned the usual way, each route's
+    backward makes a full (S, B, T, D) stack gradient that autograd then sums with a separate add (eagerly, when the
+    DDP optimizer has split the compiled graph between the routes). Here route i takes `link` (the previous route's
+    link output, or the stack itself for the block's first route) and returns a new link that aliases the stack; in
+    backward, the gradient arriving on its link output is the running sum of the later routes' contributions, and
+    the kernel returns that sum plus its own (fp32 add, one round into the stack dtype) as the gradient of its link
+    input. The last route of a chain gets no link gradient and writes its own contribution alone. Same math as the
+    unchained op; the sum's order and rounding differ (each partial sum rounds once instead of each term).
+    """
+
+    @staticmethod
+    def forward(ctx, block_representations, pseudo_queries, link, eps, num_active, eps_fp64_compat):
+        softmax_outputs, lses, inverse_rms_norms, attention_logits = (
+            _phase_1_batched_attention_forward_with_aux_triton_op(
+                block_representations, pseudo_queries, eps, num_active, eps_fp64_compat))
+        ctx.save_for_backward(block_representations, pseudo_queries, lses, inverse_rms_norms, attention_logits)
+        ctx.eps = eps
+        ctx.num_active = num_active
+        ctx.set_materialize_grads(False)
+        return softmax_outputs, lses, block_representations.view_as(block_representations)
+
+    @staticmethod
+    def backward(ctx, grad_softmax_outputs, grad_lses, grad_link):
+        block_representations, pseudo_queries, lses, inverse_rms_norms, attention_logits = ctx.saved_tensors
+        if grad_softmax_outputs is None and grad_lses is None:
+            return None, None, grad_link, None, None, None
+        num_queries = pseudo_queries.shape[0]
+        B, T, D = block_representations.shape[1:]
+        if grad_softmax_outputs is None:
+            grad_softmax_outputs = block_representations.new_zeros((num_queries, B, T, D))
+        has_grad_lses = grad_lses is not None
+        grad_stack, grad_queries = _batched_attention_backward_chained_triton_op(
+            block_representations,
+            pseudo_queries,
+            lses,
+            inverse_rms_norms,
+            attention_logits,
+            grad_softmax_outputs.contiguous(),
+            grad_lses.contiguous() if has_grad_lses else lses,
+            has_grad_lses,
+            ctx.eps,
+            ctx.num_active,
+            grad_link,
+        )
+        return None, grad_queries.to(pseudo_queries.dtype), grad_stack, None, None, None
+
+
+def phase_1_route_chained(
+    block_representations: torch.Tensor,
+    pseudo_queries: torch.Tensor,
+    eps: float,
+    link: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`phase_1_batched_attention_triton_op` over the whole stack (num_active = S) whose stack gradient flows through
+    the link chain (_Phase1RouteChained). Pass the stack itself as `link` for the first route on a stack and the
+    returned link afterwards. Returns (softmax_outputs, lses, link)."""
+    return _Phase1RouteChained.apply(
+        block_representations, pseudo_queries, link, eps, block_representations.shape[0], EPS_FP64_COMPAT)

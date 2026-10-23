@@ -830,6 +830,8 @@ def train(args: argparse.Namespace) -> None:
                        "regime) — effective batch = 1/%d of the global batch", dp_size)
     if apply_attnres_eps_compat(args) and is_main:
         logger.info("AttnRes eps fp64 compat ON: forward routing runs in fp64 under torch.compile (pre-constexpr numerics)")
+    if apply_attnres_stack_grad_chain(args) and is_main:
+        logger.info("AttnRes stack-gradient chain ON: routes sharing a committed stack sum its gradient in-kernel")
     doc_masking = getattr(args, "doc_masking", False)
     varlen_dynamic = bool(getattr(args, "varlen_dynamic", False) and args.compile and doc_masking)
     if is_main and getattr(args, "varlen_dynamic", False) and not varlen_dynamic:
@@ -2007,6 +2009,18 @@ def apply_attnres_eps_compat(args: argparse.Namespace) -> bool:
     return bool(p1ops.EPS_FP64_COMPAT and p2ops.EPS_FP64_COMPAT)
 
 
+def apply_attnres_stack_grad_chain(args: argparse.Namespace) -> bool:
+    """``--attnres_stack_grad_chain``: the sublayer routes sharing a committed AttnRes stack pass its gradient along
+    a chain (each route's backward adds its contribution in-kernel) instead of each returning a full stack gradient
+    that autograd sums. Same math; the sum's order and rounding differ, so a lineage keeps the choice it started
+    with. Also enabled by KOTODAMA_ATTNRES_STACK_GRAD_CHAIN=1. Returns whether the chain is on."""
+    from kotodama.model import llama
+
+    if getattr(args, "attnres_stack_grad_chain", False):
+        llama._STACK_GRAD_CHAIN = True
+    return bool(llama._STACK_GRAD_CHAIN)
+
+
 def ddp_options(args: argparse.Namespace, find_unused: bool) -> dict[str, Any]:
     """DistributedDataParallel keyword options from the run flags.
 
@@ -2479,6 +2493,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no_attnres_eps_fp64_compat", dest="attnres_eps_fp64_compat", action="store_false",
         help="Turn off --attnres_eps_fp64_compat set by a config (fp32 AttnRes routing).",
+    )
+    p.add_argument(
+        "--attnres_stack_grad_chain", action="store_true",
+        help="AttnRes routes sharing a committed stack chain its gradient through a single-query backward kernel "
+             "(summed in-kernel, one round per partial sum) instead of autograd summing a full stack gradient per "
+             "route. Faster; the sum's order and rounding differ (new runs only).",
     )
     p.add_argument(
         "--ddp_bucket_cap_mb", type=float, default=None,

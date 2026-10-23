@@ -5,5 +5,5 @@ Phase 1: inter-block attention (softmax over committed blocks).
 Phase 2: online softmax merge with intra-block partial sum.
 """
 
-from .ops.phase_1 import phase_1_batched_attention_triton_op
+from .ops.phase_1 import phase_1_batched_attention_triton_op, phase_1_route_chained
 from .ops.phase_2 import phase_2_online_softmax_merge_triton_op

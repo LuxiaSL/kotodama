@@ -57,3 +57,17 @@ def test_attnres_eps_compat_flag_sets_both_ops():
                      "--no_attnres_eps_fp64_compat").attnres_eps_fp64_compat is False
     finally:
         p1ops.EPS_FP64_COMPAT, p2ops.EPS_FP64_COMPAT = saved
+
+
+def test_attnres_stack_grad_chain_flag():
+    from kotodama.model import llama
+
+    saved = llama._STACK_GRAD_CHAIN
+    try:
+        llama._STACK_GRAD_CHAIN = False
+        assert train.apply_attnres_stack_grad_chain(_args()) is False
+        assert train.apply_attnres_stack_grad_chain(_args("--attnres_stack_grad_chain")) is True
+        assert llama._STACK_GRAD_CHAIN is True
+        assert _args("--config", "configs/moonshot-1b-shapeA.yaml").attnres_stack_grad_chain is False
+    finally:
+        llama._STACK_GRAD_CHAIN = saved

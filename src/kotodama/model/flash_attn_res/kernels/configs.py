@@ -85,6 +85,18 @@ phase1_online_forward_configs = [
 ]
 
 
+# Chained single-query phase-1 backward (phase_1_route_chained_backward_kernel; unmasked 2-D tiles). One token per
+# program (measured best on B200 at S 6-8, D 1536; 2+ tokens per program, or several walked serially, are slower), so
+# the query-grad partials have one row per token and every row is written. BLOCK_D must divide the hidden size (the
+# wrapper checks).
+phase1_route_chained_backward_configs = [
+    triton.Config({"BLOCK_BT": 1, "BLOCK_D": 512}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_BT": 1, "BLOCK_D": 512}, num_warps=2, num_stages=3),
+    triton.Config({"BLOCK_BT": 1, "BLOCK_D": 512}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_BT": 1, "BLOCK_D": 256}, num_warps=1, num_stages=3),
+]
+
+
 def set_autotune_configs(kernel, configs):
     kernel.configs = list(configs)
     kernel.cache.clear()

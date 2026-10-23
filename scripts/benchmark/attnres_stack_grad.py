@@ -53,6 +53,11 @@ def main() -> int:
     ap.add_argument("--modes", default="eager,compiled")
     ap.add_argument("--save", default="")
     ap.add_argument("--compare", nargs=2, default=None)
+    ap.add_argument("--chain", action="store_true", help="routes via phase_1_route_chained (the link chain)")
+    ap.add_argument("--gate", action="store_true",
+                    help="accuracy gate (implies --ref64): per case, the chain's grad_stack error vs fp64, eager and "
+                         "compiled, must be <= 1.05x the unchained op's eager error (the autograd bf16 sum the "
+                         "DDP-split model runs today). Exit 1 on failure.")
     ap.add_argument("--ref64", action="store_true",
                     help="also an fp64 torch reference; report each mode's grad_stack error vs it")
     ap.add_argument("--kernels", action="store_true", help="per-kernel device time of one backward (torch.profiler)")
@@ -82,6 +87,10 @@ def main() -> int:
     sys.path.insert(0, a.src)
     from kotodama.model.flash_attn_res.ops.phase_1 import phase_1_batched_attention_triton_op
     from kotodama.model.flash_attn_res.ops.phase_2 import phase_2_online_softmax_merge_triton_op
+    if a.gate:
+        a.ref64 = True
+    if a.chain or a.gate:
+        from kotodama.model.flash_attn_res.ops.phase_1 import phase_1_route_chained
     import kotodama.model.flash_attn_res.ops.phase_1 as p1mod
 
     print(f"kernels from {p1mod.__file__}", flush=True)
@@ -98,12 +107,16 @@ def main() -> int:
                     obj.cache.clear()
                     print(f"pinned {name}: {obj.configs[0]}", flush=True)
 
-    def block_loss(stack, queries, partials, gouts):
+    def block_loss(stack, queries, partials, gouts, chain=a.chain):
         loss = stack.new_zeros((), dtype=torch.float32)
         S = stack.shape[0]
+        link = stack
         for i in range(queries.shape[0]):
             qw = queries[i]
-            p1_out, p1_lse = phase_1_batched_attention_triton_op(stack, qw.unsqueeze(0), EPS, num_active=S)
+            if chain:
+                p1_out, p1_lse, link = phase_1_route_chained(stack, qw.unsqueeze(0), EPS, link)
+            else:
+                p1_out, p1_lse = phase_1_batched_attention_triton_op(stack, qw.unsqueeze(0), EPS, num_active=S)
             h = phase_2_online_softmax_merge_triton_op(partials[i], qw, p1_out[0], p1_lse[0], EPS)
             loss = loss + (h.float() * gouts[i].float()).sum()
         return loss
@@ -125,6 +138,16 @@ def main() -> int:
     compiled_loss = torch.compile(block_loss, fullgraph=True, dynamic=False)
     saved: dict[str, torch.Tensor] = {}
     modes = a.modes.split(",")
+    gate_ok = True
+    if a.gate:
+        def unchained_eager(*xs):
+            return block_loss(*xs, chain=False)
+
+        def chain_eager(*xs):
+            return block_loss(*xs, chain=True)
+
+        chain_compiled = torch.compile(chain_eager, fullgraph=True, dynamic=False)
+        runs = {"unchained eager": unchained_eager, "chain eager": chain_eager, "chain compiled": chain_compiled}
     for S, k in parse_cases(a.cases):
         x = make_inputs(S, k, a.mb, a.seq, a.hidden, seed=1000 * S + k)
         ref_gs = None
@@ -134,6 +157,22 @@ def main() -> int:
             (ref_gs,) = torch.autograd.grad(l64, (st64,))
             del st64, l64
             torch.cuda.empty_cache()
+        if a.gate:
+            errs = {}
+            for label, fn in runs.items():
+                stack = x["stack"].clone().requires_grad_(True)
+                queries = x["queries"].clone().requires_grad_(True)
+                (gs,) = torch.autograd.grad(fn(stack, queries, x["partials"], x["gouts"]), (stack,))
+                errs[label] = ((gs.double() - ref_gs).norm() / ref_gs.norm()).item()
+            base = errs["unchained eager"]
+            for label in ("chain eager", "chain compiled"):
+                ok = errs[label] <= 1.05 * base
+                gate_ok &= ok
+                print(f"GATE S={S} k={k} {label:15s} rel err {errs[label]:.3e} vs unchained eager {base:.3e}: "
+                      f"{'ok' if ok else 'FAIL'}", flush=True)
+            del x, ref_gs
+            torch.cuda.empty_cache()
+            continue
         for mode in modes:
             fn = compiled_loss if mode == "compiled" else block_loss
 
@@ -170,13 +209,16 @@ def main() -> int:
                 d = gs.double() - ref_gs
                 err = (f"  grad_stack vs fp64: rel {(d.norm() / ref_gs.norm()).item():.3e}"
                        f" max {d.abs().max().item():.3e}")
-            print(f"S={S} k={k:3d} {mode:8s} bwd median {med:8.2f} ms "
+            print(f"S={S} k={k:3d} {mode:8s}{' chain' if a.chain else ''} bwd median {med:8.2f} ms "
                   f"({med / k:6.3f} ms/route)  warm-up {warm:6.1f} s{err}", flush=True)
             saved[f"S{S}_k{k}_{mode}_grad_stack"] = gs.cpu()
             saved[f"S{S}_k{k}_{mode}_grad_queries"] = gq.cpu()
             del gs, gq
         del x
         torch.cuda.empty_cache()
+    if a.gate:
+        print("GATE PASS" if gate_ok else "GATE FAIL", flush=True)
+        return 0 if gate_ok else 1
     if a.save:
         Path(a.save).parent.mkdir(parents=True, exist_ok=True)
         torch.save(saved, a.save)

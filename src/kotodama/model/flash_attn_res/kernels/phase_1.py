@@ -5,6 +5,7 @@ from .configs import (
     phase1_online_forward_configs,
     phase1_backward_configs,
     phase1_backward_v2_configs,
+    phase1_route_chained_backward_configs,
 )
 
 
@@ -607,3 +608,108 @@ def phase_1_online_forward_kernel(
         mask=mask_2d,
     )
     tl.store(lse_ptr + bt_offsets, running_max + tl.log(running_sum), mask=valid_bt)
+
+
+@triton.autotune(
+    configs=phase1_route_chained_backward_configs,
+    key=["NUM_SOURCE_BLOCKS", "HIDDEN_DIM"],
+)
+@triton.jit
+def phase_1_route_chained_backward_kernel(
+    block_representations_ptr,
+    pseudo_query_ptr,
+    lse_ptr,
+    inverse_rms_norm_ptr,
+    attention_logits_ptr,
+    grad_softmax_normalized_output_ptr,
+    grad_lse_ptr,
+    grad_block_representations_ptr,
+    grad_block_representations_prev_ptr,
+    grad_pseudo_query_partials_ptr,
+    scratch_ptr,
+    BT,
+    NUM_SOURCE_BLOCKS: tl.constexpr,
+    HIDDEN_DIM: tl.constexpr,
+    PADDED_SRC: tl.constexpr,
+    HAS_GRAD_LSE: tl.constexpr,
+    ACCUMULATE_FROM_PREV: tl.constexpr,
+    BLOCK_BT: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # Single-query (per-sublayer route) backward over the whole stack, chained (ACCUMULATE_FROM_PREV). Same math as
+    # the v1 backward at one query:
+    #   grad_src[s] = p_s * g + gl_s * irms_s * q - gl_s * logit_s * irms_s^2 / D * src[s]
+    #   gl_s = p_s * (grad_lse + g.src[s] - sum_s' p_s' g.src[s'])
+    #   grad_q = sum_{tokens, s} gl_s * irms_s * src[s]
+    # written for the instruction budget of a bandwidth-bound kernel: no masks (the wrapper requires
+    # BT % BLOCK_BT == 0 and HIDDEN_DIM % BLOCK_D == 0, so loads vectorize), the exact source count (no padded rows),
+    # int32 offsets inside a source plane, and every reduction done once per source (pass 1) or once per D chunk
+    # (pass 2).
+    # A program owns BLOCK_BT tokens (measured best: 1; walking several tokens per program serially is slower):
+    #   pass 1 (source-major): dot_s[t] = g[t] . src[s, t] via an elementwise (BLOCK_BT, BLOCK_D) accumulator and one
+    #     row reduction per source, into this program's scratch; then the per-token coefficients
+    #     p, a = gl * irms, c = gl * logit * irms^2 / D.
+    #   pass 2 (chunk-major): grad_src[s] = p_s g + a_s q - c_s src[s] (+ prev) stored in the output dtype; the query
+    #     gradient sum_{t,s} a_s src[s] accumulates elementwise and is reduced once per chunk into this program's
+    #     partial row (one row per program, summed by the caller: a fixed order, no atomics).
+    pid = tl.program_id(0)
+    t_range = tl.arange(0, BLOCK_BT)
+    d_range = tl.arange(0, BLOCK_D)
+    plane = BT * HIDDEN_DIM
+    scratch = scratch_ptr + pid * (4 * PADDED_SRC * BLOCK_BT)  # [dots | p | a | c], each (PADDED_SRC, BLOCK_BT)
+    plane_sc = PADDED_SRC * BLOCK_BT
+    partial_row = grad_pseudo_query_partials_ptr + pid * HIDDEN_DIM
+    src_range = tl.arange(0, PADDED_SRC)
+    valid_src = src_range < NUM_SOURCE_BLOCKS
+    scratch_2d = src_range[None, :] * BLOCK_BT + t_range[:, None]
+
+    row = pid * BLOCK_BT + t_range  # global token index
+    row_offsets = row[:, None] * HIDDEN_DIM  # (BLOCK_BT, 1) int32 within one (BT, D) plane
+
+    # ── Pass 1 ────────────────────────────────────────────────────
+    for s in tl.static_range(NUM_SOURCE_BLOCKS):
+        acc = tl.zeros((BLOCK_BT, BLOCK_D), tl.float32)
+        for d_start in tl.range(0, HIDDEN_DIM, BLOCK_D):
+            offsets = row_offsets + d_start + d_range[None, :]
+            grad_out = tl.load(grad_softmax_normalized_output_ptr + offsets).to(tl.float32)
+            src = tl.load(block_representations_ptr + s * plane + offsets).to(tl.float32)
+            acc += src * grad_out
+        tl.store(scratch + s * BLOCK_BT + t_range, tl.sum(acc, axis=1))
+    tl.debug_barrier()
+
+    # ── Per-token coefficients (BLOCK_BT, PADDED_SRC) ─────────────
+    dots = tl.load(scratch + scratch_2d, mask=valid_src[None, :], other=0.0)
+    aux = row[:, None] * NUM_SOURCE_BLOCKS + src_range[None, :]
+    logits = tl.load(attention_logits_ptr + aux, mask=valid_src[None, :], other=0.0).to(tl.float32)
+    inverse_rms_norm = tl.load(inverse_rms_norm_ptr + aux, mask=valid_src[None, :], other=0.0).to(tl.float32)
+    lse = tl.load(lse_ptr + row).to(tl.float32)
+    probs = tl.where(valid_src[None, :], tl.exp(logits - lse[:, None]), 0.0)
+    dot_expected = tl.sum(probs * dots, axis=1)
+    if HAS_GRAD_LSE:
+        grad_logits = probs * (tl.load(grad_lse_ptr + row).to(tl.float32)[:, None] + dots - dot_expected[:, None])
+    else:
+        grad_logits = probs * (dots - dot_expected[:, None])
+    tl.store(scratch + plane_sc + scratch_2d, probs)
+    tl.store(scratch + 2 * plane_sc + scratch_2d, grad_logits * inverse_rms_norm)
+    tl.store(scratch + 3 * plane_sc + scratch_2d,
+             grad_logits * logits * inverse_rms_norm * inverse_rms_norm / float(HIDDEN_DIM))
+    tl.debug_barrier()
+
+    # ── Pass 2 ────────────────────────────────────────────────────
+    for d_start in tl.range(0, HIDDEN_DIM, BLOCK_D):
+        offsets = row_offsets + d_start + d_range[None, :]
+        grad_out = tl.load(grad_softmax_normalized_output_ptr + offsets).to(tl.float32)
+        query = tl.load(pseudo_query_ptr + d_start + d_range).to(tl.float32)
+        grad_query = tl.zeros((BLOCK_BT, BLOCK_D), tl.float32)
+        for s in tl.static_range(NUM_SOURCE_BLOCKS):
+            p_s = tl.load(scratch + plane_sc + s * BLOCK_BT + t_range)
+            a_s = tl.load(scratch + 2 * plane_sc + s * BLOCK_BT + t_range)
+            c_s = tl.load(scratch + 3 * plane_sc + s * BLOCK_BT + t_range)
+            src = tl.load(block_representations_ptr + s * plane + offsets).to(tl.float32)
+            grad_src = p_s[:, None] * grad_out + a_s[:, None] * query[None, :] - c_s[:, None] * src
+            if ACCUMULATE_FROM_PREV:
+                grad_src += tl.load(grad_block_representations_prev_ptr + s * plane + offsets).to(tl.float32)
+            tl.store(grad_block_representations_ptr + s * plane + offsets,
+                     grad_src.to(grad_block_representations_ptr.dtype.element_ty))
+            grad_query += a_s[:, None] * src
+        tl.store(partial_row + d_start + d_range, tl.sum(grad_query, axis=0))

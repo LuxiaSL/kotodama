@@ -55,11 +55,16 @@ except ImportError:
 _TRITON_ATTN_RES_AVAILABLE = False
 _BATCH_PHASE1 = bool(os.environ.get("KOTODAMA_BATCH_P1"))  # opt-IN: batched Phase 1 regresses throughput (register spilling)
 _P1_MAX_BATCH = 10
+# opt-IN: the sublayer routes that share a committed stack hand its gradient along a chain (ops.phase_1
+# phase_1_route_chained) instead of each returning a full stack gradient for autograd to sum. Same math; the sum's
+# order and rounding differ, so a lineage keeps whichever it started with. train.py --attnres_stack_grad_chain.
+_STACK_GRAD_CHAIN = os.environ.get("KOTODAMA_ATTNRES_STACK_GRAD_CHAIN", "0") == "1"
 _TRITON_ATTN_RES_IMPORT_ERROR: Optional[str] = None
 if not os.environ.get("KOTODAMA_NO_TRITON_ATTNRES"):
     try:
         import triton  # noqa: F401
         from .flash_attn_res import phase_1_batched_attention_triton_op  # noqa: F401
+        from .flash_attn_res import phase_1_route_chained  # noqa: F401
         from .flash_attn_res import phase_2_online_softmax_merge_triton_op  # noqa: F401
         _TRITON_ATTN_RES_AVAILABLE = True
     except Exception as _triton_exc:  # keep the reason inspectable, not silent
@@ -1118,15 +1123,19 @@ class KotodamaModel(nn.Module):
         partial: torch.Tensor,
         query: torch.Tensor,
         norm: nn.Module,
-    ) -> torch.Tensor:
+        link: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Route using Phase 1 (inter-block attention) + Phase 2 (online merge).
 
         Eliminates _pad_and_stack entirely. Phase 1 attends over committed blocks,
         Phase 2 merges the result with the current partial via online softmax.
         Falls back to PyTorch when Triton is unavailable.
+
+        ``link`` (stack-gradient chain, _STACK_GRAD_CHAIN): the previous route's link on this stack, or the stack
+        itself for its first route; the new link is returned. None = the unchained op. Returns (h, link).
         """
         if n_committed == 0:
-            return partial
+            return partial, link
 
         qw = query * norm.weight
         eps = norm.eps
@@ -1136,10 +1145,13 @@ class KotodamaModel(nn.Module):
             # A runtime relative re-import here resolves through sys.modules
             # and breaks when an embedding process has purged/replaced the
             # package in sys.modules (e.g. to import it from another source tree).
-            p1_out, p1_lse = phase_1_batched_attention_triton_op(
-                committed_stack, qw.unsqueeze(0), eps, num_active=n_committed)
+            if link is not None:
+                p1_out, p1_lse, link = phase_1_route_chained(committed_stack, qw.unsqueeze(0), eps, link)
+            else:
+                p1_out, p1_lse = phase_1_batched_attention_triton_op(
+                    committed_stack, qw.unsqueeze(0), eps, num_active=n_committed)
             return phase_2_online_softmax_merge_triton_op(
-                partial, qw, p1_out[0], p1_lse[0], eps)
+                partial, qw, p1_out[0], p1_lse[0], eps), link
 
         # PyTorch fallback
         rsqrt_c = torch.rsqrt(committed_stack.pow(2).mean(-1) + eps)
@@ -1149,7 +1161,7 @@ class KotodamaModel(nn.Module):
         all_logits = torch.cat([logits_c, logit_p.unsqueeze(0)], dim=0)
         weights = F.softmax(all_logits, dim=0)
         all_sources = torch.cat([committed_stack, partial.unsqueeze(0)], dim=0)
-        return (weights.unsqueeze(-1) * all_sources).sum(0)
+        return (weights.unsqueeze(-1) * all_sources).sum(0), link
 
     def _collect_block_queries(
         self,
@@ -1207,6 +1219,8 @@ class KotodamaModel(nn.Module):
             rope_sin = rope_sin[position_ids]
         block_ranges = self._attn_res_block_ranges
         batch_p1 = _TRITON_ATTN_RES_AVAILABLE and _BATCH_PHASE1 and embed.is_cuda
+        chain = _TRITON_ATTN_RES_AVAILABLE and _STACK_GRAD_CHAIN and embed.is_cuda and not batch_p1
+        stack_link: Optional[torch.Tensor] = None
 
         committed: list[torch.Tensor] = []
         committed_stack: Optional[torch.Tensor] = None
@@ -1235,10 +1249,10 @@ class KotodamaModel(nn.Module):
                 h_attn = phase_2_online_softmax_merge_triton_op(
                     partial, prev_bnd_qw, prev_bnd_p1_out, prev_bnd_p1_lse, eps)
             else:
-                h_attn = self._route_p12(
+                h_attn, stack_link = self._route_p12(
                     committed_stack, n_committed, partial,
                     self.layers[block_start].attn_res_query,
-                    self.layers[block_start].attn_res_norm)
+                    self.layers[block_start].attn_res_norm, stack_link)
             if capture_routing and n_committed > 0:
                 qw = self.layers[block_start].attn_res_query * self.layers[block_start].attn_res_norm.weight
                 intermediate_alphas.append((block_start, "pre_attn",
@@ -1249,6 +1263,7 @@ class KotodamaModel(nn.Module):
             partial = torch.zeros_like(embed)
             committed_stack = torch.stack(committed, dim=0)
             n_committed = len(committed)
+            stack_link = committed_stack if chain else None
 
             # ── Batch Phase 1 for all queries in this block ───────────
             if batch_p1:
@@ -1282,9 +1297,9 @@ class KotodamaModel(nn.Module):
                             partial, qws[qi], p1_outs[qi], p1_lses[qi], eps)
                         qi += 1
                     else:
-                        h_attn = self._route_p12(
+                        h_attn, stack_link = self._route_p12(
                             committed_stack, n_committed, partial,
-                            lyr.attn_res_query, lyr.attn_res_norm)
+                            lyr.attn_res_query, lyr.attn_res_norm, stack_link)
                     if capture_routing:
                         qw = lyr.attn_res_query * lyr.attn_res_norm.weight
                         intermediate_alphas.append((i, "pre_attn",
@@ -1307,9 +1322,9 @@ class KotodamaModel(nn.Module):
                         partial, qws[qi], p1_outs[qi], p1_lses[qi], eps)
                     qi += 1
                 else:
-                    h_mlp = self._route_p12(
+                    h_mlp, stack_link = self._route_p12(
                         committed_stack, n_committed, partial,
-                        lyr.mlp_res_query, lyr.mlp_res_norm)
+                        lyr.mlp_res_query, lyr.mlp_res_norm, stack_link)
                 if capture_routing:
                     qw = lyr.mlp_res_query * lyr.mlp_res_norm.weight
                     intermediate_alphas.append((i, "pre_mlp",
@@ -1334,9 +1349,9 @@ class KotodamaModel(nn.Module):
             h_final = phase_2_online_softmax_merge_triton_op(
                 partial, prev_bnd_qw, prev_bnd_p1_out, prev_bnd_p1_lse, eps)
         else:
-            h_final = self._route_p12(
+            h_final, stack_link = self._route_p12(
                 committed_stack, len(committed), partial,
-                self.final_res_query, self.final_res_norm)
+                self.final_res_query, self.final_res_norm, stack_link)
 
         if not self.training:
             self._last_attn_res_diagnostics = _compute_attn_res_diagnostics(
