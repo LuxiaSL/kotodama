@@ -467,6 +467,7 @@ def train(args: argparse.Namespace) -> None:
     model_kwargs["activation_checkpointing"] = args.activation_checkpointing
     model_kwargs["use_liger"] = getattr(args, "use_liger", False)
     model_kwargs["attn_res_gain"] = getattr(args, "attnres_res_gain", "learned")
+    model_kwargs["liger_rmsnorm_tuned"] = getattr(args, "liger_rmsnorm_tuned", False)
     model_kwargs["rope_fp32"] = getattr(args, "rope_fp32", False)
     model_kwargs["attn_impl"] = getattr(args, "attn_impl", "auto")
     model_kwargs["attn_res"] = args.attn_res
@@ -2469,6 +2470,14 @@ def parse_args() -> argparse.Namespace:
         "--use_liger",
         action="store_true",
         help="Enable Liger fused kernels (RMSNorm, SwiGLU, CrossEntropy)",
+    )
+    p.add_argument(
+        "--liger_rmsnorm_tuned",
+        action="store_true",
+        help="With --use_liger: launch Liger's RMSNorm kernels with B200-tuned grids (same kernels and math; the "
+             "weight gradient's partial sums are grouped differently, so new runs only). +4.3%% tok/s on the 1B "
+             "moonshot shape; to 2.5B tokens the loss tracks the default launch (mean delta +0.0003) and the "
+             "induction / rider gauges converge (an induction-formation timing shift around step 476 closes).",
     )
 
     # Attention implementation

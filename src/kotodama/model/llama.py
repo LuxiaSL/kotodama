@@ -145,6 +145,9 @@ class KotodamaModelConfig:
     activation_checkpointing: bool = False
     # Liger fused kernels (RMSNorm, SwiGLU, CrossEntropy)
     use_liger: bool = False
+    # With use_liger: Liger's RMSNorm kernels launched with B200-tuned grids (kotodama.model.liger_tuned) — same
+    # kernels and math; reduction grouping of dW (and of a few dX elements) differs, so a lineage keeps its choice.
+    liger_rmsnorm_tuned: bool = False
     # Keep RoPE cos/sin tables in fp32 through .to(bf16) and rotate in fp32 (one
     # rounding back to the activation dtype). Off = the bf16 tables every model
     # through the 3B trained with (23% of cos entries round to exactly 1.0).
@@ -298,6 +301,12 @@ def _select_norm_class(config: KotodamaModelConfig) -> type:
     stores it as .variance_epsilon instead.
     """
     if config.use_liger and _LIGER_AVAILABLE:
+        if config.liger_rmsnorm_tuned:
+            from . import liger_tuned
+
+            if liger_tuned.AVAILABLE:
+                return liger_tuned.LigerRMSNormTuned
+            logger.warning("liger_rmsnorm_tuned: liger_kernel internals not importable; using LigerRMSNorm")
         return LigerRMSNorm
     return RMSNorm
 
