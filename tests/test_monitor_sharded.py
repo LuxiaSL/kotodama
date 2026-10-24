@@ -83,6 +83,8 @@ def _worker(rank: int, init_file: str, out: dict) -> None:
 
         # EoC power iteration: sharded over sequences == on all of them (both converged)
         A_mix = torch.randn(D, D) * 0.5
+        sharded._eoc_n_global = B
+        sharded._eoc_local_global = rows
         sharded.EOC_REL_TOL = plain.EOC_REL_TOL = 1e-6
         sig_sh, gain_sh = sharded._power_iterate(X_local, _layer_fn(A_mix), "k", torch.device("cpu"), 400)
         sig_full, gain_full = plain._power_iterate(X, _layer_fn(A_mix), "k", torch.device("cpu"), 400)
@@ -91,13 +93,18 @@ def _worker(rank: int, init_file: str, out: dict) -> None:
 
         # a rank holding none of the EoC rows still takes part
         empty = X_local[:0] if rank == 1 else X_local
+        sharded._eoc_local_global = [] if rank == 1 else rows
         sig_e, _ = sharded._power_iterate(empty, _layer_fn(A_mix), "e", torch.device("cpu"), 400)
         sig_r0, _ = plain._power_iterate(X[[0, 2]], _layer_fn(A_mix), "e0", torch.device("cpu"), 400)  # rank 0's rows
         assert abs(sig_e - sig_r0) <= 1e-3 * sig_r0, (sig_e, sig_r0)
 
-        # gather_rows: about k rows drawn from every rank
-        g = shard.gather_rows(X_local.reshape(-1, D), 10)
-        assert g.shape == (10, D)
+        # sample_rows draws exactly the unsharded sample (rank 0's randperm over all rows), so order-invariant
+        # consumers agree to rounding
+        torch.manual_seed(123)
+        a_sh = geometric._anisotropy(shard.sample_rows(X_local, B, 10), max_samples=10)
+        torch.manual_seed(123)
+        a_full = geometric._anisotropy(X.reshape(-1, D), max_samples=10)
+        assert abs(a_sh - a_full) < 1e-5, (a_sh, a_full)
 
         out[rank] = "ok"
     finally:

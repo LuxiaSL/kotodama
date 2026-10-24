@@ -150,17 +150,30 @@ class _ProbeShard:
         sq = t.float().pow(2).sum().reshape(1)
         return self.sum_(sq).sqrt()[0]
 
-    def gather_rows(self, x: torch.Tensor, k_total: int) -> torch.Tensor:
-        """A random sample of about k_total rows of the concatenation of every rank's x: each rank contributes
-        ceil(k_total / world) random rows of its own (fewer if it holds fewer); every rank gets the sample."""
-        k = -(-k_total // self.world)
-        n = min(k, x.shape[0])
-        buf = torch.full((k, x.shape[1]), float("nan"), device=x.device, dtype=torch.float32)
-        if n:
-            buf[:n] = x[torch.randperm(x.shape[0], device=x.device)[:n]].float()
-        out = torch.empty((self.world * k, x.shape[1]), device=x.device, dtype=torch.float32)
+    def broadcast_(self, t: torch.Tensor) -> torch.Tensor:
+        """In place: rank 0's t on every rank (no-op unsharded)."""
+        if self.on:
+            dist.broadcast(t, src=0)
+        return t
+
+    def sample_rows(self, h_local: torch.Tensor, n_seq_global: int, k: int) -> torch.Tensor:
+        """The random token sample the unsharded probe would draw. Rank 0 draws ``torch.randperm(n_seq_global * T)[:k]``
+        over the flattened (sequence, position) rows of the WHOLE probe (the CPU-RNG call the unsharded code makes) and
+        broadcasts it; each rank contributes the drawn rows it holds (h_local: (this rank's sequences, T, D)), and every
+        rank gets all k rows (in rank order; the consumers, anisotropy and TwoNN, are order-invariant)."""
+        T, D = h_local.shape[1], h_local.shape[2]
+        n = n_seq_global * T
+        k = min(k, n)
+        idx = torch.randperm(n)[:k] if self.rank == 0 else torch.empty(k, dtype=torch.long)
+        idx = self.broadcast_(idx.to(h_local.device))
+        seq, pos = idx // T, idx % T
+        mine = (seq % self.world) == self.rank
+        rows = h_local[seq[mine] // self.world, pos[mine]].float()
+        buf = torch.full((k, D), float("nan"), device=h_local.device, dtype=torch.float32)
+        buf[: rows.shape[0]] = rows
+        out = torch.empty((self.world * k, D), device=h_local.device, dtype=torch.float32)
         dist.all_gather_into_tensor(out, buf)
-        return out[~torch.isnan(out[:, 0])][:k_total]
+        return out[~torch.isnan(out[:, 0])]
 
 
 class GeometricMonitor:
@@ -543,7 +556,16 @@ class GeometricMonitor:
 
         v = None if (cold_start or rerandomize) else self._warm_vectors[warm_key].to(device)
         if v is None or v.shape != h_detached.shape:
-            v = torch.randn_like(h_detached)
+            if shard.on:
+                # The random start the unsharded probe draws (randn over all the EoC sequences, rank 0's CUDA RNG),
+                # broadcast; each rank keeps its rows.
+                full = torch.empty((self._eoc_n_global,) + tuple(h_detached.shape[1:]), device=device,
+                                   dtype=h_detached.dtype)
+                if shard.rank == 0:
+                    full.normal_()
+                v = shard.broadcast_(full)[self._eoc_local_global]
+            else:
+                v = torch.randn_like(h_detached)
             n_iters = max(n_iters, self.COLD_ITERS)
         v = v / shard.norm(v)
 
@@ -594,6 +616,8 @@ class GeometricMonitor:
         if n_seq and self._shard.on:
             # The first n_seq probe sequences: the ones of them this rank holds.
             local = [i for i, g in enumerate(self._local_rows) if g < n_seq]
+            self._eoc_n_global = sum(1 for g in range(n_seq) if g < self._n_probe_rows)
+            self._eoc_local_global = [g for g in self._local_rows if g < n_seq]
             cut = lambda t: t[local]  # noqa: E731
         else:
             cut = (lambda t: t[:n_seq]) if n_seq else (lambda t: t)
@@ -670,7 +694,9 @@ class GeometricMonitor:
         shard = self._shard
         if shard.on and shard.world > batch.shape[0]:
             raise ValueError(f"sharded geo monitor: {shard.world} ranks > {batch.shape[0]} probe sequences")
-        self._local_rows = shard.rows(batch.shape[0])
+        n_probe_rows = batch.shape[0]
+        self._n_probe_rows = n_probe_rows
+        self._local_rows = shard.rows(n_probe_rows)
         n_local_tokens = len(self._local_rows) * batch.shape[1]
         batch = shard.take(batch)
 
@@ -716,8 +742,8 @@ class GeometricMonitor:
                         h = hidden_states[layer_idx]
                         h_flat = h.reshape(-1, h.shape[-1])
                         if shard.on:
-                            metrics[f"{prefix}/anisotropy"] = _anisotropy(shard.gather_rows(h_flat, 512),
-                                                                          max_samples=512)
+                            metrics[f"{prefix}/anisotropy"] = _anisotropy(
+                                shard.sample_rows(h, n_probe_rows, 512), max_samples=512)
                         else:
                             metrics[f"{prefix}/anisotropy"] = _anisotropy(h_flat, max_samples=512)
 
@@ -743,7 +769,8 @@ class GeometricMonitor:
                             -1, hidden_states[layer_idx].shape[-1]
                         )
                         if shard.on:
-                            h_sub = shard.gather_rows(h, self.config.tier2_twonn_samples)
+                            h_sub = shard.sample_rows(hidden_states[layer_idx], n_probe_rows,
+                                                      self.config.tier2_twonn_samples)
                         else:
                             n = min(self.config.tier2_twonn_samples, h.shape[0])
                             idx = torch.randperm(h.shape[0])[:n]
