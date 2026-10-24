@@ -2498,7 +2498,8 @@ def parse_args() -> argparse.Namespace:
         "--attnres_stack_grad_chain", action="store_true",
         help="AttnRes routes sharing a committed stack chain its gradient through a single-query backward kernel "
              "(summed in-kernel, one round per partial sum) instead of autograd summing a full stack gradient per "
-             "route. Faster; the sum's order and rounding differ (new runs only).",
+             "route. +3%% tok/s on the 1B moonshot shape; the sum's order and rounding differ (loss +0.002 after "
+             "an early +0.01 bump that closes by ~300 steps), so use it for new runs only.",
     )
     p.add_argument(
         "--ddp_bucket_cap_mb", type=float, default=None,

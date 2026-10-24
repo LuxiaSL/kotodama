@@ -58,6 +58,8 @@ _P1_MAX_BATCH = 10
 # opt-IN: the sublayer routes that share a committed stack hand its gradient along a chain (ops.phase_1
 # phase_1_route_chained) instead of each returning a full stack gradient for autograd to sum. Same math; the sum's
 # order and rounding differ, so a lineage keeps whichever it started with. train.py --attnres_stack_grad_chain.
+# Measured on the 1B moonshot shape (8xB200, 2 runs per arm, to 2.5B tokens): +3% tok/s; the training loss runs
+# +0.01 higher over the first ~300 steps, then a steady +0.002; induction / rider gauges converge by 2.5B tokens.
 _STACK_GRAD_CHAIN = os.environ.get("KOTODAMA_ATTNRES_STACK_GRAD_CHAIN", "0") == "1"
 _TRITON_ATTN_RES_IMPORT_ERROR: Optional[str] = None
 if not os.environ.get("KOTODAMA_NO_TRITON_ATTNRES"):
