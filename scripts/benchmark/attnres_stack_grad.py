@@ -153,17 +153,23 @@ def main() -> int:
         ref_gs = None
         if a.ref64:
             st64 = x["stack"].double().requires_grad_(True)
-            l64 = block_loss_ref64(st64, x["queries"].double(), x["partials"].double(), x["gouts"].double())
-            (ref_gs,) = torch.autograd.grad(l64, (st64,))
-            del st64, l64
+            q64 = x["queries"].double().requires_grad_(True)
+            l64 = block_loss_ref64(st64, q64, x["partials"].double(), x["gouts"].double())
+            ref_gs, ref_gq = torch.autograd.grad(l64, (st64, q64))
+            del st64, q64, l64
             torch.cuda.empty_cache()
         if a.gate:
             errs = {}
             for label, fn in runs.items():
                 stack = x["stack"].clone().requires_grad_(True)
                 queries = x["queries"].clone().requires_grad_(True)
-                (gs,) = torch.autograd.grad(fn(stack, queries, x["partials"], x["gouts"]), (stack,))
+                gs, gq = torch.autograd.grad(fn(stack, queries, x["partials"], x["gouts"]), (stack, queries))
                 errs[label] = ((gs.double() - ref_gs).norm() / ref_gs.norm()).item()
+                # Routing-query gradient, per query row: the params that drive early routing formation.
+                qerr = (gq.double() - ref_gq).norm(dim=1) / ref_gq.norm(dim=1).clamp_min(1e-30)
+                print(f"QGRAD S={S} k={k} {label:15s} per-query rel err vs fp64: median {qerr.median().item():.3e} "
+                      f"max {qerr.max().item():.3e}  (bias: mean signed rel {((gq.double() - ref_gq) * ref_gq).sum(1).div(ref_gq.pow(2).sum(1)).mean().item():+.2e})",
+                      flush=True)
             base = errs["unchained eager"]
             for label in ("chain eager", "chain compiled"):
                 ok = errs[label] <= 1.05 * base

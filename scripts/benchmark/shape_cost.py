@@ -45,6 +45,12 @@ def main() -> int:
     ap.add_argument("--seq", type=int, default=4096)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--chain", action="store_true", help="--attnres_stack_grad_chain")
+    ap.add_argument("--eager", action="store_true", help="no torch.compile (debugging)")
+    ap.add_argument("--flce", action="store_true",
+                    help="loss via the model's fused linear CE inside the compiled graph (as in training). Default: "
+                         "the compiled model returns logits and the CE runs eagerly — under a single unsplit compiled "
+                         "graph (no DDP) inductor mis-reconstructs FLCE's chunked in-place writes (an as_strided read "
+                         "past a 128-element slice -> illegal address at B*T 4096).")
     ap.add_argument("--tag", default="")
     a = ap.parse_args()
 
@@ -60,7 +66,7 @@ def main() -> int:
     torch.manual_seed(0)
     model = KotodamaModel(cfg).to(device=DEVICE, dtype=torch.bfloat16)
     model.train()
-    compiled = torch.compile(model)
+    compiled = model if a.eager else torch.compile(model)
     B, T = a.mb, a.seq
     g = torch.Generator(device=DEVICE).manual_seed(0)
     ids = torch.randint(0, cfg.vocab_size, (B, T), device=DEVICE, generator=g)
@@ -68,8 +74,13 @@ def main() -> int:
     cu_seqlens = (torch.arange(B + 1, device=DEVICE) * T).to(torch.int32)
 
     def step() -> None:
-        out = compiled(ids, labels=ids, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=T)
-        out["loss"].backward()
+        if a.flce:
+            loss = compiled(ids, labels=ids, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=T)["loss"]
+        else:
+            logits = compiled(ids, position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=T)["logits"]
+            loss = torch.nn.functional.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)).float(),
+                                                     ids[:, 1:].reshape(-1))
+        loss.backward()
 
     t0 = time.perf_counter()
     step()
@@ -91,9 +102,9 @@ def main() -> int:
     ms = times[len(times) // 2]
     print(json.dumps({
         "tag": a.tag, "hidden": a.hidden, "heads": a.heads, "kv": a.kv, "ffn": a.ffn, "eff_layers": cfg.num_layers,
-        "unique_layers": cfg.num_unique_layers(), "n_blocks": a.n_blocks,
+        "unique_layers": cfg.num_unique_layers, "n_blocks": a.n_blocks,
         "loop": [a.loop_start, a.loop_len, a.loop_times],
-        "chain": a.chain, "mb": B, "seq": T, "params": sum(p.numel() for p in model.parameters()),
+        "chain": a.chain, "flce": a.flce, "mb": B, "seq": T, "params": sum(p.numel() for p in model.parameters()),
         "fwd_bwd_ms": ms, "us_per_token": ms * 1e3 / (B * T), "peak_mem_gb": torch.cuda.max_memory_allocated() / 1e9,
         "compile_s": compile_s,
     }), flush=True)
