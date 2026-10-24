@@ -93,31 +93,60 @@ def mix_window_seqs(spec: str | None, tokens_per_seq_step: int) -> tuple[int, in
 
 # ── Scheduler metrics (lightweight, no dependency) ────────────────────────────
 
-_hm_client = None
 _hm_job_id = os.environ.get("KOTODAMA_SCHEDULER_JOB_ID")
+# Metrics post from a background thread: a synchronous POST on rank 0 stalled every rank at the next all-reduce for as
+# long as the coordinator took to answer. Bounded queue; when full, new points are dropped (telemetry never stalls
+# training). One worker, so points arrive in order. Flushed (bounded wait) at exit.
+_HM_QUEUE_MAX = 4096
+_hm_queue: Optional["queue.Queue[Optional[tuple[int, dict[str, float]]]]"] = None
+
+
+def _hm_worker(q: "queue.Queue[Optional[tuple[int, dict[str, float]]]]") -> None:
+    client = None
+    while True:
+        item = q.get()
+        try:
+            if item is None:
+                return
+            if client is None:
+                import httpx
+                client = httpx.Client(
+                    base_url=os.environ.get("KOTODAMA_SCHEDULER_URL", "http://127.0.0.1:7000"), timeout=5)
+            step, clean = item
+            client.post(f"/api/v1/jobs/{_hm_job_id}/metrics", json={"step": step, "metrics": clean})
+        except Exception:
+            pass  # Never crash the training loop
+        finally:
+            q.task_done()
+
+
+def hm_flush(timeout: float = 30.0) -> None:
+    """Wait (at most ``timeout`` s) for queued metrics to be posted."""
+    if _hm_queue is None:
+        return
+    deadline = time.time() + timeout
+    while _hm_queue.unfinished_tasks and time.time() < deadline:
+        time.sleep(0.05)
 
 
 def hm_log(step: int, **metrics: float) -> None:
-    """Log metrics to Scheduler. No-op if not running under Scheduler."""
-    global _hm_client
+    """Queue metrics for the Scheduler (posted by a background thread). No-op if not running under Scheduler."""
+    global _hm_queue
     if not _hm_job_id:
         return
+    clean = {k: v for k, v in metrics.items() if v is not None}
+    if not clean:
+        return
+    if _hm_queue is None:
+        import atexit
+
+        _hm_queue = queue.Queue(maxsize=_HM_QUEUE_MAX)
+        threading.Thread(target=_hm_worker, args=(_hm_queue,), daemon=True, name="hm_log").start()
+        atexit.register(hm_flush)
     try:
-        if _hm_client is None:
-            import httpx
-            _hm_client = httpx.Client(
-                base_url=os.environ.get("KOTODAMA_SCHEDULER_URL", "http://127.0.0.1:7000"),
-                timeout=2,
-            )
-        # Filter out None values
-        clean = {k: v for k, v in metrics.items() if v is not None}
-        if clean:
-            _hm_client.post(
-                f"/api/v1/jobs/{_hm_job_id}/metrics",
-                json={"step": step, "metrics": clean},
-            )
-    except Exception:
-        pass  # Never crash the training loop
+        _hm_queue.put_nowait((step, clean))
+    except queue.Full:
+        pass
 
 
 _SECRETISH = re.compile(r"(key|secret|passw|auth|credential|_token$|^token$)", re.I)

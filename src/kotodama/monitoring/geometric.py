@@ -25,6 +25,7 @@ Usage in training loop::
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -99,6 +100,14 @@ class MonitorConfig:
     tier1_every: int = 500
     tier2_every: int = 5000
 
+    # Memory hygiene around probes. torch.cuda.empty_cache() hands the caching allocator's blocks back to the driver,
+    # and the next training steps then re-cudaMalloc them (on the 1B moonshot the steps after each probe point ran
+    # ~5-15% slower). So a probe releases the cache only when the device is short of free memory.
+    release_cache_below_gb: float = 8.0
+    # The sharpness probe snapshots the weights it perturbs: on the GPU when that much memory is free (fast), else on
+    # the CPU (the 7B-era default, which avoids 2x weights on rank 0).
+    sharpness_gpu_snapshot: bool = True
+
     # General
     device: str = "cuda"
 
@@ -170,6 +179,17 @@ class GeometricMonitor:
             self.config.tier2_twonn_layers,
         )
 
+    def _free_gb(self) -> float:
+        """Free device memory: the driver's free bytes plus what the caching allocator holds unused (0 without CUDA)."""
+        if not torch.cuda.is_available():
+            return 0.0
+        free, _total = torch.cuda.mem_get_info()
+        return (free + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) / 1e9
+
+    def _maybe_release_cache(self) -> None:
+        if torch.cuda.is_available() and self._free_gb() < self.config.release_cache_below_gb:
+            torch.cuda.empty_cache()
+
     def set_probe_batch(self, input_ids: torch.Tensor) -> None:
         """
         Set the fixed probe batch for longitudinal monitoring.
@@ -220,7 +240,7 @@ class GeometricMonitor:
 
         t0 = time.time()
         device = next(self.model.parameters()).device
-        torch.cuda.empty_cache()
+        self._maybe_release_cache()
         batch = self._probe_batch[:n_sequences].to(device)
 
         grad_norm = torch.sqrt(
@@ -240,10 +260,13 @@ class GeometricMonitor:
         self.model.eval()
 
         metrics: dict[str, float] = {}
-        # Exact snapshot (CPU, so 7B rank 0 does not need 2x weight memory). In-place
-        # +e / -2e / +e adds on bf16 weights do not restore exactly and would leave a
+        # Exact snapshot — on the GPU when it fits beside the release margin, else on the CPU (so a 7B rank 0 does not
+        # need 2x weight memory). In-place +e / -2e / +e adds on bf16 weights do not restore exactly and would leave a
         # residual on rank 0 only -> DDP ranks silently diverge.
-        snapshot = [p.detach().to("cpu", copy=True) for p in params_with_grad]
+        snapshot_gb = sum(p.numel() * p.element_size() for p in params_with_grad) / 1e9
+        on_gpu = (self.config.sharpness_gpu_snapshot and params_with_grad[0].is_cuda
+                  and self._free_gb() > snapshot_gb + self.config.release_cache_below_gb)
+        snapshot = [p.detach().clone() if on_gpu else p.detach().to("cpu", copy=True) for p in params_with_grad]
         inv_norm = 1.0 / grad_norm
 
         def _set_perturbed(sign: float) -> float:
@@ -330,7 +353,7 @@ class GeometricMonitor:
 
         t0 = time.time()
         device = next(self.model.parameters()).device
-        torch.cuda.empty_cache()
+        self._maybe_release_cache()
         batch = self._probe_batch[:n_sequences].to(device)
 
         was_training = self.model.training
@@ -506,18 +529,29 @@ class GeometricMonitor:
 
         t0 = time.time()
         device = next(self.model.parameters()).device
-        torch.cuda.empty_cache()
+        self._maybe_release_cache()
         batch = self._probe_batch.to(device)
 
         was_training = self.model.training
         self.model.eval()
 
         metrics: dict[str, float] = {}
+        t_phase = time.time()
+
+        def _phase(name: str) -> None:
+            # geo/time/<phase>: where a probe point's seconds go (one sync per phase).
+            nonlocal t_phase
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            now = time.time()
+            metrics[f"geo/time/{name}"] = now - t_phase
+            t_phase = now
 
         try:
             # == Phase 1: probe forward + activation-based metrics (no grad) ==
             with torch.no_grad():
                 hidden_states, attn_weights = self._probe_forward(batch)
+                _phase("probe_forward")
 
                 # -- RankMe (effective rank) on last-layer hidden states --
                 last_layer_idx = len(self.model.layers) - 1
@@ -525,6 +559,7 @@ class GeometricMonitor:
                     last_hidden = hidden_states[last_layer_idx]
                     H = last_hidden.reshape(-1, last_hidden.shape[-1]).float()
                     metrics["geo/rankme_last"] = _rankme(H)
+                _phase("rankme")
 
                 # -- Per-layer metrics --
                 for layer_idx in self.config.tier1_sample_layers:
@@ -554,6 +589,7 @@ class GeometricMonitor:
                 # -- AttnRes diagnostics --
                 if self._attn_res_diagnostics:
                     metrics.update(self._attn_res_diagnostics)
+                _phase("layer_metrics")
 
                 # -- TwoNN intrinsic dimensionality --
                 for layer_idx in self.config.tier2_twonn_layers:
@@ -567,10 +603,12 @@ class GeometricMonitor:
                         id_est = _twonn_id(h_sub)
                         if id_est is not None:
                             metrics[f"geo/twonn_id/layer_{layer_idx}"] = id_est
+                _phase("twonn")
 
             # == Phase 2: EoC Jacobian spectral radius (needs autograd) ==
             self._eoc_call_count += 1
             metrics.update(self._eoc_metrics(hidden_states, device, n_eoc_iters, n_seq=4))
+            _phase("eoc")
 
         except Exception as e:
             logger.warning("compute_all failed: %s", e, exc_info=True)
@@ -583,11 +621,12 @@ class GeometricMonitor:
         metrics["geo/step"] = float(step)
 
         logger.info(
-            "Geo [step %d]: RankMe=%.1f, σ_max=%.4f, time=%.2fs",
+            "Geo [step %d]: RankMe=%.1f, σ_max=%.4f, time=%.2fs (%s)",
             step,
             metrics.get("geo/rankme_last", 0),
             metrics.get("eoc/sigma_max", 0),
             elapsed,
+            " ".join(f"{k[9:]} {v:.2f}" for k, v in metrics.items() if k.startswith("geo/time/")),
         )
 
         return metrics
@@ -994,11 +1033,16 @@ def _stable_rank(W: torch.Tensor) -> float:
 
     Measures effective dimensionality of a weight matrix.
     Stable rank 1 = rank-1 matrix. Higher = more distributed.
+
+    sigma_max^2 is the top eigenvalue of the Gram matrix on the smaller side (fp64 W^T W or W W^T + eigvalsh):
+    ~6x faster than svdvals on the model's projection shapes and equal to it within ~1e-4 relative (svdvals' own
+    fp32 error; the fp64 Gram path agrees with an fp32 one).
     """
     try:
-        W_f = W.float()
-        frob_sq = W_f.pow(2).sum()
-        spectral_sq = torch.linalg.svdvals(W_f)[0].pow(2)
+        W_d = W.detach().double()
+        frob_sq = W_d.pow(2).sum()
+        gram = W_d.t() @ W_d if W_d.shape[0] >= W_d.shape[1] else W_d @ W_d.t()
+        spectral_sq = torch.linalg.eigvalsh(gram)[-1]
         return (frob_sq / (spectral_sq + 1e-10)).item()
     except Exception:
         return 0.0
