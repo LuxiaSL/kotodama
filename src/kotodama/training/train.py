@@ -2378,8 +2378,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--geo_monitor_sharded",
         action="store_true",
-        help="Split each geometric probe over the DDP ranks instead of rank 0 computing it while the others wait "
-             "(same metric definitions: token means and Gram matrices summed over ranks).",
+        default=True,
+        help="(default on) Split each geometric probe over the DDP ranks instead of rank 0 computing it while the "
+             "others wait (same metric definitions: token means and Gram matrices summed over ranks; random-sample "
+             "metrics use rank 0's draw).",
+    )
+    p.add_argument(
+        "--no_geo_monitor_sharded",
+        dest="geo_monitor_sharded",
+        action="store_false",
+        help="Compute the geometric probes on rank 0 only (the pre-sharding behaviour).",
     )
     p.add_argument("--geo_monitor_schedule", type=str, default=None,
                    help="Decaying cadence as 'step:interval,...' e.g. "
