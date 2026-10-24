@@ -976,9 +976,11 @@ def train(args: argparse.Namespace) -> None:
     # -- SIGTERM handler -------------------------------------------------------
     sigterm = SIGTERMHandler()
 
-    # -- Geometric monitoring (rank 0 only) ------------------------------------
+    # -- Geometric monitoring (rank 0; every rank with --geo_monitor_sharded) ---
     monitor: Optional[GeometricMonitor] = None
-    if is_main and args.geo_monitor:
+    geo_sharded = bool(getattr(args, "geo_monitor_sharded", False) and dist.is_initialized()
+                       and dist.get_world_size() > 1)
+    if args.geo_monitor and (is_main or geo_sharded):
         geo_schedule_str = getattr(args, "geo_monitor_schedule", None)
         if geo_schedule_str:
             schedule = MonitorSchedule.from_string(geo_schedule_str)
@@ -990,6 +992,7 @@ def train(args: argparse.Namespace) -> None:
             schedule=schedule,
             tier1_every=args.geo_monitor_tier1_every,
             tier2_every=args.geo_monitor_tier2_every,
+            sharded=geo_sharded,
         )
         monitor = GeometricMonitor(model, monitor_config)
 
@@ -1002,7 +1005,7 @@ def train(args: argparse.Namespace) -> None:
             logger.info("Probe batch restored from checkpoint")
             _restored_probe = True
 
-        if not _restored_probe:
+        if not _restored_probe and is_main:
             probe_ids: list[torch.Tensor] = []
             # The probe must not advance the training stream: rank 0 would skip
             # ahead of the other ranks, and the saved (rank-0) data position
@@ -1029,6 +1032,15 @@ def train(args: argparse.Namespace) -> None:
                 probe_batch = torch.cat(probe_ids, dim=0)[:probe_tokens_needed]
                 monitor.set_probe_batch(probe_batch)
             logger.info("Geometric monitor ready (probe batch: %s)", tuple(probe_batch.shape))
+        if geo_sharded:
+            # Every rank probes its share of rank 0's probe batch (built above, or restored from the checkpoint).
+            _probe_obj = [monitor._probe_batch.cpu() if is_main and monitor._probe_batch is not None else None]
+            dist.broadcast_object_list(_probe_obj, src=0)
+            if _probe_obj[0] is None:
+                raise RuntimeError("--geo_monitor_sharded: rank 0 has no probe batch")
+            monitor.set_probe_batch(_probe_obj[0])
+            if is_main:
+                logger.info("Geo monitor sharded over %d ranks", dist.get_world_size())
 
     # -- Wandb logger (rank 0 only) -------------------------------------------
     wb: Optional[WandbLogger] = None
@@ -1337,7 +1349,7 @@ def train(args: argparse.Namespace) -> None:
         # EoS sharpness (needs live gradients, must be before zero_grad)
         if monitor is not None and monitor.should_monitor(step):
             eos_metrics = monitor.compute_sharpness(step)
-            if eos_metrics:
+            if eos_metrics and is_main:
                 if wb is not None:
                     wb.log_geo(step, eos_metrics)
                 hm_log(step, **{k: v for k, v in eos_metrics.items() if isinstance(v, (int, float))})
@@ -1448,10 +1460,10 @@ def train(args: argparse.Namespace) -> None:
             log_data_wait = 0.0
             step_t0 = time.time()
 
-        # -- Geometric monitoring (rank 0 only) --------------------------------
+        # -- Geometric monitoring (rank 0; every rank when sharded) ------------
         if monitor is not None and monitor.should_monitor(step):
             geo_metrics = monitor.compute_all(step)
-            if geo_metrics:
+            if geo_metrics and is_main:
                 if wb is not None:
                     wb.log_geo(step, geo_metrics)
                 hm_log(step, **{k: v for k, v in geo_metrics.items() if isinstance(v, (int, float))})
@@ -2362,6 +2374,12 @@ def parse_args() -> argparse.Namespace:
         "--geo_monitor",
         action="store_true",
         help="Enable geometric health monitoring (rank 0 only)",
+    )
+    p.add_argument(
+        "--geo_monitor_sharded",
+        action="store_true",
+        help="Split each geometric probe over the DDP ranks instead of rank 0 computing it while the others wait "
+             "(same metric definitions: token means and Gram matrices summed over ranks).",
     )
     p.add_argument("--geo_monitor_schedule", type=str, default=None,
                    help="Decaying cadence as 'step:interval,...' e.g. "

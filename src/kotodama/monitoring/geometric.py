@@ -25,12 +25,14 @@ Usage in training loop::
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -107,9 +109,58 @@ class MonitorConfig:
     # The sharpness probe snapshots the weights it perturbs: on the GPU when that much memory is free (fast), else on
     # the CPU (the 7B-era default, which avoids 2x weights on rank 0).
     sharpness_gpu_snapshot: bool = True
+    # Split each probe over the data-parallel ranks instead of computing it on rank 0 while the others wait. Every
+    # rank must then construct the monitor with the same probe batch and call it at the same steps. Metrics keep
+    # their definitions: token means and Gram matrices are summed over ranks, random-sample metrics draw their
+    # sample from every rank's rows, and the EoC power iteration normalizes its vector over all ranks.
+    sharded: bool = False
 
     # General
     device: str = "cuda"
+
+
+class _ProbeShard:
+    """Which probe rows this rank holds, and the reductions that put a sharded probe back together.
+
+    Rows are interleaved (rank r holds rows r, r + world, ...), so the leading-row subsets some probes use (the
+    first 8 sequences for sharpness, the first 4 for EoC and attention entropy) are spread over the ranks too."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.on = bool(enabled and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1)
+        self.rank = dist.get_rank() if self.on else 0
+        self.world = dist.get_world_size() if self.on else 1
+
+    def rows(self, n: int) -> list[int]:
+        """Global indices of the rows (of an n-row batch) held here."""
+        return list(range(self.rank, n, self.world))
+
+    def take(self, batch: torch.Tensor) -> torch.Tensor:
+        return batch[self.rank::self.world] if self.on else batch
+
+    def sum_(self, t: torch.Tensor) -> torch.Tensor:
+        """In-place sum over ranks (no-op unsharded)."""
+        if self.on:
+            dist.all_reduce(t)
+        return t
+
+    def norm(self, t: torch.Tensor) -> torch.Tensor:
+        """L2 norm of the concatenation of every rank's t."""
+        if not self.on:
+            return t.norm()
+        sq = t.float().pow(2).sum().reshape(1)
+        return self.sum_(sq).sqrt()[0]
+
+    def gather_rows(self, x: torch.Tensor, k_total: int) -> torch.Tensor:
+        """A random sample of about k_total rows of the concatenation of every rank's x: each rank contributes
+        ceil(k_total / world) random rows of its own (fewer if it holds fewer); every rank gets the sample."""
+        k = -(-k_total // self.world)
+        n = min(k, x.shape[0])
+        buf = torch.full((k, x.shape[1]), float("nan"), device=x.device, dtype=torch.float32)
+        if n:
+            buf[:n] = x[torch.randperm(x.shape[0], device=x.device)[:n]].float()
+        out = torch.empty((self.world * k, x.shape[1]), device=x.device, dtype=torch.float32)
+        dist.all_gather_into_tensor(out, buf)
+        return out[~torch.isnan(out[:, 0])][:k_total]
 
 
 class GeometricMonitor:
@@ -138,6 +189,8 @@ class GeometricMonitor:
         if hasattr(m, "_orig_mod"):
             m = m._orig_mod
         self.model = m
+        self._shard = _ProbeShard(self.config.sharded)
+        self._local_rows: list[int] = []  # global probe-row indices this rank holds in the current probe
 
         # Determine layer sampling positions
         num_layers = len(self.model.layers)
@@ -185,6 +238,57 @@ class GeometricMonitor:
             return 0.0
         free, _total = torch.cuda.mem_get_info()
         return (free + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) / 1e9
+
+    def _stable_ranks(self, device: torch.device) -> dict[str, float]:
+        """geo/layer_{i}/stable_rank_{proj} for the sampled layers. Sharded, the matrices are dealt round-robin over
+        the ranks and the values summed back (each rank computes about 1/world of the eigvalsh calls)."""
+        items: list[tuple[str, torch.Tensor]] = []
+        for layer_idx in self.config.tier1_sample_layers:
+            layer = self.model.layers[layer_idx]
+            for name, param in [
+                ("q_proj", layer.attn.q_proj.weight),
+                ("k_proj", layer.attn.k_proj.weight),
+                ("o_proj", layer.attn.o_proj.weight),
+                ("gate_proj", layer.ffn.gate_proj.weight),
+                ("down_proj", layer.ffn.down_proj.weight),
+            ]:
+                items.append((f"geo/layer_{layer_idx}/stable_rank_{name}", param))
+        if not self._shard.on:
+            return {k: _stable_rank(p) for k, p in items}
+        vals = torch.zeros(len(items), device=device, dtype=torch.float64)
+        for i, (_k, p) in enumerate(items):
+            if i % self._shard.world == self._shard.rank:
+                vals[i] = _stable_rank(p)
+        self._shard.sum_(vals)
+        return dict(zip((k for k, _p in items), vals.tolist()))
+
+    def _reduce_probe_stats(self, n_local_tokens: int, device: torch.device) -> None:
+        """Sharded probe: turn this rank's token means (MLP neuron activity, AttnRes diagnostics) into means over
+        every rank's tokens, in place. routing_entropy (the entropy OF a site's token-mean routing weights, so not
+        itself a token mean) is recomputed from the reduced per-site means."""
+        shard = self._shard
+        total = shard.sum_(torch.tensor([float(n_local_tokens)], device=device, dtype=torch.float64))[0]
+        for k in sorted(self._mlp_mean_abs):
+            m = self._mlp_mean_abs[k].double() * n_local_tokens
+            self._mlp_mean_abs[k] = (shard.sum_(m) / total).float()
+        diag = self._attn_res_diagnostics
+        if not diag:
+            return
+        keys = sorted(diag)
+        vals = torch.tensor([diag[k] for k in keys], device=device, dtype=torch.float64) * n_local_tokens
+        reduced = dict(zip(keys, (shard.sum_(vals) / total).tolist()))
+        sites: dict[str, list[tuple[int, float]]] = {}
+        for k in keys:
+            if k.startswith("attnres/_alpha_mean/"):
+                site, src = k[len("attnres/_alpha_mean/"):].rsplit("/", 1)
+                sites.setdefault(site, []).append((int(src), reduced.pop(k)))
+        for site, pairs in sites.items():
+            alphas = torch.tensor([a for _s, a in sorted(pairs)], dtype=torch.float64)
+            n_src = alphas.shape[0]
+            entropy = -(alphas * (alphas + 1e-10).log()).sum().item()
+            reduced[f"attnres/routing_entropy/{site}"] = entropy / (math.log(n_src) if n_src > 1 else 1.0)
+        diag.clear()
+        diag.update(reduced)
 
     def _maybe_release_cache(self) -> None:
         if torch.cuda.is_available() and self._free_gb() < self.config.release_cache_below_gb:
@@ -241,7 +345,20 @@ class GeometricMonitor:
         t0 = time.time()
         device = next(self.model.parameters()).device
         self._maybe_release_cache()
-        batch = self._probe_batch[:n_sequences].to(device)
+        batch = self._shard.take(self._probe_batch[:n_sequences]).to(device)
+
+        def _probe_loss() -> float:
+            # Token-mean probe loss. Sharded, each rank holds some of the sequences and the (loss x tokens, tokens)
+            # pairs are summed over ranks: the same mean (unsharded, loss * n / n returns the loss unchanged).
+            acc = torch.zeros(2, device=device, dtype=torch.float64)
+            if batch.shape[0] > 0:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    loss = self.model(batch, labels=batch)["loss"].float()
+                n_tok = batch.shape[0] * (batch.shape[1] - 1)
+                acc[0] = loss.double() * n_tok
+                acc[1] = n_tok
+            self._shard.sum_(acc)
+            return (acc[0] / acc[1]).item()
 
         grad_norm = torch.sqrt(
             sum(p.grad.float().pow(2).sum() for p in params_with_grad)
@@ -286,14 +403,11 @@ class GeometricMonitor:
 
         try:
             with torch.no_grad():
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    L0 = self.model(batch, labels=batch)["loss"].float().item()
+                L0 = _probe_loss()
                 landed_plus = _set_perturbed(+1.0)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    L_plus = self.model(batch, labels=batch)["loss"].float().item()
+                L_plus = _probe_loss()
                 _set_perturbed(-1.0)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    L_minus = self.model(batch, labels=batch)["loss"].float().item()
+                L_minus = _probe_loss()
 
             sharpness = (L_plus - 2.0 * L0 + L_minus) / (epsilon ** 2)
             metrics["eos/sharpness"] = sharpness
@@ -315,6 +429,8 @@ class GeometricMonitor:
 
         except Exception as e:
             logger.warning("Sharpness computation failed: %s", e)
+            if self._shard.on:
+                raise  # the other ranks would be left waiting in this probe's collectives
         finally:
             try:
                 with torch.no_grad():
@@ -354,6 +470,8 @@ class GeometricMonitor:
         t0 = time.time()
         device = next(self.model.parameters()).device
         self._maybe_release_cache()
+        if self._shard.on:
+            raise ValueError("compute_jacobian_spectral is unsharded only; compute_all computes EoC sharded")
         batch = self._probe_batch[:n_sequences].to(device)
 
         was_training = self.model.training
@@ -415,6 +533,11 @@ class GeometricMonitor:
         back up).
         Iteration stops early once σ is stable to EOC_REL_TOL.
         """
+        # Sharded: h_detached holds this rank's rows (possibly none). The Jacobian is block-diagonal across sequences,
+        # so iterating on every rank's rows with the vector normalized over all of them is the same power iteration;
+        # sigma is global, so every rank takes the same number of steps (and collectives).
+        shard = self._shard
+        has_rows = h_detached.shape[0] > 0
         cold_start = warm_key not in self._warm_vectors
         rerandomize = (self._eoc_call_count % 10 == 0) and not cold_start
 
@@ -422,17 +545,20 @@ class GeometricMonitor:
         if v is None or v.shape != h_detached.shape:
             v = torch.randn_like(h_detached)
             n_iters = max(n_iters, self.COLD_ITERS)
-        v = v / v.norm()
+        v = v / shard.norm(v)
 
         sigma, prev = 0.0, None
         for it in range(n_iters):
-            h_input = h_detached.clone().requires_grad_(True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                layer_out = layer_fn(h_input)
-            Jt_v = torch.autograd.grad(
-                (layer_out * v).sum(), h_input,
-            )[0].float()
-            sigma = Jt_v.norm().item()
+            if has_rows:
+                h_input = h_detached.clone().requires_grad_(True)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    layer_out = layer_fn(h_input)
+                Jt_v = torch.autograd.grad(
+                    (layer_out * v).sum(), h_input,
+                )[0].float()
+            else:
+                Jt_v = torch.zeros_like(h_detached, dtype=torch.float32)
+            sigma = shard.norm(Jt_v).item()
             if sigma < 1e-10:
                 break
             v = (Jt_v / sigma).detach()
@@ -441,8 +567,9 @@ class GeometricMonitor:
             prev = sigma
 
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            out_norm = layer_fn(h_detached).float().norm().item()
-        in_norm = h_detached.float().norm().item()
+            out = layer_fn(h_detached).float() if has_rows else torch.zeros(0, device=device)
+        out_norm = shard.norm(out).item()
+        in_norm = shard.norm(h_detached.float()).item()
         rel = sigma * in_norm / out_norm if out_norm > 0 else float("nan")
 
         self._warm_vectors[warm_key] = v.cpu()
@@ -464,7 +591,12 @@ class GeometricMonitor:
         use_attn_res = getattr(self.model.config, "attn_res", False)
         rope_cos, rope_sin = self.model.rope_cos, self.model.rope_sin
         mlp_inputs = getattr(self, "_mlp_inputs", {})
-        cut = (lambda t: t[:n_seq]) if n_seq else (lambda t: t)
+        if n_seq and self._shard.on:
+            # The first n_seq probe sequences: the ones of them this rank holds.
+            local = [i for i, g in enumerate(self._local_rows) if g < n_seq]
+            cut = lambda t: t[local]  # noqa: E731
+        else:
+            cut = (lambda t: t[:n_seq]) if n_seq else (lambda t: t)
 
         for layer_idx in self.config.tier1_sample_layers:
             if layer_idx not in hidden_states:
@@ -531,6 +663,16 @@ class GeometricMonitor:
         device = next(self.model.parameters()).device
         self._maybe_release_cache()
         batch = self._probe_batch.to(device)
+        # The AttnRes probe forward caps the batch at 16 sequences (see _probe_forward); cap before sharding so the
+        # sharded probe covers the same 16.
+        if getattr(self.model.config, "attn_res", False) and batch.shape[0] > 16:
+            batch = batch[:16]
+        shard = self._shard
+        if shard.on and shard.world > batch.shape[0]:
+            raise ValueError(f"sharded geo monitor: {shard.world} ranks > {batch.shape[0]} probe sequences")
+        self._local_rows = shard.rows(batch.shape[0])
+        n_local_tokens = len(self._local_rows) * batch.shape[1]
+        batch = shard.take(batch)
 
         was_training = self.model.training
         self.model.eval()
@@ -551,6 +693,8 @@ class GeometricMonitor:
             # == Phase 1: probe forward + activation-based metrics (no grad) ==
             with torch.no_grad():
                 hidden_states, attn_weights = self._probe_forward(batch)
+                if shard.on:
+                    self._reduce_probe_stats(n_local_tokens, device)
                 _phase("probe_forward")
 
                 # -- RankMe (effective rank) on last-layer hidden states --
@@ -558,30 +702,31 @@ class GeometricMonitor:
                 if last_layer_idx in hidden_states:
                     last_hidden = hidden_states[last_layer_idx]
                     H = last_hidden.reshape(-1, last_hidden.shape[-1]).float()
-                    metrics["geo/rankme_last"] = _rankme(H)
+                    metrics["geo/rankme_last"] = _rankme_gram(H, shard) if shard.on else _rankme(H)
                 _phase("rankme")
 
                 # -- Per-layer metrics --
+                metrics.update(self._stable_ranks(device))
                 for layer_idx in self.config.tier1_sample_layers:
                     prefix = f"geo/layer_{layer_idx}"
                     layer = self.model.layers[layer_idx]
-
-                    for name, param in [
-                        ("q_proj", layer.attn.q_proj.weight),
-                        ("k_proj", layer.attn.k_proj.weight),
-                        ("o_proj", layer.attn.o_proj.weight),
-                        ("gate_proj", layer.ffn.gate_proj.weight),
-                        ("down_proj", layer.ffn.down_proj.weight),
-                    ]:
-                        metrics[f"{prefix}/stable_rank_{name}"] = _stable_rank(param)
 
                     metrics.update(self._mlp_unit_metrics(layer_idx, prefix))
                     if layer_idx in hidden_states:
                         h = hidden_states[layer_idx]
                         h_flat = h.reshape(-1, h.shape[-1])
-                        metrics[f"{prefix}/anisotropy"] = _anisotropy(h_flat, max_samples=512)
+                        if shard.on:
+                            metrics[f"{prefix}/anisotropy"] = _anisotropy(shard.gather_rows(h_flat, 512),
+                                                                          max_samples=512)
+                        else:
+                            metrics[f"{prefix}/anisotropy"] = _anisotropy(h_flat, max_samples=512)
 
-                    if layer_idx in attn_weights:
+                    if shard.on:
+                        ent = _attention_entropy_stats_sharded(
+                            attn_weights.get(layer_idx), layer.attn.num_heads, shard, device)
+                        if ent is not None:
+                            metrics[f"{prefix}/attn_entropy_mean"], metrics[f"{prefix}/attn_entropy_std"] = ent
+                    elif layer_idx in attn_weights:
                         ent_mean, ent_std = _attention_entropy_stats(attn_weights[layer_idx])
                         metrics[f"{prefix}/attn_entropy_mean"] = ent_mean
                         metrics[f"{prefix}/attn_entropy_std"] = ent_std
@@ -597,9 +742,12 @@ class GeometricMonitor:
                         h = hidden_states[layer_idx].reshape(
                             -1, hidden_states[layer_idx].shape[-1]
                         )
-                        n = min(self.config.tier2_twonn_samples, h.shape[0])
-                        idx = torch.randperm(h.shape[0])[:n]
-                        h_sub = h[idx].float()
+                        if shard.on:
+                            h_sub = shard.gather_rows(h, self.config.tier2_twonn_samples)
+                        else:
+                            n = min(self.config.tier2_twonn_samples, h.shape[0])
+                            idx = torch.randperm(h.shape[0])[:n]
+                            h_sub = h[idx].float()
                         id_est = _twonn_id(h_sub)
                         if id_est is not None:
                             metrics[f"geo/twonn_id/layer_{layer_idx}"] = id_est
@@ -612,6 +760,8 @@ class GeometricMonitor:
 
         except Exception as e:
             logger.warning("compute_all failed: %s", e, exc_info=True)
+            if shard.on:
+                raise  # carrying on would leave the other ranks waiting in a collective this rank never reaches
 
         if was_training:
             self.model.train()
@@ -925,9 +1075,13 @@ class GeometricMonitor:
                     )
         hooks.append(model.norm.register_forward_pre_hook(_final_norm_hook))
 
+        # Sharded: the model also reports each site's token-mean routing weights, so _reduce_probe_stats can
+        # recompute routing_entropy exactly from the means over every rank.
+        model._attn_res_diag_keep_alphas = self._shard.on
         try:
             model(input_ids)
         finally:
+            model._attn_res_diag_keep_alphas = False
             for h in hooks:
                 h.remove()
 
@@ -956,6 +1110,7 @@ class GeometricMonitor:
         rope_sin: torch.Tensor,
         seq_len: int,
     ) -> Optional[torch.Tensor]:
+        """(The first 4 probe sequences; sharded, the ones of those this rank holds — None if it holds none.)"""
         """
         Compute raw attention weights for a layer.
 
@@ -966,7 +1121,13 @@ class GeometricMonitor:
         try:
             attn = layer.attn
             # Limit to first few sequences to save memory
-            x_sub = x_normed[:4]
+            if self._shard.on:
+                local = [i for i, g in enumerate(self._local_rows) if g < 4]
+                if not local:
+                    return None
+                x_sub = x_normed[local]
+            else:
+                x_sub = x_normed[:4]
             bsz = x_sub.shape[0]
 
             q = attn.q_proj(x_sub).view(bsz, seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
@@ -1019,6 +1180,21 @@ def _rankme(H: torch.Tensor, eps: float = 1e-7) -> float:
     # SVD of the (potentially large) matrix — use only singular values
     try:
         S = torch.linalg.svdvals(H)
+        S = S / (S.sum() + eps)
+        S = S[S > eps]
+        entropy = -(S * torch.log(S)).sum()
+        return torch.exp(entropy).item()
+    except Exception:
+        return 0.0
+
+
+def _rankme_gram(H: torch.Tensor, shard: _ProbeShard, eps: float = 1e-7) -> float:
+    """_rankme over the rows of every rank's H: the singular values of the stacked matrix are the square roots of the
+    eigenvalues of its Gram matrix, which is the sum of the ranks' H^T H (fp64)."""
+    try:
+        Hd = H.double()
+        gram = shard.sum_(Hd.t() @ Hd)
+        S = torch.linalg.eigvalsh(gram).clamp_min(0).sqrt().flip(0).float()
         S = S / (S.sum() + eps)
         S = S[S > eps]
         entropy = -(S * torch.log(S)).sum()
@@ -1088,6 +1264,24 @@ def _attention_entropy_stats(
     return per_head.mean().item(), per_head.std().item()
 
 
+
+
+def _attention_entropy_stats_sharded(
+    attn: Optional[torch.Tensor], n_heads: int, shard: _ProbeShard, device: torch.device, eps: float = 1e-10,
+) -> Optional[tuple[float, float]]:
+    """_attention_entropy_stats over every rank's sequences: per-head entropy sums and position counts are summed
+    over ranks (a rank holding none of the sequences contributes zeros), then mean / std over heads."""
+    buf = torch.zeros(n_heads + 1, device=device, dtype=torch.float64)
+    if attn is not None:
+        a = attn.float().clamp(min=eps)
+        entropy = -(a * a.log()).sum(dim=-1)  # [batch, heads, seq]
+        buf[:n_heads] = entropy.sum(dim=(0, 2)).double()
+        buf[n_heads] = entropy.shape[0] * entropy.shape[2]
+    shard.sum_(buf)
+    if buf[n_heads] == 0:
+        return None
+    per_head = (buf[:n_heads] / buf[n_heads]).float()
+    return per_head.mean().item(), per_head.std().item()
 
 
 def _twonn_id(X: torch.Tensor) -> Optional[float]:

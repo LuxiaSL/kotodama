@@ -319,8 +319,12 @@ def _compute_attn_res_diagnostics(
     eps: float,
     intermediate_alphas: Optional[list[tuple[int, str, torch.Tensor]]] = None,
     block_ranges: Optional[list[tuple[int, int]]] = None,
+    keep_alpha_means: bool = False,
 ) -> dict[str, float]:
     """Compute per-block norms, final routing weights, and intermediate routing stats.
+
+    ``keep_alpha_means`` also emits ``attnres/_alpha_mean/layer_{i}/{sublayer}/{s}`` (a site's token-mean weight on
+    source s), which a sharded probe needs to recompute routing_entropy over every rank's tokens.
 
     ``intermediate_alphas`` holds per-token weights (n_src, B, T) per site. With
     ``block_ranges``, every site (and the final aggregation) also gets who-reads-what
@@ -370,6 +374,9 @@ def _compute_attn_res_diagnostics(
             entropy = -(alphas * (alphas + 1e-10).log()).sum().item()
             max_entropy = math.log(n_src) if n_src > 1 else 1.0
             diag[f"attnres/routing_entropy/layer_{layer_idx}/{sublayer}"] = entropy / max_entropy
+            if keep_alpha_means:
+                for s_idx, a in enumerate(alphas.tolist()):
+                    diag[f"attnres/_alpha_mean/layer_{layer_idx}/{sublayer}/{s_idx}"] = a
 
             for s in range(n_src):
                 bucket = s if s < n_blocks else n_blocks  # last = partial
@@ -1361,6 +1368,7 @@ class KotodamaModel(nn.Module):
                 self.final_res_norm.weight, self.config.norm_eps,
                 intermediate_alphas=intermediate_alphas,
                 block_ranges=block_ranges,
+                keep_alpha_means=getattr(self, "_attn_res_diag_keep_alphas", False),
             )
 
         return self.norm(h_final)
