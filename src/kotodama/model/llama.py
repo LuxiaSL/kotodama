@@ -122,6 +122,9 @@ def _init_fa4() -> bool:
     return True
 
 
+ATTN_RES_GAIN_MODES = ("learned", "frozen", "folded")
+
+
 @dataclass
 class KotodamaModelConfig:
     """Model configuration; named shapes live in kotodama.presets."""
@@ -158,6 +161,11 @@ class KotodamaModelConfig:
     # find_unused_parameters=False. Disable only when resuming a checkpoint
     # whose optimizer state was saved without this freeze (AdamW param-count mismatch).
     attn_res_freeze_unused: bool = True
+    # The routing query only ever acts as q * res_norm.weight, so the pair has a rescaling symmetry (q*c, g/c) that the
+    # optimizer can drift along. "learned": both trained (as before). "frozen": the gain is not trained (its init, or
+    # loaded, value is kept). "folded": fold_attn_res_gains() moves the gain into the query (q <- q*g, g <- 1) and the
+    # gain is not trained; outputs are unchanged by the fold. Fresh runs: frozen == folded (the gain starts at 1).
+    attn_res_gain: str = "learned"
     # Looped depth: effective positions [loop_start, loop_start + loop_len*loop_times) reuse the attention
     # and FFN weights of the core [loop_start, loop_start + loop_len), run loop_times times. num_layers stays the
     # EFFECTIVE depth (AttnRes masks/boundaries, KV caches and capture all see one layer per position); each
@@ -167,6 +175,8 @@ class KotodamaModelConfig:
     loop_times: int = 1
 
     def __post_init__(self) -> None:
+        if self.attn_res_gain not in ATTN_RES_GAIN_MODES:
+            raise ValueError(f"attn_res_gain={self.attn_res_gain!r}; expected one of {ATTN_RES_GAIN_MODES}")
         if self.loop_start is not None:
             end = self.loop_start + self.loop_len * self.loop_times
             if self.loop_start < 0 or self.loop_len < 1 or self.loop_times < 2 or end > self.num_layers:
@@ -999,6 +1009,9 @@ class KotodamaModel(nn.Module):
                 first_boundary_layer = self.layers[sorted_boundaries[0]]
                 first_boundary_layer.attn_res_query.requires_grad_(False)
                 first_boundary_layer.attn_res_norm.weight.requires_grad_(False)
+            if config.attn_res_gain != "learned":
+                for _query, norm in self._attn_res_query_norm_pairs():
+                    norm.weight.requires_grad_(False)
 
         # Precompute RoPE frequencies
         rope_cos, rope_sin = precompute_rope_frequencies(
@@ -1530,6 +1543,31 @@ class KotodamaModel(nn.Module):
             output["logits"] = logits
 
         return output
+
+    def _attn_res_query_norm_pairs(self) -> list[tuple[nn.Parameter, nn.Module]]:
+        """Every AttnRes routing site's (query, res_norm): two per layer plus the final aggregation."""
+        if not self.config.attn_res:
+            return []
+        pairs: list[tuple[nn.Parameter, nn.Module]] = []
+        for layer in self.layers:
+            pairs.append((layer.attn_res_query, layer.attn_res_norm))
+            pairs.append((layer.mlp_res_query, layer.mlp_res_norm))
+        pairs.append((self.final_res_query, self.final_res_norm))
+        return pairs
+
+    @torch.no_grad()
+    def fold_attn_res_gains(self) -> int:
+        """Move each routing site's res_norm gain into its query: q <- q * g (rounded once, into q's dtype — the same
+        product every route computes), g <- 1. Every forward is unchanged (routing only reads q * g); idempotent.
+        Returns how many sites had a gain != 1."""
+        changed = 0
+        for query, norm in self._attn_res_query_norm_pairs():
+            w = norm.weight
+            if not bool((w == 1).all()):
+                changed += 1
+            query.copy_(query * w)
+            w.fill_(1.0)
+        return changed
 
     def reinit_mlps(self) -> None:
         """Reinitialize all MLP weights. Used after NCA pre-pre-training."""

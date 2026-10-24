@@ -466,6 +466,7 @@ def train(args: argparse.Namespace) -> None:
     model_kwargs["z_loss_weight"] = args.z_loss_weight
     model_kwargs["activation_checkpointing"] = args.activation_checkpointing
     model_kwargs["use_liger"] = getattr(args, "use_liger", False)
+    model_kwargs["attn_res_gain"] = getattr(args, "attnres_res_gain", "learned")
     model_kwargs["rope_fp32"] = getattr(args, "rope_fp32", False)
     model_kwargs["attn_impl"] = getattr(args, "attn_impl", "auto")
     model_kwargs["attn_res"] = args.attn_res
@@ -638,6 +639,16 @@ def train(args: argparse.Namespace) -> None:
     elif args.resume_nca and _has_existing_ckpts:
         if is_main:
             logger.info("Skipping NCA init — existing checkpoints found (resuming from preemption)")
+
+    # --attnres_res_gain folded: move every routing gain into its query now, after any weights were loaded and before
+    # the optimizers take their fp32 masters (fold_attn_res_gains is idempotent; the full-resume load re-applies it).
+    if config.attn_res and config.attn_res_gain == "folded":
+        _folded = model.fold_attn_res_gains()
+        if is_main:
+            logger.info("AttnRes res_norm gains folded into the queries (%d sites had a gain != 1); gains frozen",
+                        _folded)
+    elif config.attn_res and config.attn_res_gain == "frozen" and is_main:
+        logger.info("AttnRes res_norm gains frozen at their current values")
 
     # Enable TF32 for fp32 matmuls outside autocast (grad norm, loss compute)
     torch.set_float32_matmul_precision("high")
@@ -946,6 +957,8 @@ def train(args: argparse.Namespace) -> None:
     start_step = 0
     tokens_consumed = 0
     ckpt_state = ckpt_mgr.load_latest(model, muon_opt, adamw_opt, device)
+    if ckpt_state is not None and config.attn_res and config.attn_res_gain == "folded":
+        raw_model.fold_attn_res_gains()  # a folded run's own checkpoint: a no-op (its gains are already 1)
     if ckpt_state is not None:
         start_step = ckpt_state["step"] + 1
         tokens_consumed = ckpt_state.get("tokens_consumed", 0)
@@ -2519,6 +2532,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no_attnres_eps_fp64_compat", dest="attnres_eps_fp64_compat", action="store_false",
         help="Turn off --attnres_eps_fp64_compat set by a config (fp32 AttnRes routing).",
+    )
+    p.add_argument(
+        "--attnres_res_gain", choices=["learned", "frozen", "folded"], default="learned",
+        help="AttnRes routing gain (res_norm.weight, which only ever multiplies the routing query): 'learned' trains "
+             "both (default; the lineage before this flag); 'frozen' keeps the gain fixed (1 for a fresh run); "
+             "'folded' moves it into the query (q <- q*g, g <- 1; outputs unchanged) and keeps it fixed. A run "
+             "switching mode must start from --resume_weights (the optimizer state no longer matches).",
     )
     p.add_argument(
         "--attnres_stack_grad_chain", action="store_true",
