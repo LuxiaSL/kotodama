@@ -80,7 +80,7 @@ def load_steer_banks(
     count two per layer (after-attn of layer L = sublayer 2*L), so each key's
     site LAYER = suffix//2; odd suffixes (mlp sublayers) are fatal — the
     engine anchor is after-attn only. Multiple npz files compose one bank:
-    duplicate vector keys and median norms resolve FIRST-NPZ-WINS. Suffixless
+    duplicate vector keys and median norms resolve first-npz-wins. Suffixless
     vector keys can't be placed and are skipped.
 
     Returns (bank: key -> (site_layer, fp32 on-device unit vec),

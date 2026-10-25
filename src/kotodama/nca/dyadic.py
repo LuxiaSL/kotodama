@@ -10,7 +10,7 @@ this module adds the sequence families the original could not express:
      temperature) supported. ``mark_turns=False`` drops the TURN tokens: the
      handover must be detected from the dynamics alone (the writer mixes
      marked and unmarked episodes ~half/half).
-  B. COMMITMENTS + QUERIES, LAST-WRITE-WINS (v3) — [COMMIT, TAG_k, VAL_v]
+  B. COMMITMENTS + QUERIES, last-write-wins (v3) — [COMMIT, TAG_k, VAL_v]
      events write a tagged association; [QUERY, TAG_k] must be answered by
      the value of the MOST RECENT commit to that tag — well-posed by
      construction (an overwritten commit is never the gold).
@@ -20,7 +20,7 @@ this module adds the sequence families the original could not express:
      distinct within an episode, so the ANTI-SHORTCUT LAW holds structurally:
      a gold value's token appears exactly at its own commit and at queries it
      answers, nowhere else.
-  C. PERTURBATION-AND-REPAIR — a marked exogenous patch overwrite mid-rollout;
+  C. perturbation and repair — a marked exogenous patch overwrite mid-rollout;
      the ground-truth continuation INCORPORATES the perturbation. Eval pairs
      each perturbed rollout with its counterfactual unperturbed twin.
 
@@ -442,7 +442,7 @@ def selftest() -> None:
         if reserve_eos:
             check(int((toks == 0).sum()) == 0, f"{tag} EOS inside episode")
         check(int(toks.max()) <= tm["VAL0"] + N_VALS - 1, f"{tag} id overflow")
-        # 3. LAST-WRITE-WINS gold: for every query, the answer equals the val
+        # 3. Last-write-wins gold: for every query, the answer equals the val
         # of the most recent commit to that tag earlier in the token stream
         q_pos = np.where(toks == tm["QUERY"])[0]
         c_pos = np.where(toks == tm["COMMIT"])[0]

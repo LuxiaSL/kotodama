@@ -197,7 +197,7 @@ def instrumented_forward(model, input_ids, light=False, routing_only=False):
 # them comparable to each other.
 #
 # CACHE CONVENTION — the model's own (`GQAttention._forward_sdpa`, read at
-# source): per layer a `(k, v)` tuple with k POST-QK-NORM AND ROTATED at its
+# source): per layer a `(k, v)` tuple with k post-QK-norm and rotated at its
 # absolute position, v raw, both `(B, n_kv, S, hd)`. AttnRes routing state
 # (committed/partial) is POSITION-LOCAL and is NOT cached: continuation tokens
 # compute their own block structure; only attention reads back through the KV

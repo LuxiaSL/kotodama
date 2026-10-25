@@ -22,7 +22,7 @@ Turn marking: ``--p-unmarked`` of dyadic episodes drop TURN tokens (handover
 must be detected from dynamics; the marked/unmarked contrast is a free
 in-domain gate).
 
-Usage (sharded across GPUs; CPU works for tests/small doses):
+Usage (sharded across GPUs; CPU works for tests and small doses):
   for s in 0..5: CUDA_VISIBLE_DEVICES=$s python -m kotodama.nca.gen_dyadic_data \
       --shard $s --n-shards 6 --target-tokens 125_000_000 --out <dir> &
   python -m kotodama.nca.gen_dyadic_data --finalize --out <dir>   # concat +

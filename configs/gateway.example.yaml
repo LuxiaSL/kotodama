@@ -18,6 +18,8 @@ hf_home: .cache/huggingface
 log_dir: logs/gateway
 serve_args: ["--engine", "fast"]
 
+# Both routes go to the one model here; a fleet with a chat-tuned replica points chat_pool at its key.
+chat_pool: base
 completion_pool: base
 max_inflight_global: 8
 request_timeout_s: 900.0

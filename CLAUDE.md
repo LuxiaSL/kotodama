@@ -17,4 +17,7 @@ use them; do not add a parallel way to do something that already has one.
   `llama.py`); do not write another AttnRes forward mirror.
 - **Tests**: `.venv/bin/python -m pytest` (CPU). A change to model/serve/train code ships
   with a test or a parity check.
+- **Gates + style** (`CONTRIBUTING.md`): tests, G2 test retention, G3 timelessness + referents, G4 import closure —
+  all must pass before a push. Comments state what is true now (no dates, no edit narration) and point only at things
+  in this repo or public URLs. Pages a stranger reads (README, model cards) are third person, timeless, scoped.
 - The architecture of the shipped 3B is FROZEN (DD-3B boundaries `0,1,3,7,15,19,24`).

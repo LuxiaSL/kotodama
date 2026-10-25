@@ -12,7 +12,7 @@ paths resolve against ``$KOTODAMA_DATA_ROOT``.
 
 CLI:
   python -m kotodama.ckpt info  <name-or-path>
-  python -m kotodama.ckpt strip <name-or-path> <out.pt[.zst]> [--bf16]
+  python -m kotodama.ckpt strip <name-or-path> <out> [--bf16]    (<out> ending .zst is compressed)
   python -m kotodama.ckpt list
 """
 

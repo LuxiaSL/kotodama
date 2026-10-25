@@ -1,5 +1,5 @@
 """OpenAI-compatible request models tolerate client quirks: null = "not sent" (default applies), a one-element prompt
-list is unwrapped, and ranges still validate (Loom sends unchecked fields as null — 2026-10-24)."""
+list is unwrapped, and ranges still validate (Loom sends unchecked fields as null)."""
 from __future__ import annotations
 
 import pytest

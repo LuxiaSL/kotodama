@@ -19,12 +19,12 @@ Same math as FA2 varlen up to fp reassociation (gate with
 scripts/utils/fa4_varlen_parity.py + a canary loss overlay before any
 production use).
 
-Return-arity: the installed flash_attn.cute (upstream Dao-AILab/flash-attention
-98024f9) returns
+Return-arity: the pinned flash_attn.cute
+(https://github.com/Dao-AILab/flash-attention/commit/98024f9) returns
 (out, lse) from _flash_attn_fwd; upstream head returns a longer tuple. Both
 wrappers take res[0], res[1] (and bwd res[0..2]) so either works.
 
-LSE layout (read from _flash_attn_fwd's `lse_shape` at 98024f9):
+LSE layout (read from the pinned _flash_attn_fwd's `lse_shape`):
 dense (B, H, S) fp32; varlen (H, total) fp32. Fakes mirror that, and every
 fake allocates with new_empty(shape) — real outputs are always freshly
 allocated contiguous tensors (the kernels contiguify q/k/v first), so an
@@ -44,9 +44,9 @@ except ImportError:
     _flash_attn_fwd = None  # type: ignore[assignment]
     _flash_attn_bwd = None  # type: ignore[assignment]
 
-# The pinned FA4 (upstream 98024f9) calls SingleTileVarlenScheduler.producer_tail
-# in the varlen forward but never defines it; our installs carry a no-op stub
-# (upstream added the same stub in 29e40cf). A plain reinstall drops it.
+# The pinned FA4 calls SingleTileVarlenScheduler.producer_tail in the varlen forward
+# but never defines it, so a working install carries a no-op stub (upstream adds the
+# same stub in https://github.com/Dao-AILab/flash-attention/commit/29e40cf). A plain reinstall drops it.
 _FA4_VARLEN_STUB_OK = True
 if _FA4_CUTE_AVAILABLE:
     try:
@@ -62,8 +62,8 @@ def _require_varlen_stub() -> None:
     if not _FA4_VARLEN_STUB_OK:
         raise RuntimeError(
             "flash_attn.cute lacks SingleTileVarlenScheduler.producer_tail: this FA4 "
-            "install is missing the varlen stub (pinned upstream 98024f9 + a no-op "
-            "producer_tail stub). Re-apply the stub or use "
+            "install is missing the no-op producer_tail stub the pinned upstream needs. "
+            "Re-apply the stub or use "
             "--attn_impl fa2 / the dense fa4 path (no doc masking)."
         )
 
