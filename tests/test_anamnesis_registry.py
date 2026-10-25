@@ -118,3 +118,26 @@ def test_a_looped_attnres_model_reaches_an_anamnesis_vector():
     again = compute_features_with_families_from_data(
         replay_extract_koto(model, ids, prompt_length=16, positional_means=None), ext, fam, None, None)
     assert np.asarray(again.features, np.float32).tobytes() == v.tobytes()
+
+
+def test_calibrate_registers_once_and_parses(monkeypatch) -> None:
+    import os
+
+    from kotodama import anamnesis_registry
+    from kotodama.eval import anamnesis_calibrate as cal
+
+    monkeypatch.setenv("ANAMNESIS_MODELS", "/elsewhere/models.json")
+    cal._register()
+    cal._register()
+    paths = os.environ["ANAMNESIS_MODELS"].split(os.pathsep)
+    assert paths == ["/elsewhere/models.json", str(anamnesis_registry.REGISTRY_FILE)]
+    a = cal.parser().parse_args(["--checkpoint", "c.pt", "--out_dir", "o"])
+    assert a.model == "kotodama-tsumugi-1b" and not a.refit_basis and not a.dry_run
+
+
+def test_calibrate_dry_run_against_installed_anamnesis(tmp_path, capsys) -> None:
+    pytest.importorskip("anamnesis")
+    from kotodama.eval import anamnesis_calibrate as cal
+
+    cal.main(["--checkpoint", "c.pt", "--out_dir", str(tmp_path), "--dry_run"])
+    assert "kotodama-tsumugi-1b" in capsys.readouterr().out
