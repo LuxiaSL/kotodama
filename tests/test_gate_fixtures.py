@@ -122,7 +122,7 @@ MUST_CATCH: tuple[Case, ...] = (
         frozenset({CITATION}),
     ),
     Case(
-        "PORT-MANIFEST-anamnesis-2026-09-13.md holds the allow-list.",
+        "PORT-MANIFEST-example-2026-09-13.md holds the allow-list.",
         "docstring",
         frozenset({PRIVATE, DATED}),
     ),

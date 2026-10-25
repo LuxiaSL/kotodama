@@ -458,7 +458,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-new", type=int, default=32)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--rep-penalty", type=float, default=1.2)
-    ap.add_argument("--prompts", type=Path, default=Path.home() / "projects/entropy-gradient/prompts.txt")
+    ap.add_argument("--prompts", type=Path, required=True,
+                    help="plain-text openings, one per line; the vectors are only as general as these prompts")
     ap.add_argument("--band", type=int, nargs=2, default=list(BAND))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

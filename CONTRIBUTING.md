@@ -63,7 +63,7 @@ standing fact it depends on, stated in the present tense.
 # We now compile by default; this used to run eager.
 
 # Bad — dates the evidence instead of stating it.
-# Loops survive repetition penalty 1.2 (loom read 2026-10-24, 8 readers).
+# Loops survive repetition penalty 1.2 (felt read 2026-01-15, n=8).
 ```
 
 ### 2. Every referent must be reachable from this repository
@@ -100,7 +100,7 @@ nobody can open.
 # shared nouns.
 
 # Bad — a referent this repository does not contain.
-# See research/notes/loom-qual for why the threshold is 0.2.
+# See research/notes/threshold-memo for why the threshold is 0.2.
 
 # Bad — cites the plan instead of stating the constraint.
 # Gates per the release plan §3.
