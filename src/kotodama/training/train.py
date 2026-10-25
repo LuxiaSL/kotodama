@@ -468,6 +468,7 @@ def train(args: argparse.Namespace) -> None:
     model_kwargs["use_liger"] = getattr(args, "use_liger", False)
     model_kwargs["attn_res_gain"] = getattr(args, "attnres_res_gain", "learned")
     model_kwargs["liger_rmsnorm_tuned"] = getattr(args, "liger_rmsnorm_tuned", False)
+    model_kwargs["liger_rmsnorm_tuned_scope"] = getattr(args, "liger_rmsnorm_tuned_scope", "all")
     model_kwargs["rope_fp32"] = getattr(args, "rope_fp32", False)
     model_kwargs["attn_impl"] = getattr(args, "attn_impl", "auto")
     model_kwargs["attn_res"] = args.attn_res
@@ -2478,6 +2479,12 @@ def parse_args() -> argparse.Namespace:
              "weight gradient's partial sums are grouped differently, so new runs only). +4.3%% tok/s on the 1B "
              "moonshot shape; to 2.5B tokens the loss tracks the default launch (mean delta +0.0003) and the "
              "induction / rider gauges converge (an induction-formation timing shift around step 476 closes).",
+    )
+    p.add_argument(
+        "--liger_rmsnorm_tuned_scope", choices=["all", "qk"], default="all",
+        help="With --liger_rmsnorm_tuned: 'all' norms (default), or 'qk' = the QK-norms only (dX bitwise Liger's; "
+             "only their weight gradient's partial-sum grouping differs) - a minimal numerics perturbation for "
+             "sensitivity controls, not a throughput setting.",
     )
 
     # Attention implementation

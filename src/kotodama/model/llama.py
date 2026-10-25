@@ -123,6 +123,7 @@ def _init_fa4() -> bool:
 
 
 ATTN_RES_GAIN_MODES = ("learned", "frozen", "folded")
+LIGER_RMSNORM_TUNED_SCOPES = ("all", "qk")
 
 
 @dataclass
@@ -148,6 +149,9 @@ class KotodamaModelConfig:
     # With use_liger: Liger's RMSNorm kernels launched with B200-tuned grids (kotodama.model.liger_tuned) — same
     # kernels and math; reduction grouping of dW (and of a few dX elements) differs, so a lineage keeps its choice.
     liger_rmsnorm_tuned: bool = False
+    # Which norms get the tuned launch: "all", or "qk" (only the QK-norms, whose dX is bitwise Liger's; only their
+    # dW partial-sum grouping differs — the smallest numerics perturbation available, for sensitivity controls).
+    liger_rmsnorm_tuned_scope: str = "all"
     # Keep RoPE cos/sin tables in fp32 through .to(bf16) and rotate in fp32 (one
     # rounding back to the activation dtype). Off = the bf16 tables every model
     # through the 3B trained with (23% of cos entries round to exactly 1.0).
@@ -178,6 +182,9 @@ class KotodamaModelConfig:
     loop_times: int = 1
 
     def __post_init__(self) -> None:
+        if self.liger_rmsnorm_tuned_scope not in LIGER_RMSNORM_TUNED_SCOPES:
+            raise ValueError(f"liger_rmsnorm_tuned_scope={self.liger_rmsnorm_tuned_scope!r}; "
+                             f"expected one of {LIGER_RMSNORM_TUNED_SCOPES}")
         if self.attn_res_gain not in ATTN_RES_GAIN_MODES:
             raise ValueError(f"attn_res_gain={self.attn_res_gain!r}; expected one of {ATTN_RES_GAIN_MODES}")
         if self.loop_start is not None:
@@ -293,15 +300,17 @@ def apply_rope_fa2(
     return (x * cos + x_rotated * sin).to(x.dtype)
 
 
-def _select_norm_class(config: KotodamaModelConfig) -> type:
+def _select_norm_class(config: KotodamaModelConfig, site: str = "hidden") -> type:
     """Select norm class: LigerRMSNorm when use_liger is enabled, else custom RMSNorm.
+
+    ``site`` is "hidden" (block / final norms) or "qk" (QK-norms); liger_rmsnorm_tuned_scope="qk" tunes only the latter.
 
     NOT used for AttnRes norms — those always use custom RMSNorm because
     _route_static() accesses norm.eps directly, and LigerRMSNorm
     stores it as .variance_epsilon instead.
     """
     if config.use_liger and _LIGER_AVAILABLE:
-        if config.liger_rmsnorm_tuned:
+        if config.liger_rmsnorm_tuned and (config.liger_rmsnorm_tuned_scope == "all" or site == "qk"):
             from . import liger_tuned
 
             if liger_tuned.AVAILABLE:
@@ -476,7 +485,7 @@ class GQAttention(nn.Module):
         # QK-norm: RMSNorm applied to Q and K after projection, before attention
         self.qk_norm = config.qk_norm
         if self.qk_norm:
-            NormClass = _select_norm_class(config)
+            NormClass = _select_norm_class(config, site="qk")
             self.q_norm = NormClass(self.head_dim, eps=config.norm_eps)
             self.k_norm = NormClass(self.head_dim, eps=config.norm_eps)
 
