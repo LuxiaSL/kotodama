@@ -62,7 +62,7 @@ torch.set_num_threads(_SERVE_THREADS)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from transformers import AutoTokenizer
 
 from kotodama import ckpt, presets
@@ -1280,6 +1280,14 @@ async def generate_endpoint(request: GenerateRequest, http_request: Request):
 
 # ── OpenAI-compatible /v1/completions (for Loom/Loomsidian) ─────────────────────
 
+def _drop_nulls(data: Any) -> Any:
+    """OpenAI clients (e.g. Loom) send unset sampling fields as JSON null; treat null as "not sent" so the field's
+    default applies instead of a 422."""
+    if isinstance(data, dict):
+        return {k: v for k, v in data.items() if v is not None}
+    return data
+
+
 class OAICompletionRequest(BaseModel):
     prompt: str
     model: str = ""
@@ -1292,6 +1300,17 @@ class OAICompletionRequest(BaseModel):
     best_of: int | None = None
     stop: list[str] | str | None = None
     return_token_ids: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _tolerant(cls, data: Any) -> Any:
+        data = _drop_nulls(data)
+        if isinstance(data, dict) and isinstance(data.get("prompt"), list):
+            p = data["prompt"]
+            if len(p) != 1 or not isinstance(p[0], str):
+                raise ValueError("prompt: send one string (a list of several prompts is not supported; use n)")
+            data = {**data, "prompt": p[0]}
+        return data
 
 
 @app.post("/v1/completions")
@@ -1398,6 +1417,11 @@ class OAIChatRequest(BaseModel):
     stream: bool = False
     n: int = Field(default=1, ge=1, le=8)
     return_token_ids: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _tolerant(cls, data: Any) -> Any:
+        return _drop_nulls(data)
 
 
 @app.post("/v1/chat/completions")
