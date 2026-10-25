@@ -33,6 +33,11 @@ STEER_ALIAS_TABLE: tuple[tuple[str, str, float, str], ...] = (
      "Repetition dial. NEGATIVE values (try -0.05) suppress loops and repeated phrases; positive values cause looping (entertaining, not useful)."),
     ("v7-entropy", "V7_s20", 0.05,
      "Word-choice looseness. Positive = more surprising, exploratory phrasing; negative = more focused and predictable. Small doses (±0.03-0.05)."),
+    # kotodama-tsumugi (1b-moonshot-loop): the same two dials, built at effective layer 29 (scripts/steer/build_egv.py).
+    ("vrep", "Vrepperp_s58", -0.05,
+     "Repetition dial. The default (-0.05) suppresses loops and repeated phrases with entropy held flat; positive values cause looping."),
+    ("v7-entropy", "V7_s58", 0.05,
+     "Word-choice looseness. Positive = more surprising, exploratory phrasing; negative = more focused and predictable. Small doses (±0.03-0.05)."),
     ("echoness", "Alg_echo_bravo_s46", 0.07,
      "A strange, dreamy, inward-looking streak — poetic, sometimes cryptic. Gets incoherent if pushed alone; best small (0.03) or paired with crown."),
     ("echo-install", "Alg_echo_base_s46", 0.07,
@@ -157,10 +162,11 @@ def load_steer_banks(
     if skipped:
         logger.info("Steering banks: skipped non-vector/suffixless keys %s", sorted(skipped))
 
-    aliases: dict[str, tuple[str | None, float, str]] = {
-        alias: (key, alpha, desc)
-        for alias, key, alpha, desc in STEER_ALIAS_TABLE
-        if key in bank
-    }
+    # An alias may name one vector per model (e.g. vrep at the 3B's s20 and tsumugi's s58); the first row whose key
+    # is in the loaded banks wins.
+    aliases: dict[str, tuple[str | None, float, str]] = {}
+    for alias, key, alpha, desc in STEER_ALIAS_TABLE:
+        if key in bank and alias not in aliases:
+            aliases[alias] = (key, alpha, desc)
     aliases["control"] = (None, 0.0, STEER_CONTROL_DESC)
     return bank, meds, aliases

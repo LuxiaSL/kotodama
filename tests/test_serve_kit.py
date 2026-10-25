@@ -76,3 +76,20 @@ def test_steer_bank_loader(tmp_path):
     np.savez(odd, X_s39=vec, median_norm_s39=np.float32(1.0))
     with pytest.raises(ValueError, match="ODD sublayer"):
         steering.load_steer_banks([str(odd)], n_layers=28, hidden=8, device=torch.device("cpu"))
+
+
+def test_steer_alias_per_model_site(tmp_path):
+    """vrep / v7-entropy resolve to whichever model's vector is loaded (3B s20, tsumugi s58)."""
+    import numpy as np
+    from kotodama.serve import steering
+
+    vec = np.zeros(8, dtype=np.float32)
+    vec[0] = 1.0
+    tsu = tmp_path / "tsumugi.npz"
+    np.savez(tsu, Vrepperp_s58=vec, V7_s58=vec, median_norm_s58=np.float32(3.0))
+    _, _, aliases = steering.load_steer_banks([str(tsu)], n_layers=72, hidden=8, device=torch.device("cpu"))
+    assert aliases["vrep"][:2] == ("Vrepperp_s58", -0.05) and aliases["v7-entropy"][0] == "V7_s58"
+    k3b = tmp_path / "koto3b.npz"
+    np.savez(k3b, Vrepperp_s20=vec, median_norm_s20=np.float32(3.0))
+    _, _, aliases = steering.load_steer_banks([str(k3b)], n_layers=28, hidden=8, device=torch.device("cpu"))
+    assert aliases["vrep"][0] == "Vrepperp_s20" and "v7-entropy" not in aliases
