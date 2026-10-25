@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import itertools
+import json
 import logging
 import math
 import os
@@ -748,6 +749,27 @@ def train(args: argparse.Namespace) -> None:
     # -- Optimizer -------------------------------------------------------------
     raw_model = model.module if hasattr(model, "module") else model
 
+    # Per-microbatch grad stats + spike capture (opt-in; kotodama.training.grad_stats)
+    micro_stats = None
+    spike_det = None
+    if getattr(args, "micro_grad_stats", False) or getattr(args, "spike_capture_factor", 0.0):
+        from kotodama.training.grad_stats import MicroGradStats, SpikeDetector
+
+        _is_ddp = isinstance(model, DDP)
+        micro_stats = MicroGradStats(
+            [p for p in raw_model.parameters() if p.requires_grad], device, group=dp_group, ddp=_is_ddp,
+            out_path=(Path(args.checkpoint_dir) / "micro_grad_stats.jsonl"
+                      if is_main and getattr(args, "micro_grad_stats", False) else None))
+        if _is_ddp:
+            model.register_comm_hook(dp_group, micro_stats.comm_hook)
+        if getattr(args, "spike_capture_factor", 0.0):
+            spike_det = SpikeDetector(args.spike_capture_factor, window=args.spike_capture_window,
+                                      max_captures=args.spike_capture_max)
+        if is_main:
+            logger.info("micro grad stats on (file=%s); spike capture factor=%s",
+                        micro_stats.out_path, getattr(args, "spike_capture_factor", 0.0) or "off")
+    _micro_rec = None
+
     if args.adamw_only:
         # Pure AdamW baseline (no Muon) — all params in one optimizer.
         # MasterAdamW keeps fp32 masters: stock AdamW on a bf16 model freezes
@@ -1256,6 +1278,8 @@ def train(args: argparse.Namespace) -> None:
             ramp_pct=args.batch_ramp_pct,
         )
 
+        if micro_stats is not None:
+            micro_stats.begin(current_grad_accum)
         for micro_step in range(current_grad_accum):
             _t_data = time.perf_counter()
             try:
@@ -1318,6 +1342,8 @@ def train(args: argparse.Namespace) -> None:
 
                 loss.backward()
 
+            if micro_stats is not None:
+                micro_stats.after_micro(micro_step, output["loss"])
             _loss_accum += output["loss"].detach()
             if "z_loss" in output:
                 _z_loss_accum += output["z_loss"].detach()
@@ -1347,6 +1373,27 @@ def train(args: argparse.Namespace) -> None:
         _gn_win_max = torch.maximum(_gn_win_max, _gn_t.detach().float())
         if args.gradient_clip > 0:
             _gn_win_clipped = _gn_win_clipped + (_gn_t.detach().float() > args.gradient_clip).float()
+
+        # Per-micro grad stats; on a spike, the PRE-update weights + the step's record (before the optimizer step)
+        if micro_stats is not None:
+            _micro_rec = micro_stats.finish(step, float(_gn_t))
+            if is_main:
+                micro_stats.write(_micro_rec)
+            if spike_det is not None:
+                _spike = torch.tensor([float(is_main and spike_det.update(float(_gn_t)))], device=device)
+                if dist.is_available() and dist.is_initialized():
+                    dist.broadcast(_spike, src=0)  # one decision for every rank (the save below barriers)
+                if _spike.item() > 0:
+                    _sdir = Path(args.checkpoint_dir) / "spikes"
+                    if is_main:
+                        logger.warning("grad-norm spike at step %d: %.3f > %.1f x median %.3f — saving pre-step "
+                                       "weights to %s", step, float(_gn_t), spike_det.factor,
+                                       spike_det.last_median, _sdir)
+                        _sdir.mkdir(parents=True, exist_ok=True)
+                        (_sdir / f"step_{step:08d}.json").write_text(json.dumps(
+                            {**_micro_rec, "median": spike_det.last_median, "factor": spike_det.factor,
+                             "tokens_consumed": tokens_consumed}))
+                    save_weights_only(_sdir, step, model, tokens_consumed, rank=rank)
 
         # Per-layer gradient analysis (before optimizer step clears grads)
         if wb is not None and step % 50 == 0:
@@ -1450,6 +1497,7 @@ def train(args: argparse.Namespace) -> None:
                        "train/grad_norm_max": _gn_max_s,
                        "train/grad_clip_frac": _gn_clip_s / max(log_steps, 1),
                        "train/z_loss": avg_z_loss,
+                       **(_micro_summary(_micro_rec) if _micro_rec is not None else {}),
                        "train/muon_lr": lrs["muon_lr"],
                        "train/adamw_lr": lrs["adamw_lr"],
                        "tokens_seen": float(tokens_consumed),
@@ -2048,6 +2096,17 @@ def apply_attnres_stack_grad_chain(args: argparse.Namespace) -> bool:
     return bool(llama._STACK_GRAD_CHAIN)
 
 
+def _micro_summary(rec: dict[str, Any]) -> dict[str, float]:
+    """grad_stats.summarize, never raising (telemetry must not stop a run)."""
+    from kotodama.training.grad_stats import summarize
+
+    try:
+        return summarize(rec)
+    except (ValueError, ZeroDivisionError, KeyError) as e:
+        logger.debug("micro grad summary skipped: %s", e)
+        return {}
+
+
 def ddp_options(args: argparse.Namespace, find_unused: bool) -> dict[str, Any]:
     """DistributedDataParallel keyword options from the run flags.
 
@@ -2575,6 +2634,21 @@ def parse_args() -> argparse.Namespace:
         "--ddp_no_broadcast_buffers", action="store_true",
         help="DDP broadcast_buffers=False: skip the per-forward rank-0 broadcast of the model's constant buffers.",
     )
+    p.add_argument(
+        "--micro_grad_stats", action="store_true",
+        help="Per step, per DP rank and micro-step: the micro-batch loss and the accumulated local squared grad norm "
+             "(last micro read by a DDP comm hook before the all-reduce) -> <checkpoint_dir>/micro_grad_stats.jsonl, "
+             "plus gradstats/* telemetry. Localizes a spike to (rank, micro). One small all-gather per step.",
+    )
+    p.add_argument(
+        "--spike_capture_factor", type=float, default=0.0,
+        help="When > 1: a step whose grad norm exceeds this x the running median saves its PRE-update weights and "
+             "its micro record to <checkpoint_dir>/spikes/ (re-score the batch offline against the exact state).",
+    )
+    p.add_argument("--spike_capture_window", type=int, default=200,
+                   help="Steps in the running-median window for --spike_capture_factor.")
+    p.add_argument("--spike_capture_max", type=int, default=5,
+                   help="At most this many spike captures per run (each is a full weights-only save).")
     p.add_argument(
         "--varlen_dynamic",
         action="store_true",
