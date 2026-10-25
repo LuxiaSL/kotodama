@@ -77,3 +77,8 @@ def test_geo_monitor_sharded_default_on():
     assert _args().geo_monitor_sharded is True
     assert _args("--no_geo_monitor_sharded").geo_monitor_sharded is False
     assert _args("--config", "configs/moonshot-1b-shapeA.yaml").geo_monitor_sharded is True
+
+
+def test_no_attn_res_overrides_the_config():
+    assert _args("--config", "configs/moonshot-1b-shapeA.yaml").attn_res is True
+    assert _args("--config", "configs/moonshot-1b-shapeA.yaml", "--no_attn_res").attn_res is False

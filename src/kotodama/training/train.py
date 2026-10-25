@@ -2101,6 +2101,10 @@ def parse_args() -> argparse.Namespace:
         help="Enable Block Attention Residuals (learned depth-wise routing)",
     )
     p.add_argument(
+        "--no_attn_res", dest="attn_res", action="store_false",
+        help="Turn off AttnRes set by a config: a plain residual stack of the same shape (controls).",
+    )
+    p.add_argument(
         "--attn_res_n_blocks",
         type=int,
         default=7,
