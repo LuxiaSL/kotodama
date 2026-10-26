@@ -4,7 +4,8 @@ Prompt files live under one prompts directory (``--prompts-dir``, else ``$KOTODA
 belong in site.env). Every file is pinned by sha256, and a run refuses a file that does not match its pin, so a
 number in the record always names the exact strings it was scored on. ``capacity-v1`` can be regenerated
 (``python -m kotodama.eval.binding gen-capacity``), and the pin then checks that the regeneration is byte-identical;
-so can the ``fluid`` group (``gen-fluid``, :mod:`kotodama.eval.binding.fluid`).
+so can the ``fluid`` group (``gen-fluid``, :mod:`kotodama.eval.binding.fluid`) and ``formupdate-v1``
+(``gen-formupdate``, :mod:`kotodama.eval.binding.formupdate`).
 """
 
 from __future__ import annotations
@@ -61,6 +62,9 @@ BATTERIES: dict[str, Battery] = {b.name: b for b in (
     Battery("cryst-v1", "rows", "cryst-v1.jsonl",
             "e73e55699384eab1665b0dc7501a5f96f3ab793aeeca475bdc8089946783e5a2", "cryst",
             "crystallized control C0: facts in the fluid few-shot frame (shots 6 / 3 / 1 / 0)"),
+    Battery("formupdate-v1", "rows", "formupdate-v1.jsonl",
+            "13cd945f470335281d13d7d9ac1c8859c0237aa28cf23106ee9ad7643a09a26f", "formupdate",
+            "forming vs updating: static / update-other / update-target, paired per base item (K × U × register)"),
     Battery("bp-deixis-lite", "bindprobes", "bindprobes-deixis-lite/items.jsonl",
             "229e7ac377ff2ec5ef298ecdee5c27667f9c97d86ba2337fb5e411aac9167c3e", None,
             "bindprobes deixis-lite (0shot / 3shot)", ("deixis",), ("0shot", "3shot")),
@@ -83,6 +87,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "bindprobes": ("bp-deixis-lite", "bp-profile", "bp-v3.1", "bp-deixis-v2"),
     "scorecard": ("joinlite-v1", "swapdyn-v1", "stage5-decomp-v1", "capacity-v1"),
     "fluid": ("fluid-v1-morph", "fluid-v1-algebra", "fluid-v1-rebind", "fluid-v1-seqind", "cryst-v1"),
+    "formupdate": ("formupdate-v1",),
     "all": tuple(BATTERIES),
 }
 

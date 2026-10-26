@@ -115,7 +115,7 @@ of the model's own text and template loops, never reuse of names or objects.
 | Uncheatable BPB | `tools/run_py.sh -m kotodama.eval.uncheatable --checkpoint <ckpt> --config-section 3b --attn-res-boundaries dd3b --out <json>` (data: `--data-dir`, else `$KOTODAMA_UNCHEATABLE_DATA`, else the HF dataset; checkpoint sweeps: `--max-docs-per-domain N`) |
 | induction score | `tools/run_py.sh -m kotodama.eval.induction --checkpoint <ckpt> --config-section proxy --attn-res-boundaries ddv1 --tag <t>` |
 | NCA gates | `python -m kotodama.eval.nca_gates --checkpoint <ckpt> --eval-dir <dir> --tag <t>` · every checkpoint of a run: `tools/run_py.sh -m scripts.eval.nca_gates_sweep --ckpt-dir <run> --eval-dir <dir> --init-seed <seed>` |
-| binding suite (every battery, one model load) | `tools/run_py.sh -m kotodama.eval.binding run --model koto:<ckpt> --name <m> --batteries scorecard --out <dir>` (`hf:<path>` for public models; `list` shows batteries and groups) · scorecard: `python -m kotodama.eval.binding report --scores <dir>` · capacity size law: `python -m kotodama.eval.binding capacity --scores <dir> --params <tsv>` · fluid vs crystallized (`--batteries fluid`): `python -m kotodama.eval.binding fluid --scores <dir>` |
+| binding suite (every battery, one model load) | `tools/run_py.sh -m kotodama.eval.binding run --model koto:<ckpt> --name <m> --batteries scorecard --out <dir>` (`hf:<path>` for public models; `list` shows batteries and groups) · scorecard: `python -m kotodama.eval.binding report --scores <dir>` · capacity size law: `python -m kotodama.eval.binding capacity --scores <dir> --params <tsv>` · fluid vs crystallized (`--batteries fluid`): `python -m kotodama.eval.binding fluid --scores <dir>` · form vs update (`--batteries formupdate`): `python -m kotodama.eval.binding formupdate --scores <dir>` |
 | rider grid | `python -m kotodama.eval.riders {gen,run,aggregate}` (against a server's `/logprobs`) |
 | binding probes, core | `python -m kotodama.eval.bindprobes {gen,run,aggregate}` · deixis validity gates: `python -m kotodama.eval.bindprobes gates --grids <dir> --items items.jsonl --chance-model <m> --learn-model <m> [--pilot]` |
 | binding probes, v3 families | `python -m kotodama.eval.bindprobes gen --out <dir> --families setbind,answer,adjacency,codevarmut --verify`, then `run` / `aggregate` |
@@ -324,6 +324,12 @@ Every item also runs under few-shot conditions with exemplars.
     ladder and is read by the ladder position where accuracy falls halfway to
     chance; `fluid` z-scores fluid and crystallized ability across the models
     it is given.
+  - `formupdate-v1`: forming a binding vs updating it. Each base item binds K
+    holders to values and asks about one; three conditions differ only in the
+    U lines before the query (neutral filler, updates to other holders, or one
+    update to the queried holder). `formupdate` reads form accuracy, the
+    interference cost and the update cost, raw and normalized by headroom, with
+    paired-bootstrap intervals over base items, and the stale-value rate.
   `report` prints one scorecard row per model.
 
 Rider generation is byte-identical per seed and name pool, so banked grids stay

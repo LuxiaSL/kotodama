@@ -10,6 +10,8 @@ Readers take scored rows (``score.prompt_row`` shape) for ONE model and return p
   capacity      K50 / AUC / D=256 (:func:`kotodama.eval.binding.capacity.summarize`)
   fluid-*, cryst  per-family ladder midpoint / AUC, F3 stale-value rate, C0 accuracy by shots
                 (:func:`kotodama.eval.binding.fluid.summarize`)
+  formupdate    form acc(A), interference and update costs (raw and normalized) with paired-bootstrap intervals,
+                C's stale rate (:func:`kotodama.eval.binding.formupdate.summarize`)
 The arithmetic is that of the readers the recorded gauge numbers came from, so a suite number equals the recorded
 one for the same rows.
 """
@@ -130,9 +132,15 @@ def fluid(rows: Sequence[Row]) -> dict[str, Any]:
     return summarize(rows).as_dict()
 
 
+def formupdate(rows: Sequence[Row]) -> dict[str, Any]:
+    from kotodama.eval.binding.formupdate import summarize
+
+    return summarize(rows).as_dict()
+
+
 READERS = {"joinlite": joinlite, "swapdyn": swapdyn, "decomp": decomp, "capacity": capacity,
            "fluid-morph": fluid, "fluid-algebra": fluid, "fluid-rebind": fluid, "fluid-seqind": fluid,
-           "cryst": fluid}
+           "cryst": fluid, "formupdate": formupdate}
 
 
 def _f(x: Any, fmt: str = "{:+.3f}") -> str:

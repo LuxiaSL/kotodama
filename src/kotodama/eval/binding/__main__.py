@@ -10,6 +10,9 @@
     python -m kotodama.eval.binding gen-fluid --out DIR
     python -m kotodama.eval.binding fluid --scores binding-scores [--models a,b] [--stat midpoint|auc] [--json OUT]
     python -m kotodama.eval.binding check-fluid-tokens [--tokenizers a,b]
+    python -m kotodama.eval.binding gen-formupdate --out DIR
+    python -m kotodama.eval.binding formupdate --scores binding-scores [--models a,b] [--json OUT]
+        [--reference a,b,c --release R --anneal X]
 
 ``run`` loads the model ONCE and scores every requested battery into ``OUT/<battery>/<name>.jsonl`` (resumable).
 Prompt-row batteries are read by ``report``; bindprobes batteries by ``python -m kotodama.eval.bindprobes aggregate
@@ -65,6 +68,17 @@ def build_parser() -> argparse.ArgumentParser:
     fr.add_argument("--json", default="", help="also write per-model summaries and scores here")
     ct = sub.add_parser("check-fluid-tokens", help="check the fluid answer pools are one token in every tokenizer")
     ct.add_argument("--tokenizers", default="", help="comma list of HF tokenizer names (default: the zoo)")
+    gu = sub.add_parser("gen-formupdate", help="write the formupdate-v1 prompt rows into a directory")
+    gu.add_argument("--out", required=True)
+    fu = sub.add_parser("formupdate", help="form / interference / update costs with paired-bootstrap intervals")
+    fu.add_argument("--scores", required=True, help="a run --out directory (reads <scores>/formupdate-v1)")
+    fu.add_argument("--models", default="", help="comma list (default: every model found)")
+    fu.add_argument("--json", default="", help="also write per-model summaries (and predictions) here")
+    fu.add_argument("--boot", type=int, default=10_000, help="bootstrap resamples")
+    fu.add_argument("--reference", default="", help="comma list: the reference set for the predictions")
+    fu.add_argument("--release", default="", help="the release model compared against the reference set")
+    fu.add_argument("--anneal", default="", help="the checkpoint whose normalized update cost is compared to the "
+                                                 "release's")
     return ap
 
 
@@ -272,6 +286,80 @@ def cmd_check_fluid_tokens(a: argparse.Namespace) -> int:
     return 0 if not bad else 1
 
 
+def cmd_gen_formupdate(a: argparse.Namespace) -> int:
+    from kotodama.eval.binding import formupdate as fu
+
+    rows = fu.generate()
+    bad = fu.audit_failures(fu.audit(rows)) + fu.pairing_failures(rows)
+    b = bt.BATTERIES[fu.BATTERY]
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    dest = out / b.file
+    dest.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    got = bt.sha256(dest)
+    same = got == b.sha256
+    print(f"{b.name} {len(rows)} rows → {dest}; sha256 {got} {'= pin' if same else f'≠ pin {b.sha256[:16]}…'}"
+          f"{'' if not bad else '; AUDIT: ' + '; '.join(bad)}")
+    return 0 if same and not bad else 1
+
+
+def _ci(s: Any, stat: str) -> str:
+    ci = s.ci[stat]["ci"]
+    x = s.point[stat]
+    return f"{_fmt(x, '{:+.3f}')} [{_fmt(ci[0] if ci else None, '{:+.3f}')}, {_fmt(ci[1] if ci else None, '{:+.3f}')}]"
+
+
+def cmd_formupdate(a: argparse.Namespace) -> int:
+    from kotodama.eval.binding import formupdate as fu
+
+    root = Path(a.scores) / fu.BATTERY
+    names = [m for m in a.models.split(",") if m] or sorted(p.stem for p in root.glob("*.jsonl"))
+    sums: dict[str, fu.Summary] = {}
+    for m in names:
+        f = root / f"{m}.jsonl"
+        rows = read_jsonl(f) if f.exists() else []
+        if rows:
+            sums[m] = fu.summarize(rows, n_boot=a.boot)
+    if not sums:
+        print(f"no {fu.BATTERY} rows under {root}")
+        return 1
+    print(f"{'model':28} {'form [95% CI]':>24} {'interference':>24} {'update':>24} {'norm interf.':>24} "
+          f"{'norm update':>24} {'stale':>6} {'stale/err':>9} {'upd C≠last':>24}")
+    for m, s in sums.items():
+        st = s.pooled
+        print(f"{m:28} {_ci(s, 'form'):>24} {_ci(s, 'interference'):>24} {_ci(s, 'update'):>24} "
+              f"{_ci(s, 'norm_interference'):>24} {_ci(s, 'norm_update'):>24} {_fmt(st['stale_rate']):>6} "
+              f"{_fmt(st['stale_of_errors']):>9} {_ci(s, 'update_nonrecent'):>24}"
+              f"{'' if not s.incomplete else f'  ({s.incomplete} incomplete base items left out)'}")
+    print("\nacc A / B / C by K, U, register:")
+    for m, s in sums.items():
+        parts = [f"K{k} " + "/".join(f"{x['acc'][c]:.2f}" for c in fu.CONDITIONS) for k, x in s.by_k.items() if x["n"]]
+        parts += [f"U{u} " + "/".join(f"{x['acc'][c]:.2f}" for c in fu.CONDITIONS) for u, x in s.by_u.items()
+                  if x["n"]]
+        parts += [f"{r} " + "/".join(f"{x['acc'][c]:.2f}" for c in fu.CONDITIONS) for r, x in s.by_register.items()
+                  if x["n"]]
+        print(f"{m:28} " + "  ".join(parts))
+    preds = None
+    if a.reference or a.release or a.anneal:
+        if not (a.reference and a.release and a.anneal):
+            print("predictions need all of --reference, --release and --anneal")
+            return 1
+        preds = fu.predictions(sums, [x for x in a.reference.split(",") if x], a.release, a.anneal)
+        print(f"\npredictions (release {a.release}, anneal {a.anneal}; reference {a.reference}):")
+        for p in ("P1", "P2", "P3"):
+            d = preds[p]
+            print(f"  {p} {d['stat']:32} release {_fmt(d['release'], '{:+.3f}')} {d['op']} median "
+                  f"{_fmt(d['median'], '{:+.3f}')} → {d['holds']}"
+                  f"{'' if not d['undefined'] else '  (undefined: ' + ','.join(d['undefined']) + ')'}")
+        d = preds["P4"]
+        print(f"  P4 {d['stat']:32} anneal {_fmt(d['anneal'], '{:+.3f}')} < release {_fmt(d['release'], '{:+.3f}')}"
+              f" → {d['holds']}")
+    if a.json:
+        Path(a.json).write_text(json.dumps({"summaries": {m: s.as_dict() for m, s in sums.items()},
+                                            "predictions": preds}, indent=1, default=str))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     a = build_parser().parse_args(argv)
@@ -282,7 +370,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     return {"run": cmd_run, "report": cmd_report, "capacity": cmd_capacity,
             "gen-capacity": cmd_gen_capacity, "gen-fluid": cmd_gen_fluid, "fluid": cmd_fluid,
-            "check-fluid-tokens": cmd_check_fluid_tokens}[a.cmd](a)
+            "check-fluid-tokens": cmd_check_fluid_tokens, "gen-formupdate": cmd_gen_formupdate,
+            "formupdate": cmd_formupdate}[a.cmd](a)
 
 
 if __name__ == "__main__":
