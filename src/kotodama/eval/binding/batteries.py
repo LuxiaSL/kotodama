@@ -63,7 +63,7 @@ BATTERIES: dict[str, Battery] = {b.name: b for b in (
             "e73e55699384eab1665b0dc7501a5f96f3ab793aeeca475bdc8089946783e5a2", "cryst",
             "crystallized control C0: facts in the fluid few-shot frame (shots 6 / 3 / 1 / 0)"),
     Battery("formupdate-v1", "rows", "formupdate-v1.jsonl",
-            "13cd945f470335281d13d7d9ac1c8859c0237aa28cf23106ee9ad7643a09a26f", "formupdate",
+            "7222046c4c63a4eca769212c6cca327eb64401d4909db58e675dc16a31a17d1f", "formupdate",
             "forming vs updating: static / update-other / update-target, paired per base item (K × U × register)"),
     Battery("bp-deixis-lite", "bindprobes", "bindprobes-deixis-lite/items.jsonl",
             "229e7ac377ff2ec5ef298ecdee5c27667f9c97d86ba2337fb5e411aac9167c3e", None,

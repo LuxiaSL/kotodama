@@ -6,7 +6,7 @@ battery separates the three with a paired design. A **base item** is K holders, 
 lines, then a query about one holder Q. Three conditions are derived from each base item and share its holders, its
 initial values, its query, its candidate layout and its line count; only the U lines differ:
 
-  A  static          U neutral lines with no holder and no value (templated filler). Gold = Q's initial value.
+  A  static          U event lines that name no holder and no value. Gold = Q's initial value.
   B  update-other    U updates, all to holders other than Q. Gold = Q's initial value.
   C  update-target   U updates; exactly one updates Q, at a scheduled position among the U lines (the others are B's
                      lines unchanged, so B and C differ in that one line). Gold = Q's new value; Q's initial value is
@@ -31,9 +31,10 @@ Choices left open, fixed here:
   - B's U updates go to the other holders in shuffled rounds (no holder twice in a row while another is free), so a
     holder is updated more than once only when U > K − 1. An update empties the holder before the new value goes in
     and never names the old value, so every value in a prompt is mentioned exactly once.
-  - A's neutral lines are the capacity battery's filler sentences (``kotodama.eval.binding.capacity``), minus any
-    phrase containing a holder or value word, distinct within a prompt: prose ``The quiet river runs past the
-    town.``; code, the same words as a comment (``# the quiet river runs past the town``).
+  - A's lines are events in the update family that bind nothing: prose ``Then the lights are switched off.``; code a
+    neutral statement such as ``step += 1``. Distinct within a prompt, drawn from a stream seeded by the base item
+    alone, so the B and C rows do not depend on them. (Neutral descriptive sentences or comments as A's lines
+    distract more than updates to other holders do, so A would not measure holding a binding.)
   - K = 2 has one other holder, so "three other holders' current values" cannot be met: its two remaining
     candidates are values shown in none of the three prompts (role ``absent``), the same two in A, B and C.
   - candidate layout: per cell, the (Q initial, Q new) slot pair cycles through the 20 ordered pairs of distinct
@@ -44,7 +45,7 @@ Choices left open, fixed here:
   - roles: ``gold``; ``stale`` (C) or ``q_unshown`` (A, B); ``other_current`` (a holder's value from its binding
     line) or ``other_updated`` (a holder's value from an update line); ``absent`` (K = 2).
   - bootstrap: resamples base items with replacement WITHIN each (K, U, register) cell (the grid is designed, not
-    sampled), 10,000 resamples, seed 0; percentile 95% intervals. A resample whose acc(A) ≤ chance has no normalized
+    sampled), 10,000 resamples, seed 0; percentile 95% intervals. A resample whose acc(B) ≤ chance has no normalized
     cost and is left out of that statistic's interval (the count is reported).
 
 Shortcut controls (recorded per row; :func:`audit`, :func:`audit_failures`):
@@ -68,7 +69,8 @@ Read-out (:func:`summarize`), per model, paired within base item:
   form              acc(A)
   interference cost acc(A) − acc(B)
   update cost       acc(B) − acc(C)
-  normalized        cost / (acc(A) − chance)
+  normalized        on the recency-matched items (C's gold not the last mention): cost / (acc(B) − chance), B
+                    being the matched baseline of the update contrast
   stale rate        C rows that pick the stale value, overall and as a share of C's errors, by K / U / register
   breakdowns        the same statistics per K, per U, per register and per cell
   intervals         paired bootstrap (above) for form, both costs, both normalized costs, normalized update −
@@ -80,6 +82,7 @@ reference set of models; membership is passed in, not built in.
 from __future__ import annotations
 
 import random
+import re
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -116,7 +119,7 @@ def _clean(phrases: Sequence[str]) -> tuple[str, ...]:
     return tuple(p for p in phrases if not set(p.split()) & banned)
 
 
-# The capacity battery's filler vocabulary, minus phrases that name a holder or a value ("the edge of the map").
+# The capacity battery's filler vocabulary (minus holder / value words): its draw holds the generator stream's order.
 FILLER_ADJ: tuple[str, ...] = _clean(cap._ADJ)
 FILLER_NOUN: tuple[str, ...] = _clean(cap._NOUN)
 FILLER_VERB: tuple[str, ...] = _clean(cap._VERB)
@@ -165,6 +168,34 @@ def _targets(rng: random.Random, others: Sequence[str], u: int) -> list[str]:
             r.append(r.pop(0))
         out.extend(r)
     return out[:u]
+
+
+# A's U lines: events in the update family that name no holder and no value (a sentence in prose, a statement in code).
+_PROSE_EVENTS: tuple[str, ...] = (
+    "Then the lights are switched off.", "Then the door is closed.", "Then the window is opened.",
+    "Then the kettle is switched on.", "Then the curtains are drawn.", "Then the fan is turned off.",
+    "Then the music stops.", "Then the rain begins.", "Then the alarm goes quiet.", "Then the tap is turned off.")
+_CODE_EVENTS: tuple[str, ...] = (
+    "step += 1", "count = count + 1", "done = False", "flag = True", "n = n * 2", "i += 1", "total = 0",
+    "ready = True", "retries = 3", "mode = 1")
+
+
+def _event_ok(line: str) -> bool:
+    words = set(re.findall(r"[a-z]+", line.lower()))
+    return not words & (set(HOLDERS) | set(VALUES))
+
+
+PROSE_EVENTS: tuple[str, ...] = tuple(e for e in _PROSE_EVENTS if _event_ok(e))
+CODE_EVENTS: tuple[str, ...] = tuple(e for e in _CODE_EVENTS if _event_ok(e))
+
+
+def _events_for(register: str, base_id: str, u: int) -> tuple[str, ...]:
+    """A's U event lines, distinct within a prompt, from their own seeded stream (so B and C rows do not depend on
+    them)."""
+    pool = PROSE_EVENTS if register == "prose" else CODE_EVENTS
+    if len(pool) < u:
+        raise ValueError(f"{len(pool)} {register} events for U = {u}")
+    return tuple(random.Random(f"{base_id}:events").sample(pool, u))
 
 
 def _fillers(rng: random.Random, u: int) -> list[str]:
@@ -216,10 +247,10 @@ def render(register: str, events: Sequence[tuple[str, Optional[str], Optional[st
             elif kind == "update":
                 parts.append(f"Then the {h} is emptied and the {v} is put in it.")
             else:
-                parts.append(f"The {h}.")
+                parts.append(str(h))
         return " ".join(parts) + f" In the end, the {q} holds the"
     if register == "code":
-        lines = [f"{h} = {v}" if kind != "filler" else f"# the {h}" for kind, h, v in events]
+        lines = [f"{h} = {v}" if kind != "filler" else str(h) for kind, h, v in events]
         return "\n".join(lines) + f"\nassert {q} =="
     raise ValueError(f"unknown register {register!r} (prose | code)")
 
@@ -246,8 +277,10 @@ def _make_base(k: int, u: int, register: str, b: int, s: _CellSchedule) -> BaseI
     layout: list[tuple[str, str]] = []
     for slot in range(N_CANDIDATES):
         layout.append(("q", "initial") if slot == first else ("q", "new") if slot == second else rest.pop(0))
-    return BaseItem(f"{VERSION}|{cell}|b{b:02d}", k, u, register, q, tuple(order), initial, v1, updates,
-                    s.q_update[b], tuple(_fillers(rng, u)), tuple(layout))
+    base_id = f"{VERSION}|{cell}|b{b:02d}"
+    _fillers(rng, u)                        # the stream's last draw, kept so every earlier draw stays where it was
+    return BaseItem(base_id, k, u, register, q, tuple(order), initial, v1, updates,
+                    s.q_update[b], _events_for(register, base_id, u), tuple(layout))
 
 
 def _row(item: BaseItem, cond: Condition) -> Row:
@@ -448,7 +481,7 @@ def _stats(items: Sequence[_Item]) -> dict[str, Any]:
     if not n:
         return {"n": 0}
     acc = {c: sum(it.ok[i] for it in items) / n for i, c in enumerate(CONDITIONS)}
-    head = acc["A"] - CHANCE
+    head = acc["B"] - CHANCE
     inter, upd = acc["A"] - acc["B"], acc["B"] - acc["C"]
     c_wrong = sum(not it.ok[2] for it in items)
     stale = sum(it.stale for it in items)
@@ -463,11 +496,14 @@ BOOT_STATS: tuple[str, ...] = ("form", "interference", "update", "norm_interfere
 _BASE = 1 << 12                            # one digit per counter: holds any count up to the number of base items
 
 
-def _counts_stats(a: int, b: int, c: int, n: int, sb: int, sc: int, sn: int) -> dict[str, Optional[float]]:
+def _counts_stats(a: int, b: int, c: int, n: int, sb: int, sc: int, sn: int,
+                  sa: int) -> dict[str, Optional[float]]:
     acc_a, acc_b, acc_c = a / n, b / n, c / n
-    head = acc_a - CHANCE
-    ni = (acc_a - acc_b) / head if head > 0 else None
-    nu = (acc_b - acc_c) / head if head > 0 else None
+    # The normalized costs are read on the recency-matched items (C's gold not the last mention), against B's
+    # headroom there: B is the matched baseline of the update contrast.
+    head = sb / sn - CHANCE if sn else 0.0
+    ni = (sa - sb) / sn / head if head > 0 else None
+    nu = (sb - sc) / sn / head if head > 0 else None
     return {"form": acc_a, "interference": acc_a - acc_b, "update": acc_b - acc_c, "norm_interference": ni,
             "norm_update": nu, "norm_update_minus_interference": (nu - ni) if nu is not None and ni is not None
             else None, "update_nonrecent": (sb - sc) / sn if sn else None}
@@ -485,7 +521,8 @@ def bootstrap(items: Sequence[_Item], n_boot: int = BOOT, seed: int = BOOT_SEED)
         sub = not it.c_recent
         # digits: A, B, C, recency-matched flag, B and C on recency-matched items
         code = (it.ok[0] + it.ok[1] * _BASE + it.ok[2] * _BASE ** 2 + sub * _BASE ** 3
-                + (sub and it.ok[1]) * _BASE ** 4 + (sub and it.ok[2]) * _BASE ** 5)
+                + (sub and it.ok[1]) * _BASE ** 4 + (sub and it.ok[2]) * _BASE ** 5
+                + (sub and it.ok[0]) * _BASE ** 6)
         by[it.cell].append(code)
     cells = [by[k] for k in sorted(by)]
     n = len(items)
@@ -495,8 +532,8 @@ def bootstrap(items: Sequence[_Item], n_boot: int = BOOT, seed: int = BOOT_SEED)
         tot = 0
         for codes in cells:
             tot += sum(rng.choices(codes, k=len(codes)))
-        d = [(tot // _BASE ** i) % _BASE for i in range(6)]
-        for s, v in _counts_stats(d[0], d[1], d[2], n, d[4], d[5], d[3]).items():
+        d = [(tot // _BASE ** i) % _BASE for i in range(7)]
+        for s, v in _counts_stats(d[0], d[1], d[2], n, d[4], d[5], d[3], d[6]).items():
             if v is not None:
                 draws[s].append(v)
     out: dict[str, dict[str, Any]] = {}
@@ -570,7 +607,7 @@ def summarize(rows: Sequence[Mapping[str, Any]], n_boot: int = BOOT, seed: int =
     sub = [it for it in items if not it.c_recent]
     point = _counts_stats(sum(it.ok[0] for it in items), sum(it.ok[1] for it in items),
                           sum(it.ok[2] for it in items), len(items), sum(it.ok[1] for it in sub),
-                          sum(it.ok[2] for it in sub), len(sub))
+                          sum(it.ok[2] for it in sub), len(sub), sum(it.ok[0] for it in sub))
     s = Summary(model=str(rows[0].get("model", "?")), n_items=len(items), n_rows=len(rows), incomplete=incomplete,
                 multi_token_rows=sum(bool(r.get("multi_token")) for r in rows), pooled=pooled,
                 ci=bootstrap(items, n_boot, seed), point=point,
@@ -604,7 +641,7 @@ def _cmp(x: Optional[float], ref: Optional[float], op: Literal[">=", ">", "<"]) 
 def predictions(summaries: Mapping[str, Summary], reference: Sequence[str], release: str,
                 anneal: str) -> dict[str, Any]:
     """Four comparisons on point estimates (intervals carried beside them), ``holds`` None where a normalized cost
-    is undefined (acc(A) ≤ chance) for a model the comparison needs:
+    is undefined (acc(B) ≤ chance) for a model the comparison needs:
 
       P1  the release's form acc(A) ≥ the reference set's median form
       P2  the release's normalized update cost > the reference set's median normalized update cost

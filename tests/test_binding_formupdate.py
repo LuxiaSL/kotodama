@@ -94,7 +94,7 @@ def _replay(r: dict[str, Any]) -> tuple[list[tuple[str, Optional[str], Optional[
         *lines, q = r["prompt"].split("\n")
         seen: set[str] = set()
         for x in lines:
-            if x.startswith("# the "):
+            if x in fu.CODE_EVENTS:
                 out.append(("filler", None, None))
                 continue
             h, v = x.split(" = ")
@@ -108,7 +108,7 @@ def _replay(r: dict[str, Any]) -> tuple[list[tuple[str, Optional[str], Optional[
         elif m := re.fullmatch(r"\s*Then the (\w+) is emptied and the (\w+) is put in it\.", sent):
             out.append(("update", *m.groups()))
         else:
-            assert re.fullmatch(r"\s*The [a-z ]+\.", sent), sent
+            assert sent.strip() in fu.PROSE_EVENTS, sent
             out.append(("filler", None, None))
     return out, q.removesuffix(" holds the")
 
@@ -277,9 +277,16 @@ def test_reader_recovers_known_costs(full):
     assert s.n_items == 720 and s.incomplete == 0 and s.n_rows == 2160
     assert p["acc"] == pytest.approx({"A": 1.0, "B": 0.8, "C": 0.5})
     assert p["form"] == 1.0 and p["interference"] == pytest.approx(0.2) and p["update"] == pytest.approx(0.3)
-    assert p["norm_interference"] == pytest.approx(0.2 / 0.8) and p["norm_update"] == pytest.approx(0.3 / 0.8)
+    # pooled: every item, normalized by B's headroom
+    assert p["norm_interference"] == pytest.approx(0.2 / 0.6) and p["norm_update"] == pytest.approx(0.3 / 0.6)
     assert p["stale_rate"] == pytest.approx(0.3) and p["stale_of_errors"] == pytest.approx(0.6)
-    assert s.point["norm_update_minus_interference"] == pytest.approx(0.1 / 0.8)
+    # point (the predictions' statistics): the recency-matched items, normalized by their B headroom
+    acc = s.recency_split["c_gold_not_last"]["acc"]
+    head = acc["B"] - fu.CHANCE
+    assert s.point["norm_update"] == pytest.approx((acc["B"] - acc["C"]) / head)
+    assert s.point["norm_interference"] == pytest.approx((acc["A"] - acc["B"]) / head)
+    assert s.point["norm_update_minus_interference"] == pytest.approx(
+        (acc["B"] - acc["C"]) / head - (acc["A"] - acc["B"]) / head)
     for part in (s.by_k, s.by_u, s.by_register, s.by_cell):
         for x in part.values():
             assert x["update"] == pytest.approx(0.3) and x["interference"] == pytest.approx(0.2)
@@ -411,3 +418,13 @@ def test_formupdate_cli_reads_scores_and_predictions(tmp_path, full, capsys):
     assert cli_main(["formupdate", "--scores", str(tmp_path / "scores"), "--boot", "50", "--release", "rel"]) == 1
     assert cli_main(["formupdate", "--scores", str(tmp_path / "empty")]) == 1
     assert cli_main(["report", "--scores", str(tmp_path / "scores")]) == 0       # the scorecard tolerates them
+
+
+def test_a_events_name_nothing_and_stay_out_of_b_and_c(full):
+    assert len(fu.PROSE_EVENTS) >= max(fu.U_GRID) and len(fu.CODE_EVENTS) >= max(fu.U_GRID)
+    events = fu.PROSE_EVENTS + fu.CODE_EVENTS
+    for r in full:
+        if r["condition"] == "A":
+            assert sum(e in r["prompt"] for e in events) == r["U"]
+        else:
+            assert not any(e in r["prompt"] for e in events)
