@@ -6,7 +6,7 @@ so two source trees can be compared bitwise.
   tools/run_py.sh scripts/benchmark/attnres_stack_grad.py --save /dev/shm/x/new.pt          # time + save grads
   tools/run_py.sh scripts/benchmark/attnres_stack_grad.py --compare /dev/shm/x/old.pt /dev/shm/x/new.pt
 
-`--src <tree>/src` imports the kernels from another checkout (the reference). Default (S, k) pairs are the moonshot
+`--src <tree>/src` imports the kernels from another checkout (the reference). Default (S, k) pairs are the tsumugi
 Shape A blocks: stack depth S with k routes per block.
 """
 

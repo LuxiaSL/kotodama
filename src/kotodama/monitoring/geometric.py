@@ -103,7 +103,7 @@ class MonitorConfig:
     tier2_every: int = 5000
 
     # Memory hygiene around probes. torch.cuda.empty_cache() hands the caching allocator's blocks back to the driver,
-    # and the next training steps then re-cudaMalloc them (on the 1B moonshot the steps after each probe point ran
+    # and the next training steps then re-cudaMalloc them (on the 1B tsumugi the steps after each probe point ran
     # ~5-15% slower). So a probe releases the cache only when the device is short of free memory.
     release_cache_below_gb: float = 8.0
     # The sharpness probe snapshots the weights it perturbs: on the GPU when that much memory is free (fast), else on

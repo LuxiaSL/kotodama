@@ -33,7 +33,7 @@ STEER_ALIAS_TABLE: tuple[tuple[str, str, float, str], ...] = (
      "Repetition dial. NEGATIVE values (try -0.05) suppress loops and repeated phrases; positive values cause looping (entertaining, not useful)."),
     ("v7-entropy", "V7_s20", 0.05,
      "Word-choice looseness. Positive = more surprising, exploratory phrasing; negative = more focused and predictable. Small doses (±0.03-0.05)."),
-    # kotodama-tsumugi (1b-moonshot-loop): the same two dials, built at effective layer 29 (scripts/steer/build_egv.py).
+    # kotodama-tsumugi (1b-tsumugi): the same two dials, built at effective layer 29 (scripts/steer/build_egv.py).
     ("vrep", "Vrepperp_s58", -0.05,
      "Repetition dial. The default (-0.05) suppresses loops and repeated phrases with entropy held flat; positive values cause looping."),
     ("v7-entropy", "V7_s58", 0.05,

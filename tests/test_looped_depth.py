@@ -145,20 +145,20 @@ def test_preset_1b_deep_loopfit():
     assert c["loop_times"] == 2 and c["attn_res_boundaries"] == list(b)
 
 
-def test_preset_1b_moonshot_loop():
-    """1b-moonshot-loop (configs/moonshot-1b-shapeA.yaml): 52 unique (1b-deep's budget), 72 effective, the loop = the CF52_FIT long block 19–38 x2,
+def test_preset_1b_tsumugi():
+    """1b-tsumugi (configs/tsumugi-1b.yaml): 52 unique (1b-deep's budget), 72 effective, the loop = the CF52_FIT long block 19–38 x2,
     a block boundary at every pass start and at the coda."""
-    s, d = presets.shape("1b-moonshot-loop"), presets.shape("1b-deep")
+    s, d = presets.shape("1b-tsumugi"), presets.shape("1b-deep")
     for k in ("hidden_size", "num_attention_heads", "num_kv_heads", "head_dim", "intermediate_size"):
         assert s[k] == d[k], k
     cfg = KotodamaModelConfig(**s)
     assert cfg.num_layers == 72 and cfg.num_unique_layers == 52
-    b = presets.DEFAULT_BOUNDARIES["1b-moonshot-loop"]
-    assert b == presets.MOONSHOT_LOOP
+    b = presets.DEFAULT_BOUNDARIES["1b-tsumugi"]
+    assert b == presets.TSUMUGI_LOOP
     starts = [s["loop_start"] + k * s["loop_len"] for k in range(s["loop_times"])]
     coda = s["loop_start"] + s["loop_len"] * s["loop_times"]
     assert all(x in b for x in starts) and coda in b
     assert abs(cfg.param_count() - KotodamaModelConfig(**d).param_count()) / KotodamaModelConfig(**d).param_count() < 0.01
     from kotodama.serve import server
-    c = server.MODEL_CONFIGS["1b-moonshot-loop"]
+    c = server.MODEL_CONFIGS["1b-tsumugi"]
     assert c["num_layers"] == 72 and c["attn_res_boundaries"] == list(b)

@@ -45,7 +45,7 @@ QK-norm, tied embeddings, z-loss weight) is a `KotodamaModelConfig` default in
 | `1b-deep` | 52 | 1536 | the `1b` parameter budget spent on depth |
 | `1b-deep-loop` | 52 from 28 unique | 1536 | 12-layer core run 3× |
 | `1b-deep-loopfit` | 52 from 42 unique | 1536 | 10-layer core run 2×; boundaries `CF52_FIT` |
-| `1b-moonshot-loop` | 72 from 52 unique | 1536 | 20-layer core run 2×; boundaries `MOONSHOT_LOOP` |
+| `1b-tsumugi` | 72 from 52 unique | 1536 | 20-layer core run 2×; boundaries `TSUMUGI_LOOP` |
 | `intermediate`, `proxy`, `smoke` | 28 / 28 / 4 | 1024 / 512 / 256 | small-scale and test shapes |
 
 ## Setup
@@ -83,7 +83,7 @@ single-process job inside the launcher environment.
 | task | command |
 |---|---|
 | pretrain (NCA, language, CPT) | `tools/run_train.sh --config configs/<run>.yaml [--flag value ...]` (torchrun over `KOTODAMA_NPROC` GPUs, default 8) |
-| 1B trunk | `tools/run_train.sh --config configs/moonshot-1b-shapeA.yaml --global_batch_tokens 2097152 --data_path <train.bin> --mix_data_path <mix.bin> --checkpoint_dir <dir>` |
+| 1B trunk | `tools/run_train.sh --config configs/tsumugi-1b.yaml --global_batch_tokens 2097152 --data_path <train.bin> --mix_data_path <mix.bin> --checkpoint_dir <dir>` |
 | cooldown branch at anchor step S | copy `<dir>/anchors/step_<S>.pt` (8-digit step) into a fresh `--checkpoint_dir` and launch there with `--total_steps S+1+K --decay_start_pct (S+1)/(S+1+K) --save_schedule 1B:end --anchor_tokens ""` |
 | in-loop evals | add `--inloop_evals riders,induction` to a train launch |
 
@@ -174,7 +174,7 @@ effective values; it is regenerated on purpose with
   (`1b` shape, DD-3B boundaries, 30B tokens; the `-deep*` arms use the 52-layer
   shapes), NCA-phase arms extend `ladder-a1-nca.yaml`, and `ladder-cf-*` are
   no-AttnRes counterfactuals for boundary fitting.
-- **`moonshot-1b-shapeA.yaml`** runs the `1b-moonshot-loop` shape as a
+- **`tsumugi-1b.yaml`** runs the `1b-tsumugi` shape as a
   constant-LR trunk with anchors (see [Trunk and cooldown branches](#trunk-and-cooldown-branches)).
 - **`canary-7b*`, `bench-7b-profile`, `soak-7b`** are 7B throughput configs
   (canaries: `tools/run_canary.sh 7b`); their uniform AttnRes blocks are a
@@ -194,7 +194,7 @@ archived algorithm that produced DD-3B, kept verbatim and pinned by a test.
 `scripts/eval/fit_boundaries.py` fits every snapshot of a no-AttnRes run on
 held-out language text and declares a fit settled at the first snapshot after
 which its cuts never change. The resulting tuples (`DD3B`, `DDV1`,
-`DD3B_DEEP52`, `CF52_FIT`, `MOONSHOT_LOOP`) are named in `presets.py`.
+`DD3B_DEEP52`, `CF52_FIT`, `TSUMUGI_LOOP`) are named in `presets.py`.
 
 ### Looped depth
 

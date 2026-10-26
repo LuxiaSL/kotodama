@@ -1,4 +1,4 @@
-"""DecodeEngine on a LOOPED model (1b-moonshot-loop shape, tiny): the static-cache decode step, the eager
+"""DecodeEngine on a LOOPED model (1b-tsumugi shape, tiny): the static-cache decode step, the eager
 reference prefill and the block prefill must reproduce the full no-cache forward.
 
 Looped repeats alias their core's attn/FFN, but each effective position keeps its own KV cache, pre-norms and
@@ -19,8 +19,8 @@ from torch.nn.attention import SDPBackend
 from kotodama.model.decode_engine import DecodeEngine
 from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
-# Moonshot geometry in miniature: prelude 0-2, a 3-layer core run 2x (3-8), coda 9-10; a boundary at each pass
-# start and at the coda (cf. presets.MOONSHOT_LOOP).
+# tsumugi geometry in miniature: prelude 0-2, a 3-layer core run 2x (3-8), coda 9-10; a boundary at each pass
+# start and at the coda (cf. presets.TSUMUGI_LOOP).
 CFG = dict(hidden_size=64, num_layers=11, num_attention_heads=4, num_kv_heads=2, head_dim=16,
            intermediate_size=128, vocab_size=211, max_position_embeddings=128, rope_theta=10000.0,
            qk_norm=True, tie_word_embeddings=True, attn_impl="sdpa", use_liger=False,

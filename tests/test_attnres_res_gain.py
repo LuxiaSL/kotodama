@@ -87,4 +87,4 @@ def _args(*extra: str):
 def test_flag_parses_and_defaults():
     assert _args().attnres_res_gain == "learned"
     assert _args("--attnres_res_gain", "folded").attnres_res_gain == "folded"
-    assert _args("--config", "configs/moonshot-1b-shapeA.yaml").attnres_res_gain == "learned"  # trunk lineage
+    assert _args("--config", "configs/tsumugi-1b.yaml").attnres_res_gain == "learned"  # trunk lineage

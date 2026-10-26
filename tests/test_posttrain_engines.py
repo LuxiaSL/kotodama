@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from kotodama import presets
 from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 
-# Moonshot geometry in miniature (cf. tests/test_decode_engine_looped.py), at the SmolLM2 vocab so the real
+# tsumugi geometry in miniature (cf. tests/test_decode_engine_looped.py), at the SmolLM2 vocab so the real
 # tokenizer's ids fit.
 TINY = dict(hidden_size=32, num_layers=7, num_attention_heads=2, num_kv_heads=1, head_dim=16, intermediate_size=64,
             vocab_size=49152, max_position_embeddings=512, loop_start=2, loop_len=2, loop_times=2)
@@ -178,7 +178,7 @@ def test_posttrain_configs_parse(name: str, module: str) -> None:
     req = ["--checkpoint", "c.pt", "--out_dir", "o"] + (
         ["--train_jsonl", "t.jsonl"] if module == "sft" else ["--data", "d.jsonl"])
     a = mod.parse_args(["--config", str(cfg)] + req)
-    assert a.model_size == "1b-moonshot-loop" and not a.attnres_eps_fp64_compat
+    assert a.model_size == "1b-tsumugi" and not a.attnres_eps_fp64_compat
     assert a.attn_res_boundaries == "0,1,7,9,17,19,39,59"
 
 

@@ -1,4 +1,4 @@
-"""AttnRes Phase-1 micro-bench + parity at a model's per-sublayer routing shapes (default: the moonshot).
+"""AttnRes Phase-1 micro-bench + parity at a model's per-sublayer routing shapes (default: the tsumugi).
 
 The per-sublayer path calls Phase 1 with one query over the committed block stack; the stack depth S at each call
 follows the AttnRes block layout. This times the forward and each backward variant at every S the model meets
@@ -12,7 +12,7 @@ output / lse / rms / logits parity of online vs default next to the default's re
 Backward variants: v1 (default), v2 (KOTODAMA_P1_BWD_V2: D-chunked, single bf16 round like v1), torch
 (KOTODAMA_P1_BWD_TORCH: einsum; sums its terms in bf16).
 
-Run on a GPU host: tools/run_py.sh scripts/benchmark/attnres_p1_bench.py [--model_size 1b-moonshot-loop] [--mb 8]
+Run on a GPU host: tools/run_py.sh scripts/benchmark/attnres_p1_bench.py [--model_size 1b-tsumugi] [--mb 8]
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def timed(fn, iters: int) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model_size", default="1b-moonshot-loop")
+    ap.add_argument("--model_size", default="1b-tsumugi")
     ap.add_argument("--mb", type=int, default=8)
     ap.add_argument("--seq", type=int, default=4096)
     ap.add_argument("--iters", type=int, default=10)

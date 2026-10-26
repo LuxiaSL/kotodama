@@ -43,7 +43,7 @@ WRITE_ENV = "KOTODAMA_WRITE_ANAMNESIS_REGISTRY"
 
 MODELS: dict[str, dict[str, str]] = {
     "kotodama-tsumugi-1b": dict(
-        shape="1b-moonshot-loop",
+        shape="1b-tsumugi",
         law="base",
         torch_dtype="bfloat16",
         calibration_dir="calibration/kotodama_tsumugi_1b",

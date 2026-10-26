@@ -14,7 +14,7 @@ each completion offline on a local copy of the model:
 
 Usage (node, 1 GPU, server already up):
   tools/run_py.sh scripts/steer/egv_ladder.py --url http://localhost:2352 --npz egv.npz --ckpt <pt> \
-      --config-section 1b-moonshot-loop --boundaries 0,1,7,9,17,19,39,59 --rope-fp32 --sites 29,49 --out dir/
+      --config-section 1b-tsumugi --boundaries 0,1,7,9,17,19,39,59 --rope-fp32 --sites 29,49 --out dir/
 """
 
 from __future__ import annotations
@@ -152,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--url", default="http://localhost:2352")
     ap.add_argument("--npz", type=Path, required=True)
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--config-section", default="1b-moonshot-loop")
+    ap.add_argument("--config-section", default="1b-tsumugi")
     ap.add_argument("--boundaries", default=None)
     ap.add_argument("--rope-fp32", action="store_true")
     ap.add_argument("--sites", required=True)

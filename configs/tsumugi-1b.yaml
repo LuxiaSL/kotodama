@@ -1,10 +1,10 @@
-# The 1B MOONSHOT trunk — Shape A: 1b-deep's 52 unique layers (~1.42B) with the boundary-fitted
-# long block (19–38) run 2x → 72 effective layers, loop-aligned AttnRes boundaries (presets.MOONSHOT_LOOP), the A0
+# The 1B kotodama-tsumugi trunk — Shape A: 1b-deep's 52 unique layers (~1.42B) with the boundary-fitted
+# long block (19–38) run 2x → 72 effective layers, loop-aligned AttnRes boundaries (presets.TSUMUGI_LOOP), the A0
 # recipe (Muon 0.04, 2M-token batch, 4K ctx), rdlg2 mixed as one extra source at its natural share (~0.67%, no window).
 # The TRUNK NEVER DECAYS (WSD): constant LR to the token ceiling; cooldowns are branches forked from the anchors.
 #
 # Launch (8 GPUs; pass --global_batch_tokens on the CLI too so the scheduler telemetry derives the tokens axis):
-#   tools/run_train.sh --config configs/moonshot-1b-shapeA.yaml --global_batch_tokens 2097152 \
+#   tools/run_train.sh --config configs/tsumugi-1b.yaml --global_batch_tokens 2097152 \
 #     --data_path <train.bin> --mix_data_path <rdlg2.bin> --checkpoint_dir <dir> [--seed N]
 # Re-seed order on a failed formation check: 17 → 7 → 11 → 101 → 313 → 727 → 1117.
 # Branch cooldown at an anchor A (step S): copy <dir>/anchors/step_S.pt into a fresh dir and resume with
@@ -12,7 +12,7 @@
 
 extends: ladder-a0.yaml
 
-model_size: 1b-moonshot-loop
+model_size: 1b-tsumugi
 attn_res_boundaries: "0,1,7,9,17,19,39,59"
 muon_lr: 0.04
 
@@ -29,4 +29,4 @@ inloop_evals: riders,induction
 # The trunk and its branches were trained with fp64 AttnRes routing (the forward kernels' eps was a runtime float,
 # which inductor types fp64); keep that lineage's numerics. New runs on this shape: --no_attnres_eps_fp64_compat.
 attnres_eps_fp64_compat: true
-checkpoint_shm_dir: /dev/shm/kotodama-moonshot
+checkpoint_shm_dir: /dev/shm/kotodama-tsumugi

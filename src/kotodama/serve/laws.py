@@ -10,7 +10,7 @@ from __future__ import annotations
 LAWS: dict[str, dict[str, float]] = {
     # Conversation with the post-trained models.
     "chat": {"temperature": 0.9, "top_k": 0, "top_p": 0.0, "repetition_penalty": 1.2},
-    # kotodama-tsumugi (1b-moonshot-loop): the sampling bench's best binding (.42 vs .34 at the 3B's 0.9/1.2) sits at
+    # kotodama-tsumugi (1b-tsumugi): the sampling bench's best binding (.42 vs .34 at the 3B's 0.9/1.2) sits at
     # T 0.7-0.8 with top-p off; repetition 1.2 (1.35 if it loops).
     "tsumugi": {"temperature": 0.75, "top_k": 0, "top_p": 0.0, "repetition_penalty": 1.2},
     # The base model: raw base loops without strong anti-repetition.

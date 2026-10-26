@@ -54,7 +54,7 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group("model")
     g.add_argument("--config", default=None, help="flat YAML of these flags (extends: supported)")
     g.add_argument("--checkpoint", required=False, help=".pt/.pt.zst path or a checkpoint registry name")
-    g.add_argument("--model_size", default="1b-moonshot-loop", choices=presets.names())
+    g.add_argument("--model_size", default="1b-tsumugi", choices=presets.names())
     g.add_argument("--attn_res_boundaries", default=None,
                    help="comma list; default = presets.DEFAULT_BOUNDARIES[model_size]")
     g.add_argument("--no_attn_res", action="store_true", help="plain residual stack (non-AttnRes checkpoints)")

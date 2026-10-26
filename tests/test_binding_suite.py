@@ -24,7 +24,7 @@ from kotodama.eval.binding.score import read_jsonl, score_bindprobe_items, score
 
 def test_spec_parse():
     s = ModelSpec.parse("koto:/c/step.pt")
-    assert (s.kind, s.path, s.size, s.bounds, s.attn_res) == ("koto", "/c/step.pt", "1b-moonshot-loop", None, "config")
+    assert (s.kind, s.path, s.size, s.bounds, s.attn_res) == ("koto", "/c/step.pt", "1b-tsumugi", None, "config")
     s = ModelSpec.parse("koto:/c/a.pt?size=3b&bounds=0,1,3,7,15,19,24&attn_res=on")
     assert (s.size, s.bounds, s.attn_res) == ("3b", "0,1,3,7,15,19,24", "on")
     assert ModelSpec.parse("hf:EleutherAI/pythia-1.4b") == ModelSpec(kind="hf", path="EleutherAI/pythia-1.4b")
@@ -251,11 +251,13 @@ def test_report_cli(tmp_path, capsys):
     assert json.loads((tmp_path / "r.json").read_text())["m1"]["decomp"]["third/0shot"]["acc"] == 1.0
 
 
-def test_public_shape_alias_reaches_the_server():
+def test_prerelease_shape_name_still_resolves():
     from kotodama import presets
     from kotodama.serve import server
 
-    assert presets.resolve("1b-tsumugi") == "1b-moonshot-loop"
-    assert presets.shape("1b-tsumugi") == presets.shape("1b-moonshot-loop")
-    assert server.model_config_for("1b-tsumugi") is server.MODEL_CONFIGS["1b-moonshot-loop"]
+    # the pre-release name stays loadable: checkpoints and published config.json files carry it
+    assert presets.resolve("1b-moonshot-loop") == "1b-tsumugi"
+    assert presets.shape("1b-moonshot-loop") == presets.shape("1b-tsumugi")
+    assert presets.DEFAULT_BOUNDARIES["1b-moonshot-loop"] == presets.TSUMUGI_LOOP
+    assert server.model_config_for("1b-moonshot-loop") is server.MODEL_CONFIGS["1b-tsumugi"]
     assert server.model_config_for("no-such-shape") is None

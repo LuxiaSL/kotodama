@@ -2540,7 +2540,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="With --use_liger: launch Liger's RMSNorm kernels with B200-tuned grids (same kernels and math; the "
              "weight gradient's partial sums are grouped differently, so new runs only). +4.3%% tok/s on the 1B "
-             "moonshot shape; to 2.5B tokens the loss tracks the default launch (mean delta +0.0003) and the "
+             "tsumugi shape; to 2.5B tokens the loss tracks the default launch (mean delta +0.0003) and the "
              "induction / rider gauges converge (an induction-formation timing shift around step 476 closes).",
     )
     p.add_argument(
@@ -2623,7 +2623,7 @@ def parse_args() -> argparse.Namespace:
         "--attnres_stack_grad_chain", action="store_true",
         help="AttnRes routes sharing a committed stack chain its gradient through a single-query backward kernel "
              "(summed in-kernel, one round per partial sum) instead of autograd summing a full stack gradient per "
-             "route. +3%% tok/s on the 1B moonshot shape; the sum's order and rounding differ (loss +0.002 after "
+             "route. +3%% tok/s on the 1B tsumugi shape; the sum's order and rounding differ (loss +0.002 after "
              "an early +0.01 bump that closes by ~300 steps), so use it for new runs only.",
     )
     p.add_argument(

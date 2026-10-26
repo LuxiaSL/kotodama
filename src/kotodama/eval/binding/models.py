@@ -1,11 +1,11 @@
 """Model specs for the binding suite: a kotodama checkpoint or a Hugging Face model, loaded once per run.
 
 Spec strings (CLI ``--model``):
-    koto:CHECKPOINT[?size=1b-moonshot-loop][&bounds=0,1,7,…][&attn_res=config|on|off]
+    koto:CHECKPOINT[?size=1b-tsumugi][&bounds=0,1,7,…][&attn_res=config|on|off]
     hf:MODEL                (a Hugging Face repo id or a local model directory)
 
 A koto checkpoint loads through ``kotodama.serve.server.load_model`` with ``rope_fp32`` on (the serve law for the
-ladder and moonshot lineages). Logits come from ``kotodama.model.capture.instrumented_forward`` (the parity-tested
+ladder and tsumugi lineages). Logits come from ``kotodama.model.capture.instrumented_forward`` (the parity-tested
 eager walker) when the model has AttnRes, else from the model's own forward. These are exactly the paths the stage
 gauges on record were scored with, so suite numbers are comparable with them. AttnRes geometry is explicit: a checkpoint whose boundaries differ from its preset loads silently wrong
 (routing params have the same shapes), so pass ``bounds=`` for any non-default geometry.
@@ -30,7 +30,7 @@ class SpecError(ValueError):
 class ModelSpec:
     kind: Literal["koto", "hf"]
     path: str
-    size: str = "1b-moonshot-loop"
+    size: str = "1b-tsumugi"
     bounds: Optional[str] = None
     attn_res: Literal["config", "on", "off"] = "config"
 

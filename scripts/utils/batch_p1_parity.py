@@ -2,14 +2,14 @@
 
 The per-sublayer path routes every sublayer with its own Phase 1 call over the committed block stack; the batched
 path runs Phase 1 once per block for all of the block's queries (chunks of _P1_MAX_BATCH) and Phase 2 per
-sublayer. Gate: on the full model (default 1b-moonshot-loop, its fitted boundaries, bf16, doc-masked fa4 varlen
+sublayer. Gate: on the full model (default 1b-tsumugi, its fitted boundaries, bf16, doc-masked fa4 varlen
 batch), loss and every parameter gradient of the batched path differ from the per-sublayer path by no more than
 the per-sublayer path's own run-to-run floor (two identical runs), with a bf16 reassociation allowance (loss 1e-4,
 relative grad norm 1e-3) when that floor is zero — reported per tensor family. Routing queries
 are randomized (they initialize to zero, which would make every route uniform and the check vacuous). Also
 times eager fwd+bwd for both.
 
-Run on a GPU host: tools/run_py.sh scripts/utils/batch_p1_parity.py [--model_size 1b-moonshot-loop] [--mb 2]
+Run on a GPU host: tools/run_py.sh scripts/utils/batch_p1_parity.py [--model_size 1b-tsumugi] [--mb 2]
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ def family(name: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model_size", default="1b-moonshot-loop")
+    ap.add_argument("--model_size", default="1b-tsumugi")
     ap.add_argument("--mb", type=int, default=2)
     a = ap.parse_args()
     if not (llama._TRITON_ATTN_RES_AVAILABLE and torch.cuda.is_available()):

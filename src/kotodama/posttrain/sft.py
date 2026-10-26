@@ -1,4 +1,4 @@
-"""Chat SFT on a kotodama checkpoint, including the looped 1b-moonshot-loop shape.
+"""Chat SFT on a kotodama checkpoint, including the looped 1b-tsumugi shape.
 
     python -m kotodama.posttrain.sft --config configs/posttrain/tsumugi-sft.yaml \\
         --checkpoint <base.pt> --train_jsonl <chat.jsonl> --out_dir <dir>

@@ -43,7 +43,7 @@ def test_the_rule_reproduces_the_70b_row():
 
 
 def test_tsumugi_layer_plan():
-    plan = reg.layer_plan("1b-moonshot-loop")
+    plan = reg.layer_plan("1b-tsumugi")
     assert plan["rule_layers"] == [0, 18, 36, 45, 54, 63, 71]
     assert plan["loop_twin_layers"] == [25, 34, 56]
     assert plan["sampled_layers"] == [0, 18, 25, 34, 36, 45, 54, 56, 63, 71]
@@ -51,8 +51,8 @@ def test_tsumugi_layer_plan():
 
 
 def test_every_loop_twin_runs_its_partners_weights():
-    config = KotodamaModelConfig(**presets.shape("1b-moonshot-loop"))
-    plan = reg.layer_plan("1b-moonshot-loop")
+    config = KotodamaModelConfig(**presets.shape("1b-tsumugi"))
+    plan = reg.layer_plan("1b-tsumugi")
     for layer in plan["rule_layers"]:
         for twin in reg.loop_twins(config, layer):
             assert config.layer_source(twin) == config.layer_source(layer)
@@ -62,7 +62,7 @@ def test_every_loop_twin_runs_its_partners_weights():
 
 def test_rows_restate_no_table():
     row = reg.preset_row("kotodama-tsumugi-1b")
-    shape = presets.shape("1b-moonshot-loop")
+    shape = presets.shape("1b-tsumugi")
     assert (row["num_layers"], row["hidden_dim"], row["num_attention_heads"], row["num_kv_heads"],
             row["head_dim"]) == (shape["num_layers"], shape["hidden_size"], shape["num_attention_heads"],
                                  shape["num_kv_heads"], shape["head_dim"])
@@ -77,7 +77,7 @@ def test_anamnesis_reads_the_file():
 
     registry = models.load_registry((*models.registry_paths(), reg.REGISTRY_FILE))
     row = registry.presets["kotodama-tsumugi-1b"]
-    assert tuple(row.sampled_layers) == tuple(reg.layer_plan("1b-moonshot-loop")["sampled_layers"])
+    assert tuple(row.sampled_layers) == tuple(reg.layer_plan("1b-tsumugi")["sampled_layers"])
     config = ExtractionConfig(sampled_layers=list(row.sampled_layers), pca_layers=list(row.pca_layers),
                               early_layer_cutoff=row.early_layer_cutoff, late_layer_cutoff=row.late_layer_cutoff)
     config.check_depth(row)

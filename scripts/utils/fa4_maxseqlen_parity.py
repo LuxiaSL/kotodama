@@ -2,7 +2,7 @@
 
 Training can pass max_seqlen = sequence_length instead of the batch's longest document so the compiled graph does
 not specialize on a per-batch int (each new value is a recompile, and ranks recompile at different steps). This
-checks the bound is exact at the moonshot attention shape (12 q / 6 kv heads, head_dim 128, mb 8 x 4096):
+checks the bound is exact at the tsumugi attention shape (12 q / 6 kv heads, head_dim 128, mb 8 x 4096):
 forward out + lse bitwise equal; dq/dk/dv differences no larger than the kernel's own run-to-run floor (the
 backward accumulates with atomics). Also times both.
 

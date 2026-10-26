@@ -35,7 +35,7 @@ Outputs:
   <out>_samples.jsonl  the sampled continuations (ids + text), for audit / reuse
 
 Usage (node, GPU):
-  tools/run_py.sh scripts/steer/build_egv.py --ckpt <step.pt> --config-section 1b-moonshot-loop \
+  tools/run_py.sh scripts/steer/build_egv.py --ckpt <step.pt> --config-section 1b-tsumugi \
       --boundaries 0,1,7,9,17,19,39,59 --rope-fp32 --sites 29,49 --out /path/egv.npz
 """
 
@@ -477,7 +477,7 @@ def build_site(model: KotodamaModel, sig_seqs: list[Seq], grad_seqs: list[Seq], 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--config-section", default="1b-moonshot-loop", help="kotodama.presets shape name")
+    ap.add_argument("--config-section", default="1b-tsumugi", help="kotodama.presets shape name")
     ap.add_argument("--boundaries", default=None, help="comma list; default = the preset's")
     ap.add_argument("--rope-fp32", action="store_true")
     ap.add_argument("--sites", required=True, help="comma list of EFFECTIVE layer indices")

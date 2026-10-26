@@ -46,10 +46,10 @@ SHAPES: dict[str, dict[str, Any]] = {
     "1b-deep-loopfit": dict(hidden_size=1536, num_layers=52, num_attention_heads=12,
                             num_kv_heads=6, head_dim=128, intermediate_size=4096,
                             loop_start=19, loop_len=10, loop_times=2, **_COMMON),
-    # MOONSHOT Shape A (configs/moonshot-1b-shapeA.yaml): 1b-deep's 52 unique layers (~1.42B) with the CF52_FIT
+    # kotodama-tsumugi (Shape A) (configs/tsumugi-1b.yaml): 1b-deep's 52 unique layers (~1.42B) with the CF52_FIT
     # long block (19–38) run 2x → 72 effective = 19 prelude + 20-layer core x2 + 13 coda; loop-aligned boundaries
-    # MOONSHOT_LOOP.
-    "1b-moonshot-loop": dict(hidden_size=1536, num_layers=72, num_attention_heads=12,
+    # TSUMUGI_LOOP.
+    "1b-tsumugi": dict(hidden_size=1536, num_layers=72, num_attention_heads=12,
                              num_kv_heads=6, head_dim=128, intermediate_size=4096,
                              loop_start=19, loop_len=20, loop_times=2, **_COMMON),
     # d1024 x 28 (~0.38B with tied embeddings) — between the proxy and the 1b.
@@ -64,7 +64,8 @@ SHAPES: dict[str, dict[str, Any]] = {
 }
 
 # Older names still found in configs and scripts, and public model names for their shapes.
-ALIASES: dict[str, str] = {"full": "3b", "model": "3b", "8b": "7b", "1b-tsumugi": "1b-moonshot-loop"}
+# "1b-moonshot-loop" is kotodama-tsumugi's pre-release name; checkpoints, published config.json files and older scripts carry it.
+ALIASES: dict[str, str] = {"full": "3b", "model": "3b", "8b": "7b", "1b-moonshot-loop": "1b-tsumugi"}
 
 # The boundaries each shape was trained with, where there is a shipped model
 # (the 1b ladder runs DD-3B verbatim by design — same 28-layer block geometry).
@@ -73,11 +74,13 @@ DD3B_DEEP52: tuple[int, ...] = (0, 2, 6, 13, 28, 35, 45)
 # 52L boundaries fit by scripts/eval/fit_boundaries.py with no AttnRes and no decay (robust cuts + the late cut).
 CF52_FIT: tuple[int, ...] = (0, 1, 7, 9, 17, 19, 39)
 # Shape A's effective-position boundaries: CF52_FIT's prelude cuts + a block at every loop pass (19, 39) + the coda (59).
-MOONSHOT_LOOP: tuple[int, ...] = (0, 1, 7, 9, 17, 19, 39, 59)
+TSUMUGI_LOOP: tuple[int, ...] = (0, 1, 7, 9, 17, 19, 39, 59)
 DEFAULT_BOUNDARIES: dict[str, tuple[int, ...]] = {"3b": DD3B, "proxy": DDV1,
                                                   "1b": DD3B, "1b-deep": DD3B_DEEP52,
                                                   "1b-deep-loop": DD3B_DEEP52,  # same effective geometry as deep
-                                                  "1b-deep-loopfit": CF52_FIT, "1b-moonshot-loop": MOONSHOT_LOOP}
+                                                  "1b-deep-loopfit": CF52_FIT, "1b-tsumugi": TSUMUGI_LOOP}
+# an alias reads the same boundaries as its shape (callers index this table by the name they were given)
+DEFAULT_BOUNDARIES.update({a: DEFAULT_BOUNDARIES[k] for a, k in ALIASES.items() if k in DEFAULT_BOUNDARIES})
 
 
 def resolve(name: str) -> str:

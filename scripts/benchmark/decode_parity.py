@@ -179,7 +179,7 @@ def main() -> None:
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--output", default=None)
     parser.add_argument("--model_size", default="3b",
-                        help="Served architecture (kotodama.serve.server.MODEL_CONFIGS key, e.g. 1b-moonshot-loop)")
+                        help="Served architecture (kotodama.serve.server.MODEL_CONFIGS key, e.g. 1b-tsumugi)")
     parser.add_argument("--rope_fp32", action="store_true", help="Model config rope_fp32 (the 1B ladder lineage)")
     args = parser.parse_args()
 

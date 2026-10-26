@@ -149,12 +149,12 @@ CONFIG_1B_DEEP_LOOP = dict(CONFIG_3B, **presets.shape("1b-deep-loop"),
 CONFIG_1B_DEEP_LOOPFIT = dict(CONFIG_3B, **presets.shape("1b-deep-loopfit"),
                               attn_res_boundaries=list(presets.DEFAULT_BOUNDARIES["1b-deep-loopfit"]))
 
-CONFIG_1B_MOONSHOT_LOOP = dict(CONFIG_3B, **presets.shape("1b-moonshot-loop"),
-                               attn_res_boundaries=list(presets.DEFAULT_BOUNDARIES["1b-moonshot-loop"]))
+CONFIG_1B_TSUMUGI = dict(CONFIG_3B, **presets.shape("1b-tsumugi"),
+                               attn_res_boundaries=list(presets.DEFAULT_BOUNDARIES["1b-tsumugi"]))
 
 MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "1b": CONFIG_1B, "1b-deep": CONFIG_1B_DEEP,
                  "1b-deep-loop": CONFIG_1B_DEEP_LOOP, "1b-deep-loopfit": CONFIG_1B_DEEP_LOOPFIT,
-                 "1b-moonshot-loop": CONFIG_1B_MOONSHOT_LOOP, "3b": CONFIG_3B}
+                 "1b-tsumugi": CONFIG_1B_TSUMUGI, "3b": CONFIG_3B}
 
 
 def model_config_for(model_size: str) -> dict | None:

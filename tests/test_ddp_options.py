@@ -2,7 +2,7 @@
 
 DDP defaults reproduce the previous construction exactly (bucket view on, buffers broadcast, DDP's own bucket size);
 --ddp_bucket_cap_mb / --ddp_no_broadcast_buffers change only their own key. --attnres_eps_fp64_compat switches both
-AttnRes forward ops to the runtime-eps path; the moonshot config turns it on and --no_attnres_eps_fp64_compat off.
+AttnRes forward ops to the runtime-eps path; the tsumugi config turns it on and --no_attnres_eps_fp64_compat off.
 """
 
 from __future__ import annotations
@@ -51,9 +51,9 @@ def test_attnres_eps_compat_flag_sets_both_ops():
         assert train.apply_attnres_eps_compat(_args("--attnres_eps_fp64_compat")) is True
         assert p1ops.EPS_FP64_COMPAT and p2ops.EPS_FP64_COMPAT
         p1ops.EPS_FP64_COMPAT = p2ops.EPS_FP64_COMPAT = False
-        args = _args("--config", "configs/moonshot-1b-shapeA.yaml")
+        args = _args("--config", "configs/tsumugi-1b.yaml")
         assert args.attnres_eps_fp64_compat is True  # the trunk lineage keeps its numerics by default
-        assert _args("--config", "configs/moonshot-1b-shapeA.yaml",
+        assert _args("--config", "configs/tsumugi-1b.yaml",
                      "--no_attnres_eps_fp64_compat").attnres_eps_fp64_compat is False
     finally:
         p1ops.EPS_FP64_COMPAT, p2ops.EPS_FP64_COMPAT = saved
@@ -68,7 +68,7 @@ def test_attnres_stack_grad_chain_flag():
         assert train.apply_attnres_stack_grad_chain(_args()) is False
         assert train.apply_attnres_stack_grad_chain(_args("--attnres_stack_grad_chain")) is True
         assert llama._STACK_GRAD_CHAIN is True
-        assert _args("--config", "configs/moonshot-1b-shapeA.yaml").attnres_stack_grad_chain is False
+        assert _args("--config", "configs/tsumugi-1b.yaml").attnres_stack_grad_chain is False
     finally:
         llama._STACK_GRAD_CHAIN = saved
 
@@ -76,9 +76,9 @@ def test_attnres_stack_grad_chain_flag():
 def test_geo_monitor_sharded_default_on():
     assert _args().geo_monitor_sharded is True
     assert _args("--no_geo_monitor_sharded").geo_monitor_sharded is False
-    assert _args("--config", "configs/moonshot-1b-shapeA.yaml").geo_monitor_sharded is True
+    assert _args("--config", "configs/tsumugi-1b.yaml").geo_monitor_sharded is True
 
 
 def test_no_attn_res_overrides_the_config():
-    assert _args("--config", "configs/moonshot-1b-shapeA.yaml").attn_res is True
-    assert _args("--config", "configs/moonshot-1b-shapeA.yaml", "--no_attn_res").attn_res is False
+    assert _args("--config", "configs/tsumugi-1b.yaml").attn_res is True
+    assert _args("--config", "configs/tsumugi-1b.yaml", "--no_attn_res").attn_res is False
