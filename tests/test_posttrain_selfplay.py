@@ -47,6 +47,12 @@ def test_vetoes() -> None:
     assert "selfcopy" in sp.evaluate(loop, "stop", "Mara", prior, CAST, "", CFG).vetoes
     echo = " Then we should walk down there before the tide comes in."
     assert "echo" in sp.evaluate(echo, "stop", "Mara", prior, CAST, "", CFG).vetoes
+    # a short turn repeating a recent one, whoever said it (the cross-speaker ping-pong)
+    sigh = prior + [Turn("Teo", "*Sigh*")]
+    assert "repeat_turn" in sp.evaluate(" *sigh*", "stop", "Mara", sigh, CAST, "", CFG).vetoes
+    assert sp.evaluate(" *Sigh* fine, let's go.", "stop", "Mara", sigh, CAST, "", CFG).ok
+    far = sigh + [Turn("Mara", f"line {k} about the boat") for k in range(4)]
+    assert sp.evaluate(" *Sigh*", "stop", "Teo", far, CAST, "", CFG).ok  # outside the window
     # reusing names and objects is binding, not copying
     assert sp.evaluate(" Teo, the lamp and the rocks again? Fine, the bay it is.", "stop", "Mara", prior, CAST,
                        "", CFG).ok
@@ -58,12 +64,15 @@ def test_next_speaker() -> None:
 
 
 def _scripted(script):
-    """A Complete returning scripted candidate lists in order; records prompts."""
+    """A Complete returning scripted candidate lists in order; records prompts. Each call's turns are numbered
+    (" hi." -> " hi. 3") so a script that repeats one line is not a repeat-turn loop."""
     calls = []
 
     async def complete(prompt, n, stops):
         calls.append(prompt)
-        return script[min(len(calls) - 1, len(script) - 1)]
+        k = len(calls)
+        return [((t.replace("\n\n", f" {k}\n\n", 1) if "\n\n" in t else t), fr, hit)
+                for t, fr, hit in script[min(k - 1, len(script) - 1)]]
     return complete, calls
 
 
@@ -75,7 +84,7 @@ def test_play_picks_only_survivors_and_banks_everything() -> None:
     seed = sp.SeedSpec("s1", CAST, "Two friends.", [])
     row = asyncio.run(sp.play(seed, complete, CFG, random.Random(0), banked.append))
     assert row["finish"] == "max_turns" and row["n_turns"] == CFG.max_turns
-    assert all(t["text"] in ("fine, thanks.", "Not bad at all.") for t in row["turns"])
+    assert all(t["text"].rsplit(" ", 1)[0] in ("fine, thanks.", "Not bad at all.") for t in row["turns"])
     assert len(banked) == 3 * CFG.max_turns and sum(b["picked"] for b in banked) == CFG.max_turns
     assert all(not b["picked"] for b in banked if b["vetoes"])
     assert calls[0].endswith("Two friends.\n\nMara:") and calls[1].endswith("\n\nTeo:")

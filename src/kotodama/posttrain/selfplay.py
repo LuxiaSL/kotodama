@@ -68,6 +68,9 @@ class SelfPlayConfig:
     max_prompt_chars: int = 12000
     rerolls: int = 2
     echo_min_frac: float = 0.5
+    # a turn identical (case and punctuation aside) to one of the last N turns, whoever spoke it, at any length —
+    # the short cross-speaker ping-pong ("*Sigh*" / "*Sigh*") that self-copy and echo spans are too short to see
+    repeat_window: int = 4
     selfcopy: selfcopy.SelfCopyConfig = field(default_factory=selfcopy.SelfCopyConfig)
 
 
@@ -133,6 +136,9 @@ def evaluate(raw_text: str, ended_by: str, speaker: str, prior: list[Turn], cast
         c.vetoes.append("no_letters")
     if _META.search(text):
         c.vetoes.append("meta_leak")
+    key = _norm_turn(text)
+    if key and cfg.repeat_window and any(key == _norm_turn(t.text) for t in prior[-cfg.repeat_window:]):
+        c.vetoes.append("repeat_turn")
     own = "\n\n".join(t.text for t in prior if t.speaker == speaker)
     others = "\n\n".join([header] + [t.text for t in prior if t.speaker != speaker])
     rep = selfcopy.score(text, context=own, prompt=others, cfg=cfg.selfcopy)
@@ -142,6 +148,10 @@ def evaluate(raw_text: str, ended_by: str, speaker: str, prior: list[Turn], cast
     if rep.prompt_copied_frac >= cfg.echo_min_frac and rep.n_words >= cfg.selfcopy.min_span:
         c.vetoes.append("echo")
     return c
+
+
+def _norm_turn(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", "", text.lower()).strip()
 
 
 def next_speaker(cast: list[str], turns: list[Turn]) -> str:

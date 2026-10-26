@@ -14,7 +14,8 @@ def _run(tmp_path):
                (" Not bad, the kettle is on.\n\nTeo:", "stop", False)]]
 
     async def complete(prompt, n, stops):
-        return script[0]
+        k = prompt.count("\n\n")  # number each turn's lines so the script is not a repeat-turn loop
+        return [(t.replace("\n\n", f" {k}\n\n", 1) if "\n\n" in t else t, fr, hit) for t, fr, hit in script[0]]
     cfg = sp.SelfPlayConfig(candidates=3, min_turns=3, max_turns=5)
     seeds = [sp.SeedSpec("s", ["Mara", "Teo"], "Two friends.")] * 4
     asyncio.run(sp.run(seeds, complete, cfg, tmp_path, concurrency=2, seed=0))
