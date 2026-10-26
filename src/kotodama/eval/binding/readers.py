@@ -8,6 +8,8 @@ Readers take scored rows (``score.prompt_row`` shape) for ONE model and return p
                 query kind (self / addressee)
   decomp        stage-5 decomposition: accuracy per variant × condition (layer 1 = 0-shot ``third``)
   capacity      K50 / AUC / D=256 (:func:`kotodama.eval.binding.capacity.summarize`)
+  fluid-*, cryst  per-family ladder midpoint / AUC, F3 stale-value rate, C0 accuracy by shots
+                (:func:`kotodama.eval.binding.fluid.summarize`)
 The arithmetic is that of the readers the recorded gauge numbers came from, so a suite number equals the recorded
 one for the same rows.
 """
@@ -122,7 +124,15 @@ def capacity(rows: Sequence[Row]) -> dict[str, Any]:
             "curve": s.curve}
 
 
-READERS = {"joinlite": joinlite, "swapdyn": swapdyn, "decomp": decomp, "capacity": capacity}
+def fluid(rows: Sequence[Row]) -> dict[str, Any]:
+    from kotodama.eval.binding.fluid import summarize
+
+    return summarize(rows).as_dict()
+
+
+READERS = {"joinlite": joinlite, "swapdyn": swapdyn, "decomp": decomp, "capacity": capacity,
+           "fluid-morph": fluid, "fluid-algebra": fluid, "fluid-rebind": fluid, "fluid-seqind": fluid,
+           "cryst": fluid}
 
 
 def _f(x: Any, fmt: str = "{:+.3f}") -> str:

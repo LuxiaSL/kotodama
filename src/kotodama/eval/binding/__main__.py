@@ -7,6 +7,9 @@
     python -m kotodama.eval.binding report --scores binding-scores [--models a,b] [--json OUT.json]
     python -m kotodama.eval.binding capacity --scores binding-scores --params params.tsv [--ours a,b]
     python -m kotodama.eval.binding gen-capacity --out capacity-v1.jsonl
+    python -m kotodama.eval.binding gen-fluid --out DIR
+    python -m kotodama.eval.binding fluid --scores binding-scores [--models a,b] [--stat midpoint|auc] [--json OUT]
+    python -m kotodama.eval.binding check-fluid-tokens [--tokenizers a,b]
 
 ``run`` loads the model ONCE and scores every requested battery into ``OUT/<battery>/<name>.jsonl`` (resumable).
 Prompt-row batteries are read by ``report``; bindprobes batteries by ``python -m kotodama.eval.bindprobes aggregate
@@ -52,6 +55,16 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--ours", default="", help="comma names placed on the law instead of fitted into it")
     g = sub.add_parser("gen-capacity", help="write the capacity-v1 prompt rows")
     g.add_argument("--out", required=True)
+    gf = sub.add_parser("gen-fluid", help="write the fluid-v1-* and cryst-v1 prompt rows into a directory")
+    gf.add_argument("--out", required=True)
+    fr = sub.add_parser("fluid", help="fluid / crystallized read-out: ladder midpoints, AUC, F3 stale rate, scores")
+    fr.add_argument("--scores", required=True, help="a run --out directory")
+    fr.add_argument("--models", default="", help="comma list (default: every model found)")
+    fr.add_argument("--stat", choices=("midpoint", "auc"), default="midpoint")
+    fr.add_argument("--order", choices=("mean_then_z", "z_then_mean"), default="mean_then_z")
+    fr.add_argument("--json", default="", help="also write per-model summaries and scores here")
+    ct = sub.add_parser("check-fluid-tokens", help="check the fluid answer pools are one token in every tokenizer")
+    ct.add_argument("--tokenizers", default="", help="comma list of HF tokenizer names (default: the zoo)")
     return ap
 
 
@@ -177,6 +190,88 @@ def cmd_gen_capacity(a: argparse.Namespace) -> int:
     return 0 if got == pin else 1
 
 
+def cmd_gen_fluid(a: argparse.Namespace) -> int:
+    from kotodama.eval.binding import fluid as fl
+
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    ok = True
+    for name in fl.BY_BATTERY:
+        rows = fl.generate(name)
+        bad = fl.audit_failures(fl.audit(rows))
+        b = bt.BATTERIES[name]
+        dest = out / b.file
+        dest.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        got = bt.sha256(dest)
+        same = got == b.sha256
+        ok = ok and same and not bad
+        verdict = "= pin" if same else f"≠ pin {b.sha256[:16]}…"
+        print(f"{name:18} {len(rows):5} rows → {dest}; sha256 {got} {verdict}"
+              f"{'' if not bad else '; AUDIT: ' + '; '.join(bad)}")
+    return 0 if ok else 1
+
+
+def _fmt(x: Any, fmt: str = "{:.3f}") -> str:
+    return "—" if x is None else fmt.format(x)
+
+
+def cmd_fluid(a: argparse.Namespace) -> int:
+    from kotodama.eval.binding import fluid as fl
+
+    scores = Path(a.scores)
+    names = [m for m in a.models.split(",") if m] or sorted(
+        {p.stem for b in fl.BY_BATTERY for p in (scores / b).glob("*.jsonl")})
+    sums: dict[str, dict[str, fl.FamilySummary]] = {}
+    for m in names:
+        for b, fam in fl.BY_BATTERY.items():
+            f = scores / b / f"{m}.jsonl"
+            rows = read_jsonl(f) if f.exists() else []
+            if rows:
+                sums.setdefault(m, {})[fam.key] = fl.summarize(rows)
+    if not sums:
+        print(f"no fluid rows under {scores}")
+        return 1
+    res = fl.fluid_scores(sums, stat=a.stat, order=a.order)
+    keys = ("F1", "F2", "F3", "F4", "C0")
+    print(f"{'model':28} " + " ".join(f"{k + ' mid':>7} {'AUC':>5}" for k in keys)
+          + f" {'stale':>6} {'C0@0':>5} {'C0@6':>5} | {'fluid':>6} {'cryst':>6} {'gap':>6}")
+    for m in names:
+        if m not in sums:
+            continue
+        s = sums[m]
+        cells = []
+        for k in keys:
+            x = s.get(k)
+            cells.append(f"{x.midpoint.label():>7} {x.auc:5.3f}" if x else f"{'—':>7} {'—':>5}")
+        st = s["F3"].stale["rate"] if "F3" in s and s["F3"].stale else None
+        shots = (s["C0"].by_shots or {}).get("all", {}) if "C0" in s else {}
+        z = " ".join(f"{_fmt(res[m][k], '{:+.2f}'):>6}" for k in ("fluid", "crystallized", "gap"))
+        print(f"{m:28} " + " ".join(cells) + f" {_fmt(st):>6} {_fmt(shots.get(0)):>5} {_fmt(shots.get(6)):>5} | {z}")
+    if a.json:
+        Path(a.json).write_text(json.dumps({"stat": a.stat, "order": a.order, "scores": res,
+                                            "summaries": {m: {k: x.as_dict() for k, x in s.items()}
+                                                          for m, s in sums.items()}}, indent=1, default=str))
+    return 0
+
+
+def cmd_check_fluid_tokens(a: argparse.Namespace) -> int:
+    from transformers import AutoTokenizer
+
+    from kotodama.eval.binding import fluid as fl
+
+    names = [x for x in a.tokenizers.split(",") if x] or list(fl.ZOO_TOKENIZERS)
+    encoders = {}
+    for n in names:
+        tok = AutoTokenizer.from_pretrained(n)
+        encoders[n] = lambda s, t=tok: t.encode(s, add_special_tokens=False)
+    bad = fl.check_pools(encoders)
+    for line in bad:
+        print(line)
+    total = sum(len(v) for v in fl.POOLS.values())
+    print(f"{total} pool words × {len(names)} tokenizers: {'PASS' if not bad else f'{len(bad)} failures'}")
+    return 0 if not bad else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     a = build_parser().parse_args(argv)
@@ -186,7 +281,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\ngroups: " + "; ".join(f"{k} = {','.join(v)}" for k, v in bt.GROUPS.items() if k != "all"))
         return 0
     return {"run": cmd_run, "report": cmd_report, "capacity": cmd_capacity,
-            "gen-capacity": cmd_gen_capacity}[a.cmd](a)
+            "gen-capacity": cmd_gen_capacity, "gen-fluid": cmd_gen_fluid, "fluid": cmd_fluid,
+            "check-fluid-tokens": cmd_check_fluid_tokens}[a.cmd](a)
 
 
 if __name__ == "__main__":

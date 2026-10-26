@@ -3,7 +3,8 @@
 Prompt files live under one prompts directory (``--prompts-dir``, else ``$KOTODAMA_BINDING_PROMPTS``; machine paths
 belong in site.env). Every file is pinned by sha256, and a run refuses a file that does not match its pin, so a
 number in the record always names the exact strings it was scored on. ``capacity-v1`` can be regenerated
-(``python -m kotodama.eval.binding gen-capacity``), and the pin then checks that the regeneration is byte-identical.
+(``python -m kotodama.eval.binding gen-capacity``), and the pin then checks that the regeneration is byte-identical;
+so can the ``fluid`` group (``gen-fluid``, :mod:`kotodama.eval.binding.fluid`).
 """
 
 from __future__ import annotations
@@ -45,6 +46,21 @@ BATTERIES: dict[str, Battery] = {b.name: b for b in (
     Battery("capacity-v1", "rows", "capacity-v1.jsonl",
             "c7241ec026e40054c21bef0ec44465848e3758da40ff7b183a7ada4a89e3c88d", "capacity",
             "binding capacity (K50, after arXiv 2609.30634)"),
+    Battery("fluid-v1-morph", "rows", "fluid-v1-morph.jsonl",
+            "ec73660da59ba0893f5a65c6a7675105b1dbcc7c17166da255c9f2c6ccfaa341", "fluid-morph",
+            "fluid F1: nonce morphology (rule tier × examples)"),
+    Battery("fluid-v1-algebra", "rows", "fluid-v1-algebra.jsonl",
+            "81442d46aa9d0356d54f0676cef7e912d5f1ace36058f2fe74f41bfe8560ecf4", "fluid-algebra",
+            "fluid F2: symbol algebra (operators × composition depth)"),
+    Battery("fluid-v1-rebind", "rows", "fluid-v1-rebind.jsonl",
+            "035880262f4edd7cd7a36de82ed09cd5c01e807be87d5d8498c0996df9f3f9f6", "fluid-rebind",
+            "fluid F3: rebinding chains, prose + code (reassignments × distractors; stale-value rate)"),
+    Battery("fluid-v1-seqind", "rows", "fluid-v1-seqind.jsonl",
+            "b2a1e6b54040500363909cf4d669f84ef968a60df6353127599e9f041a46e15a", "fluid-seqind",
+            "fluid F4: nonce sequence induction (pattern length × gap)"),
+    Battery("cryst-v1", "rows", "cryst-v1.jsonl",
+            "e73e55699384eab1665b0dc7501a5f96f3ab793aeeca475bdc8089946783e5a2", "cryst",
+            "crystallized control C0: facts in the fluid few-shot frame (shots 6 / 3 / 1 / 0)"),
     Battery("bp-deixis-lite", "bindprobes", "bindprobes-deixis-lite/items.jsonl",
             "229e7ac377ff2ec5ef298ecdee5c27667f9c97d86ba2337fb5e411aac9167c3e", None,
             "bindprobes deixis-lite (0shot / 3shot)", ("deixis",), ("0shot", "3shot")),
@@ -66,6 +82,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "decomp": ("stage5-decomp-v1",),
     "bindprobes": ("bp-deixis-lite", "bp-profile", "bp-v3.1", "bp-deixis-v2"),
     "scorecard": ("joinlite-v1", "swapdyn-v1", "stage5-decomp-v1", "capacity-v1"),
+    "fluid": ("fluid-v1-morph", "fluid-v1-algebra", "fluid-v1-rebind", "fluid-v1-seqind", "cryst-v1"),
     "all": tuple(BATTERIES),
 }
 
