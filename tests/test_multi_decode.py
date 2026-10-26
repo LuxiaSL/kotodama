@@ -201,3 +201,49 @@ def test_bucket_choice_and_chat_route(monkeypatch, model: KotodamaModel) -> None
     assert len(r.json()["choices"]) == 3 and used == [ROWS]
     r = client.post("/v1/completions", json={"prompt": "hey", "max_tokens": 5, "n": 2, "temperature": 0.9, "top_p": 0})
     assert r.status_code == 200 and used == [ROWS, 2]
+
+
+@torch.inference_mode()
+def test_steer_write_rules_k_n_s(model: KotodamaModel) -> None:
+    eng = _engine(model, steer=True)
+    vec = torch.randn(CFG["hidden_size"], generator=torch.Generator().manual_seed(9))
+    unit = vec / vec.norm()
+    rows = (4, 6, 9)  # site 4, then the boundaries after it
+    norms = {li: 10.0 + li for li in range(CFG["num_layers"])}
+    eng.set_steer([(4, unit, 2.0)], rule="K")
+    for r in range(CFG["num_layers"]):
+        want = 2.0 * unit if r in rows else torch.zeros_like(unit)
+        torch.testing.assert_close(eng.steer_buf[r], want)
+    eng.set_steer([(4, unit, 2.0)], rule="N", norms=norms)
+    for r in rows:
+        torch.testing.assert_close(eng.steer_buf[r], 2.0 * norms[r] / norms[4] * unit)
+    eng.set_steer([(4, unit, 2.0)], rule="S")
+    assert eng.steer_buf[4].abs().sum() > 0 and eng.steer_buf[6].abs().sum() == 0 and eng.steer_buf[9].abs().sum() == 0
+    with pytest.raises(ValueError):
+        eng.set_steer([(4, unit, 2.0)], rule="N", norms={4: 1.0})
+    with pytest.raises(ValueError):
+        eng.set_steer([(4, unit, 2.0)], rule="X")
+    eng.set_steer(None)
+
+
+def test_partial_norm_loader_and_rule_n_needs_a_table(tmp_path, monkeypatch) -> None:
+    import numpy as np
+    from fastapi import HTTPException
+
+    from kotodama.serve import server
+    from kotodama.serve.steering import load_partial_norms
+
+    p = tmp_path / "norms.npz"
+    np.savez(p, partial_norm_l0=np.array(3.0), partial_norm_l2=np.array(5.0), V7_s4=np.ones(4))
+    assert load_partial_norms([str(p)], 11) == {0: 3.0, 2: 5.0}
+    bad = tmp_path / "bad.npz"
+    np.savez(bad, partial_norm_l40=np.array(1.0))
+    with pytest.raises(ValueError):
+        load_partial_norms([str(bad)], 11)
+    req = server.GenerateRequest(prompt="x", steer_rule="N")
+    monkeypatch.setattr(server, "_steer_partial_norms", {})
+    with pytest.raises(HTTPException):
+        server._steer_rule_kwargs(req)
+    monkeypatch.setattr(server, "_steer_partial_norms", {0: 3.0})
+    assert server._steer_rule_kwargs(req) == {"rule": "N", "norms": {0: 3.0}}
+    assert server.oai_completion_to_generate(server.OAICompletionRequest(prompt="x", steer_rule="S")).steer_rule == "S"

@@ -130,7 +130,7 @@ def load_steer_banks(
                 meds.setdefault(layer, val)
                 continue
             # Sidecar bank convention: sign_*/law* (and other meta) skipped.
-            if key.startswith(("median_norm", "sign_", "law")):
+            if key.startswith(("median_norm", "sign_", "law", "partial_norm")):
                 continue
             m = re.search(r"_s(\d+)$", key)
             arr = np.asarray(z[key])
@@ -170,3 +170,30 @@ def load_steer_banks(
             aliases[alias] = (key, alpha, desc)
     aliases["control"] = (None, 0.0, STEER_CONTROL_DESC)
     return bank, meds, aliases
+
+
+def load_partial_norms(npz_paths: list[str], n_layers: int) -> dict[int, float]:
+    """Per-layer median post-attention partial norms from ``partial_norm_l{L}`` keys in any of the npz files (first
+    file wins per layer) — the scale table of the N write rule. Empty when no file carries them."""
+    import re
+
+    import numpy as np
+
+    norms: dict[int, float] = {}
+    for raw_path in npz_paths:
+        with np.load(Path(raw_path.strip()), allow_pickle=False) as z:
+            for key in z.files:
+                m = re.fullmatch(r"partial_norm_l(\d+)", key)
+                if m is None:
+                    continue
+                layer, val = int(m.group(1)), float(z[key])
+                if not 0 <= layer < n_layers:
+                    raise ValueError(f"{raw_path}:{key}: layer {layer} out of range [0, {n_layers})")
+                if not math.isfinite(val) or val <= 0.0:
+                    raise ValueError(f"{raw_path}:{key} = {val} is not a positive finite norm")
+                norms.setdefault(layer, val)
+    if norms and len(norms) != n_layers:
+        logger.warning("partial norms cover %d of %d layers; rule N refuses writes that land elsewhere",
+                       len(norms), n_layers)
+    return norms
+

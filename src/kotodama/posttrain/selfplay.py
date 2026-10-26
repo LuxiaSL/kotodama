@@ -178,7 +178,8 @@ def parse_steer(spec: str) -> list[dict[str, Any]]:
 
 def oai_completer(endpoints: list[str], sampling: dict[str, float], max_tokens: int, timeout: float = 600.0,
                   model: str = "", transport: Any = None,
-                  steer: Optional[list[dict[str, Any]]] = None) -> tuple[Complete, Callable[[], Awaitable[None]]]:
+                  steer: Optional[list[dict[str, Any]]] = None,
+                  steer_rule: str = "K") -> tuple[Complete, Callable[[], Awaitable[None]]]:
     """A ``Complete`` over one or more ``/v1/completions`` endpoints (round-robin), and its async closer.
     ``steer``: a residual steering stack sent with every request (the server's ``vectors``; it needs
     ``--steer-npz``). ``transport``: an httpx transport (tests pass a mock)."""
@@ -199,6 +200,7 @@ def oai_completer(endpoints: list[str], sampling: dict[str, float], max_tokens: 
                     "frequency_penalty": max(0.0, rep - 1.0), "stop": stops, "return_token_ids": True}
             if steer:
                 body["vectors"] = steer
+                body["steer_rule"] = steer_rule
             for attempt in range(4):
                 try:
                     r = await client.post(url, json=body)
@@ -327,6 +329,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--repetition_penalty", type=float, default=None, help="override the law's repetition penalty")
     ap.add_argument("--steer", default="", help='residual steering stack, e.g. "vrep:-0.05,V7_s58:0.05" '
                                                 "(server needs --steer-npz)")
+    ap.add_argument("--steer_rule", choices=["K", "N", "S"], default="K",
+                    help="what lands at later block entries: K the site row unchanged, N scaled to the partial norm "
+                         "there (server needs partial_norm_l* in its banks), S a single write")
     ap.add_argument("--repeat", type=int, default=1, help="transcripts per seed")
     ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
@@ -351,7 +356,8 @@ def main(argv: list[str] | None = None) -> int:
         sampling["temperature"] = a.temperature
     if a.repetition_penalty is not None:
         sampling["repetition_penalty"] = a.repetition_penalty
-    complete, close = oai_completer(a.endpoint, sampling, cfg.max_tokens, steer=parse_steer(a.steer) or None)
+    complete, close = oai_completer(a.endpoint, sampling, cfg.max_tokens, steer=parse_steer(a.steer) or None,
+                                    steer_rule=a.steer_rule)
 
     async def go() -> dict[str, Any]:
         try:
@@ -361,7 +367,8 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = asyncio.run(go())
     (Path(a.out) / "run.json").write_text(json.dumps({"args": vars(a), "config": asdict(cfg), "sampling": sampling,
-                                                      "steer": parse_steer(a.steer), **summary}, indent=1))
+                                                      "steer": parse_steer(a.steer), "steer_rule": a.steer_rule,
+                                                      **summary}, indent=1))
     print(json.dumps(summary, indent=1))
     return 0
 

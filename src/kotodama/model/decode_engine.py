@@ -672,7 +672,8 @@ class DecodeEngine(nn.Module):
         # clears it in a finally after every request).
 
     @torch.inference_mode()
-    def set_steer(self, writes: Optional[list[tuple[int, torch.Tensor, float]]]) -> None:
+    def set_steer(self, writes: Optional[list[tuple[int, torch.Tensor, float]]], rule: str = "K",
+                  norms: Optional[dict[int, float]] = None) -> None:
         """Install (or clear) steering writes for subsequent decode steps.
 
         `writes` is None (or an empty list) to clear, else a list of
@@ -685,9 +686,17 @@ class DecodeEngine(nn.Module):
         identity, so this never recompiles or swaps a graph. Callers own
         scaling: pass scale = alpha * that site's median residual norm.
 
+        ``rule`` sets what lands at the later block entries: "K" the site row
+        unchanged (block-persistent, the default), "N" the site row times
+        norms[row] / norms[site] (re-added at the scale of the partial it lands
+        in; ``norms`` = per-layer median post-attention partial norm), "S" no
+        re-add (a single write at the site).
+
         Raises on a steering-disabled engine (except set_steer(None), which is
         a no-op there so callers can clear unconditionally in a finally).
         """
+        if rule not in ("K", "N", "S"):
+            raise ValueError(f"steer rule must be K, N or S, got {rule!r}")
         if not self.steer_enabled:
             if writes is None:
                 return
@@ -720,8 +729,15 @@ class DecodeEngine(nn.Module):
             v = vec.detach().reshape(self.hidden).to(device=self.device, dtype=torch.float32)
             if not bool(torch.isfinite(v).all().item()):
                 raise ValueError(f"writes[{i}]: vec contains non-finite values")
-            for row in compute_steer_points(int(site_layer), self._boundaries, self.n_layers):
-                staged[row] += scale * v
+            site = int(site_layer)
+            rows = (site,) if rule == "S" else compute_steer_points(site, self._boundaries, self.n_layers)
+            for row in rows:
+                factor = 1.0
+                if rule == "N" and row != site:
+                    if not norms or site not in norms or row not in norms:
+                        raise ValueError(f"steer rule N needs partial norms for layers {site} and {row}")
+                    factor = norms[row] / norms[site]
+                staged[row] += scale * factor * v
             if scale != 0.0:
                 active = True
         self.steer_buf.copy_(staged.to(self.dtype))

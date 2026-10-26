@@ -42,7 +42,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # CPU threading: 2 threads is optimal for single-request GPU inference.
 # cuDNN SDPA needs >= 2 threads; beyond that, overhead is kernel launch
@@ -89,6 +89,7 @@ DD3B_BOUNDARIES = list(presets.DD3B)
 
 from kotodama.serve.steering import (  # noqa: E402
     STEER_DEFAULT_ALPHA,
+    load_partial_norms,
     load_steer_banks,
 )
 from kotodama.serve.chatml import (  # noqa: E402
@@ -191,6 +192,9 @@ _steer_loaded: bool = False
 _steer_bank: dict[str, tuple[int, "torch.Tensor"]] = {}
 _steer_meds: dict[int, float] = {}
 _steer_aliases: dict[str, tuple[str | None, float, str]] = {}
+# Per-layer median post-attention partial norms (``partial_norm_l{L}`` keys in any --steer-npz file, e.g. the
+# scripts/steer/partial_norms.py sidecar): the scale table of the N write rule. Empty = rule N unavailable (400).
+_steer_partial_norms: dict[int, float] = {}
 # Server-wide default repetition penalty (CLI --default_repetition_penalty):
 # used by /generate when the field is absent and by the OpenAI routes when
 # frequency_penalty is absent.
@@ -292,7 +296,7 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
 
 def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = ()) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi
-    global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases
+    global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
     if device.startswith("cuda") and torch.cuda.is_available():
@@ -363,6 +367,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         _steer_bank, _steer_meds, _steer_aliases = load_steer_banks(
             steer_npz.split(","), config.num_layers, config.hidden_size, _device
         )
+        _steer_partial_norms = load_partial_norms(steer_npz.split(","), config.num_layers)
         _steer_loaded = True
         logger.info(
             "Steering banks loaded: %d vectors %s @ site layers %s (meds %s), aliases %s",
@@ -529,6 +534,9 @@ class GenerateRequest(BaseModel):
     vectors: list[SteerVectorSpec] | None = None
     steer_alpha: float | None = None
     steer_model: str | None = None
+    # What lands at the later block entries: K = the site row unchanged (default), N = scaled to the partial norm
+    # it lands in (needs partial_norm_l* in a bank), S = a single write at the site.
+    steer_rule: Literal["K", "N", "S"] = "K"
 
 
 class GenerateResponse(BaseModel):
@@ -655,6 +663,13 @@ def _resolve_steer_member(name: str, alpha: float | None) -> tuple[str | None, f
     if not math.isfinite(eff):
         raise HTTPException(400, f"Non-finite alpha for steering vector {name!r}")
     return key, float(eff)
+
+
+def _steer_rule_kwargs(request: GenerateRequest) -> dict[str, Any]:
+    """set_steer's rule arguments for a request; rule N without a partial-norm table is a 400."""
+    if request.steer_rule == "N" and not _steer_partial_norms:
+        raise HTTPException(400, "steer_rule N needs per-layer partial norms (partial_norm_l* keys) in --steer-npz")
+    return {"rule": request.steer_rule, "norms": _steer_partial_norms or None}
 
 
 def _compose_steer_writes(request: GenerateRequest) -> "list[tuple[int, torch.Tensor, float]] | None":
@@ -918,7 +933,7 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
     t0 = time.perf_counter()
     try:
         if steer_writes is not None:
-            _engine.set_steer(steer_writes)
+            _engine.set_steer(steer_writes, **_steer_rule_kwargs(request))
             timing["steered"] = 1.0
             timing["steer_writes"] = float(len(steer_writes))
         t_prefill = time.perf_counter()
@@ -1016,7 +1031,8 @@ async def engine_generate_stream(
                 # set_steer is eager buffer mutation (no cudagraph replay),
                 # but route it through the engine's thread anyway — same
                 # conservative discipline as every other engine call here.
-                await loop.run_in_executor(_generate_executor, _engine.set_steer, steer_writes)
+                await loop.run_in_executor(_generate_executor, functools.partial(
+                    _engine.set_steer, steer_writes, **_steer_rule_kwargs(request)))
             t_prefill = time.perf_counter()
             prefill_logits, pc_info = await loop.run_in_executor(
                 _generate_executor, _engine_prefill, input_ids
@@ -1387,6 +1403,7 @@ class OAICompletionRequest(BaseModel):
     vectors: list[SteerVectorSpec] | None = None
     steer_model: str | None = None
     steer_alpha: float | None = None
+    steer_rule: Literal["K", "N", "S"] = "K"
 
     @model_validator(mode="before")
     @classmethod
@@ -1423,7 +1440,7 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
     t0 = time.perf_counter()
     try:
         if steer_writes is not None:
-            _engine.set_steer(steer_writes)
+            _engine.set_steer(steer_writes, **_steer_rule_kwargs(request))
             timing["steered"] = 1.0
         prefill_logits, pc_info = _engine_prefill(input_ids)
         timing["prefill_ms"] = (time.perf_counter() - t0) * 1000
@@ -1474,6 +1491,7 @@ def oai_completion_to_generate(request: OAICompletionRequest) -> GenerateRequest
         vectors=request.vectors,
         steer_model=request.steer_model,
         steer_alpha=request.steer_alpha,
+        steer_rule=request.steer_rule,
     )
 
 
