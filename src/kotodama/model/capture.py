@@ -393,6 +393,8 @@ def cached_forward(
     light: bool = False,
     capture_hidden: bool = True,
     eager_nocapture: bool = False,
+    attention_sink=None,
+    capture_layers=None,
 ):
     """Instrumented AttnRes forward over `input_ids`, attending through `past`.
 
@@ -408,6 +410,16 @@ def cached_forward(
     weights freed per layer, so a cache built this way is on the SAME fp
     trajectory as `replay_extract_koto`'s forward. `light` must be False
     with it.
+
+    `attention_sink(layer, weights)`, when given, receives each layer's
+    attention weights `(B, heads, S, cache + S)` as soon as they are computed,
+    and `cap["attn"]` holds None for every layer instead: the all-layer
+    weights never coexist (an on-device reduction consumes them per layer).
+    `capture_layers`, when given, keeps keys, values, queries, gate
+    pre-activations and attention outputs only at those layers; the others
+    hold None, so every list stays indexed by layer. Routing, committed blocks
+    and residual snapshots are kept for every layer either way. With neither
+    given the capture is exactly the default one.
 
     Returns (logits, cap, new_cache):
       logits    (B, S, V) for the input positions
@@ -482,11 +494,16 @@ def cached_forward(
             new_layers.append(new_kv)
             if acap is not None:
                 ck, cv, cq, aw = acap
-                cap["keys"].append(ck)
-                cap["values"].append(cv)
-                cap["queries"].append(cq)
-                cap["attn"].append(aw)
-                cap["attn_out"].append(attn_out.detach())
+                keep = capture_layers is None or i in capture_layers
+                cap["keys"].append(ck if keep else None)
+                cap["values"].append(cv if keep else None)
+                cap["queries"].append(cq if keep else None)
+                if attention_sink is not None:
+                    attention_sink(i, aw)
+                    cap["attn"].append(None)
+                else:
+                    cap["attn"].append(aw)
+                cap["attn_out"].append(attn_out.detach() if keep else None)
             partial = partial + attn_out
             if capture_hidden or capture:
                 cap["residual_partial"].append(partial.detach())
@@ -498,7 +515,8 @@ def cached_forward(
             ffn_in = lyr.ffn_norm(h_mlp)
             if capture:
                 cap["routing"].append(("pre_mlp", i, w.detach()))
-                cap["gate"].append(lyr.ffn.gate_proj(ffn_in).detach())
+                keep = capture_layers is None or i in capture_layers
+                cap["gate"].append(lyr.ffn.gate_proj(ffn_in).detach() if keep else None)
             partial = partial + lyr.ffn(ffn_in)
             if capture_hidden or capture:
                 cap["residual_partial"].append(partial.detach())
@@ -711,6 +729,92 @@ def replay_extract_koto(
             for tag, layer, w in cap["routing"]
         ],
         attn_res_committed=[_np(c[0, positions, :]) for c in cap["committed"]],
+    )
+
+
+def capture_identity(model) -> dict:
+    """What a kotodama capture's arithmetic is made of, for a reduction's lane id:
+    this module's and the model code's source digests, the pinned lane, the
+    weights' dtype, the AttnRes and loop geometry, and the fp64-eps compat mode."""
+    import hashlib
+    import os
+    from pathlib import Path
+
+    here = Path(__file__)
+    cfg = model.config
+    return dict(
+        producer="kotodama.model.capture",
+        source_sha256={
+            f.name: hashlib.sha256(f.read_bytes()).hexdigest()
+            for f in (here, here.with_name("llama.py"))
+        },
+        lane=assert_lane_pinned(),
+        dtype=str(next(model.parameters()).dtype),
+        num_layers=int(cfg.num_layers),
+        attn_res_boundaries=list(getattr(cfg, "attn_res_boundaries", None) or []),
+        loop=[cfg.loop_start, cfg.loop_len, cfg.loop_times],
+        rope_fp32=bool(getattr(cfg, "rope_fp32", False)),
+        attnres_eps_fp64_compat=os.environ.get("KOTODAMA_ATTNRES_EPS_FP64_COMPAT", "0") == "1",
+    )
+
+
+@torch.no_grad()
+def replay_features_gpu(model, full_token_ids, prompt_length: int, lane):
+    """One span's anamnesis feature vector, captured and reduced on the model's device.
+
+    The capture is :func:`replay_extract_koto`'s, tensor for tensor: one
+    ``cached_forward`` over the whole row, the same span positions P..P+N-2, the
+    same hidden-state convention (:func:`hidden_rows`), pre-RoPE keys and
+    queries, values, pre-SiLU gates, routing weights and committed blocks. It is
+    handed to anamnesis's fast-lane reducers (``ExternalSpan``) on the device
+    instead of being copied to numpy per position: each layer's attention
+    weights are reduced as the forward computes them and dropped, and keys,
+    values, queries and gates are kept only at the lane's sampled layers.
+
+    ``lane`` is an anamnesis ``GpuFeatureLane`` on the model's device (its
+    configuration, calibration and schema). Returns anamnesis's
+    ``GpuFeatureResult``: the vector (the fast lane's battery, then the
+    attn_res family), names, mean log-probability and a receipt whose
+    ``lane_id`` names this capture's identity.
+    """
+    from anamnesis.extraction.fast.external import ExternalSpan
+
+    assert_lane_pinned()
+    device = next(model.parameters()).device
+    ids = torch.as_tensor(full_token_ids, dtype=torch.long, device=device)
+    if ids.ndim == 1:
+        ids = ids.unsqueeze(0)
+    if ids.shape[0] != 1:
+        raise KotoCaptureError(f"replay expects batch=1, got {ids.shape[0]}")
+    S = int(ids.shape[1])
+    P = int(prompt_length)
+    if P <= 0 or S - P < 2:
+        raise KotoCaptureError(f"prompt_length {P} leaves fewer than 2 generated tokens in {S}")
+    t = S - P - 1
+    L = int(model.config.num_layers)
+    sampled = list(lane.config.sampled_layers)
+    span = ExternalSpan(lane, start=P, end=S, num_layers=L)
+    logits, cap, _ = cached_forward(
+        model, ids, past=None, position_offset=0, light=False, capture_hidden=True,
+        attention_sink=span.attention, capture_layers=set(sampled),
+    )
+    hr = hidden_rows(cap, L)
+    rows = slice(P, P + t)
+
+    def heads(x):
+        return x[0, :, rows, :].permute(1, 0, 2)
+
+    return span.finish(
+        hidden=torch.stack([hr[l + 1][0, rows] for l in range(L)]),
+        keys={l: heads(cap["keys"][l]) for l in sampled},
+        values={l: heads(cap["values"][l]) for l in sampled},
+        queries={l: heads(cap["queries"][l]) for l in sampled},
+        gates={l: cap["gate"][l][0, rows] for l in sampled},
+        logits=logits[0, rows],
+        token_ids=ids[0].tolist(),
+        capture_identity=capture_identity(model),
+        routing=[(tag, int(layer), w[:, 0, rows].T) for tag, layer, w in cap["routing"]],
+        committed=[c[0, rows, :] for c in cap["committed"]],
     )
 
 
