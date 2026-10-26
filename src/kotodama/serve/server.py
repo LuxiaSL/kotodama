@@ -177,9 +177,10 @@ _max_seq_len = CONFIG_3B["max_position_embeddings"]
 # Fast decode engine (single-stream): guarded by _engine_lock.
 _engine: "DecodeEngine | None" = None
 _engine_lock = asyncio.Lock()
-# Batched multi-sample decoder over the engine (--multi_rows N): a /v1/completions request with 1 < n <= N and a
-# pure-temperature law decodes its n candidates in lockstep after one prefill. None = every candidate is serial.
-_multi: "MultiSampleDecoder | None" = None
+# Batched multi-sample decoders over the engine (--multi_rows 4,8): an OpenAI request with 1 < n <= the largest bucket
+# and a pure-temperature law decodes its n candidates in lockstep after one prefill, on the smallest bucket that fits
+# (a step costs about the same at any row count, so the bucket sets the throughput). Empty = every candidate is serial.
+_multi: "dict[int, MultiSampleDecoder]" = {}
 # Prefix caching (engine extend-from-pos prefill); set by load_model.
 _prefix_cache = False
 # Residual steering (--steer-npz, comma-separated banks); set by load_model.
@@ -289,7 +290,7 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: int = 0) -> tuple[KotodamaModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = ()) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases
     _serve_mode = mode
@@ -426,8 +427,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             eng.reset()
             return eng
 
-        def _build_and_warm_multi(eng: "DecodeEngine") -> "MultiSampleDecoder":
-            dec = MultiSampleDecoder(eng, multi_rows)
+        def _build_and_warm_multi(eng: "DecodeEngine", rows: int) -> "MultiSampleDecoder":
+            dec = MultiSampleDecoder(eng, rows)
             dec.compile_step(mode="max-autotune")
             with torch.inference_mode():
                 params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2)
@@ -449,10 +450,11 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         # replica). load_model is sync (called
         # from lifespan before serving starts), so block on the future.
         _engine = _generate_executor.submit(_build_and_warm_engine).result()
-        if multi_rows > 1:
+        for rows in sorted(set(multi_rows)):
             # Same thread as the engine: its cudagraph trees are thread-local too.
-            _multi = _generate_executor.submit(_build_and_warm_multi, _engine).result()
-            logger.info("Batched multi-sample decode ENABLED: n <= %d candidates per request in lockstep", multi_rows)
+            _multi[rows] = _generate_executor.submit(_build_and_warm_multi, _engine, rows).result()
+        if _multi:
+            logger.info("Batched multi-sample decode ENABLED: row buckets %s", sorted(_multi))
         # Disable cuDNN SDPA only AFTER the engine compiled: the captured
         # decode graph keeps its baked cuDNN flash kernels, while the eager
         # FALLBACK path (non-engine requests) avoids cuDNN's ~300ms per-shape
@@ -1221,7 +1223,7 @@ _max_seq_len_arg: int | None = None
 _prefix_cache_arg = False
 _warmup_sdpa_arg = False
 _steer_npz_arg: str | None = None
-_multi_rows_arg = 0
+_multi_rows_arg: tuple[int, ...] = ()
 
 
 @asynccontextmanager
@@ -1402,7 +1404,8 @@ class OAICompletionRequest(BaseModel):
 def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResponse]:
     """n candidates of one prompt: one engine prefill (prefix cache included), then the batched decoder. Same
     tokenization, steering, stop and capacity rules as engine_generate per candidate. Caller must hold _engine_lock."""
-    assert _engine is not None and _multi is not None and _tokenizer is not None
+    dec = _multi_bucket(n)
+    assert _engine is not None and dec is not None and _tokenizer is not None
     timing: dict[str, float] = {}
     prompt_text = _resolve_prompt(request, _tokenizer)
     input_ids = _tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
@@ -1428,12 +1431,12 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
             timing["prefix_cache_hit"] = pc_info["prefix_hit"]
             timing["prefix_common_tokens"] = pc_info["common_prefix"]
         budget = min(request.max_new_tokens, _max_seq_len - prompt_len)
-        rows = decode_rows(_multi, prefill_logits, params, n, budget, _stop_token_ids, stop_check)
+        rows = decode_rows(dec, prefill_logits, params, n, budget, _stop_token_ids, stop_check)
     finally:
         _engine.set_steer(None)
     elapsed = time.perf_counter() - t0
     timing["total_ms"] = round(elapsed * 1000, 2)
-    timing["batched_rows"] = float(n)
+    timing["batched_rows"] = float(dec.rows)
     total = sum(len(r) for r in rows)
     tps = round(total / elapsed, 1) if elapsed > 0 else 0.0
     prompt_ids = input_ids[0].tolist()
@@ -1442,8 +1445,14 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
                              prompt_ids=prompt_ids, completion_ids=list(r)) for r in rows]
 
 
+def _multi_bucket(n: int) -> "MultiSampleDecoder | None":
+    """The smallest row bucket that holds n candidates, or None."""
+    fits = [r for r in _multi if r >= n]
+    return _multi[min(fits)] if fits else None
+
+
 def _multi_compatible(request: GenerateRequest, n: int) -> bool:
-    return (_multi is not None and 1 < n <= _multi.rows
+    return (n > 1 and _multi_bucket(n) is not None
             and MultiSampleDecoder.supports(EngineSamplingParams(temperature=request.temperature,
                                                                  top_k=request.top_k, top_p=request.top_p)))
 
@@ -1637,16 +1646,22 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
 
     choices = []
     total_completion_tokens = 0
+    gen_req = GenerateRequest(
+        prompt=prompt_text,
+        max_new_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        repetition_penalty=repetition_penalty,
+        stop_strings=stop_strings,
+    )
+    batched: list[GenerateResponse] = []
+    if _multi_compatible(gen_req, request.n):
+        async with _engine_lock:
+            batched = await _run_generation(engine_generate_multi, gen_req, request.n)
     for i in range(request.n):
-        gen_req = GenerateRequest(
-            prompt=prompt_text,
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            repetition_penalty=repetition_penalty,
-            stop_strings=stop_strings,
-        )
-        if _engine_compatible(gen_req):
+        if batched:
+            result = batched[i]
+        elif _engine_compatible(gen_req):
             async with _engine_lock:
                 result = await _run_generation(engine_generate, gen_req)
         else:
@@ -1727,9 +1742,10 @@ if __name__ == "__main__":
                         help="Repetition penalty used when a request does not set one "
                              "(/generate without repetition_penalty, OpenAI routes without "
                              "frequency_penalty). 1.0 = off; range [1.0, 2.0]")
-    parser.add_argument("--multi_rows", type=int, default=0,
-                        help="Batched multi-sample decode for /v1/completions n > 1 (pure-temperature laws): up to this "
-                             "many candidates decode in lockstep after one prefill. 0 = off (candidates run serially)")
+    parser.add_argument("--multi_rows", default="",
+                        help="Batched multi-sample decode for OpenAI-route n > 1 (pure-temperature laws): comma row "
+                             "buckets, e.g. 4,8 — n candidates decode in lockstep after one prefill on the smallest "
+                             "bucket that fits (~0.9 GB of KV per row at 4096 context on the 1B). Empty = off (serial)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
@@ -1760,9 +1776,14 @@ if __name__ == "__main__":
         # that silently serves unsteered generations poisons downstream data.
         parser.error("--steer-npz requires --engine fast")
     _steer_npz_arg = args.steer_npz
-    if args.multi_rows and _engine_arg != "fast":
+    try:
+        _multi_rows_arg = tuple(int(x) for x in args.multi_rows.split(",") if x.strip())
+    except ValueError:
+        parser.error(f"--multi_rows: comma-separated ints, got {args.multi_rows!r}")
+    if any(r < 2 for r in _multi_rows_arg):
+        parser.error("--multi_rows buckets must be >= 2")
+    if _multi_rows_arg and _engine_arg != "fast":
         parser.error("--multi_rows requires --engine fast")
-    _multi_rows_arg = args.multi_rows
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

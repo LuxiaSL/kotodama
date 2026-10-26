@@ -57,8 +57,8 @@ def main() -> int:
 
     server._rope_fp32_override = a.rope_fp32
     _model, tok = server.load_model(a.checkpoint, "cuda", mode="base", model_size=a.model_size, engine="fast",
-                                    prefix_cache=True, max_seq_len=4096, multi_rows=a.rows)
-    eng, dec = server._engine, server._multi
+                                    prefix_cache=True, max_seq_len=4096, multi_rows=(a.rows,))
+    eng, dec = server._engine, server._multi.get(a.rows)
     assert eng is not None and dec is not None
     ids = tok.encode(PROMPT, return_tensors="pt").cuda()
     params = SamplingParams(temperature=0.75, repetition_penalty=1.2)

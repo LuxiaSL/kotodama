@@ -136,6 +136,9 @@ class _CharTok:
     def decode(self, ids, skip_special_tokens=True):
         return "".join(chr(97 + (i - 4) % 26) for i in ids)
 
+    def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True):
+        return "".join(f"{m['role']}: {m['content']} " for m in msgs) + "assistant:"
+
 
 def test_server_routes_n_candidates_through_the_batched_decoder(monkeypatch, model: KotodamaModel) -> None:
     pytest.importorskip("fastapi")
@@ -150,7 +153,7 @@ def test_server_routes_n_candidates_through_the_batched_decoder(monkeypatch, mod
         calls.append(fn.__name__)
         return fn(*args, **kwargs)
 
-    for k, v in {"_model": model, "_tokenizer": _CharTok(), "_engine": eng, "_multi": dec, "_device": torch.device("cpu"),
+    for k, v in {"_model": model, "_tokenizer": _CharTok(), "_engine": eng, "_multi": {ROWS: dec, 2: MultiSampleDecoder(eng, 2)}, "_device": torch.device("cpu"),
                  "_max_seq_len": 96, "_prefix_cache": False, "_stop_token_ids": frozenset({0}),
                  "_run_generation": run_inline}.items():
         monkeypatch.setattr(server, k, v)
@@ -166,3 +169,35 @@ def test_server_routes_n_candidates_through_the_batched_decoder(monkeypatch, mod
     r = client.post("/v1/completions", json={"prompt": "two friends talk", "max_tokens": 4, "n": 2,
                                              "temperature": 0.9, "top_p": 0.9})  # truncated law: serial path
     assert r.status_code == 200 and calls == ["engine_generate", "engine_generate"]
+
+
+def test_bucket_choice_and_chat_route(monkeypatch, model: KotodamaModel) -> None:
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from kotodama.serve import server
+
+    eng = _engine(model)
+    buckets = {2: MultiSampleDecoder(eng, 2), ROWS: MultiSampleDecoder(eng, ROWS)}
+    used: list[int] = []
+    real = server.decode_rows
+
+    def spy(dec, *a, **k):
+        used.append(dec.rows)
+        return real(dec, *a, **k)
+
+    async def run_inline(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    for k, v in {"_model": model, "_tokenizer": _CharTok(), "_engine": eng, "_multi": buckets, "_device": torch.device("cpu"),
+                 "_max_seq_len": 96, "_prefix_cache": False, "_stop_token_ids": frozenset({0}), "_serve_mode": "chat",
+                 "_run_generation": run_inline, "decode_rows": spy}.items():
+        monkeypatch.setattr(server, k, v)
+    assert server._multi_bucket(2).rows == 2 and server._multi_bucket(3).rows == ROWS
+    assert server._multi_bucket(ROWS + 1) is None
+    client = TestClient(server.app)
+    r = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 5,
+                                                  "n": 3, "temperature": 0.9, "top_p": 0})
+    assert r.status_code == 200, r.text
+    assert len(r.json()["choices"]) == 3 and used == [ROWS]
+    r = client.post("/v1/completions", json={"prompt": "hey", "max_tokens": 5, "n": 2, "temperature": 0.9, "top_p": 0})
+    assert r.status_code == 200 and used == [ROWS, 2]
