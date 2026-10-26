@@ -58,6 +58,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--no_chunk", action="store_true", help="truncate long conversations instead of chunking")
     g.add_argument("--drop_overlong", action="store_true",
                    help="transcript format: drop transcripts longer than --max_seq_len instead of truncating")
+    g.add_argument("--token_cache", action=argparse.BooleanOptionalAction, default=True,
+                   help="transcript format: cache the tokenized data beside the JSONL (<file>.tok-<key>.npz)")
     g.add_argument("--out_dir", default=None)
     g.add_argument("--save_every", type=int, default=0, help="weights every N steps (0 = final only)")
     g.add_argument("--eval_every", type=int, default=0)
@@ -77,7 +79,8 @@ def _examples(a: argparse.Namespace, path: str, tok: Any) -> list[cd.Example]:
     from kotodama.serve.chatml import EOS_TOKEN_ID
 
     speakers = None if a.train_speakers.strip() == "all" else {s.strip() for s in a.train_speakers.split(",")}
-    return tx.encode(tx.load_jsonl(path), tok, a.max_seq_len, EOS_TOKEN_ID, speakers, drop_overlong=a.drop_overlong)
+    return tx.encode_file(path, tok, a.tokenizer, a.max_seq_len, EOS_TOKEN_ID, speakers, drop_overlong=a.drop_overlong,
+                          cache=a.token_cache)
 
 
 def _batches(rows: list[cd.PackedRow], mb: int, seed: int) -> list[list[cd.PackedRow]]:

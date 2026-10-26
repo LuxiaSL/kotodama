@@ -3,6 +3,7 @@ run on transcript data."""
 from __future__ import annotations
 
 import json
+import random
 
 import pytest
 
@@ -128,3 +129,57 @@ def test_drop_overlong(tok) -> None:
     assert tx.encode([long], tok, 16, EOS_TOKEN_ID, {"Assistant"}, drop_overlong=True) == []
     kept = tx.encode([long], tok, 16, EOS_TOKEN_ID, None, drop_overlong=False)
     assert len(kept) == 1 and len(kept[0].input_ids) == 16
+
+
+def _random_transcripts(n: int) -> list:
+    rng = random.Random(3)
+    words = ["the", "watch", "Mara", "said", "no", "...", "well", "Dad's", "é", "\n", "okay?", "42", "  "]
+    names = ["Mara", "Teo", "Ines"]
+    out = []
+    for _ in range(n):
+        turns = tuple(tx.Turn(rng.choice(names), " ".join(rng.choice(words) for _ in range(rng.randint(1, 30))).strip()
+                              or "hm", train=rng.random() > 0.1)
+                      for _ in range(rng.randint(2, 6)))
+        out.append(tx.Transcript(turns, rng.choice(["", "Three friends at a station."])))
+    return out
+
+
+def _reference_tokenize(tr, tok, max_len: int, speakers):
+    """Per-token loop over offsets: a token trains when its start lies in a training character range."""
+    text, spans = tx.render(tr)
+    enc = tok(text, return_offsets_mapping=True, add_special_tokens=False)
+    ids = list(enc["input_ids"]) + [EOS_TOKEN_ID]
+    starts = [o[0] for o in enc["offset_mapping"]] + [len(text)]
+    ranges = []
+    for i, (t, (tag0, txt0, _e)) in enumerate(zip(tr.turns, spans)):
+        if not t.train or (speakers is not None and t.speaker not in speakers):
+            continue
+        hi = spans[i + 1][1] if i + 1 < len(tr.turns) else len(text) + 1
+        ranges.append((tag0 if speakers is None else txt0, hi))
+    labels = [x if any(lo <= a < hi for lo, hi in ranges) else IGNORE_INDEX for x, a in zip(ids, starts)]
+    ex = tx.Example(ids[:max_len], labels[:max_len])
+    return ex if ex.n_trainable else None
+
+
+@pytest.mark.parametrize("speakers", [None, {"Teo"}, {"Mara", "Ines"}])
+def test_batched_encode_matches_reference_labelling(tok, speakers) -> None:
+    trs = _random_transcripts(60)
+    want = [e for e in (_reference_tokenize(t, tok, 64, speakers) for t in trs) if e is not None]
+    assert [tx.tokenize(t, tok, 64, EOS_TOKEN_ID, speakers) for t in trs] == \
+        [_reference_tokenize(t, tok, 64, speakers) for t in trs]
+    assert tx.encode(trs, tok, 64, EOS_TOKEN_ID, speakers, chunk=7) == want
+
+
+def test_encode_file_cache_roundtrip(tok, tmp_path, caplog) -> None:
+    src = tmp_path / "t.jsonl"
+    src.write_text("".join(json.dumps(tx.to_row(t)) + "\n" for t in _random_transcripts(25)))
+    first = tx.encode_file(src, tok, "tok-a", 128, EOS_TOKEN_ID, {"Teo"})
+    caches = list(tmp_path.glob("t.jsonl.tok-*.npz"))
+    assert len(caches) == 1 and first
+    with caplog.at_level("INFO"):
+        again = tx.encode_file(src, tok, "tok-a", 128, EOS_TOKEN_ID, {"Teo"})
+    assert again == first and "loaded" in caplog.text
+    tx.encode_file(src, tok, "tok-a", 128, EOS_TOKEN_ID, None)  # different speakers -> a different cache
+    assert len(list(tmp_path.glob("t.jsonl.tok-*.npz"))) == 2
+    caches[0].write_bytes(b"not an npz")
+    assert tx.encode_file(src, tok, "tok-a", 128, EOS_TOKEN_ID, {"Teo"}) == first  # bad cache: re-encoded

@@ -34,13 +34,17 @@ CLI:  python -m kotodama.posttrain.transcript convert-markdown --in raw.jsonl --
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import os
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
+
+import numpy as np
 
 from kotodama.posttrain.chat_data import IGNORE_INDEX, Example
 
@@ -131,17 +135,12 @@ def stop_sequences(speakers: Iterable[str]) -> list[str]:
     return [f"{SEP}{s}:" for s in dict.fromkeys(speakers)]
 
 
-def tokenize(tr: Transcript, tokenizer: Any, max_len: int, eos_id: int,
-             train_speakers: Optional[set[str]] = None) -> Optional[Example]:
-    """Tokenize + label one transcript (see the module docstring); None if nothing trains after truncation."""
-    text, spans = render(tr)
-    enc = tokenizer(text, return_offsets_mapping=True, add_special_tokens=False)
-    ids = list(enc["input_ids"]) + [eos_id]
-    offs = list(enc["offset_mapping"]) + [(len(text), len(text) + 1)]
-    # character ranges that train
+def _train_ranges(tr: Transcript, spans: list[tuple[int, int, int]], n_text: int,
+                  train_speakers: Optional[set[str]]) -> list[tuple[int, int]]:
+    """Character ranges that train (sorted, disjoint); ``n_text + 1`` stands for the end-of-text token."""
     ranges: list[tuple[int, int]] = []
     n = len(tr.turns)
-    for i, (t, (tag0, txt0, end)) in enumerate(zip(tr.turns, spans)):
+    for i, (t, (tag0, txt0, _end)) in enumerate(zip(tr.turns, spans)):
         if not t.train:
             continue
         if train_speakers is None:
@@ -150,38 +149,109 @@ def tokenize(tr: Transcript, tokenizer: Any, max_len: int, eos_id: int,
             lo = txt0
         else:
             continue
-        hi = spans[i + 1][1] if i + 1 < n else len(text) + 1  # through the next tag, or through end-of-text
+        hi = spans[i + 1][1] if i + 1 < n else n_text + 1  # through the next tag, or through end-of-text
         ranges.append((lo, hi))
-    labels = [IGNORE_INDEX] * len(ids)
-    r = 0
-    for k, (a, _b) in enumerate(offs):
-        while r < len(ranges) and ranges[r][1] <= a:
-            r += 1
-        if r < len(ranges) and ranges[r][0] <= a < ranges[r][1]:
-            labels[k] = ids[k]
+    return ranges
+
+
+def _example(ids: list[int], starts: list[int], ranges: list[tuple[int, int]], n_text: int, max_len: int,
+             eos_id: int) -> Optional[Example]:
+    """Labels for one tokenized document: a token trains when its start offset falls in a training range."""
+    ids = ids + [eos_id]
+    a = np.asarray(list(starts) + [n_text], dtype=np.int64)
+    if ranges:
+        lo = np.asarray([r[0] for r in ranges], dtype=np.int64)
+        hi = np.asarray([r[1] for r in ranges], dtype=np.int64)
+        k = np.searchsorted(lo, a, side="right") - 1
+        inside = (k >= 0) & (a < hi[np.clip(k, 0, None)])
+    else:
+        inside = np.zeros(len(a), dtype=bool)
+    labels = np.where(inside, np.asarray(ids, dtype=np.int64), IGNORE_INDEX).tolist()
     if len(ids) > max_len:
         ids, labels = ids[:max_len], labels[:max_len]
     ex = Example(ids, labels)
     return ex if ex.n_trainable else None
 
 
+def tokenize(tr: Transcript, tokenizer: Any, max_len: int, eos_id: int,
+             train_speakers: Optional[set[str]] = None) -> Optional[Example]:
+    """Tokenize + label one transcript (see the module docstring); None if nothing trains after truncation."""
+    text, spans = render(tr)
+    enc = tokenizer(text, return_offsets_mapping=True, add_special_tokens=False)
+    return _example(list(enc["input_ids"]), [o[0] for o in enc["offset_mapping"]],
+                    _train_ranges(tr, spans, len(text), train_speakers), len(text), max_len, eos_id)
+
+
 def encode(transcripts: Iterable[Transcript], tokenizer: Any, max_len: int, eos_id: int,
-           train_speakers: Optional[set[str]] = None, drop_overlong: bool = False) -> list[Example]:
-    """Tokenized examples. ``drop_overlong`` drops a transcript longer than ``max_len`` instead of truncating it
-    (instruction data: a truncated answer teaches answers that stop mid-thought)."""
+           train_speakers: Optional[set[str]] = None, drop_overlong: bool = False,
+           chunk: int = 1024) -> list[Example]:
+    """Tokenized examples (the tokenizer is called on ``chunk`` documents at a time — a fast tokenizer encodes a batch
+    in parallel). ``drop_overlong`` drops a transcript longer than ``max_len`` instead of truncating it (instruction
+    data: a truncated answer teaches answers that stop mid-thought)."""
     out: list[Example] = []
     n = dropped = 0
-    for tr in transcripts:
-        n += 1
-        ex = tokenize(tr, tokenizer, max_len + (1 if drop_overlong else 0), eos_id, train_speakers)
-        if ex is not None and drop_overlong and len(ex.input_ids) > max_len:
-            ex = None
-        if ex is None:
-            dropped += 1
-        else:
-            out.append(ex)
+    cap = max_len + (1 if drop_overlong else 0)
+    it = iter(transcripts)
+    while True:
+        batch = [tr for _, tr in zip(range(chunk), it)]
+        if not batch:
+            break
+        rendered = [render(tr) for tr in batch]
+        enc = tokenizer([t for t, _ in rendered], return_offsets_mapping=True, add_special_tokens=False)
+        for tr, (text, spans), ids, offs in zip(batch, rendered, enc["input_ids"], enc["offset_mapping"]):
+            n += 1
+            ex = _example(list(ids), [o[0] for o in offs], _train_ranges(tr, spans, len(text), train_speakers),
+                          len(text), cap, eos_id)
+            if ex is not None and drop_overlong and len(ex.input_ids) > max_len:
+                ex = None
+            if ex is None:
+                dropped += 1
+            else:
+                out.append(ex)
     logger.info("encoded %d transcripts -> %d examples (%d with nothing to train dropped); %d trainable tokens",
                 n, len(out), dropped, sum(e.n_trainable for e in out))
+    return out
+
+
+CACHE_VERSION = 1
+
+
+def encode_file(path: str | Path, tokenizer: Any, tokenizer_name: str, max_len: int, eos_id: int,
+                train_speakers: Optional[set[str]] = None, drop_overlong: bool = False,
+                cache: bool = True) -> list[Example]:
+    """``encode(load_jsonl(path))``, cached beside the data as ``<path>.tok-<key>.npz``. The key covers the file
+    (size, mtime), the tokenizer name, max_len, the speakers, drop_overlong and the cache format; a miss encodes and
+    writes the cache atomically, so concurrent runs on one dataset tokenize it at most once each and later runs load it."""
+    path = Path(path)
+    st = path.stat()
+    spk = "all" if train_speakers is None else ",".join(sorted(train_speakers))
+    key = hashlib.sha256(json.dumps([CACHE_VERSION, st.st_size, int(st.st_mtime), tokenizer_name, max_len, eos_id,
+                                     spk, drop_overlong]).encode()).hexdigest()[:12]
+    cpath = path.with_name(f"{path.name}.tok-{key}.npz")
+    if cache and cpath.exists():
+        try:
+            z = np.load(cpath)
+            ids, train, lens = z["ids"], z["train"], z["lens"]
+            cuts = np.cumsum(lens)[:-1]
+            labels = np.where(train, ids, IGNORE_INDEX)
+            out = [Example(i.tolist(), l.tolist()) for i, l in zip(np.split(ids, cuts), np.split(labels, cuts))]
+            logger.info("loaded %d examples from %s", len(out), cpath)
+            return out
+        except Exception as e:  # noqa: BLE001 — a bad cache is re-encoded, never fatal
+            logger.warning("ignoring unreadable token cache %s (%s: %s)", cpath, type(e).__name__, e)
+    out = encode(load_jsonl(path), tokenizer, max_len, eos_id, train_speakers, drop_overlong)
+    if cache and out:
+        ids = np.concatenate([np.asarray(e.input_ids, dtype=np.int32) for e in out])
+        train = np.concatenate([np.asarray(e.labels) != IGNORE_INDEX for e in out])
+        lens = np.asarray([len(e.input_ids) for e in out], dtype=np.int64)
+        tmp = cpath.with_name(f"{cpath.name}.{os.getpid()}.tmp.npz")
+        try:
+            np.savez(tmp, ids=ids, train=train, lens=lens)
+            os.replace(tmp, cpath)
+            logger.info("wrote token cache %s", cpath)
+        except OSError as e:
+            logger.warning("could not write token cache %s (%s)", cpath, e)
+            tmp.unlink(missing_ok=True)
     return out
 
 
