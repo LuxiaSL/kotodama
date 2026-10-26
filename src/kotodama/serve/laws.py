@@ -1,7 +1,7 @@
 """Named sampling laws of record (temperature / top_k / top_p / repetition penalty).
 
 top_k 0 and top_p 0 mean "off": kotodama models sample best with pure temperature
-(top-p degrades them; temperature is the anti-loop dial — never go to 0.7 for chat).
+(top-p degrades them; temperature is the anti-loop dial — the 3B lineage never goes to 0.7 for chat).
 Each law is measured per model family.
 """
 
@@ -10,6 +10,9 @@ from __future__ import annotations
 LAWS: dict[str, dict[str, float]] = {
     # Conversation with the post-trained models.
     "chat": {"temperature": 0.9, "top_k": 0, "top_p": 0.0, "repetition_penalty": 1.2},
+    # kotodama-tsumugi (1b-moonshot-loop): the sampling bench's best binding (.42 vs .34 at the 3B's 0.9/1.2) sits at
+    # T 0.7-0.8 with top-p off; repetition 1.2 (1.35 if it loops).
+    "tsumugi": {"temperature": 0.75, "top_k": 0, "top_p": 0.0, "repetition_penalty": 1.2},
     # The base model: raw base loops without strong anti-repetition.
     "base": {"temperature": 0.9, "top_k": 0, "top_p": 0.0, "repetition_penalty": 1.35},
     # Checkpoint soups: temp 1.0 clears the "i-don't-know" depth collapse.

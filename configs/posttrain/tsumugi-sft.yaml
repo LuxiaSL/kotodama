@@ -1,0 +1,18 @@
+# Chat SFT on kotodama-tsumugi: Muon 1e-3 / AdamW 1e-4, 5% warmup, no decay, 4096-token packed rows, 16 rows/step,
+# <= 1 epoch — the recipe kotodama-3b was post-trained with. Tsumugi pretrained at twice the 3B's Muon LR (0.04 vs
+# 0.02), so 2e-3 is the natural next point in a sweep.
+#   tools/run_py.sh -m kotodama.posttrain.sft --config configs/posttrain/tsumugi-sft.yaml \
+#     --checkpoint <base.pt> --train_jsonl <chat.jsonl> [--eval_jsonl <held-out.jsonl>] --out_dir <dir>
+extends: base-tsumugi.yaml
+muon_lr: 1.0e-3
+adamw_lr: 1.0e-4
+warmup_ratio: 0.05
+decay_start_pct: 1.0
+decay_type: sqrt
+max_seq_len: 4096
+micro_batch_size: 4
+grad_accum: 4
+epochs: 1.0
+compile: true
+eval_every: 100
+save_every: 100

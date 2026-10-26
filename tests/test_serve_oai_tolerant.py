@@ -32,3 +32,18 @@ def test_chat_nulls() -> None:
     r = OAIChatRequest.model_validate({"messages": [{"role": "user", "content": "hi"}], "top_p": None,
                                        "presence_penalty": None})
     assert r.top_p == OAIChatRequest(messages=[{"role": "user", "content": "hi"}]).top_p
+
+
+def test_completion_maps_to_generate_with_steering() -> None:
+    from kotodama.serve.server import oai_completion_to_generate
+
+    r = OAICompletionRequest.model_validate({
+        "prompt": "Mara:", "max_tokens": 64, "temperature": 0.75, "top_p": 0.0, "frequency_penalty": 0.2,
+        "stop": "\n\nTeo:", "vectors": [{"name": "vrep", "alpha": -0.05}, {"name": "V7_s58", "alpha": 0.03}]})
+    g = oai_completion_to_generate(r)
+    assert g.prompt == "Mara:" and g.max_new_tokens == 64 and g.temperature == 0.75
+    assert g.repetition_penalty == 1.2 and g.stop_strings == ["\n\nTeo:"]
+    assert [(v.name, v.alpha) for v in g.vectors] == [("vrep", -0.05), ("V7_s58", 0.03)]
+    single = oai_completion_to_generate(OAICompletionRequest.model_validate(
+        {"prompt": "x", "steer_model": "vrep", "steer_alpha": None}))
+    assert single.steer_model == "vrep" and single.steer_alpha is None and single.vectors is None

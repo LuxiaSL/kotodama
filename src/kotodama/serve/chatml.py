@@ -17,8 +17,9 @@ CHATML_TEMPLATE = (
     "{% endif %}"
 )
 
-# Token ids in the SmolLM2 vocab: 0 = <|endoftext|>, 2 = <|im_end|>.
+# Token ids in the SmolLM2 vocab: 0 = <|endoftext|>, 1 = <|im_start|>, 2 = <|im_end|>.
 EOS_TOKEN_ID = 0
+IM_START_TOKEN_ID = 1
 IM_END_TOKEN_ID = 2
 BASE_STOP_TOKEN_IDS = frozenset({EOS_TOKEN_ID})
 CHAT_STOP_TOKEN_IDS = frozenset({EOS_TOKEN_ID, IM_END_TOKEN_ID})

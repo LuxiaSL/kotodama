@@ -1,0 +1,5 @@
+# Dialogue SFT, masked arm: as tsumugi-dialogue-unmasked.yaml, with loss only on the model speaker's turns (each
+# through the next speaker's tag, which teaches the turn to end). Name the speaker for the data at hand with
+# --train_speakers "<label>"; the default below is the label of User / Assistant transcripts.
+extends: tsumugi-dialogue-unmasked.yaml
+train_speakers: Assistant

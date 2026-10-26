@@ -1463,7 +1463,10 @@ class KotodamaModel(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         block_mask=None,
+        return_hidden: bool = False,
     ) -> dict[str, torch.Tensor]:
+        """``return_hidden``: return ``{"hidden": norm(h)}`` (B, S, D) and skip the LM head and loss — for callers
+        that apply the head to a subset of positions (post-training log-probs at completion tokens only)."""
         x = self.embed_tokens(input_ids)
         new_kv_list: list[tuple[torch.Tensor, torch.Tensor]] = []
 
@@ -1511,6 +1514,9 @@ class KotodamaModel(nn.Module):
         output: dict[str, Any] = {}
         if use_cache:
             output["past_kv"] = new_kv_list
+        if return_hidden:
+            output["hidden"] = x
+            return output
 
         if labels is not None:
             if self.fused_linear_ce_loss is not None and self.training:

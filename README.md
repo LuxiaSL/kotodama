@@ -87,6 +87,26 @@ single-process job inside the launcher environment.
 | cooldown branch at anchor step S | copy `<dir>/anchors/step_<S>.pt` (8-digit step) into a fresh `--checkpoint_dir` and launch there with `--total_steps S+1+K --decay_start_pct (S+1)/(S+1+K) --save_schedule 1B:end --anchor_tokens ""` |
 | in-loop evals | add `--inloop_evals riders,induction` to a train launch |
 
+### Post-train
+
+| task | command |
+|---|---|
+| chat SFT | `tools/run_py.sh -m kotodama.posttrain.sft --config configs/posttrain/tsumugi-sft.yaml --checkpoint <base.pt> --train_jsonl <chat.jsonl> --out_dir <dir>` (rows `{"messages": [...]}`; assistant turns train) |
+| DPO / DPOP / IPO | `tools/run_py.sh -m kotodama.posttrain.pref --config configs/posttrain/tsumugi-dpo.yaml --checkpoint <init.pt> --data <pairs.jsonl> --out_dir <dir>` |
+| KTO against self-copying | `python -m kotodama.posttrain.selfcopy label --in <samples.jsonl> --out <kto.jsonl>`, then `pref` with `configs/posttrain/tsumugi-kto-repetition.yaml` |
+| instruction data → transcripts | `python -m kotodama.posttrain.transcript convert-messages --in <*.parquet> --out <transcripts.jsonl>` (`User:` / `Assistant:`; `convert-markdown` for `**Name:**` dialogues) |
+| self-play seeds | `python -m kotodama.posttrain.seeds --endpoint <url> --n 2000 --out <seeds.jsonl>` (the model writes each cast and setting) |
+| self-play transcripts | `python -m kotodama.posttrain.selfplay --seeds <seeds.jsonl> --endpoint <url> --out <run>` (K candidates per turn, mechanical vetoes, uniform choice among survivors, every candidate banked) |
+| self-play → SFT data / health / coherence study | `python -m kotodama.posttrain.corpus {assemble,meters,precision-sample,rate,score} <run> ...` |
+
+Conversations are plain-text transcripts with no special tokens: an optional prose header, then `Name: text`
+turns separated by blank lines (`kotodama.posttrain.transcript`); `--train_speakers all` puts loss on every turn.
+`kotodama.posttrain` trains single-GPU on pretraining's precision recipe (bf16
+weights, fp32 masters in Muon + AdamW) with fp32 AttnRes routing, the numerics the
+serving engine computes. Preference runs precompute reference log-probs once (disk-cached, verified on
+reuse) and refuse more than one epoch. The self-copy labeller flags verbatim reuse
+of the model's own text and template loops, never reuse of names or objects.
+
 ### Evaluate
 
 | task | command |

@@ -1,0 +1,16 @@
+# DPO on kotodama-tsumugi (pairs): beta 0.1, Muon 5e-5 / AdamW 5e-6, 10% warmup, linear decay from 70%, 4 pairs x 4
+# accum, reference = the init — the recipe kotodama-3b was post-trained with. More than one epoch is refused.
+#   tools/run_py.sh -m kotodama.posttrain.pref --config configs/posttrain/tsumugi-dpo.yaml \
+#     --checkpoint <init.pt> --data <pairs.jsonl> --out_dir <dir>
+extends: base-tsumugi.yaml
+objective: dpo
+beta: 0.1
+muon_lr: 5.0e-5
+adamw_lr: 5.0e-6
+warmup_ratio: 0.1
+decay_start_pct: 0.7
+decay_type: linear
+batch: 4
+grad_accum: 4
+max_len: 3584
+compile: false

@@ -1,0 +1,11 @@
+# Track 2, stage 2: length-normalized DPO (the Tulu 3 / Olmo 3 variant) on User: / Assistant: preference pairs,
+# beta 5, 1 epoch; sweep the LR {3e-7, 5e-7, 1e-6} with --optimizer adamw and the dataset size as early stopping.
+extends: tsumugi-dpo.yaml
+objective: dpo_ln
+beta: 5.0
+optimizer: adamw
+adamw_lr: 5.0e-7
+warmup_ratio: 0.1
+decay_start_pct: 0.0
+decay_type: linear
+max_len: 2048

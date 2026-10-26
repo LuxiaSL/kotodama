@@ -1,0 +1,10 @@
+# Dialogue SFT, unmasked arm: plain-text two-speaker transcripts (no special tokens) with loss on EVERY turn. Paired
+# with tsumugi-dialogue-masked.yaml (loss on the model's speaker only): the pair is both a "how does it feel"
+# baseline and the unmasking A/B.
+#   tools/run_py.sh -m kotodama.posttrain.sft --config configs/posttrain/tsumugi-dialogue-unmasked.yaml \
+#     --checkpoint <base.pt> --train_jsonl <transcripts.jsonl> --out_dir <dir>
+extends: tsumugi-sft.yaml
+format: transcript
+train_speakers: all
+drop_overlong: true
+epochs: 1.0

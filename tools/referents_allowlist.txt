@@ -75,11 +75,11 @@ https?://[^\s`'"<>)\]]+
 (?<![\w.])/[ab]/checkpoints\b
 
 # Artifacts this package's tools write and read: the run layout of the eval batteries
-# (riders, bindprobes, nca gates, sampling bench), named in their docstrings so an
+# (riders, bindprobes, nca gates, sampling bench) and of a self-play run, named in their docstrings so an
 # operator knows what lands next to a grid. They name the SHAPE of an output
 # directory, not files in this repository.
 \b(?:items|shots|emit_meta|meta|summary|verified_names|smoothing_index|stage1_summary|bindprobes_summary|bindprobes_gates)\.json\b
-\b(?:items|eval_ledger\*?|eval_smoothing|joinlite-v1|swapdyn-v1)\.jsonl\b
+\b(?:items|eval_ledger\*?|eval_smoothing|joinlite-v1|swapdyn-v1|transcripts|candidates)\.jsonl\b
 \b(?:summary|stage1_tables|bindprobes_tables|final_comparison)\.md\b
 \bsummary\.csv\b
 \bprompts\.txt\b

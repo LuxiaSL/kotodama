@@ -1,0 +1,336 @@
+"""Plain-text transcripts: conversations as documents, with no special chat tokens.
+
+A transcript renders as an optional header (plain prose: the setting, the participants), a blank line, then one
+``Name: text`` turn per paragraph, turns separated by a blank line, and the end-of-text token after the last turn::
+
+    A conversation between Mara and Teo, recorded at the station.
+
+    Mara: You gave away Dad's watch.
+
+    Teo: He didn't even know me.<|endoftext|>
+
+Every piece of this is ordinary text the base model has read in pretraining (transcripts, screenplays, forum
+threads), so post-training teaches a document genre rather than a new protocol. A turn ends where the next speaker's
+``Name:`` begins, which is also the stop sequence at generation time.
+
+Labels come from character offsets on the whole-document tokenization, so token boundaries are exactly the ones the
+model sees at inference:
+
+* ``train_speakers=None`` (unmasked): every turn trains, from the first speaker tag to the end-of-text token. The
+  model learns the whole document — every participant's side — which is what a multi-voice transcript needs.
+* ``train_speakers={...}`` (masked): a listed speaker's turn trains from its text through the NEXT speaker's ``Name:``
+  tag (that tag is how the turn learns to stop); the last turn trains through the end-of-text token. Other turns are
+  context. A turn with ``"train": false`` is context whoever speaks it.
+
+The header never trains: it is the frame a run supplies.
+
+CLI:  python -m kotodama.posttrain.transcript convert-markdown --in raw.jsonl --out turns.jsonl [--rename "A=B"]
+      (rows ``{"text": "**User:** ... **Night Owl:** ..."}`` -> rows ``{"turns": [{"speaker", "text"}, ...]}``)
+      python -m kotodama.posttrain.transcript convert-messages --in data.parquet|.jsonl --out turns.jsonl
+      (instruction data ``{"messages": [{"role", "content"}]}`` -> ``User:`` / ``Assistant:`` transcripts; a system
+      message becomes the header; rows whose text contains a turn tag are dropped)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+from kotodama.posttrain.chat_data import IGNORE_INDEX, Example
+
+logger = logging.getLogger(__name__)
+
+SEP = "\n\n"
+_NAME_OK = re.compile(r"^[^\n:]{1,40}$")
+_MD_ROLE = re.compile(r"\*\*([^*\n]{1,40}?):\*\*")
+
+
+@dataclass(frozen=True)
+class Turn:
+    speaker: str
+    text: str
+    train: bool = True
+
+
+@dataclass(frozen=True)
+class Transcript:
+    turns: tuple[Turn, ...]
+    header: str = ""
+
+
+def parse_row(row: dict[str, Any]) -> Optional[Transcript]:
+    """A transcript from ``{"turns": [{"speaker", "text"[, "train"]}], "header"?}``; None if malformed."""
+    turns = row.get("turns") if isinstance(row, dict) else None
+    if not isinstance(turns, list) or not turns:
+        return None
+    out = []
+    for t in turns:
+        if not isinstance(t, dict) or not isinstance(t.get("speaker"), str) or not isinstance(t.get("text"), str):
+            return None
+        sp = t["speaker"].strip()
+        if not _NAME_OK.match(sp):
+            return None
+        out.append(Turn(sp, t["text"].strip(), bool(t.get("train", True))))
+    header = row.get("header", "")
+    return Transcript(tuple(out), header.strip() if isinstance(header, str) else "")
+
+
+def load_jsonl(path: str | Path) -> list[Transcript]:
+    res: list[Transcript] = []
+    bad = 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                tr = parse_row(json.loads(line))
+            except json.JSONDecodeError:
+                tr = None
+            if tr is None:
+                bad += 1
+            else:
+                res.append(tr)
+    if bad:
+        logger.warning("%s: %d rows skipped (need turns of {speaker, text}; speaker without ':' or newline)", path, bad)
+    return res
+
+
+def render(tr: Transcript) -> tuple[str, list[tuple[int, int, int]]]:
+    """(document text without the end-of-text token, per-turn (tag_start, text_start, end) character offsets)."""
+    parts: list[str] = []
+    spans: list[tuple[int, int, int]] = []
+    pos = 0
+    if tr.header:
+        parts.append(tr.header + SEP)
+        pos += len(tr.header) + len(SEP)
+    for i, t in enumerate(tr.turns):
+        tag = f"{t.speaker}:"
+        body = f" {t.text}" if t.text else ""
+        spans.append((pos, pos + len(tag), pos + len(tag) + len(body)))
+        piece = tag + body + (SEP if i < len(tr.turns) - 1 else "")
+        parts.append(piece)
+        pos += len(piece)
+    return "".join(parts), spans
+
+
+def render_prompt(tr: Transcript, next_speaker: str) -> str:
+    """The document up to an open turn for ``next_speaker`` — what a generator continues. Stop on ``"\\n\\n<Name>:"``."""
+    text, _ = render(tr)
+    lead = text + SEP if tr.turns else (tr.header + SEP if tr.header else "")
+    return f"{lead}{next_speaker}:"
+
+
+def stop_sequences(speakers: Iterable[str]) -> list[str]:
+    """Stops that end a generated turn: the next turn starting under any participant's name."""
+    return [f"{SEP}{s}:" for s in dict.fromkeys(speakers)]
+
+
+def tokenize(tr: Transcript, tokenizer: Any, max_len: int, eos_id: int,
+             train_speakers: Optional[set[str]] = None) -> Optional[Example]:
+    """Tokenize + label one transcript (see the module docstring); None if nothing trains after truncation."""
+    text, spans = render(tr)
+    enc = tokenizer(text, return_offsets_mapping=True, add_special_tokens=False)
+    ids = list(enc["input_ids"]) + [eos_id]
+    offs = list(enc["offset_mapping"]) + [(len(text), len(text) + 1)]
+    # character ranges that train
+    ranges: list[tuple[int, int]] = []
+    n = len(tr.turns)
+    for i, (t, (tag0, txt0, end)) in enumerate(zip(tr.turns, spans)):
+        if not t.train:
+            continue
+        if train_speakers is None:
+            lo = tag0  # unmasked: the speaker tag trains too (who speaks next is part of the document)
+        elif t.speaker in train_speakers:
+            lo = txt0
+        else:
+            continue
+        hi = spans[i + 1][1] if i + 1 < n else len(text) + 1  # through the next tag, or through end-of-text
+        ranges.append((lo, hi))
+    labels = [IGNORE_INDEX] * len(ids)
+    r = 0
+    for k, (a, _b) in enumerate(offs):
+        while r < len(ranges) and ranges[r][1] <= a:
+            r += 1
+        if r < len(ranges) and ranges[r][0] <= a < ranges[r][1]:
+            labels[k] = ids[k]
+    if len(ids) > max_len:
+        ids, labels = ids[:max_len], labels[:max_len]
+    ex = Example(ids, labels)
+    return ex if ex.n_trainable else None
+
+
+def encode(transcripts: Iterable[Transcript], tokenizer: Any, max_len: int, eos_id: int,
+           train_speakers: Optional[set[str]] = None, drop_overlong: bool = False) -> list[Example]:
+    """Tokenized examples. ``drop_overlong`` drops a transcript longer than ``max_len`` instead of truncating it
+    (instruction data: a truncated answer teaches answers that stop mid-thought)."""
+    out: list[Example] = []
+    n = dropped = 0
+    for tr in transcripts:
+        n += 1
+        ex = tokenize(tr, tokenizer, max_len + (1 if drop_overlong else 0), eos_id, train_speakers)
+        if ex is not None and drop_overlong and len(ex.input_ids) > max_len:
+            ex = None
+        if ex is None:
+            dropped += 1
+        else:
+            out.append(ex)
+    logger.info("encoded %d transcripts -> %d examples (%d with nothing to train dropped); %d trainable tokens",
+                n, len(out), dropped, sum(e.n_trainable for e in out))
+    return out
+
+
+# ── conversion ───────────────────────────────────────────────────────────────
+
+
+def _name_key(name: str) -> str:
+    """Spacing, case and a parenthetical descriptor do not make a different speaker: "NightOwl", "night owl" and
+    "Night Owl (curious)" share a key."""
+    return re.sub(r"\s+|\(.*?\)", "", name).lower()
+
+
+def from_markdown_roles(text: str, rename: dict[str, str] | None = None, min_turns: int = 4,
+                        keep_speakers: Optional[list[str]] = None) -> Optional[Transcript]:
+    """``**Name:** text`` markdown dialogue -> a transcript (None below ``min_turns`` or with fewer than 2 speakers).
+    A trailing "Response" on a label is dropped. With ``keep_speakers``, labels fold onto those canonical names by
+    ``_name_key`` and a conversation with any other speaker is rejected (label noise is usually a broken turn)."""
+    rename = rename or {}
+    canon = {_name_key(s): s for s in keep_speakers} if keep_speakers else None
+    marks = list(_MD_ROLE.finditer(text))
+    turns: list[Turn] = []
+    for i, m in enumerate(marks):
+        body = text[m.end():marks[i + 1].start() if i + 1 < len(marks) else len(text)].strip()
+        raw = re.sub(r"\s+Response$", "", m.group(1).strip())
+        if canon is not None:
+            if _name_key(raw) not in canon:
+                return None
+            raw = canon[_name_key(raw)]
+        sp = rename.get(raw, raw)
+        if not body or not _NAME_OK.match(sp):
+            continue
+        if turns and turns[-1].speaker == sp:  # a split turn: merge
+            turns[-1] = Turn(sp, turns[-1].text + SEP + body)
+        else:
+            turns.append(Turn(sp, body))
+    if len(turns) < min_turns or len({t.speaker for t in turns}) < 2:
+        return None
+    return Transcript(tuple(turns))
+
+
+ROLE_SPEAKERS = {"user": "User", "assistant": "Assistant"}
+
+
+def from_messages(messages: Any) -> Optional[Transcript]:
+    """``[{"role", "content"}]`` -> a ``User:`` / ``Assistant:`` transcript (a leading system message becomes the
+    header). None for other roles (tools), an empty turn, no assistant turn, or text containing a turn tag."""
+    if not isinstance(messages, (list, tuple)) or not messages:
+        return None
+    header = ""
+    turns: list[Turn] = []
+    for i, m in enumerate(messages):
+        role, content = (m.get("role"), m.get("content")) if isinstance(m, dict) else (None, None)
+        if not isinstance(content, str):
+            return None
+        if role == "system" and i == 0:
+            header = content.strip()
+            continue
+        sp = ROLE_SPEAKERS.get(role)
+        if sp is None or not content.strip():
+            return None
+        turns.append(Turn(sp, content.strip()))
+    if not any(t.speaker == "Assistant" for t in turns):
+        return None
+    tags = [f"{SEP}{s}:" for s in ROLE_SPEAKERS.values()] + [f"\n{s}:" for s in ROLE_SPEAKERS.values()]
+    if any(tag in t.text for t in turns for tag in tags) or any(t.text.startswith(f"{s}:") for t in turns
+                                                                  for s in ROLE_SPEAKERS.values()):
+        return None
+    return Transcript(tuple(turns), header)
+
+
+def _iter_records(path: str) -> Iterable[dict[str, Any]]:
+    if path.endswith(".parquet"):
+        import pyarrow.parquet as pq
+
+        for batch in pq.ParquetFile(path).iter_batches(batch_size=2048):
+            yield from batch.to_pylist()
+    else:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+
+def to_row(tr: Transcript) -> dict[str, Any]:
+    row: dict[str, Any] = {"turns": [{"speaker": t.speaker, "text": t.text} | ({} if t.train else {"train": False})
+                                     for t in tr.turns]}
+    if tr.header:
+        row["header"] = tr.header
+    return row
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    ap = argparse.ArgumentParser(description="plain-text transcript tools")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("convert-markdown", help="**Name:** markdown dialogues -> transcript rows")
+    c.add_argument("--in", dest="inp", required=True)
+    c.add_argument("--out", required=True)
+    c.add_argument("--field", default="text")
+    c.add_argument("--rename", action="append", default=[], help="OLD=NEW speaker rename (repeatable)")
+    c.add_argument("--min_turns", type=int, default=4)
+    c.add_argument("--keep_speakers", default=None,
+                   help="comma list of canonical speaker labels (before --rename); other speakers reject the row")
+    cm = sub.add_parser("convert-messages", help="{messages: [{role, content}]} -> User:/Assistant: transcript rows")
+    cm.add_argument("--in", dest="inp", required=True, nargs="+", help=".parquet or .jsonl files")
+    cm.add_argument("--out", required=True)
+    cm.add_argument("--field", default="messages")
+    cm.add_argument("--source_field", default="source", help="per-row provenance column carried into the output")
+    a = ap.parse_args(argv)
+    if a.cmd == "convert-messages":
+        kept = skipped = 0
+        with open(a.out, "w", encoding="utf-8") as fo:
+            for path in a.inp:
+                for rec in _iter_records(path):
+                    tr = from_messages(rec.get(a.field))
+                    if tr is None:
+                        skipped += 1
+                        continue
+                    row = to_row(tr)
+                    if rec.get(a.source_field) is not None:
+                        row["source"] = str(rec[a.source_field])
+                    fo.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    kept += 1
+        logger.info("converted %d, skipped %d (tool roles, empty turns, turn-tag collisions) -> %s", kept, skipped,
+                    a.out)
+        return 0
+    rename = dict(r.split("=", 1) for r in a.rename)
+    keep = [s.strip() for s in a.keep_speakers.split(",")] if a.keep_speakers else None
+    kept = skipped = 0
+    with open(a.inp, encoding="utf-8") as fi, open(a.out, "w", encoding="utf-8") as fo:
+        for line in fi:
+            if not line.strip():
+                continue
+            try:
+                text = json.loads(line).get(a.field)
+            except (json.JSONDecodeError, AttributeError):
+                text = None
+            tr = from_markdown_roles(text, rename, a.min_turns, keep) if isinstance(text, str) else None
+            if tr is None:
+                skipped += 1
+                continue
+            fo.write(json.dumps(to_row(tr), ensure_ascii=False) + "\n")
+            kept += 1
+    logger.info("converted %d, skipped %d -> %s", kept, skipped, a.out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1352,6 +1352,10 @@ class OAICompletionRequest(BaseModel):
     best_of: int | None = None
     stop: list[str] | str | None = None
     return_token_ids: bool = False
+    # Residual steering, as on /generate (needs the fast engine + --steer-npz; else 400).
+    vectors: list[SteerVectorSpec] | None = None
+    steer_model: str | None = None
+    steer_alpha: float | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -1365,29 +1369,34 @@ class OAICompletionRequest(BaseModel):
         return data
 
 
-@app.post("/v1/completions")
-async def oai_completions(request: OAICompletionRequest):
-    if _model is None or _tokenizer is None:
-        raise HTTPException(503, detail="Model not loaded")
-
+def oai_completion_to_generate(request: OAICompletionRequest) -> GenerateRequest:
+    """The /generate request one /v1/completions choice runs: sampling, stops and steering carried over."""
     stop_strings: list[str] = []
     if isinstance(request.stop, str):
         stop_strings = [request.stop]
     elif isinstance(request.stop, list):
         stop_strings = request.stop
+    return GenerateRequest(
+        prompt=request.prompt,
+        max_new_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        repetition_penalty=resolve_oai_repetition_penalty(request.frequency_penalty),
+        stop_strings=stop_strings,
+        vectors=request.vectors,
+        steer_model=request.steer_model,
+        steer_alpha=request.steer_alpha,
+    )
 
-    repetition_penalty = resolve_oai_repetition_penalty(request.frequency_penalty)
+
+@app.post("/v1/completions")
+async def oai_completions(request: OAICompletionRequest):
+    if _model is None or _tokenizer is None:
+        raise HTTPException(503, detail="Model not loaded")
 
     choices = []
     for i in range(request.n):
-        gen_req = GenerateRequest(
-            prompt=request.prompt,
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            repetition_penalty=repetition_penalty,
-            stop_strings=stop_strings,
-        )
+        gen_req = oai_completion_to_generate(request)
         if _engine_compatible(gen_req):
             async with _engine_lock:
                 result = await _run_generation(engine_generate, gen_req)

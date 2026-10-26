@@ -1,0 +1,16 @@
+# KTO against self-copying on kotodama-tsumugi, whose most common failure is re-emitting its own sentences and
+# template loops. Data: on-policy samples at the
+# tsumugi sampling law (T 0.7-0.8, top_p off, rep 1.2; 256-512-token completions so loops have room to show),
+# labelled by the span-level self-copy detector (verbatim own-text reuse / template loops — NOT name or object
+# reuse, so binding is never penalized):
+#   python -m kotodama.posttrain.selfcopy label --in samples.jsonl --out kto.jsonl
+#   tools/run_py.sh -m kotodama.posttrain.pref --config configs/posttrain/tsumugi-kto-repetition.yaml \
+#     --checkpoint <init.pt> --data kto.jsonl --out_dir <dir>
+# Set kto_lambda_d / kto_lambda_u so lambda_D n_D / lambda_U n_U lands in [1, 4/3] (the run logs the ratio).
+# Gates before/after: riders + stage gauges (binding must not erode), loop rate AND early-EOS rate at T .7 / rep 1.2,
+# then a human read.
+extends: tsumugi-dpo.yaml
+objective: kto
+kto_kl: mismatched
+kto_lambda_d: 1.0
+kto_lambda_u: 1.0

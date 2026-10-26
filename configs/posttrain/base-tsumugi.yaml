@@ -1,0 +1,8 @@
+# kotodama-tsumugi (1b-moonshot-loop: 52 unique / 72 effective layers, core 19-38 run twice) — the model block every
+# post-training run on it shares. Routing runs fp32, the numerics the serving engine computes.
+model_size: 1b-moonshot-loop
+attn_res_boundaries: "0,1,7,9,17,19,39,59"
+rope_fp32: true
+attnres_eps_fp64_compat: false
+use_liger: true
+attn_impl: auto

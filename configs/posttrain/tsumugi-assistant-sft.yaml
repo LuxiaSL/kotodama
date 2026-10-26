@@ -1,0 +1,19 @@
+# Track 2, stage 1: standard instruction SFT on User: / Assistant: transcripts (outside instruction data, e.g. the
+# Tulu 3 OLMo-2 SFT mixture converted with `python -m kotodama.posttrain.transcript convert-messages`). Loss on the
+# Assistant's turns; transcripts over 4096 tokens dropped, not truncated; 2 epochs (the Tulu 3 / SmolLM2 setting).
+# The LR is the sweep axis (one config per GPU): AdamW {1e-5, 2e-5, 5e-5, 1e-4} with --optimizer adamw, and the
+# hybrid Muon recipe at 1e-3 / 2e-3.
+#   tools/run_py.sh -m kotodama.posttrain.sft --config configs/posttrain/tsumugi-assistant-sft.yaml \
+#     --checkpoint <base.pt> --train_jsonl <transcripts.jsonl> --eval_jsonl <held-out.jsonl> --out_dir <dir> \
+#     [--optimizer adamw --adamw_lr 2e-5]
+extends: tsumugi-sft.yaml
+format: transcript
+train_speakers: Assistant
+drop_overlong: true
+epochs: 2.0
+warmup_ratio: 0.03
+decay_start_pct: 0.0
+decay_type: linear
+# Final weights only: a 2-epoch run is ~23K steps and each save is ~2.9 GB, so a sweep's intermediates would not fit.
+save_every: 0
+eval_every: 1000
