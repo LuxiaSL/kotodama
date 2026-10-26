@@ -121,3 +121,16 @@ def test_overlong_keep() -> None:
     assert st["ended"]["degraded"] == 0 and st["max_depth"] == 3
     st2, _ = grow(loom.LoomConfig(candidates=2, children=1, width=2, max_depth=3, min_turns=1), complete)
     assert st2["ended"]["degraded"] == 1
+
+
+def test_engagement_failure_falls_back_to_uniform() -> None:
+    async def broken(pairs):
+        raise RuntimeError("server went away")
+
+    cfg = loom.LoomConfig(candidates=4, children=2, width=4, max_depth=3, min_turns=2, select="engage",
+                          select_lambda=1.0)
+    recs = {"node": [], "path": [], "state": []}
+    st = asyncio.run(loom.grow(SEED, "t0", fake()[0], cfg, SelfPlayConfig(min_turns=2), "s",
+                               lambda k, r: recs[k].append(r), broken))
+    assert st["max_depth"] == 3 and st.get("engage_failures", 0) > 0
+    assert all("engage" not in r for r in recs["node"])

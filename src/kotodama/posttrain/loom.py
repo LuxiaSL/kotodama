@@ -137,9 +137,16 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
         rng = random.Random(f"{salt}:{node.id}")
         eng: dict[int, float] = {}
         if cfg.select == "engage" and score is not None and len(survivors) > cfg.children:
-            vals = await asyncio.gather(*(engagement(node.turns, seed.header, seed.cast, Turn(speaker, cands[i].text),
-                                                     complete, score, cfg.engage_replies) for i in survivors))
-            eng = dict(zip(survivors, vals))
+            try:
+                vals = await asyncio.gather(*(engagement(node.turns, seed.header, seed.cast,
+                                                         Turn(speaker, cands[i].text), complete, score,
+                                                         cfg.engage_replies) for i in survivors))
+                eng = dict(zip(survivors, vals))
+            except Exception as e:  # a failed scoring round costs this node its weighting, not the tree
+                logger.warning("node %s: engagement scoring failed (%s); choosing uniformly", node.id, e)
+                stats["engage_failures"] = stats.get("engage_failures", 0) + 1
+        if eng:
+            vals = [eng[i] for i in survivors]
             mu = sum(vals) / len(vals)
             sd = (sum((v - mu) ** 2 for v in vals) / len(vals)) ** 0.5 or 1.0
             w = [math.exp(cfg.select_lambda * (eng[i] - mu) / sd) for i in survivors]
@@ -198,10 +205,18 @@ def http_scorer(endpoints: list[str], timeout: float = 600.0, transport: Any = N
             items = [{"id": str(j), "prompt_ids": tok.encode(p, add_special_tokens=False)[-3500:],
                       "completion_ids": tok.encode(c, add_special_tokens=False)[:256]}
                      for j, (p, c) in enumerate(pairs[k:k + 32])]
-            url = endpoints[counter["i"] % len(endpoints)].rstrip("/") + "/score_tokens"
-            counter["i"] += 1
-            r = await client.post(url, json={"items": items})
-            r.raise_for_status()
+            for attempt in range(4):  # idle keep-alive sockets get closed server-side between engagement rounds
+                url = endpoints[counter["i"] % len(endpoints)].rstrip("/") + "/score_tokens"
+                counter["i"] += 1
+                try:
+                    r = await client.post(url, json={"items": items})
+                    r.raise_for_status()
+                    break
+                except (httpx.HTTPError, httpx.TimeoutException) as e:
+                    if attempt == 3:
+                        raise
+                    logger.warning("score request failed (%s); retrying", e)
+                    await asyncio.sleep(2 ** attempt)
             out += [-x["mean_nll"] if x["n_tokens"] else 0.0 for x in r.json()["results"]]
         return out
 
