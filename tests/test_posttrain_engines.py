@@ -140,6 +140,16 @@ def test_kto_mismatched_runs(tiny_ckpt, tok, tmp_path) -> None:
     assert first.get("reward_desirable", 0.0) == pytest.approx(0.0, abs=1e-4)
 
 
+def test_sft_varlen_inputs_static_bound_when_compiled() -> None:
+    from kotodama.posttrain.sft import varlen_inputs
+    b = {"labels": torch.zeros(1, 8), "position_ids": torch.zeros(1, 8), "cu_seqlens": torch.tensor([0, 3, 8]),
+         "max_seqlen": 5}
+    assert varlen_inputs(b, 8, compiled=False)["max_seqlen"] == 5
+    kw = varlen_inputs(b, 8, compiled=True)
+    assert kw["max_seqlen"] == 8 and kw["cu_seqlens"] is b["cu_seqlens"] and set(kw) == {
+        "labels", "position_ids", "cu_seqlens", "max_seqlen"}
+
+
 def test_pref_save_steps_are_bounded() -> None:
     from kotodama.posttrain.pref import save_steps
     assert save_steps(600, 5) == {100, 200, 300, 400, 500}

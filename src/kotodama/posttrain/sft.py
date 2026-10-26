@@ -94,6 +94,18 @@ def _to_device(batch: dict[str, Any], device: str) -> dict[str, Any]:
 
 
 @torch.no_grad()
+def varlen_inputs(b: dict[str, Any], max_seq_len: int, compiled: bool) -> dict[str, Any]:
+    """Forward kwargs for a packed batch. Compiled: the segment count is dynamic from the first trace and max_seqlen is
+    the row length (an exact upper bound for the varlen attention kernels) — a per-batch int would recompile on every
+    new value and, past dynamo's cache limit, drop the rest of the run to eager."""
+    max_seqlen = b["max_seqlen"]
+    if compiled:
+        torch._dynamo.maybe_mark_dynamic(b["cu_seqlens"], 0)
+        max_seqlen = max_seq_len
+    return {"labels": b["labels"], "position_ids": b["position_ids"], "cu_seqlens": b["cu_seqlens"],
+            "max_seqlen": max_seqlen}
+
+
 def evaluate(model: torch.nn.Module, rows: list[cd.PackedRow], mb: int, device: str) -> dict[str, float]:
     """Token-weighted eval loss, and top-1 accuracy on the tokens that close a turn (<|im_end|>) or a document
     (end-of-text) — does the model stop where the data stops."""
@@ -169,8 +181,9 @@ def main(argv: list[str] | None = None) -> int:
         tel.log(0, **ev)
 
     step = micro = 0
-    loss_acc = 0.0
-    tok_acc = 0
+    loss_acc = torch.zeros((), device=a.device)
+    tok_acc = torch.zeros((), dtype=torch.long, device=a.device)
+    is_compiled = fwd is not model
     t0 = time.perf_counter()
     epoch = 0
     done = False
@@ -178,11 +191,10 @@ def main(argv: list[str] | None = None) -> int:
         for rows in _batches(train_rows, a.micro_batch_size, a.seed + epoch):
             b = _to_device(cd.collate(rows), a.device)
             with common.autocast(a.device):
-                out = fwd(b["input_ids"], labels=b["labels"], position_ids=b["position_ids"],
-                          cu_seqlens=b["cu_seqlens"], max_seqlen=b["max_seqlen"])
+                out = fwd(b["input_ids"], **varlen_inputs(b, a.max_seq_len, is_compiled))
             (out["loss"] / a.grad_accum).backward()
-            loss_acc += float(out["loss"].detach())
-            tok_acc += int((b["labels"] != cd.IGNORE_INDEX).sum())
+            loss_acc += out["loss"].detach()  # accumulated on device: one host sync per step, not per micro-batch
+            tok_acc += (b["labels"] != cd.IGNORE_INDEX).sum()
             micro += 1
             if micro % a.grad_accum:
                 continue
@@ -190,10 +202,10 @@ def main(argv: list[str] | None = None) -> int:
             step += 1
             dt = time.perf_counter() - t0
             t0 = time.perf_counter()
-            loss = loss_acc / a.grad_accum
+            loss = float(loss_acc) / a.grad_accum
             lrs = sched.get_last_lr()
             rec: dict[str, Any] = {"loss": loss, "grad_norm": gn, "muon_lr": lrs["muon_lr"],
-                                   "adamw_lr": lrs["adamw_lr"], "trainable_tokens": tok_acc,
+                                   "adamw_lr": lrs["adamw_lr"], "trainable_tokens": int(tok_acc),
                                    "tok_s": a.grad_accum * a.micro_batch_size * a.max_seq_len / max(dt, 1e-9)}
             logger.info("step %d/%d loss %.4f gn %.2f lr %.2e", step, total_steps, loss, gn, lrs["muon_lr"])
             if not math.isfinite(loss):
@@ -203,7 +215,8 @@ def main(argv: list[str] | None = None) -> int:
                 rec.update(evaluate(model, eval_rows, a.micro_batch_size, a.device))
                 logger.info("eval @%d: loss %.4f", step, rec["eval/loss"])
             tel.log(step, **rec)
-            loss_acc, tok_acc = 0.0, 0
+            loss_acc.zero_()
+            tok_acc.zero_()
             if a.save_every and step % a.save_every == 0 and step < total_steps:
                 common.save_weights(ckpt_dir / f"step_{step:08d}.pt", model, step, meta)
             if sig.received or step >= total_steps:
