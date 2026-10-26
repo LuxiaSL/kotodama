@@ -58,8 +58,11 @@ Choices left open, fixed here:
     it.``), so only the new object is in it afterwards and the stale value is strictly wrong; the code register is
     plain assignment. Neither names the old object, so every value is mentioned once (a swap template that named
     it would mention stale values twice and gold once, a least-frequent cue). Every value is distinct within a
-    prompt; the R distractor reassignments go to random other
-    holders; the other holders' first lines fall anywhere in the chain, so recency is controlled even at R = 0.
+    prompt. The other holders are introduced first, then the target's chain; the R distractor reassignments go to
+    random other holders and fall at random between the target's updates. At R = 0 the target's last update is the
+    prompt's last line, so R = 0 rungs are the labelled recency subset; at R = N the last line is the target's on
+    1/5 of rows (the neutral rate); on the rest one reassignment is held back to close the prompt. (Introducing the other holders after the chain
+    left the ladder without an easy end: primacy in code and recency in prose both pulled away from gold.)
   - F4: example and query tokens all distinct within a prompt; within a rung, pattern type and the read position
     in the copy are balanced.
   - C0: the work's answer is the first word of its title (the shots show whole titles); the facts are unambiguous
@@ -73,9 +76,10 @@ Shortcut controls (recorded per row; :func:`audit`, :func:`audit_failures`). Eac
 following that shortcut would get, compared with the row's NEUTRAL rate (the shortcut-neutral law of the bindprobes
 families: a shortcut neither helps nor, by being scheduled at zero, becomes an exclusion cue):
   recency    gold = the most recent example's answer (F3: the value in the last line). Scheduled at the neutral rate
-             where the answer varies within a prompt (F2, F3 1/C; F1 conditioned 1/2, its two in-context affixes).
-             Structurally 0 where the gold is a new form (F1 vowel change, F4, C0). F1 suffix and infix rows are the
-             labelled recency subset (``recency_subset``): one affix answers every line of the prompt.
+             where the answer varies within a prompt (F2, F3 at R = N 1/C; F1 conditioned 1/2, its two in-context
+             affixes). Structurally 0 where the gold is a new form (F1 vowel change, F4, C0). The labelled recency
+             subset (``recency_subset``): F1 suffix and infix rows (one affix answers every line of the prompt) and
+             F3 R = 0 rows (the target's last update closes the prompt).
   frequency  gold = the candidate occurring most often in the prompt (ties split). Scheduled at 1/6 in F2; at or
              below neutral by construction elsewhere; exempt in the recency subset.
   novelty    gold = the only kind of candidate absent from the prompt (ties split). Reported, not gated: F1 vowel
@@ -93,7 +97,7 @@ Read-out (:func:`summarize`), per family, per model:
             share of the errors; per-register midpoints
   C0        accuracy by shots, per relation
 :func:`fluid_scores` turns many models' summaries into the fluid score (the mean of F1–F4 midpoints, z-scored across
-the models passed in) and the crystallized score (C0's, z-scored the same way).
+the models passed in) and the crystallized score (C0's AUC, z-scored the same way).
 """
 
 from __future__ import annotations
@@ -608,22 +612,28 @@ def _f3_make(rng: random.Random, params: tuple[int, int, str], s: _Schedule, k: 
     vals = [gold] + rng.sample([w for w in VALUES if w != gold], n_values - 1)
     chain = vals[1:n + 1] + [gold]                      # the target's values, first → current
     rest = vals[n + 1:]
-    queues: dict[str, list[str]] = {target: list(chain)}
-    for h in others:
-        queues[h] = [rest.pop()]
+    history: dict[str, list[str]] = {target: list(chain), **{h: [rest.pop()] for h in others}}
+    moves: list[tuple[str, str, bool]] = []            # the other holders' reassignments (the R axis)
     for _ in range(r):
-        queues[rng.choice(others)].append(rest.pop())
-    history = {h: list(q) for h, q in queues.items()}
-    want = s.recent[k]
-    held = target if want else rng.choice(others)
-    last = (held, queues[held].pop())
-    events: list[tuple[str, str, bool]] = []
-    seen: set[str] = set()
-    while any(queues.values()):
-        h = rng.choices(list(queues), weights=[len(q) for q in queues.values()])[0]
-        events.append((h, queues[h].pop(0), h in seen))
-        seen.add(h)
-    events.append((last[0], last[1], last[0] in seen))
+        h = rng.choice(others)
+        history[h].append(rest.pop())
+        moves.append((h, history[h][-1], True))
+    # The other holders are introduced first; then the target's chain, with the reassignments in random gaps between
+    # its lines. At R = 0 the target's last line is the prompt's last line (the recency subset). At R > 0 the last
+    # line is the target's on the scheduled neutral share of rows; on the rest, one reassignment is held back and
+    # closes the prompt.
+    events: list[tuple[str, str, bool]] = [(h, history[h][0], False) for h in others]
+    hold = moves.pop() if r and not s.recent[k] else None
+    gaps = sorted(rng.randrange(n) for _ in moves)  # move i follows target line gaps[i] (0 = its introduction)
+    mi = 0
+    for i, v in enumerate(chain):
+        events.append((target, v, i > 0))
+        while mi < len(moves) and gaps[mi] == i:
+            events.append(moves[mi])
+            mi += 1
+    if hold is not None:
+        events.append(hold)
+    last = (events[-1][0], events[-1][1])
     stale = chain[-2]
     roles: dict[str, str] = {gold: "gold", stale: "stale"}
     if n >= 2:
@@ -636,9 +646,9 @@ def _f3_make(rng: random.Random, params: tuple[int, int, str], s: _Schedule, k: 
         if len(roles) >= fam.n_candidates:
             break
         roles.setdefault(v, "cross_current" if v in cross_now else "cross_old" if v in cross_old else "older")
-    c = fam.n_candidates
-    return _finish(fam, _f3_render(register, events, target), gold, roles, s.gold_index[k], rng, last[1], 1 / c,
-                   1 / c, {"N": n, "R": r, "register": register, "holder": target, "stale": stale,
+    neutral = 1 / fam.n_candidates if r else None      # R = 0: the labelled recency subset, audits exempt
+    return _finish(fam, _f3_render(register, events, target), gold, roles, s.gold_index[k], rng, last[1], neutral,
+                   neutral, {"N": n, "R": r, "register": register, "holder": target, "stale": stale,
                            "n_lines": len(events)})
 
 
@@ -984,7 +994,8 @@ Order = Literal["mean_then_z", "z_then_mean"]
 
 
 def _value(s: FamilySummary, stat: Stat) -> Optional[float]:
-    return s.midpoint.score() if stat == "midpoint" else s.auc
+    # C0 is always read by AUC: knowledge barely depends on the shot count, so its midpoint censors for most models.
+    return s.auc if stat == "auc" or s.family == "C0" else s.midpoint.score()
 
 
 def _z(xs: Mapping[str, float]) -> dict[str, float]:
@@ -1002,7 +1013,8 @@ def fluid_scores(summaries: Mapping[str, Mapping[str, FamilySummary]], stat: Sta
     fluid         the mean over F1–F4 of each family's ``stat`` (censored midpoints at their bounds), z-scored
                   across the models that have all four (``order="z_then_mean"`` z-scores each family first, then
                   averages the z's)
-    crystallized  C0's ``stat``, z-scored across the models that have it
+    crystallized  C0's AUC whatever ``stat`` is (its shot-ladder midpoint censors for most models), z-scored across
+                  the models that have it
     gap           fluid − crystallized (z units), where both exist
     A z-score needs ≥ 2 models; with fewer every z is 0. Models missing a family get None for that score."""
     raw: dict[str, dict[str, Optional[float]]] = {

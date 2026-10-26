@@ -151,7 +151,7 @@ def test_f2_equations_evaluate_to_gold(full):
     assert {r["path_steps"] for r in full["fluid-v1-algebra"] if r["depth"] == 3} >= {0, 1, 2, 3}
 
 
-def _f3_replay(r: dict[str, Any]) -> tuple[str, str, str]:
+def _f3_replay(r: dict[str, Any]) -> tuple[str, str, str, list[str]]:
     if r["register"] == "code":
         *lines, q = r["prompt"].split("\n")
         events = [tuple(x.split(" = ")) for x in lines]
@@ -173,13 +173,22 @@ def _f3_replay(r: dict[str, Any]) -> tuple[str, str, str]:
             events.append((h, v))
         target = q.removesuffix(" holds the")
     hist = [v for h, v in events if h == target]
-    return hist[-1], hist[-2], events[-1][1]
+    return hist[-1], hist[-2], events[-1][1], [h for h, _ in events]
 
 
 def test_f3_replay_gives_gold_stale_and_recency(full):
     for r in full["fluid-v1-rebind"]:
-        gold, stale, last = _f3_replay(r)
+        gold, stale, last, order = _f3_replay(r)
         assert (gold, stale, last) == (r["gold"], r["stale"], r["recent_answer"])
+        others = fl.F3_HOLDERS - 1               # the other holders are introduced first, then the target's chain
+        assert r["holder"] not in order[:others] and order[others] == r["holder"]
+        assert len(set(order[:others])) == others
+        assert r["recency_subset"] == (r["R"] == 0)
+        if r["R"] == 0:
+            assert order[others:] == [r["holder"]] * (r["N"] + 1) and r["gold_is_recent"]
+        else:                                    # reassignments sit between the target's lines; at most one after
+            after = len(order) - 1 - max(i for i, h in enumerate(order) if h == r["holder"])
+            assert after == (0 if r["gold_is_recent"] else 1)
         assert r["roles"][stale] == "stale" and r["gold_count"] == 1
         assert all(fl.count_word(r["prompt"], c.strip()) == 1 for c in r["candidates"])   # no frequency cue
         target_lines = (sum(1 for x in r["prompt"].split("\n") if x.startswith(f"{r['holder']} = "))
@@ -224,7 +233,13 @@ def test_audits_pass_on_the_generated_batteries(full):
         assert all(a["position_max_dev"] <= max(fl.BALANCE_TOL, 1 / a["n"]) for k, a in aud.items()
                    if not k.endswith(":*"))
     aud = fl.audit(full["fluid-v1-rebind"])
-    assert all(abs(a["recency"] - 0.2) < 1e-9 for k, a in aud.items() if not k.endswith(":*"))
+    for k, a in aud.items():
+        if k.endswith(":*"):
+            continue
+        if "|R0|" in k:
+            assert a["recency_subset"] == a["n"] and a["recency"] is None and a["frequency"] is None
+        else:
+            assert abs(a["recency"] - 0.2) < 1e-9 and a["frequency"] <= 0.2 + 1e-9
     aud = fl.audit(full["fluid-v1-morph"])
     assert aud["F1:suffix|n8"]["recency_subset"] == 120 and aud["F1:suffix|n8"]["recency"] is None
     assert abs(aud["F1:cond|n4"]["recency"] - 0.5) < 1e-9
@@ -358,6 +373,21 @@ def test_fluid_scores_zscore_across_models(full):
     assert alt["strong"]["fluid"] > alt["weak"]["fluid"]
     with pytest.raises(ValueError):
         fl.fluid_scores(models, order="median")   # type: ignore[arg-type]
+
+
+def test_crystallized_score_reads_c0_auc_whatever_the_stat(full):
+    """Every C0 curve above half at all rungs (midpoint censored HIGH for all): the AUC still separates them."""
+    rows = full["cryst-v1"]
+    flu = {k: fl.summarize(_scored(full[fl.FAMILIES[k].battery], _acc_for(fl.FAMILIES[k], 4.0)))
+           for k in fl.FLUID_KEYS}
+    models = {name: {**flu, "C0": fl.summarize(_scored(rows, {1: p, 2: p, 3: p, 4: p}))}
+              for name, p in (("knows-more", 0.95), ("knows-less", 0.7))}
+    assert all(m["C0"].midpoint.censored == "high" for m in models.values())
+    for stat in ("midpoint", "auc"):
+        res = fl.fluid_scores(models, stat=stat)     # type: ignore[arg-type]
+        assert res["knows-more"]["crystallized"] == pytest.approx(1.0)
+        assert res["knows-less"]["crystallized"] == pytest.approx(-1.0)
+        assert res["knows-more"]["raw"]["C0"] == pytest.approx(models["knows-more"]["C0"].auc)
 
 
 def test_fluid_cli_reads_scores(tmp_path, full, capsys):
