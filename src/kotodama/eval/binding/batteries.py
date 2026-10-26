@@ -53,7 +53,7 @@ BATTERIES: dict[str, Battery] = {b.name: b for b in (
             "81442d46aa9d0356d54f0676cef7e912d5f1ace36058f2fe74f41bfe8560ecf4", "fluid-algebra",
             "fluid F2: symbol algebra (operators × composition depth)"),
     Battery("fluid-v1-rebind", "rows", "fluid-v1-rebind.jsonl",
-            "035880262f4edd7cd7a36de82ed09cd5c01e807be87d5d8498c0996df9f3f9f6", "fluid-rebind",
+            "34638a377c9fcdb94d2dc057a7247d281d094ffacff76899c2e8d8e29f9927b1", "fluid-rebind",
             "fluid F3: rebinding chains, prose + code (reassignments × distractors; stale-value rate)"),
     Battery("fluid-v1-seqind", "rows", "fluid-v1-seqind.jsonl",
             "b2a1e6b54040500363909cf4d669f84ef968a60df6353127599e9f041a46e15a", "fluid-seqind",

@@ -158,7 +158,19 @@ def _f3_replay(r: dict[str, Any]) -> tuple[str, str, str]:
         target = q.removeprefix("assert ").removesuffix(" ==")
     else:
         body, q = r["prompt"].split(" In the end, the ")
-        events = re.findall(r"(?:Then t|T)he (\w+) holds the (\w+)\.", body)
+        events = []
+        seen: set[str] = set()
+        for sent in re.findall(r"[^.]+\.", body):
+            if m := re.fullmatch(r"\s*The (\w+) holds the (\w+)\.", sent):
+                h, v = m.groups()
+                assert h not in seen                   # a holder is introduced once, then only emptied + refilled
+            else:
+                m = re.fullmatch(r"\s*Then the (\w+) is emptied and the (\w+) is put in it\.", sent)
+                assert m, sent
+                h, v = m.groups()
+                assert h in seen
+            seen.add(h)
+            events.append((h, v))
         target = q.removesuffix(" holds the")
     hist = [v for h, v in events if h == target]
     return hist[-1], hist[-2], events[-1][1]
@@ -169,9 +181,11 @@ def test_f3_replay_gives_gold_stale_and_recency(full):
         gold, stale, last = _f3_replay(r)
         assert (gold, stale, last) == (r["gold"], r["stale"], r["recent_answer"])
         assert r["roles"][stale] == "stale" and r["gold_count"] == 1
+        assert all(fl.count_word(r["prompt"], c.strip()) == 1 for c in r["candidates"])   # no frequency cue
         target_lines = (sum(1 for x in r["prompt"].split("\n") if x.startswith(f"{r['holder']} = "))
                         if r["register"] == "code" else
-                        len(re.findall(rf"(?i)\bthe {r['holder']} holds the \w+\.", r["prompt"])))
+                        len(re.findall(rf"The {r['holder']} holds the \w+\.|the {r['holder']} is emptied and",
+                                       r["prompt"])))
         assert target_lines == r["N"] + 1
         assert r["n_lines"] == r["N"] + 1 + (fl.F3_HOLDERS - 1) + r["R"]
 

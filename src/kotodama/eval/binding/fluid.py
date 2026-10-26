@@ -26,7 +26,7 @@ Families (battery · ladder, easy → hard · candidates · chance):
                         through examples). Rungs: operators k ∈ {1, 2, 3} × composition depth d ∈ {1, 2, 3}, left-
                         nested (``(a ⊕ b) ⊗ c =``): 9 rungs. Candidates: the 6-token inventory. Chance 1/6.
   F3  fluid-v1-rebind   one holder of four is reassigned N times, interleaved with the other holders' lines, in
-                        prose (``Then the box holds the lamp.``) and in a code-like register (``box = lamp``), then
+                        prose (``Then the box is emptied and the lamp is put in it.``) and in a code-like register (``box = lamp``), then
                         queried. Rungs: N ∈ {1, 2, 4, 8, 16} × distractor reassignments R ∈ {0, N}: 10 rungs; the
                         two registers are a condition inside every rung. 5 candidates: the current value, the STALE
                         value (the one just before it), an older value of the same holder, and the other holders'
@@ -54,7 +54,11 @@ Choices left open, fixed here:
     step the query needs is shown as an example line with another right operand; operator symbols are assigned to
     rules at random per prompt. Projections short-circuit a chain, so rows record ``path_steps`` (the PARTNER steps
     after the last SECOND, the chain's effective depth) beside the written depth.
-  - F3: four holders; every value is distinct within a prompt; the R distractor reassignments go to random other
+  - F3: four holders; a prose update empties the holder first (``Then the bag is emptied and the camera is put in
+    it.``), so only the new object is in it afterwards and the stale value is strictly wrong; the code register is
+    plain assignment. Neither names the old object, so every value is mentioned once (a swap template that named
+    it would mention stale values twice and gold once, a least-frequent cue). Every value is distinct within a
+    prompt; the R distractor reassignments go to random other
     holders; the other holders' first lines fall anywhere in the chain, so recency is controlled even at R = 0.
   - F4: example and query tokens all distinct within a prompt; within a rung, pattern type and the read position
     in the copy are balanced.
@@ -583,7 +587,10 @@ def _f3_sched(rng: random.Random, n: int, params: tuple[int, int, str]) -> _Sche
 
 def _f3_render(register: str, events: Sequence[tuple[str, str, bool]], target: str) -> str:
     if register == "prose":
-        body = " ".join(f"Then the {h} holds the {v}." if again else f"The {h} holds the {v}."
+        # A holder can hold two things, so an update empties it first: afterwards only the new object is in it, and
+        # the stale value is strictly wrong. The update does not name the old object, so every value is mentioned
+        # once and frequency stays neutral.
+        body = " ".join(f"Then the {h} is emptied and the {v} is put in it." if again else f"The {h} holds the {v}."
                         for h, v, again in events)
         return f"{body} In the end, the {target} holds the"
     if register == "code":
