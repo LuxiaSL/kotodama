@@ -39,6 +39,9 @@ def test_vetoes() -> None:
     ok = sp.evaluate(" Yes, bring the lantern.", "stop", "Mara", prior, CAST, "", CFG)
     assert ok.ok
     assert "overlong" in sp.evaluate(" words", "length", "Mara", prior, CAST, "", CFG).vetoes
+    # a whole dialogue written inside one turn hits the cap — but the turn itself ended at the next label
+    inline = sp.evaluate(" Fine, the lantern.\nTeo: and the rope?\nMara: yes", "length", "Mara", prior, CAST, "", CFG)
+    assert inline.ok and inline.text == "Fine, the lantern." and inline.ended_by == "stop" and inline.cut_label == "Teo"
     assert "early_end" in sp.evaluate(" bye", "eos", "Teo", prior[:1], CAST, "", CFG).vetoes
     assert sp.evaluate(" bye", "eos", "Mara", prior, CAST, "", CFG).ok  # 3 turns = min_turns: a fine ending
     assert "meta_leak" in sp.evaluate(" As an AI language model I can't.", "stop", "Mara", prior, CAST, "", CFG).vetoes

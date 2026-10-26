@@ -124,6 +124,10 @@ def evaluate(raw_text: str, ended_by: str, speaker: str, prior: list[Turn], cast
     """Run the mechanical vetoes on one candidate turn for ``speaker`` after ``prior`` turns."""
     text, label = cut_stray_label(raw_text, cast)
     text = text.strip()
+    if label is not None and ended_by == "length":
+        # the turn ended where another speaker's line began (single-newline transcript written inside one turn);
+        # the token cap was hit by the text after it, which is cut away
+        ended_by = "stop"
     c = Candidate(text=text, ended_by=ended_by, cut_label=label)
     if ended_by == "length":
         c.vetoes.append("overlong")
