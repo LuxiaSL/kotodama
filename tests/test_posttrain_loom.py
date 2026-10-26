@@ -85,3 +85,39 @@ def test_growth_is_order_independent() -> None:
     assert key(a) == key(b)
     c = grow(cfg, fake()[0], salt="8")[1]
     assert key(a) != key(c)
+
+
+def test_engagement_selection_leans_with_lambda() -> None:
+    """A fake scorer makes turns mentioning "?" engaging: λ > 0 should pick them, λ < 0 avoid them."""
+    def script(prompt, i):
+        d = prompt.count("\n\n")
+        return f"what about the {d}-{i}?" if i % 2 == 0 else f"the tide is {d}-{i}."
+
+    async def score(pairs):
+        # (with candidate, without) pairs: engaging candidates raise the reply's log-prob
+        return [(1.0 if "?" in p.rsplit("\n\n", 2)[-2] else 0.0) if k % 2 == 0 else 0.0 for k, (p, c) in enumerate(pairs)]
+
+    def picked(lam):
+        cfg = loom.LoomConfig(candidates=6, children=2, width=8, max_depth=4, min_turns=2, select="engage",
+                              select_lambda=lam)
+        recs = {"node": [], "path": [], "state": []}
+        asyncio.run(loom.grow(SEED, "t0", fake(script)[0], cfg, SelfPlayConfig(min_turns=2), "s",
+                              lambda k, r: recs[k].append(r), score))
+        kids = [r for r in recs["node"] if r["status"] == "child"]
+        assert all("engage" in r for r in kids)
+        return sum("?" in r["text"] for r in kids) / len(kids)
+
+    assert picked(4.0) > 0.85 and picked(-4.0) < 0.15
+
+
+def test_overlong_keep() -> None:
+    async def complete(prompt, n, stops):
+        d = prompt.count("\n\n")
+        words = ["harbour", "lantern", "orchard", "violin", "gravel", "sparrow", "kettle", "meadow"]
+        return [(f"{words[d % 8]} {words[(d + 3 * i + 1) % 8]} keeps going {d}{i}", "length", True) for i in range(n)]
+
+    cfg = loom.LoomConfig(candidates=2, children=1, width=2, max_depth=3, min_turns=1, overlong="keep")
+    st, recs = grow(cfg, complete)
+    assert st["ended"]["degraded"] == 0 and st["max_depth"] == 3
+    st2, _ = grow(loom.LoomConfig(candidates=2, children=1, width=2, max_depth=3, min_turns=1), complete)
+    assert st2["ended"]["degraded"] == 1

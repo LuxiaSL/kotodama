@@ -9,7 +9,15 @@ good branches that simply were not continued). One tree therefore gives breadth 
 and every node's sibling set (the K candidates of one draw) for preference pairs or branch-relative steering.
 
     python -m kotodama.posttrain.loom --seeds seeds.jsonl --endpoint http://host:port --out loom/run \\
-        [--candidates 8 --children 3 --width 16 --max_depth 24] [--steer vrep:-0.30 --steer_rule N]
+        [--candidates 8 --children 3 --width 16 --max_depth 24] [--steer vrep:-0.30 --steer_rule N] \\
+        [--select engage --select_lambda 1.0] [--overlong keep --max_tokens 768]
+
+Choosing children: ``uniform`` (default) samples survivors evenly. ``engage`` weights each survivor by
+exp(λ·z), z = its engagement standardised among the node's survivors, where engagement = mean over a few sampled
+replies of log p(reply | context + this turn) − log p(reply | context) for the next speaker — how much the turn hands
+the other speaker something to answer. λ > 0 leans toward engaging turns (questions, challenges), λ < 0 toward
+self-contained ones (narration, scene-setting, monologue); nothing is vetoed by it. ``--overlong keep`` lets a turn
+that reaches the token cap live (flagged) instead of vetoing it.
 
 Writes, under the run directory ``<out>``:
   ``<out>/nodes.jsonl``   every candidate drawn: tree, id, parent, depth, speaker, text, ended_by, vetoes, status
@@ -27,11 +35,12 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from kotodama.posttrain.selfplay import (Complete, SeedSpec, SelfPlayConfig, evaluate, next_speaker, oai_completer,
                                          parse_seed, parse_steer, split_completion)
@@ -50,6 +59,10 @@ class LoomConfig:
     min_turns: int = 6
     max_tokens: int = 256
     max_prompt_chars: int = 12000
+    select: str = "uniform"  # uniform | engage
+    select_lambda: float = 0.0
+    engage_replies: int = 2
+    overlong: str = "veto"  # veto | keep
 
 
 @dataclass
@@ -61,8 +74,33 @@ class Node:
     state: str = "open"
 
 
+Score = Callable[[list[tuple[str, str]]], Awaitable[list[float]]]
+"""[(prompt, completion)] -> mean per-token log-prob of each completion given its prompt."""
+
+
+def weighted_choice(rng: random.Random, weights: list[float], k: int) -> list[int]:
+    """k distinct indices, drawn without replacement with probability proportional to weight (Efraimidis–Spirakis)."""
+    keys = sorted(((rng.random() ** (1.0 / max(w, 1e-12)), i) for i, w in enumerate(weights)), reverse=True)
+    return [i for _, i in keys[:k]]
+
+
+async def engagement(turns: tuple[Turn, ...], header: str, cast: list[str], cand: Turn, complete: Complete,
+                     score: Score, replies: int) -> float:
+    """Mean over sampled next-speaker replies of log p(reply | context + cand) − log p(reply | context)."""
+    after = turns + (cand,)
+    nxt = next_speaker(cast, list(after))
+    stops = stop_sequences(cast)
+    with_c = render_prompt(Transcript(after, header), nxt)
+    without = render_prompt(Transcript(turns, header), nxt)
+    raw = await complete(with_c, replies, stops)
+    texts = [split_completion(t, stops, fr, hit)[0].strip() for t, fr, hit in raw]
+    texts = [t for t in texts if t] or ["..."]
+    lps = await score([(p, " " + t) for t in texts for p in (with_c, without)])
+    return sum(lps[2 * i] - lps[2 * i + 1] for i in range(len(texts))) / len(texts)
+
+
 async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, sp: SelfPlayConfig,
-               salt: str, emit: Callable[[str, dict[str, Any]], None]) -> dict[str, Any]:
+               salt: str, emit: Callable[[str, dict[str, Any]], None], score: Optional[Score] = None) -> dict[str, Any]:
     """Grow one tree breadth-first; every candidate goes to ``emit("node", ...)``, every ended branch to
     ``emit("path", ...)``. Choices are seeded per node (``salt`` + node id), so a tree does not depend on the order
     concurrent requests return in. Returns the tree's stats."""
@@ -91,15 +129,30 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
         stats["requests"] += 1
         cands = [evaluate(*split_completion(t, stops, fr, hit)[:2], speaker, list(node.turns), seed.cast,
                           seed.header, sp) for t, fr, hit in raw]
+        if cfg.overlong == "keep":
+            for c in cands:
+                if "overlong" in c.vetoes:
+                    c.vetoes.remove("overlong")
         survivors = [i for i, c in enumerate(cands) if c.ok]
-        chosen = set(random.Random(f"{salt}:{node.id}").sample(survivors, min(cfg.children, len(survivors))))
+        rng = random.Random(f"{salt}:{node.id}")
+        eng: dict[int, float] = {}
+        if cfg.select == "engage" and score is not None and len(survivors) > cfg.children:
+            vals = await asyncio.gather(*(engagement(node.turns, seed.header, seed.cast, Turn(speaker, cands[i].text),
+                                                     complete, score, cfg.engage_replies) for i in survivors))
+            eng = dict(zip(survivors, vals))
+            mu = sum(vals) / len(vals)
+            sd = (sum((v - mu) ** 2 for v in vals) / len(vals)) ** 0.5 or 1.0
+            w = [math.exp(cfg.select_lambda * (eng[i] - mu) / sd) for i in survivors]
+            chosen = {survivors[j] for j in weighted_choice(rng, w, cfg.children)}
+        else:
+            chosen = set(rng.sample(survivors, min(cfg.children, len(survivors))))
         kids: list[Node] = []
         for i, c in enumerate(cands):
             stats["candidates"] += 1
             cid = f"{node.id}.{i}"
             status = "child" if i in chosen else ("vetoed" if c.vetoes else "unchosen")
             emit("node", {"tree": tree, "id": cid, "parent": node.id, "depth": node.depth + 1, "speaker": speaker,
-                          **asdict(c), "status": status})
+                          **asdict(c), "status": status, **({"engage": eng[i]} if i in eng else {})})
             if i in chosen:
                 kid = Node(cid, node.id, node.depth + 1, node.turns + (Turn(speaker, c.text),))
                 stats["children"] += 1
@@ -128,8 +181,35 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
     return stats
 
 
+def http_scorer(endpoints: list[str], timeout: float = 600.0, transport: Any = None) -> tuple[Score, Callable[[], Awaitable[None]]]:
+    """A ``Score`` over the servers' /score_tokens (round-robin), tokenizing locally; and its async closer."""
+    import httpx
+    from transformers import AutoTokenizer
+
+    from kotodama import presets
+
+    tok = AutoTokenizer.from_pretrained(presets.TOKENIZER_NAME)
+    client = httpx.AsyncClient(timeout=timeout, transport=transport)
+    counter = {"i": 0}
+
+    async def score(pairs: list[tuple[str, str]]) -> list[float]:
+        out: list[float] = []
+        for k in range(0, len(pairs), 32):
+            items = [{"id": str(j), "prompt_ids": tok.encode(p, add_special_tokens=False)[-3500:],
+                      "completion_ids": tok.encode(c, add_special_tokens=False)[:256]}
+                     for j, (p, c) in enumerate(pairs[k:k + 32])]
+            url = endpoints[counter["i"] % len(endpoints)].rstrip("/") + "/score_tokens"
+            counter["i"] += 1
+            r = await client.post(url, json={"items": items})
+            r.raise_for_status()
+            out += [-x["mean_nll"] if x["n_tokens"] else 0.0 for x in r.json()["results"]]
+        return out
+
+    return score, client.aclose
+
+
 async def run(seeds: list[SeedSpec], complete: Complete, cfg: LoomConfig, sp: SelfPlayConfig, out_dir: Path,
-              concurrency: int, seed: int) -> dict[str, Any]:
+              concurrency: int, seed: int, score: Optional[Score] = None) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     files = {k: (out_dir / f"{k}s.jsonl").open("a", encoding="utf-8") for k in ("node", "path", "tree")}
     states = (out_dir / "states.jsonl").open("a", encoding="utf-8")
@@ -142,7 +222,7 @@ async def run(seeds: list[SeedSpec], complete: Complete, cfg: LoomConfig, sp: Se
     async def one(i: int, s: SeedSpec) -> None:
         async with sem:
             try:
-                st = await grow(s, f"t{i:05d}", complete, cfg, sp, f"{seed}:{s.id}:{i}", emit)
+                st = await grow(s, f"t{i:05d}", complete, cfg, sp, f"{seed}:{s.id}:{i}", emit, score)
             except Exception as e:  # one tree's failure must not stop the run
                 logger.error("tree %d (seed %s) failed: %s", i, s.id, e)
                 return
@@ -178,6 +258,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--law", default="tsumugi")
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--repetition_penalty", type=float, default=None)
+    ap.add_argument("--select", choices=["uniform", "engage"], default="uniform")
+    ap.add_argument("--select_lambda", type=float, default=0.0,
+                    help="engage: >0 leans to turns that hand the next speaker something, <0 to self-contained ones")
+    ap.add_argument("--engage_replies", type=int, default=2)
+    ap.add_argument("--overlong", choices=["veto", "keep"], default="veto")
     ap.add_argument("--steer", default="")
     ap.add_argument("--steer_rule", choices=["K", "N", "S"], default="K")
     ap.add_argument("--seed", type=int, default=0)
@@ -191,17 +276,23 @@ def main(argv: list[str] | None = None) -> int:
     seeds = [s for s in (parse_seed(r, i) for i, r in enumerate(rows)) if s is not None]
     if a.limit:
         seeds = seeds[: a.limit]
-    cfg = LoomConfig(a.candidates, a.children, a.width, a.max_depth, a.min_turns, a.max_tokens)
+    cfg = LoomConfig(a.candidates, a.children, a.width, a.max_depth, a.min_turns, a.max_tokens,
+                     select=a.select, select_lambda=a.select_lambda, engage_replies=a.engage_replies,
+                     overlong=a.overlong)
     sp = SelfPlayConfig(candidates=a.candidates, max_tokens=a.max_tokens, min_turns=a.min_turns)
     complete, close = oai_completer(a.endpoint, sampling, a.max_tokens, steer=parse_steer(a.steer) or None,
                                     steer_rule=a.steer_rule)
     out = Path(a.out)
 
+    score, close_score = http_scorer(a.endpoint) if a.select == "engage" else (None, None)
+
     async def go() -> dict[str, Any]:
         try:
-            return await run(seeds, complete, cfg, sp, out, a.concurrency, a.seed)
+            return await run(seeds, complete, cfg, sp, out, a.concurrency, a.seed, score)
         finally:
             await close()
+            if close_score is not None:
+                await close_score()
 
     summary = asyncio.run(go())
     (out / "run.json").write_text(json.dumps({"config": asdict(cfg), "sampling": sampling, "steer": parse_steer(a.steer),
