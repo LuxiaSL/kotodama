@@ -95,6 +95,7 @@ single-process job inside the launcher environment.
 | Uncheatable BPB | `tools/run_py.sh -m kotodama.eval.uncheatable --checkpoint <ckpt> --config-section 3b --attn-res-boundaries dd3b --out <json>` (data: `--data-dir`, else `$KOTODAMA_UNCHEATABLE_DATA`, else the HF dataset; checkpoint sweeps: `--max-docs-per-domain N`) |
 | induction score | `tools/run_py.sh -m kotodama.eval.induction --checkpoint <ckpt> --config-section proxy --attn-res-boundaries ddv1 --tag <t>` |
 | NCA gates | `python -m kotodama.eval.nca_gates --checkpoint <ckpt> --eval-dir <dir> --tag <t>` · every checkpoint of a run: `tools/run_py.sh -m scripts.eval.nca_gates_sweep --ckpt-dir <run> --eval-dir <dir> --init-seed <seed>` |
+| binding suite (every battery, one model load) | `tools/run_py.sh -m kotodama.eval.binding run --model koto:<ckpt> --name <m> --batteries scorecard --out <dir>` (`hf:<path>` for public models; `list` shows batteries and groups) · scorecard: `python -m kotodama.eval.binding report --scores <dir>` · capacity size law: `python -m kotodama.eval.binding capacity --scores <dir> --params <tsv>` |
 | rider grid | `python -m kotodama.eval.riders {gen,run,aggregate}` (against a server's `/logprobs`) |
 | binding probes, core | `python -m kotodama.eval.bindprobes {gen,run,aggregate}` · deixis validity gates: `python -m kotodama.eval.bindprobes gates --grids <dir> --items items.jsonl --chance-model <m> --learn-model <m> [--pilot]` |
 | binding probes, v3 families | `python -m kotodama.eval.bindprobes gen --out <dir> --families setbind,answer,adjacency,codevarmut --verify`, then `run` / `aggregate` |
@@ -276,6 +277,25 @@ Every item also runs under few-shot conditions with exemplars.
     literals per item (chance 1/5); only alias-graph tracking clears all three
     traps.
 
+- **The binding suite** (`kotodama.eval.binding`): one runner for every battery
+  above and below. It loads a model once (a kotodama checkpoint or any Hugging Face
+  model), scores each requested battery in-process with the same scorer as
+  `/logprobs`, and writes resumable rows. Prompt files are pinned by sha256, so a
+  recorded number always names its exact strings. Beyond the bindprobes families
+  it carries:
+  - stage gauges `joinlite-v1` (static I / you and a speaker-swap counterfactual)
+    and `swapdyn-v1` (the swap on transfer dialogues). A shift above +.02 at the
+    low end of its 95% CI binds; one below −.02 at the high end inverts.
+  - `stage5-decomp-v1`: dynamic "you" split into its prerequisites (third-person
+    possession transfer, deictic transfer speech acts, query-time deixis), each
+    a prompt variant over the same episodes.
+  - `capacity-v1`: binding capacity after arXiv 2609.30634. K "Name: task" lines
+    (K = 1…64), with or without ~256 tokens of filler, then one query. K50 is
+    where recall falls halfway to chance; `capacity` fits K50 ∝ N^α over
+    baselines scored on this same harness and places any model on the law as a
+    parameter-equivalent size.
+  `report` prints one scorecard row per model.
+
 Rider generation is byte-identical per seed and name pool, so banked grids stay
 comparable. Shortcut controls (recency, last speaker, last literal) are
 scheduled at the chance rate and audited.
@@ -290,7 +310,7 @@ src/kotodama/
   training/    train.py, Muon, checkpointing, inloop (in-loop evals)
   data/        uint16 token-stream dataset
   eval/        model loading, lm-eval adapter, uncheatable, induction, nca_gates,
-               riders/ (rider grid), bindprobes/ (binding probes)
+               riders/ (rider grid), bindprobes/ (binding probes), binding/ (the suite: one runner + scorecard)
   monitoring/  per-layer geometric telemetry, wandb callback
   serve/       server, gateway, chatml, laws, steering, chat client
   presets.py   shapes, AttnRes boundaries, tokenizer
