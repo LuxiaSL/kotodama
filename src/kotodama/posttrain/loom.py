@@ -37,6 +37,7 @@ import json
 import logging
 import math
 import random
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -76,6 +77,17 @@ class Node:
 
 Score = Callable[[list[tuple[str, str]]], Awaitable[list[float]]]
 """[(prompt, completion)] -> mean per-token log-prob of each completion given its prompt."""
+
+
+_WORDS = re.compile(r"[a-z']+")
+
+
+def echo_question(text: str, prev: str, max_words: int = 4) -> bool:
+    """A short question built only from the previous turn's words ("A job?" after "...if you'd like a job") — it makes
+    the reply predictable, so engagement over-scores it."""
+    t = text.strip()
+    words = _WORDS.findall(t.lower())
+    return t.endswith("?") and 0 < len(words) <= max_words and set(words) <= set(_WORDS.findall(prev.lower()))
 
 
 def weighted_choice(rng: random.Random, weights: list[float], k: int) -> list[int]:
@@ -149,7 +161,10 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
             vals = [eng[i] for i in survivors]
             mu = sum(vals) / len(vals)
             sd = (sum((v - mu) ** 2 for v in vals) / len(vals)) ** 0.5 or 1.0
-            w = [math.exp(cfg.select_lambda * (eng[i] - mu) / sd) for i in survivors]
+            prev = node.turns[-1].text if node.turns else ""
+            # an echo question is neutral (z = 0): neither end of the dial selects it for its echo
+            z = {i: 0.0 if echo_question(cands[i].text, prev) else (eng[i] - mu) / sd for i in survivors}
+            w = [math.exp(cfg.select_lambda * z[i]) for i in survivors]
             chosen = {survivors[j] for j in weighted_choice(rng, w, cfg.children)}
         else:
             chosen = set(rng.sample(survivors, min(cfg.children, len(survivors))))

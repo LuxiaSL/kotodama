@@ -134,3 +134,11 @@ def test_engagement_failure_falls_back_to_uniform() -> None:
                                lambda k, r: recs[k].append(r), broken))
     assert st["max_depth"] == 3 and st.get("engage_failures", 0) > 0
     assert all("engage" not in r for r in recs["node"])
+
+
+def test_echo_question() -> None:
+    assert loom.echo_question("A job?", "He wanted to know if you'd be interested in a job?")
+    assert loom.echo_question("a house?", "the guy's looking for a handyman for his house.")
+    assert not loom.echo_question("What kind of house?", "for his house.")  # 'what', 'kind' are new words
+    assert not loom.echo_question("A job.", "a job")  # not a question
+    assert not loom.echo_question("So what would you pay me for the job?", "a job")  # too long
