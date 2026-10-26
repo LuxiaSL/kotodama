@@ -19,8 +19,12 @@ Functionals (per-position terms; ``logits[t]`` predicts ids[t+1]):
   repmass  P(next ∈ ids[0..t]) (egv; incl. prompt), t = p-1..T-2      -> Vrepmass
   margin   top-1 − top-2 log-prob,                  t = p-1..T-2      -> Vmargin
   eos      log P(eos),                              t = p-1..T-2      -> Veos
+  loglik   log P(ids[t+1]) — the realized token,     t = p-1..T-2      -> Vll     (no contrast: "more like what I wrote")
+  typdev   |−log P(ids[t+1]) − H(z_t)|,              t = p-1..T-2      -> Vtyp    (distance from local typicality)
 Every non-entropy V also gets ``<name>perp = unit(V − (V·V7) V7)`` (Gram-Schmidt against V7; the ⊥ is
-load-bearing — it removes the entropy leak). +Vrep raises self-repeat mass, so the anti-repetition
+load-bearing — it removes the entropy leak). With selfrep also requested, every other non-entropy V gets
+``<name>perp2`` = its Gram-Schmidt residual against both V7 and Vrepperp (what is left once entropy AND repetition
+are removed). +Vrep raises self-repeat mass, so the anti-repetition
 lever is NEGATIVE alpha on Vrepperp. ``Rband{1,2,3}`` are matched-support random controls (unit(U c)).
 
 Outputs:
@@ -66,7 +70,8 @@ BAND = (16, 256)
 RANDOM_SEED = 20261024
 N_RANDOM = 3
 # npz vector name per functional (V7 = the entropy vector, the 3B rack's name).
-VEC_NAME = {"entropy": "V7", "selfrep": "Vrep", "repmass": "Vrepmass", "margin": "Vmargin", "eos": "Veos"}
+VEC_NAME = {"entropy": "V7", "selfrep": "Vrep", "repmass": "Vrepmass", "margin": "Vmargin", "eos": "Veos",
+            "loglik": "Vll", "typdev": "Vtyp"}
 
 
 def sublayer_key(name: str, layer: int) -> str:
@@ -193,8 +198,21 @@ def f_eos(logits: Tensor, ids: Tensor, p: int) -> Tensor:
     return torch.logsumexp(lp[:, sorted(BASE_STOP_TOKEN_IDS)], dim=-1).mean()
 
 
+def f_loglik(logits: Tensor, ids: Tensor, p: int) -> Tensor:
+    lp = torch.log_softmax(logits[p - 1:-1], dim=-1)
+    return lp.gather(-1, ids[p:, None]).squeeze(-1).mean()
+
+
+def f_typdev(logits: Tensor, ids: Tensor, p: int) -> Tensor:
+    """Mean |surprisal of the realized token − entropy| — how far each step sits from local typicality."""
+    lp = torch.log_softmax(logits[p - 1:-1], dim=-1)
+    H = -(lp.exp() * lp).sum(-1)
+    return (-lp.gather(-1, ids[p:, None]).squeeze(-1) - H).abs().mean()
+
+
 FUNCTIONALS: dict[str, Functional] = {
     "entropy": f_entropy, "selfrep": f_selfrep, "repmass": f_repmass, "margin": f_margin, "eos": f_eos,
+    "loglik": f_loglik, "typdev": f_typdev,
 }
 
 
@@ -416,6 +434,20 @@ def build_site(model: KotodamaModel, sig_seqs: list[Seq], grad_seqs: list[Seq], 
                 raise AssertionError(f"⊥ failed: {VEC_NAME[k]}perp·V7 = {float(u @ v7):.2e}")
             res.bank[sublayer_key(f"{VEC_NAME[k]}perp", layer)] = u
             perp[VEC_NAME[k]] = {"cos_to_V7": c, "perp_residual_fraction": pn}
+        if "selfrep" in vec:
+            rep = res.bank[sublayer_key("Vrepperp", layer)]
+            for k in names:
+                if k in ("entropy", "selfrep"):
+                    continue
+                r = vec[k] - float(vec[k] @ v7) * v7
+                c2 = float(r @ rep)
+                r = r - c2 * rep
+                pn2 = float(np.linalg.norm(r))
+                if pn2 < 1e-6:
+                    raise ValueError(f"{VEC_NAME[k]} @ layer {layer} collapses onto span(V7, Vrepperp)")
+                res.bank[sublayer_key(f"{VEC_NAME[k]}perp2", layer)] = unit(r)
+                pn1 = perp[VEC_NAME[k]]["perp_residual_fraction"]
+                perp[VEC_NAME[k]].update({"cos_perp_to_Vrepperp": c2 / pn1, "perp2_residual_fraction": pn2})
     rng = np.random.default_rng(RANDOM_SEED + layer)
     rnd = [unit(U @ rng.standard_normal(U.shape[1])) for _ in range(N_RANDOM)]
     for i, r in enumerate(rnd, 1):

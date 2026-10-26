@@ -164,6 +164,36 @@ def test_functionals_selfrep_matches_loop_reference():
     torch.testing.assert_close(egv.f_selfrep(logits, ids, p), ref)
 
 
+def test_functionals_loglik_typdev_match_loop_reference():
+    torch.manual_seed(1)
+    T, V, p = 12, 19, 4
+    ids = torch.randint(0, V, (T,))
+    logits = torch.randn(T, V)
+    ll, dev = [], []
+    for t in range(p - 1, T - 1):
+        lp = torch.log_softmax(logits[t], -1)
+        H = -(lp.exp() * lp).sum()
+        ll.append(lp[ids[t + 1]])
+        dev.append((-lp[ids[t + 1]] - H).abs())
+    torch.testing.assert_close(egv.f_loglik(logits, ids, p), torch.stack(ll).mean())
+    torch.testing.assert_close(egv.f_typdev(logits, ids, p), torch.stack(dev).mean())
+
+
+def test_perp2_removes_entropy_and_repetition(model):
+    seqs = [egv.Seq(_ids(28, 10 + i), 8, i) for i in range(10)]
+    res = egv.build_site(model, seqs[:6], seqs[6:], SITE, ["entropy", "selfrep", "loglik", "typdev"], (2, 40))
+    s = 2 * SITE
+    v7, rep = res.bank[f"V7_s{s}"], res.bank[f"Vrepperp_s{s}"]
+    for n in ("Vll", "Vtyp"):
+        u = res.bank[f"{n}perp2_s{s}"]
+        assert abs(float(np.linalg.norm(u)) - 1) < 1e-5
+        assert abs(float(u @ v7)) < 1e-5 and abs(float(u @ rep)) < 1e-5
+        meta = res.meta["perp"][n]
+        assert 0 < meta["perp2_residual_fraction"] <= meta["perp_residual_fraction"] + 1e-9
+        assert -1 - 1e-6 <= meta["cos_perp_to_Vrepperp"] <= 1 + 1e-6
+    assert "Vrepperp2_s%d" % s not in res.bank
+
+
 def test_bank_roundtrip_through_server_loader(model, tmp_path):
     seqs = [egv.Seq(_ids(28, 10 + i), 8, i) for i in range(10)]
     names = ["entropy", "selfrep", "margin"]
@@ -173,7 +203,7 @@ def test_bank_roundtrip_through_server_loader(model, tmp_path):
     np.savez(out, **res.bank)
     bank, meds, aliases = load_steer_banks([str(out)], CFG["num_layers"], CFG["hidden_size"], torch.device("cpu"))
     s = 2 * SITE
-    expect = {f"{n}_s{s}" for n in ("V7", "Vrep", "Vmargin", "Vrepperp", "Vmarginperp",
+    expect = {f"{n}_s{s}" for n in ("V7", "Vrep", "Vmargin", "Vrepperp", "Vmarginperp", "Vmarginperp2",
                                     "Rband1", "Rband2", "Rband3")}
     assert set(bank) == expect
     assert all(site == SITE for site, _ in bank.values())
