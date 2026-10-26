@@ -45,6 +45,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from kotodama.serve.logs import uvicorn_log_config
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [gateway] %(message)s")
 logger = logging.getLogger("gateway")
 # The health loop polls every replica's /health + /memory; silence httpx's
@@ -713,4 +715,5 @@ if __name__ == "__main__":
         _cfg.gateway_port = args.port
     _fleet = Fleet(_cfg)
 
-    uvicorn.run(app, host=_cfg.gateway_host, port=_cfg.gateway_port, log_level="info")
+    uvicorn.run(app, host=_cfg.gateway_host, port=_cfg.gateway_port, log_level="info",
+                log_config=uvicorn_log_config())

@@ -1804,4 +1804,6 @@ if __name__ == "__main__":
         parser.error("--multi_rows requires --engine fast")
 
     import uvicorn
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+    from kotodama.serve.logs import uvicorn_log_config
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", log_config=uvicorn_log_config())
