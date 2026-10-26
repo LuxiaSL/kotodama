@@ -166,6 +166,12 @@ def test_capacity_fit_recovers_k50_and_law():
     s = cap.summarize(_synthetic(6.0, 2.0))
     assert abs(math.log(s.fit.k50) - math.log(6.0)) < 0.1 and not s.fit.censored and s.usable
     assert cap.summarize(_synthetic(400.0, 2.0)).fit.censored
+    # a midpoint fitted past the grid is censored even when r(64) has dipped under .5 (a flat, slow curve)
+    ks = list(cap.K_GRID)
+    r = [1 / (1 + (k / 100) ** 0.6) for k in ks]
+    r[-1] = 0.48                                   # dips under .5 at K = 64 ...
+    slow = cap.fit_logistic(ks, r)
+    assert slow.k50 > ks[-1] and slow.censored     # ... but the fitted midpoint is past the grid: censored
     pts = [(n, 3.0 * n ** 0.8) for n in (0.1, 0.5, 1.0, 3.0, 8.0)]
     law = cap.fit_law(pts)
     assert abs(law.alpha - 0.8) < 1e-9 and abs(law.n_eff(3.0) - 1.0) < 1e-9
@@ -243,3 +249,13 @@ def test_report_cli(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "| m1 |" in out and "1.000" in out
     assert json.loads((tmp_path / "r.json").read_text())["m1"]["decomp"]["third/0shot"]["acc"] == 1.0
+
+
+def test_public_shape_alias_reaches_the_server():
+    from kotodama import presets
+    from kotodama.serve import server
+
+    assert presets.resolve("1b-tsumugi") == "1b-moonshot-loop"
+    assert presets.shape("1b-tsumugi") == presets.shape("1b-moonshot-loop")
+    assert server.model_config_for("1b-tsumugi") is server.MODEL_CONFIGS["1b-moonshot-loop"]
+    assert server.model_config_for("no-such-shape") is None

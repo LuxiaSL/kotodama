@@ -19,7 +19,8 @@ Read-out (:func:`summarize`), per model, D = 0 unless noted:
   C     accuracy at K = 1 (the ceiling); b = chance
   r(K)  (acc(K) − b) / (C − b), the paper's fixed-ceiling normalisation
   K50   midpoint of r̂(K) = 1 / (1 + exp(β (ln K − ln K50))), least squares over the K grid; CENSORED when
-        r(64) > .5 (the curve never crosses inside the grid)
+        r(64) > .5 or the fitted midpoint lies beyond K = 64 (the curve never crosses inside the grid, so the
+        midpoint is an extrapolation, not a measurement)
   AUC   mean of r(K) clipped to [0, 1] over the log-spaced K grid (threshold-free)
   D=256 K50 against the D = 0 ceiling (fixed) and against its own K = 1 ceiling (own; n/a when that ceiling is
         within .2 of chance)
@@ -134,7 +135,8 @@ def fit_logistic(ks: Sequence[int], r: Sequence[float]) -> Fit:
             if sse < best[0]:
                 best = (sse, m, b)
     sse, m, b = best
-    return Fit(math.exp(m), b, sse, r[-1] > 0.5)
+    k50 = math.exp(m)
+    return Fit(k50, b, sse, r[-1] > 0.5 or k50 > ks[-1])
 
 
 @dataclass

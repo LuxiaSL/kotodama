@@ -157,6 +157,11 @@ MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "1b": CONFIG_1B, "1b-deep": CONFIG_1B_DE
                  "1b-moonshot-loop": CONFIG_1B_MOONSHOT_LOOP, "3b": CONFIG_3B}
 
 
+def model_config_for(model_size: str) -> dict | None:
+    """The serving config for a size name or one of its public aliases (``presets.ALIASES``, e.g. ``1b-tsumugi``)."""
+    return MODEL_CONFIGS.get(model_size) or MODEL_CONFIGS.get(presets.ALIASES.get(model_size, ""))
+
+
 # ── Global state ────────────────────────────────────────────────────────────────
 
 _model: KotodamaModel | None = None
@@ -291,7 +296,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         _device = torch.device("cpu")
     logger.info("Device: %s", _device)
 
-    model_cfg = MODEL_CONFIGS.get(model_size)
+    model_cfg = model_config_for(model_size)
     if model_cfg is None:
         raise ValueError(f"Unknown model_size {model_size!r}; choose from {sorted(MODEL_CONFIGS)}")
     # Serve non-AttnRes checkpoints (e.g. proxy ablation arms) without
@@ -1615,7 +1620,7 @@ if __name__ == "__main__":
                         help="Reuse the engine KV cache across requests sharing a token-exact "
                              "prompt prefix (multi-turn TTFT win; requires --engine fast and "
                              "per-conversation replica pinning)")
-    parser.add_argument("--model_size", choices=list(MODEL_CONFIGS), default="3b",
+    parser.add_argument("--model_size", choices=list(MODEL_CONFIGS) + [a for a, k in presets.ALIASES.items() if k in MODEL_CONFIGS], default="3b",
                         help="Model architecture size (3b=2.97B, 1b=1.42B ladder, proxy=108M legacy)")
     parser.add_argument("--served_model_name", default=None,
                         help="Override the model id reported by /info and /v1/models "

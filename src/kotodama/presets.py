@@ -63,8 +63,8 @@ SHAPES: dict[str, dict[str, Any]] = {
                   vocab_size=1024, max_position_embeddings=2048),
 }
 
-# Older names still found in configs and scripts.
-ALIASES: dict[str, str] = {"full": "3b", "model": "3b", "8b": "7b"}
+# Older names still found in configs and scripts, and public model names for their shapes.
+ALIASES: dict[str, str] = {"full": "3b", "model": "3b", "8b": "7b", "1b-tsumugi": "1b-moonshot-loop"}
 
 # The boundaries each shape was trained with, where there is a shipped model
 # (the 1b ladder runs DD-3B verbatim by design — same 28-layer block geometry).
