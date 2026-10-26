@@ -5,6 +5,13 @@ A kotodama checkpoint is a ``torch.save`` dict: ``{"model": state_dict, "step",
 checkpoints. Files may be zstd-compressed (``.pt.zst``). The pickles contain
 only torch/collections objects, so they load independent of package layout.
 
+Published weights use the Hugging Face layout instead: a directory with
+``model.safetensors`` (each tensor stored once), ``aliases.json`` (looped-depth
+repeats → the core tensors they share; ``sd[alias] = sd[source]``) and
+``config.json`` (shape, loop spec, AttnRes boundaries, step, tokens). ``load``
+accepts such a directory, or ``hf:REPO[@REVISION]`` to fetch one from the Hub
+(e.g. ``hf:LuxiaSL/kotodama-tsumugi-1b``), and returns the same dict shape.
+
 Names: ``resolve("kotodama-3b-base-final")`` looks the name up in the registry
 YAMLs — ``configs/checkpoints.yaml`` in the repo, plus every file listed in
 ``$KOTODAMA_CKPT_REGISTRY`` (colon-separated; a site's private models). Relative
@@ -103,9 +110,62 @@ def resolve(name_or_path: str | Path) -> Path:
 # ── loading ───────────────────────────────────────────────────────────────────
 
 
+HF_PREFIX = "hf:"
+HF_FILES = ("model.safetensors", "aliases.json", "config.json")
+
+
+def is_hf_ref(path: str | Path) -> bool:
+    """``hf:REPO[@REVISION]`` — published weights on the Hugging Face Hub."""
+    return str(path).startswith(HF_PREFIX)
+
+
+def is_hf_layout(path: str | Path) -> bool:
+    """A local directory holding published weights (``model.safetensors`` + ``aliases.json``)."""
+    p = Path(path)
+    return p.is_dir() and (p / "model.safetensors").exists()
+
+
+def fetch_hf(ref: str) -> Path:
+    """Download ``hf:REPO[@REVISION]``'s weight files into the Hugging Face cache; returns the snapshot dir."""
+    from huggingface_hub import snapshot_download
+
+    spec = str(ref)[len(HF_PREFIX):]
+    repo, _, revision = spec.partition("@")
+    if not repo:
+        raise ValueError(f"empty Hugging Face repo in {ref!r} (want hf:OWNER/NAME[@REVISION])")
+    return Path(snapshot_download(repo, revision=revision or None, allow_patterns=list(HF_FILES)))
+
+
+def load_hf_layout(path: str | Path) -> dict[str, Any]:
+    """Published weights → ``{"model", "step", "tokens_consumed", "config"}``, looped repeats re-tied."""
+    import json
+
+    from safetensors.torch import load_file
+
+    p = Path(path)
+    sd: dict[str, torch.Tensor] = load_file(str(p / "model.safetensors"))
+    aliases_path = p / "aliases.json"
+    aliases: dict[str, str] = json.loads(aliases_path.read_text()) if aliases_path.exists() else {}
+    missing = sorted({src for src in aliases.values() if src not in sd})
+    if missing:
+        raise KeyError(f"{p}: aliases.json points at {len(missing)} tensors not in model.safetensors "
+                       f"(first: {missing[0]})")
+    for alias, src in aliases.items():
+        sd[alias] = sd[src]
+    cfg_path = p / "config.json"
+    cfg: dict[str, Any] = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    return {"model": sd, "step": cfg.get("step"), "tokens_consumed": cfg.get("tokens_consumed"), "config": cfg}
+
+
 def load(path: str | Path) -> dict[str, Any]:
     """Load a checkpoint dict. ``.zst`` streams through a temp file so the
-    compressed bytes, decompressed bytes, and tensors are never all in RAM."""
+    compressed bytes, decompressed bytes, and tensors are never all in RAM.
+    Published weights (a directory, or ``hf:REPO[@REVISION]``) load through
+    :func:`load_hf_layout`."""
+    if is_hf_ref(path):
+        return load_hf_layout(fetch_hf(str(path)))
+    if is_hf_layout(path):
+        return load_hf_layout(path)
     path = resolve(path)
     if path.suffix != ".zst":
         return torch.load(path, map_location="cpu", weights_only=False)

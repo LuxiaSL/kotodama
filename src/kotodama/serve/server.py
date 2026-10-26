@@ -274,8 +274,9 @@ def _warmup_sdpa_cache(model: KotodamaModel, max_seq_len: int = 4096, step: int 
     logger.info("SDPA warmup done in %.1fs (%d positions)", time.time() - t0, pos)
 
 
-def _load_checkpoint(checkpoint_path: Path) -> Any:
-    """Load a checkpoint dict (.pt or streamed .pt.zst) — see kotodama.ckpt.load."""
+def _load_checkpoint(checkpoint_path: Path | str) -> Any:
+    """Load a checkpoint dict (.pt, streamed .pt.zst, or published weights: a directory or hf:REPO) —
+    see kotodama.ckpt.load."""
     return ckpt.load(checkpoint_path)
 
 
@@ -317,18 +318,18 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
 
     model = KotodamaModel(config)
 
-    ckpt_path = Path(checkpoint_path)
-    if not ckpt_path.exists():
+    ckpt_path = checkpoint_path if ckpt.is_hf_ref(checkpoint_path) else Path(checkpoint_path)
+    if not ckpt.is_hf_ref(ckpt_path) and not Path(ckpt_path).exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     logger.info("Loading checkpoint: %s", ckpt_path)
-    ckpt = _load_checkpoint(ckpt_path)
+    loaded = _load_checkpoint(ckpt_path)
 
-    state_dict = ckpt.get("model", ckpt)
+    state_dict = loaded.get("model", loaded)
     model.load_state_dict(state_dict, strict=True)
-    logger.info("Checkpoint loaded (step %s, %s tokens)", ckpt.get("step", "?"), ckpt.get("tokens_consumed", "?"))
+    logger.info("Checkpoint loaded (step %s, %s tokens)", loaded.get("step", "?"), loaded.get("tokens_consumed", "?"))
     del state_dict
-    del ckpt
+    del loaded
     gc.collect()
 
     model = model.to(_device).eval()

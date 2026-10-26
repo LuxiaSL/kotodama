@@ -110,6 +110,7 @@ single-process job inside the launcher environment.
 |---|---|
 | one model | `tools/run_serve.sh --checkpoint <ckpt> [--mode chat] [--model_size <shape>]` |
 | the public 3B base | `tools/serve_3b_base.sh` (downloads the checkpoint once, then serves it) |
+| the released kotodama-tsumugi 1B base | `tools/run_serve.sh --checkpoint hf:LuxiaSL/kotodama-tsumugi-1b --model_size 1b-moonshot-loop --rope_fp32 --mode base` (published weights load from the Hub or a downloaded directory) |
 | a fleet behind one port | `tools/run_gateway.sh --config configs/gateway.example.yaml` |
 | chat / completion client | `python -m kotodama.serve.chat [complete]` (sampling laws: `kotodama.serve.laws`) |
 

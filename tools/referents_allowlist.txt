@@ -29,6 +29,10 @@
 
 [allow]
 
+# The file names of the published-weights layout (Hugging Face repos: model.safetensors, aliases.json, config.json)
+# name files inside a downloaded repo, not paths in this tree; kotodama.ckpt.load_hf_layout reads them.
+\b(?:model\.safetensors|aliases\.json)\b
+
 # Public URLs are reachable by definition: the rule asks for a reader who can
 # follow the name, and a link is the one pointer that always works. Includes the
 # lineage links in the README and the citations in module docstrings.
