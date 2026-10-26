@@ -105,6 +105,17 @@ class SamplingParams:
         return self.top_k > 0 or 0.0 < self.top_p < 1.0
 
 
+def _graph_input(tokens: torch.Tensor) -> torch.Tensor:
+    """``tokens`` as a fresh offset-0 tensor with canonical strides, for a compiled graph.
+
+    A (1, n) slice of a (1, S) prompt keeps stride (S, 1) and its storage offset, and ``.contiguous()`` returns it
+    as-is (a size-1 row already counts as contiguous). Compiled graphs guard on both, so a new offset recompiles, and
+    once they are dynamic, inductor's cudagraph trees record a graph with its own memory pool for each distinct value:
+    graph memory then grows with every new prompt length. A contiguous-format clone has one layout per shape.
+    """
+    return tokens.clone(memory_format=torch.contiguous_format)
+
+
 class DecodeEngine(nn.Module):
     """Single-stream (B=1) static-shape decode engine.
 
@@ -784,7 +795,7 @@ class DecodeEngine(nn.Module):
         logits = None
         for s, b in plan:
             self.pos.fill_(s)
-            logits = self._compiled_block(input_ids[:, s: s + b].contiguous())
+            logits = self._compiled_block(_graph_input(input_ids[:, s: s + b]))
         # Block graphs derive their bias in-graph; re-establish the decode
         # invariant on the persistent buffer: [0, end) open, rest closed.
         self.attn_bias.fill_(float("-inf"))
@@ -911,13 +922,13 @@ class DecodeEngine(nn.Module):
             # which never injects) to preserve generated-positions-only
             # semantics. Vector off -> unchanged fast path.
             # The step opens bias at its own position and records history.
-            # .contiguous(): the slice has a nonzero storage offset, which the
-            # compiled step has never seen as an input -> dynamo guard miss ->
-            # ~10s recompile (measured; long enough to flap gateway health).
+            # The suffix is a slice with a nonzero storage offset; _graph_input
+            # gives the compiled step the layout it was captured with (see
+            # _graph_input for what a varying offset costs).
             self.attn_bias[..., :common] = 0.0
             self.pos.fill_(common)
             self._pos_cpu = common
-            logits = self.step_logits(suffix.contiguous())
+            logits = self.step_logits(_graph_input(suffix))
             return logits[0, -1:].float(), {
                 "prefix_hit": True, "common_prefix": common, "suffix_len": 1,
             }
