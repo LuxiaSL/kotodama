@@ -12,8 +12,9 @@
 #
 # Detached use: nohup tools/launch_lmeval_sharded.sh ... > logs/lmeval_sharded.log 2>&1 &
 #
-# Env knobs (defaults = the 3B): EVAL_SECTION (preset; e.g. 1b), EVAL_EXTRA_ARGS
-# (e.g. "--rope-fp32" for the 1B ladder arms). Boundaries stay DD-3B.
+# Env knobs (defaults = the 3B): EVAL_SECTION (preset; e.g. 1b, 1b-tsumugi), EVAL_BOUNDARIES (default: the
+# published config's or the preset's trained boundaries), EVAL_EXTRA_ARGS (e.g. "--rope-fp32" for the 1B ladder arms).
+# <checkpoint> may also be hf:REPO[@REVISION] (published weights).
 #
 # After any harness change, gate the numbers:
 #   python -m scripts.eval.check_lmeval_equivalence <banked>/results.json <new>/results.json
@@ -70,7 +71,7 @@ for i in "${!SHARD_TASKS[@]}"; do
     TMPDIR="${TMPDIR:-$KOTODAMA_DATA_ROOT/tmp}" \
     python -m scripts.eval.run_lm_eval \
       --checkpoint "$CKPT" --tasks "${SHARD_TASKS[$i]}" \
-      --config-section "${EVAL_SECTION:-model}" --attn-res-boundaries 0,1,3,7,15,19,24 \
+      --config-section "${EVAL_SECTION:-model}" ${EVAL_BOUNDARIES:+--attn-res-boundaries "$EVAL_BOUNDARIES"} \
       ${EVAL_EXTRA_ARGS:-} \
       --batch-size "$BS" --device cuda:0 \
       --output-dir "$SHARD_ROOT/shard$N"

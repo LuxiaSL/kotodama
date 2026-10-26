@@ -218,9 +218,7 @@ def _force_sdpa(model: torch.nn.Module) -> int:
     """Point every attention module at SDPA (no params; math-equivalent).
 
     ``load_model`` builds with ``attn_impl="auto"`` (flash-attn when
-    installed, which has no CPU kernel); passing ``attn_impl`` through its
-    ``attn_res_config`` would switch off AttnRes auto-detection, so the
-    backend is flipped after load instead.
+    installed, which has no CPU kernel), so the backend is flipped after load.
     """
     n = 0
     for m in model.modules():

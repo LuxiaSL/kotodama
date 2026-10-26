@@ -409,9 +409,9 @@ def main(argv: list[str] | None = None) -> None:
     from kotodama.eval.model_loader import load_model
     from kotodama.presets import TOKENIZER_NAME
 
-    model_cfg: dict[str, Any] = {"attn_res": bounds is not None}
+    model_cfg: dict[str, Any] = {}       # no boundaries resolved: the loader reads AttnRes from the weights
     if bounds is not None:
-        model_cfg["attn_res_boundaries"] = bounds
+        model_cfg.update(attn_res=True, attn_res_boundaries=bounds)
     if args.rope_fp32:
         model_cfg["rope_fp32"] = True
     attn_impl = args.attn_impl or ("sdpa" if "cuda" not in device else None)

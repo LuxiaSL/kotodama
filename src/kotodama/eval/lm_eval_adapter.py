@@ -21,13 +21,6 @@ from kotodama.eval.model_loader import load_model
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ATTN_RES_CONFIG: dict[str, Any] = {
-    "attn_res": True,
-    "attn_res_n_blocks": 7,
-    "attn_res_boundaries": [0, 3, 7, 12, 21, 25],
-}
-
-
 class KotodamaEvalLM(TemplateLM):
     """lm-eval adapter for KotodamaModel checkpoints."""
 
@@ -46,9 +39,7 @@ class KotodamaEvalLM(TemplateLM):
     ) -> None:
         super().__init__()
 
-        if attn_res_config is None:
-            attn_res_config = DEFAULT_ATTN_RES_CONFIG
-
+        # attn_res_config None: the loader reads the geometry from the weights, their config or the preset
         self.model = load_model(
             checkpoint_path=checkpoint_path,
             config_path=config_path,

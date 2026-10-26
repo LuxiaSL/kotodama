@@ -24,13 +24,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TASKS = "hellaswag,piqa,arc_easy,arc_challenge,boolq,lambada_openai,winogrande,wikitext,copa,sciq"
 
-DEFAULT_ATTN_RES_CONFIG = {
-    "attn_res": True,
-    "attn_res_n_blocks": 7,
-    "attn_res_boundaries": [0, 3, 7, 12, 21, 25],
-}
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run lm-eval benchmarks on KotodamaModel checkpoints"
@@ -84,8 +77,8 @@ def parse_args() -> argparse.Namespace:
         "--attn-res-boundaries",
         type=str,
         default=None,
-        help="AttnRes block boundaries as comma-separated ints (e.g. '0,1,3,7,15,19,24'). "
-             "Overrides the default DD-v1 boundaries.",
+        help="AttnRes block boundaries: comma-separated ints or a kotodama.presets.BOUNDARIES name "
+             "(dd3b, ddv1). Default: the published weights' config, else the preset's trained boundaries.",
     )
     parser.add_argument(
         "--rope-fp32",
@@ -110,16 +103,17 @@ def run_eval(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    from kotodama.presets import BOUNDARIES
+
+    attn_res_config: dict | None = None    # None: kotodama.eval.model_loader decides the geometry
     if args.no_attn_res:
-        attn_res_config = None
+        attn_res_config = {"attn_res": False}
     elif args.attn_res_boundaries:
-        boundaries = [int(x) for x in args.attn_res_boundaries.split(",")]
+        b = args.attn_res_boundaries
         attn_res_config = {
             "attn_res": True,
-            "attn_res_boundaries": boundaries,
+            "attn_res_boundaries": list(BOUNDARIES[b]) if b in BOUNDARIES else [int(x) for x in b.split(",")],
         }
-    else:
-        attn_res_config = DEFAULT_ATTN_RES_CONFIG
     all_results: dict[str, dict] = {}
 
     for ckpt_path in checkpoints:

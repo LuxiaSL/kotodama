@@ -1,8 +1,15 @@
 """Unified model loading for evaluation and analysis.
 
-Consolidates checkpoint loading patterns from ~10 scripts into one module.
-Handles torch.compile prefix stripping, AttnRes auto-detection / explicit
-config, YAML config loading, and device placement.
+One loader for every eval entry point (lm-eval, Uncheatable, induction, NCA gates, post-training): a ``.pt`` /
+``.pt.zst`` path, a ``kotodama.ckpt`` registry name, a published-weights directory or ``hf:REPO[@REVISION]``. It also
+decides the AttnRes geometry, so callers do not restate boundaries:
+
+  1. ``attn_res_config`` fields the caller states win (``attn_res``, ``attn_res_boundaries``, ``attn_res_n_blocks``);
+  2. ``attn_res`` not stated: read from the weights (AttnRes query keys present or not);
+  3. AttnRes on with no boundaries stated: the published weights' ``config.json``, else the preset's trained
+     boundaries (``kotodama.presets.DEFAULT_BOUNDARIES``), else the legacy 7 equal blocks, with a warning.
+
+Published weights whose ``config.json`` names a different shape than ``config_section`` are refused.
 """
 
 from __future__ import annotations
@@ -53,6 +60,29 @@ def load_model_config(
     return dict(full_config[section])
 
 
+def attn_res_geometry(stated: dict[str, Any] | None, state: dict[str, Any], published: dict[str, Any],
+                      preset: str | None) -> dict[str, Any]:
+    """The AttnRes fields for a model: what the caller stated, then the weights, the published config, the preset's
+    trained boundaries (``preset`` None: a YAML shape, no preset lookup), the legacy 7 blocks (module docstring)."""
+    out = dict(stated or {})
+    if "attn_res" not in out:
+        out["attn_res"] = any("attn_res_query" in k for k in state)
+    if out["attn_res"] and "attn_res_boundaries" not in out and "attn_res_n_blocks" not in out:
+        bounds = published.get("attn_res_boundaries")
+        source = "the published config"
+        if bounds is None and preset is not None:
+            bounds, source = presets.DEFAULT_BOUNDARIES.get(preset), f"preset {preset!r}"
+        if bounds is not None:
+            out["attn_res_boundaries"] = list(bounds)
+            logger.info("AttnRes boundaries from %s: %s", source, list(bounds))
+        else:
+            out["attn_res_n_blocks"] = 7
+            logger.warning("AttnRes on with no boundaries stated, published or preset: 7 equal blocks. "
+                           "Pass the boundaries the model was trained with.")
+    logger.info("AttnRes config: %s", out)
+    return out
+
+
 def load_model(
     checkpoint_path: Path | str,
     config_path: Path | str | None = None,
@@ -70,16 +100,16 @@ def load_model(
     - AttnRes configuration (explicit or auto-detected)
     - State dict wrapped in {"model": ...} or bare
 
-    AttnRes handling priority:
-    1. If ``attn_res_config`` is provided, use it (preferred, explicit).
-    2. Otherwise, auto-detect from state dict keys (fallback, assumes n_blocks=7).
+    AttnRes geometry: :func:`attn_res_geometry` (stated fields, then the weights, the published config, the
+    preset's trained boundaries).
 
     Args:
-        checkpoint_path: A .pt/.pt.zst path or a kotodama.ckpt registry name.
+        checkpoint_path: A .pt/.pt.zst path, a kotodama.ckpt registry name, a published-weights directory or
+            ``hf:REPO[@REVISION]``.
         config_path: Optional model YAML; default = kotodama.presets.
         config_section: Preset name (3b, proxy, ...) or YAML section.
-        attn_res_config: Explicit AttnRes kwargs (attn_res, attn_res_n_blocks,
-            attn_res_boundaries). Preferred over auto-detection.
+        attn_res_config: AttnRes fields the caller states (attn_res, attn_res_n_blocks, attn_res_boundaries);
+            any field left out is decided by :func:`attn_res_geometry`.
         device: Target device for the model.
         meta: If given, filled with the checkpoint's bookkeeping (``step``,
             ``tokens_consumed``; None when the file does not carry them).
@@ -91,33 +121,32 @@ def load_model(
 
     Raises:
         FileNotFoundError: If checkpoint or config doesn't exist.
+        ValueError: Published weights of a different shape than ``config_section``.
     """
-    checkpoint_path = ckpt.decompress_cached(ckpt.resolve(checkpoint_path))
+    published: dict[str, Any] = {}
+    if ckpt.is_hf_ref(checkpoint_path) or ckpt.is_hf_layout(checkpoint_path):
+        name = str(checkpoint_path)
+        state = ckpt.load(checkpoint_path)
+        published = dict(state.get("config") or {})
+    else:
+        checkpoint_path = ckpt.decompress_cached(ckpt.resolve(checkpoint_path))
+        name = checkpoint_path.name
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    shape = published.get("model_size")
+    if shape and config_path is None and presets.resolve(shape) != presets.resolve(config_section):
+        raise ValueError(f"{name} holds a {shape!r} model; pass config_section={shape!r} "
+                         f"(--config-section {shape}), not {config_section!r}")
 
     # Load model architecture config
     cfg = load_model_config(config_path, config_section)
-
-    # Load checkpoint state dict
-    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cleaned = ckpt.model_state(state)
     if meta is not None:
         wrapped = isinstance(state, dict) and "model" in state
         meta["step"] = state.get("step") if wrapped else None
         meta["tokens_consumed"] = state.get("tokens_consumed") if wrapped else None
 
-    # Configure AttnRes
-    if attn_res_config is not None:
-        cfg.update(attn_res_config)
-        logger.info("AttnRes config (explicit): %s", attn_res_config)
-    else:
-        # Auto-detect from state dict keys
-        has_attn_res = any("attn_res_query" in k for k in cleaned)
-        if has_attn_res:
-            cfg.update({"attn_res": True, "attn_res_n_blocks": 7})
-            logger.warning(
-                "AttnRes auto-detected from checkpoint keys — using default "
-                "n_blocks=7. Pass attn_res_config explicitly for reliability."
-            )
+    cfg.update(attn_res_geometry(attn_res_config, cleaned, published,
+                                 config_section if config_path is None else None))
 
     if overrides:
         cfg.update(overrides)
@@ -145,7 +174,7 @@ def load_model(
     param_count = sum(p.numel() for p in model.parameters())
     logger.info(
         "Loaded model: %s (%.1fM params, device=%s, attn_res=%s)",
-        checkpoint_path.name,
+        name,
         param_count / 1e6,
         device,
         cfg.get("attn_res", False),

@@ -109,20 +109,28 @@ of the model's own text and template loops, never reuse of names or objects.
 
 ### Evaluate
 
-| task | command |
-|---|---|
-| lm-eval battery | `tools/launch_lmeval_sharded.sh <ckpt> 0,1,2` (task-sharded over GPUs) · single GPU: `tools/run_py.sh -m scripts.eval.run_lm_eval --checkpoint <ckpt> --config-section 3b` |
-| Uncheatable BPB | `tools/run_py.sh -m kotodama.eval.uncheatable --checkpoint <ckpt> --config-section 3b --attn-res-boundaries dd3b --out <json>` (data: `--data-dir`, else `$KOTODAMA_UNCHEATABLE_DATA`, else the HF dataset; checkpoint sweeps: `--max-docs-per-domain N`) |
-| induction score | `tools/run_py.sh -m kotodama.eval.induction --checkpoint <ckpt> --config-section proxy --attn-res-boundaries ddv1 --tag <t>` |
-| NCA gates | `python -m kotodama.eval.nca_gates --checkpoint <ckpt> --eval-dir <dir> --tag <t>` · every checkpoint of a run: `tools/run_py.sh -m scripts.eval.nca_gates_sweep --ckpt-dir <run> --eval-dir <dir> --init-seed <seed>` |
-| binding suite (every battery, one model load) | `tools/run_py.sh -m kotodama.eval.binding run --model koto:<ckpt> --name <m> --batteries scorecard --out <dir>` (`hf:<path>` for public models; `list` shows batteries and groups) · scorecard: `python -m kotodama.eval.binding report --scores <dir>` · capacity size law: `python -m kotodama.eval.binding capacity --scores <dir> --params <tsv>` · fluid vs crystallized (`--batteries fluid`): `python -m kotodama.eval.binding fluid --scores <dir>` · form vs update (`--batteries formupdate`): `python -m kotodama.eval.binding formupdate --scores <dir>` |
-| rider grid | `python -m kotodama.eval.riders {gen,run,aggregate}` (against a server's `/logprobs`) |
-| binding probes, core | `python -m kotodama.eval.bindprobes {gen,run,aggregate}` · deixis validity gates: `python -m kotodama.eval.bindprobes gates --grids <dir> --items items.jsonl --chance-model <m> --learn-model <m> [--pilot]` |
-| binding probes, v3 families | `python -m kotodama.eval.bindprobes gen --out <dir> --families setbind,answer,adjacency,codevarmut --verify`, then `run` / `aggregate` |
-| AttnRes boundaries from one checkpoint | `tools/run_py.sh scripts/eval/nca_profile.py --checkpoint <ckpt> --config-section 1b --out <json>` |
-| AttnRes boundaries over a run | `tools/run_py.sh scripts/eval/fit_boundaries.py --run <label> --checkpoint <run>/weights/step_*.pt --config-section 1b --out-dir <dir>`, then `--summarize --run <label> --out-dir <dir>` |
-| AttnRes routing matrix | `tools/run_py.sh scripts/eval/routing_matrix.py --run <label> --checkpoint <ckpt> [--checkpoint ...] --config-section 1b --attn-res-boundaries dd3b --out-dir <dir>` (every routing site × source on held-out text, per domain; `--plot` renders finished JSONs) |
-| capture / readout | `kotodama.model.capture` (instrumented AttnRes forward, parity-tested against `llama.py`) |
+`<ckpt>` is a `.pt` / `.pt.zst` path, a registry name (`configs/checkpoints.yaml`), a published-weights directory, or
+`hf:REPO[@REVISION]` (e.g. `hf:LuxiaSL/kotodama-tsumugi-1b`, or a step branch of its trajectory repo). `<preset>` is a
+`kotodama.presets` shape (`3b`, `1b-tsumugi`, `proxy`, …). Every Kotodama-checkpoint eval loads through
+`kotodama.eval.model_loader`, which takes the AttnRes boundaries from the published `config.json`, else the preset's
+trained boundaries; pass `--attn-res-boundaries` only to override them. Public Hugging Face models have their own
+runner per eval, scored with the same math.
+
+| task | Kotodama checkpoint | public HF model |
+|---|---|---|
+| lm-eval battery | `EVAL_SECTION=<preset> tools/launch_lmeval_sharded.sh <ckpt> 0,1,2` (task-sharded over 3 GPUs) · one GPU: `tools/run_py.sh -m scripts.eval.run_lm_eval --checkpoint <ckpt> --config-section <preset>` | `tools/run_py.sh -m scripts.eval.run_lm_eval_hf --model <repo> [--revision <rev>] --output-dir <dir>` |
+| Uncheatable BPB | `tools/run_py.sh -m kotodama.eval.uncheatable --checkpoint <ckpt> --config-section <preset> --out <json>` (data: `--data-dir`, else `$KOTODAMA_UNCHEATABLE_DATA`, else the HF dataset; checkpoint sweeps: `--max-docs-per-domain N`) | `tools/run_py.sh -m scripts.eval.run_uncheatable_hf --model <repo> [--revision <rev>] --out <json>` |
+| induction score | `tools/run_py.sh -m kotodama.eval.induction --checkpoint <ckpt> --config-section <preset> --tag <t>` | — |
+| NCA gates | `python -m kotodama.eval.nca_gates --checkpoint <ckpt> --eval-dir <dir> --tag <t>` · every checkpoint of a run: `tools/run_py.sh -m scripts.eval.nca_gates_sweep --ckpt-dir <run> --eval-dir <dir> --init-seed <seed>` | — |
+| binding suite: score | `tools/run_py.sh -m kotodama.eval.binding run --model koto:<ckpt> --name <m> --batteries <battery or group> --out <dir>` (one model load for every battery; `list` shows batteries and the groups `scorecard`, `bindprobes`, `fluid`, `formupdate`, `all`) | the same with `--model hf:<repo or dir>` |
+| binding suite: read | scorecard `python -m kotodama.eval.binding report --scores <dir>` · capacity size law `… capacity --scores <dir> --params <tsv>` · fluid vs crystallized `… fluid --scores <dir>` · form vs update `… formupdate --scores <dir>` · bindprobes batteries `python -m kotodama.eval.bindprobes aggregate --grids <dir>/<battery>` | same |
+| binding suite: regenerate the pinned prompts | `python -m kotodama.eval.binding gen-capacity --out <file>` · `gen-fluid --out <dir>` · `gen-formupdate --out <dir>` (byte-identical to the pins) | — |
+| rider grid (not in the suite) | `python -m kotodama.eval.riders {gen,run,aggregate}` (scored against a server's `/logprobs`) | same, against any server |
+| new bindprobes item sets | `python -m kotodama.eval.bindprobes gen --out <dir> [--families setbind,answer,adjacency,codevarmut] --verify`, then `run` (against a server) / `aggregate` · deixis validity gates: `… gates --grids <dir> --items items.jsonl --chance-model <m> --learn-model <m> [--pilot]`. The frozen sets are the suite's `bp-*` batteries | same |
+| AttnRes boundaries from one checkpoint | `tools/run_py.sh scripts/eval/nca_profile.py --checkpoint <ckpt> --config-section 1b --out <json>` | — |
+| AttnRes boundaries over a run | `tools/run_py.sh scripts/eval/fit_boundaries.py --run <label> --checkpoint <run>/weights/step_*.pt --config-section 1b --out-dir <dir>`, then `--summarize --run <label> --out-dir <dir>` | — |
+| AttnRes routing matrix | `tools/run_py.sh scripts/eval/routing_matrix.py --run <label> --checkpoint <ckpt> [--checkpoint ...] --config-section 1b --attn-res-boundaries dd3b --out-dir <dir>` (every routing site × source on held-out text, per domain; `--plot` renders finished JSONs) | — |
+| capture / readout | `kotodama.model.capture` (instrumented AttnRes forward, parity-tested against `llama.py`) | — |
 
 ### Serve
 
