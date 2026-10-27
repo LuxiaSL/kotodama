@@ -128,6 +128,7 @@ class _Live:
     budget: int
     timing: dict[str, float]
     t_admit: float
+    stop_window: int
 
 
 class XBatchRunner:
@@ -155,7 +156,8 @@ class XBatchRunner:
         self.should_yield = should_yield or (lambda: False)
         self.queue = XBatchQueue()
         self.stats: dict[str, float] = {"batches": 0, "steps": 0, "row_steps": 0, "useful_row_steps": 0,
-                                        "admitted": 0, "refilled": 0}
+                                        "admitted": 0, "refilled": 0, "prefill_s": 0.0, "step_s": 0.0,
+                                        "host_s": 0.0}
 
     def bucket_for(self, rows: int) -> MultiSampleDecoder:
         """The narrowest decoder that holds ``rows`` rows (the widest when none does)."""
@@ -189,14 +191,19 @@ class XBatchRunner:
             timing["prefix_common_tokens"] = float(info.get("common_prefix", 0))
         timing["batched_rows"] = float(dec.rows)
         budget = min(job.max_new_tokens, self.max_seq_len - len(job.prompt_ids))
-        lv = _Live(job, rows, [[] for _ in rows], [True] * len(rows), budget, timing, t0)
-        self._consume(dec, lv, first)
+        # A stop string that first appears at this token ends inside its text, so decoding a tail that holds the
+        # longest stop several times over finds it without re-decoding the whole row every step.
+        window = 4 * max((len(x) for x in job.stop_strings), default=0) + 16
+        lv = _Live(job, rows, [[] for _ in rows], [True] * len(rows), budget, timing, t0, window)
+        self._consume(lv, first)
         self.stats["admitted"] += 1
+        self.stats["prefill_s"] += time.perf_counter() - t0
         return lv
 
-    def _consume(self, dec: MultiSampleDecoder, lv: _Live, toks: list[int]) -> None:
+    def _consume(self, lv: _Live, toks: list[int]) -> None:
         """Process one sampled token per row of ``lv`` (``toks[i]`` for ``lv.rows[i]``), ending rows at a stop
-        token (not kept), the token budget, a stop string or the context limit."""
+        token (not kept), a stop string or the token budget. The budget is capped at the context room left after
+        the prompt, so a live row never steps past the last cache slot."""
         stops = lv.job.stop_strings
         for i, tok in enumerate(toks):
             if not lv.live[i]:
@@ -207,14 +214,24 @@ class XBatchRunner:
             out = lv.out[i]
             out.append(tok)
             self.stats["useful_row_steps"] += 1
-            if (len(out) >= lv.budget or dec.row_pos(lv.rows[i]) >= self.max_seq_len
-                    or (stops and any(s in self.decode(out) for s in stops))):
+            if len(out) >= lv.budget:
                 lv.live[i] = False
+            elif stops:
+                tail = self.decode(out[-lv.stop_window:])
+                if any(s in tail for s in stops):
+                    lv.live[i] = False
 
     def _finish(self, lv: _Live) -> None:
         lv.timing["decode_ms"] = round((time.perf_counter() - lv.t_admit) * 1000 - lv.timing["prefill_ms"], 2)
         lv.timing["total_ms"] = round((time.perf_counter() - lv.job.t_enqueue) * 1000, 2)
         self._deliver(lv.job, XBatchResult(rows=lv.out, timing=lv.timing))
+
+    def _retire(self, active: list[_Live], free: list[int]) -> None:
+        """Deliver every job whose rows have all ended and free its rows."""
+        for lv in [lv for lv in active if not any(lv.live)]:
+            active.remove(lv)
+            free.extend(lv.rows)
+            self._finish(lv)
 
     def run_batch(self) -> int:
         """Decode one batch from the queue to completion; returns the number of requests it served (0 when the
@@ -236,11 +253,17 @@ class XBatchRunner:
                 if lv is not None:
                     active.append(lv)
             self.stats["batches"] += 1
+            # Software pipeline: step k+1 is launched before step k's tokens are read back and processed, so the
+            # host work (stop checks, retiring and admitting requests) overlaps the GPU step. A row that ended at
+            # step k runs one extra step whose token is ignored; a row admitted while a step is in flight joins
+            # from the next launch (its admission is stream-ordered after the in-flight step, and that step's
+            # token for the row is ignored because the step's snapshot predates the admission).
+            cuda = dec.cur_tokens.is_cuda
+            bufs = [torch.empty(dec.rows, dtype=torch.long, pin_memory=cuda) for _ in range(2)]
+            pending: Optional[tuple[torch.Tensor, Any, list[_Live]]] = None
+            k = 0
             while True:
-                for lv in [lv for lv in active if not any(lv.live)]:
-                    active.remove(lv)
-                    free.extend(lv.rows)
-                    self._finish(lv)
+                self._retire(active, free)
                 if self.refill and not self.should_yield():
                     while free:
                         job = self.queue.take_fitting(head.key, len(free))
@@ -251,17 +274,34 @@ class XBatchRunner:
                         self.stats["refilled"] += 1
                         if lv is not None:
                             active.append(lv)
-                    for lv in [lv for lv in active if not any(lv.live)]:  # a refill may end at its first token
-                        active.remove(lv)
-                        free.extend(lv.rows)
-                        self._finish(lv)
-                if not active:
+                    self._retire(active, free)  # a refill may end at its first token
+                if not active and pending is None:
                     break
-                toks = dec.step(head.params).view(-1).tolist()
-                self.stats["steps"] += 1
-                self.stats["row_steps"] += dec.rows
-                for lv in active:
-                    self._consume(dec, lv, [toks[r] for r in lv.rows])
+                t0 = time.perf_counter()
+                launched = None
+                if active:
+                    dec.step(head.params)
+                    buf = bufs[k % 2]
+                    buf.copy_(dec.cur_tokens.view(-1), non_blocking=cuda)
+                    ev = torch.cuda.Event() if cuda else None
+                    if ev is not None:
+                        ev.record()
+                    launched = (buf, ev, list(active))
+                    k += 1
+                    self.stats["steps"] += 1
+                    self.stats["row_steps"] += dec.rows
+                if pending is not None:
+                    buf, ev, snapshot = pending
+                    if ev is not None:
+                        ev.synchronize()
+                    t1 = time.perf_counter()
+                    toks = buf.tolist()
+                    for lv in snapshot:
+                        if any(lv.live):
+                            self._consume(lv, [toks[r] for r in lv.rows])
+                    self.stats["step_s"] += t1 - t0
+                    self.stats["host_s"] += time.perf_counter() - t1
+                pending = launched
         except Exception as exc:
             logger.exception("xbatch: batch failed with %d live requests", len(active))
             for lv in active:

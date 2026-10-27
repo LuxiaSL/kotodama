@@ -176,6 +176,14 @@ def test_per_row_stops_budgets_and_capacity(model: KotodamaModel) -> None:
     runner2.queue.put(rec2.job("s", _ids(8, 3), 4, max_new=20, stops=("xxx",), params=hot))
     runner2.run_batch()
     assert [len(r) for r in rec2.out["s"].rows] == [3, 3, 3, 3]
+    # the tail-window check ends each row exactly where a full decode first contains a stop
+    letters = lambda ids: "".join(chr(97 + i % 3) for i in ids)  # noqa: E731 - three letters: stops recur
+    runner3, rec3 = _runner(_engine(model), widths=(4,), decode=letters), _Rec()
+    runner3.queue.put(rec3.job("t", _ids(8, 4), 4, max_new=60, stops=("abca", "ccb"), params=hot))
+    runner3.run_batch()
+    for row in rec3.out["t"].rows:
+        hit = [k for k in range(1, len(row) + 1) if any(s in letters(row[:k]) for s in ("abca", "ccb"))]
+        assert (hit[0] if hit else 60) == len(row), row
 
 
 @torch.inference_mode()
