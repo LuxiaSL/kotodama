@@ -826,7 +826,9 @@ def main() -> int:
                 out[f"{key}_empty_group_lse_is_neg_inf"] = bool(torch.isneginf(gl1[~live]).all())
                 out[f"{key}_tail_rel_err"] = err(go2, ro2)
                 out[f"{key}_tail_lse_max_abs"] = float((gl2 - rl2).abs().max())
-                out[f"{key}_merged_rel_err"] = err(merge(go1, gl1, go2, gl2), merge(ro1, rl1, ro2, rl2))
+                got_m, ref_m = merge(go1, gl1, go2, gl2), merge(ro1, rl1, ro2, rl2)
+                out[f"{key}_merged_rel_err"] = err(got_m[live], ref_m[live])
+                out[f"{key}_merged_rel_err_empty_group_rows"] = err(got_m[~live], ref_m[~live])
         logger.info("cascade_kernel: %s", out)
         return out
 

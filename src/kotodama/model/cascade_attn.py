@@ -69,8 +69,10 @@ def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lens: torch.Tensor) -> 
 def attend_flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                  lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``attend_reference``'s contract on flash-attn's KV-cache kernel (CUDA, bf16/fp16, ``lens`` int32, keys and
-    values with a unit last stride). An item with ``lens`` 0 gets lse -inf."""
-    return torch.ops.kotodama.kv_attend_lse(q, k, v, lens)
+    values with a unit last stride). An item with ``lens`` 0 gets out 0 and lse -inf (the kernel itself writes +inf
+    there, which a merge would read as all the weight)."""
+    out, lse = torch.ops.kotodama.kv_attend_lse(q, k, v, lens)
+    return out, lse.masked_fill((lens == 0).view(-1, 1, 1), float("-inf"))
 
 
 @functools.lru_cache(maxsize=None)
