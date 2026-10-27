@@ -66,7 +66,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from kotodama.posttrain.selfplay import (Complete, PromptTooLong, SeedSpec, SelfPlayConfig, evaluate, next_speaker,
-                                         novelty, oai_completer, parse_seed, parse_steer, split_completion)
+                                         novelty, oai_completer, parse_seed, parse_steer, speech_key, split_completion)
 from kotodama.posttrain.transcript import Transcript, Turn, render_prompt, stop_sequences, to_row
 from kotodama.serve.laws import law
 
@@ -377,8 +377,61 @@ def _turn_chars(t: dict[str, Any]) -> int:
     return len(t["text"]) + len(t["speaker"]) + 4
 
 
+@dataclass
+class Clean:
+    """Assembly-time cleanup (each part off by default). ``truncate_loops``: a path ends at its loop onset — the first
+    turn from which at least half of the next 20 repeat (speech only) one of the 30 before them — so nothing inside a
+    loop trains or serves as context. ``untrain_repeats`` N: a turn whose speech repeats one of the previous N turns is
+    context, not a target. ``untrain_format``: a turn carrying another speaker's line under a non-cast name, or
+    opening with a bracket tag ("[MFT]"), is context. ``drop_minor_explicit``: a document with a turn that names a
+    minor and an explicit sexual term is dropped."""
+
+    truncate_loops: bool = False
+    untrain_repeats: int = 0
+    untrain_format: bool = False
+    drop_minor_explicit: bool = False
+
+
+_LABEL_LINE = re.compile(r"^\s*([A-Z][\w.'-]*(?: [A-Z][\w.'-]*){0,2}):\s", re.M)
+_TAG_OPEN = re.compile(r"^\s*\[[A-Z]{2,6}\]")
+_MINOR = re.compile(r"\b(child|children|kids?|little (girl|boy)|underage|minor|toddler|preteen|schoolgirl|schoolboy|"
+                    r"(1[0-7]|[1-9]|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen)[- ]years?[- ]old)\b",
+                    re.I)
+_EXPLICIT = re.compile(r"\b(sex|sexual|naked|nude|undress\w*|underwear|panties|breasts?|nipples?|cock|penis|dick|"
+                       r"vagina|pussy|orgasm|cum|cums|fuck\w*|masturbat\w*|erection|aroused|horny)\b", re.I)
+
+
+def loop_onset(turns: list[dict[str, Any]], back: int = 30, span: int = 20) -> int:
+    """Index of the first repeated turn (speech only, against the ``back`` turns before it) in the first window of
+    ``span`` turns at least half of which are repeats; ``len(turns)`` when there is none."""
+    rep_: list[bool] = []
+    hist: list[str] = []
+    for t in turns:
+        k = speech_key(t["text"])
+        rep_.append(bool(k) and k in hist)
+        hist = (hist + [k])[-back:]
+    for g in range(len(rep_)):
+        win = rep_[g:g + span]
+        if len(win) >= span // 2 and sum(win) * 2 >= len(win):
+            return g + win.index(True)  # the window's first repeat, not the fresh turns leading into it
+    return len(turns)
+
+
+def _flawed(body: list[dict[str, Any]], cast: list[str], clean: Clean) -> set[int]:
+    bad: set[int] = set()
+    keys = [speech_key(t["text"]) for t in body]
+    names = {c.strip() for c in cast}
+    for k, t in enumerate(body):
+        if clean.untrain_repeats and keys[k] and keys[k] in keys[max(0, k - clean.untrain_repeats):k]:
+            bad.add(k)
+        if clean.untrain_format and (_TAG_OPEN.match(t["text"]) or any(
+                m.group(1) not in names for m in _LABEL_LINE.finditer(t["text"]))):
+            bad.add(k)
+    return bad
+
+
 def assemble(paths: list[dict[str, Any]], max_chars: int, train_chars: int, max_uses: int, min_new: int,
-             seed: int) -> list[dict[str, Any]]:
+             seed: int, clean: Optional[Clean] = None) -> list[dict[str, Any]]:
     """Training documents from loom paths without leaning on the shared trunk.
 
     A path is its header and seed turns (always in the document, never trained), then any ``history`` an earlier run
@@ -387,7 +440,9 @@ def assemble(paths: list[dict[str, Any]], max_chars: int, train_chars: int, max_
     and fills the rest of ``max_chars`` backwards with the turns just before it, marked ``"train": false``. The path
     then continues from the end of that run, so a long path becomes consecutive documents that each condition on the
     conversation behind them. Every turn TRAINS in at most ``max_uses`` documents however many leaves share it; turns
-    already at the cap inside a run are context too. A document training fewer than ``min_new`` turns is dropped."""
+    already at the cap inside a run are context too. A document training fewer than ``min_new`` turns is dropped.
+    ``clean`` (``Clean``) truncates loops and turns flawed turns into context before any of this."""
+    clean = clean or Clean()
     rng = random.Random(seed)
     order = list(range(len(paths)))
     rng.shuffle(order)
@@ -401,10 +456,15 @@ def assemble(paths: list[dict[str, Any]], max_chars: int, train_chars: int, max_
         ids = node_ids(p["leaf"])
         if n_hist < 0 or len(ids) != p["depth"]:
             continue
+        if clean.truncate_loops:
+            body = body[:loop_onset(body)]
+            if len(body) <= n_hist:
+                continue
+        flawed = _flawed(body, p.get("cast", []), clean)
         budget = max_chars - len(p.get("header", "")) - sum(_turn_chars(t) for t in prefix)
 
         def trainable(k: int) -> bool:
-            return k >= n_hist and uses.get(ids[k - n_hist], 0) < max_uses
+            return k >= n_hist and k not in flawed and uses.get(ids[k - n_hist], 0) < max_uses
 
         i = n_hist
         while i < len(body):
@@ -424,7 +484,8 @@ def assemble(paths: list[dict[str, Any]], max_chars: int, train_chars: int, max_
                 start -= 1
                 size += _turn_chars(body[start])
             trains = [k >= i and trainable(k) for k in range(start, j)]
-            if sum(trains) >= min_new:
+            if sum(trains) >= min_new and not (clean.drop_minor_explicit and any(
+                    _MINOR.search(body[k]["text"]) and _EXPLICIT.search(body[k]["text"]) for k in range(start, j))):
                 turns = [dict(t, train=False) for t in prefix]
                 for k, tr in zip(range(start, j), trains):
                     turns.append(dict(body[k], train=tr))
@@ -488,6 +549,13 @@ def assemble_main(argv: list[str]) -> int:
     ap.add_argument("--max_uses", type=int, default=2)
     ap.add_argument("--min_new", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--truncate_loops", action="store_true", help="end each path at its loop onset")
+    ap.add_argument("--untrain_repeats", type=int, default=0,
+                    help="a turn repeating one of the previous N turns (speech only) is context, not a target")
+    ap.add_argument("--untrain_format", action="store_true",
+                    help="turns with a non-cast speaker label inside, or a leading [TAG], are context")
+    ap.add_argument("--drop_minor_explicit", action="store_true",
+                    help="drop documents with a turn naming a minor and an explicit sexual term")
     a = ap.parse_args(argv)
     paths = []
     for ri, r in enumerate(a.runs):  # tree ids restart in every run directory: namespace them by run
@@ -499,7 +567,8 @@ def assemble_main(argv: list[str]) -> int:
                     continue
                 p["tree"], p["leaf"] = f"{ri}:{p['tree']}", f"{ri}:{p['leaf']}"
                 paths.append(p)
-    docs = assemble(paths, a.max_chars, a.train_chars or a.max_chars // 2, a.max_uses, a.min_new, a.seed)
+    docs = assemble(paths, a.max_chars, a.train_chars or a.max_chars // 2, a.max_uses, a.min_new, a.seed,
+                    Clean(a.truncate_loops, a.untrain_repeats, a.untrain_format, a.drop_minor_explicit))
     with open(a.out, "w", encoding="utf-8") as f:
         for d in docs:
             f.write(json.dumps(d, ensure_ascii=False) + "\n")

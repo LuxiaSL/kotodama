@@ -340,3 +340,42 @@ def test_novel_selection_prefers_turns_with_new_content() -> None:
     st, recs = grow(cfg, fake(script)[0])
     chosen = [r for r in recs["node"] if r["status"] == "child"]
     assert chosen and all(r["text"].startswith("The ") for r in chosen)
+
+
+def _path(texts, tree="t0", cast=("A", "B")):
+    n = len(texts)
+    return {"tree": tree, "leaf": tree + "/r" + ".0" * n, "depth": n, "header": "H", "n_seed": 0, "cast": list(cast),
+            "turns": [{"speaker": cast[k % 2], "text": x} for k, x in enumerate(texts)]}
+
+
+def test_loop_onset_and_truncation() -> None:
+    fresh = [f"line number {k} about the harbour" for k in range(30)]
+    loop = ["You do.", "I don't.", "You do, Paulo.", "You don't, Richard.", "No.", "No. You don't."] * 8
+    turns = [{"speaker": "A", "text": x} for x in fresh + loop]
+    o = loom.loop_onset(turns)
+    assert o == 36  # the first cycle (turns 30-35) is new speech; the cut falls at its first repeat
+    assert loom.loop_onset(turns[:30]) == 30
+    p = _path(fresh + loop)
+    plain = loom.assemble([p], 100_000, 50_000, 1, 1, 0)
+    cut = loom.assemble([p], 100_000, 50_000, 1, 1, 0, loom.Clean(truncate_loops=True))
+    trained = lambda docs: [t["text"] for d in docs for t in d["turns"] if t["train"]]  # noqa: E731
+    assert len(trained(plain)) == len(fresh + loop)
+    assert len(trained(cut)) == o and trained(cut)[30:] == loop[:6]  # one pass of the cycle, then the cut
+
+
+def test_untrain_repeats_and_format() -> None:
+    texts = ["Where were you last night?", "Out by the docks, with Jac.", "Yes.", "Why the docks?",
+             "Jac: Because the boats were in.\nAnd we watched them.", "[MFT] So you say.", "Yes.", "I do say."]
+    p = _path(texts)
+    docs = loom.assemble([p], 100_000, 50_000, 1, 1, 0, loom.Clean(untrain_repeats=10, untrain_format=True))
+    flags = {t["text"]: t["train"] for t in docs[0]["turns"]}
+    assert flags["Where were you last night?"] and flags["Why the docks?"] and flags["I do say."]
+    assert not flags["[MFT] So you say."]  # bracket tag
+    assert not [t for t in docs[0]["turns"] if t["text"] == "Yes." and t["train"]][1:]  # the second "Yes." is context
+    assert flags["Out by the docks, with Jac."]  # a name inside a sentence is not a label line
+    q = _path(["Hello there, friend.", "Hello. I have news.\nJac: and so do I", "Tell me."], tree="t1")
+    d2 = loom.assemble([q], 100_000, 50_000, 1, 1, 0, loom.Clean(untrain_format=True))
+    assert not {t["text"]: t["train"] for t in d2[0]["turns"]}["Hello. I have news.\nJac: and so do I"]
+    cast_ok = _path(["Hello there, friend.", "Fine.\nB: and you?", "Tell me."], tree="t2")
+    d3 = loom.assemble([cast_ok], 100_000, 50_000, 1, 1, 0, loom.Clean(untrain_format=True))
+    assert all(t["train"] for t in d3[0]["turns"])  # a cast name's label is cut_stray_label's job, not this rule's
