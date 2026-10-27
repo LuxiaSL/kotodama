@@ -185,3 +185,17 @@ def test_assemble_bounds_trunk_reuse() -> None:
     assert all(d["header"] == "H" for d in docs) and len(docs) >= 5
     small = loom.assemble(paths[:1], max_chars=60, lead_in=0, max_uses=1, min_new=1, seed=0)
     assert len(small) > 1 and all(len(d["turns"]) * 6 <= 60 for d in small)  # a deep path yields several windows
+
+
+def test_assemble_main_namespaces_runs(tmp_path) -> None:
+    for name in ("a", "b"):  # two runs whose tree/leaf ids collide
+        d = tmp_path / name
+        d.mkdir()
+        p = {"tree": "t00000", "leaf": "t00000/r.0.0.0.0.0.0.0.0", "depth": 8, "header": name, "state": "depth",
+             "turns": [{"speaker": "A" if k % 2 == 0 else "B", "text": f"{name}{k}"} for k in range(8)]}
+        (d / "paths.jsonl").write_text(json.dumps(p) + "\n")
+    out = tmp_path / "docs.jsonl"
+    assert loom.main(["assemble", str(tmp_path / "a"), str(tmp_path / "b"), "--out", str(out), "--max_uses", "1",
+                      "--min_new", "4"]) == 0
+    docs = [json.loads(x) for x in out.read_text().splitlines()]
+    assert {d["header"] for d in docs} == {"a", "b"}  # the second run's identical ids were not counted as used

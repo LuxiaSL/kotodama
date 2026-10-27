@@ -364,8 +364,13 @@ def assemble_main(argv: list[str]) -> int:
     ap.add_argument("--min_new", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
-    paths = [json.loads(line) for r in a.runs for line in (Path(r) / "paths.jsonl").read_text().splitlines()
-             if line.strip()]
+    paths = []
+    for ri, r in enumerate(a.runs):  # tree ids restart in every run directory: namespace them by run
+        for line in (Path(r) / "paths.jsonl").read_text().splitlines():
+            if line.strip():
+                p = json.loads(line)
+                p["tree"], p["leaf"] = f"{ri}:{p['tree']}", f"{ri}:{p['leaf']}"
+                paths.append(p)
     docs = assemble(paths, a.max_chars, a.lead_in, a.max_uses, a.min_new, a.seed)
     with open(a.out, "w", encoding="utf-8") as f:
         for d in docs:
