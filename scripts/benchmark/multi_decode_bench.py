@@ -9,9 +9,13 @@ then reports:
     is distributional, not bitwise);
   * the compiled batched step at a near-zero temperature vs the engine's greedy continuation (matching prefix).
 
+``--rows`` takes a list (one compiled decoder per bucket, timed at its full width) and ``--context_tokens`` a list of
+prompt lengths (the dialogue repeated to that many tokens), so batch width is measured where the loom decodes: deep
+in a long context, where attention reads every row's KV each step.
+
 Usage (node, GPU):
   tools/run_py.sh scripts/benchmark/multi_decode_bench.py --checkpoint <step.pt> --model_size 1b-moonshot-loop \
-      --rope_fp32 --rows 8 [--out results/multi_decode.json]
+      --rope_fp32 --rows 8 [--context_tokens 0,3000] [--out results/multi_decode.json]
 """
 
 from __future__ import annotations
@@ -50,19 +54,32 @@ def main() -> int:
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--model_size", default="1b-moonshot-loop")
     ap.add_argument("--rope_fp32", action="store_true")
-    ap.add_argument("--rows", type=int, default=8)
+    ap.add_argument("--rows", default="8", help="comma list of batch widths, e.g. 8,16,32,64")
+    ap.add_argument("--context_tokens", default="0", help="comma list of prompt lengths (0 = the short prompt)")
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
+    widths = sorted({int(x) for x in a.rows.split(",") if x.strip()})
+    contexts = [int(x) for x in a.context_tokens.split(",") if x.strip()]
     server._rope_fp32_override = a.rope_fp32
     _model, tok = server.load_model(a.checkpoint, "cuda", mode="base", model_size=a.model_size, engine="fast",
-                                    prefix_cache=True, max_seq_len=4096, multi_rows=(a.rows,))
-    eng, dec = server._engine, server._multi.get(a.rows)
-    assert eng is not None and dec is not None
-    ids = tok.encode(PROMPT, return_tensors="pt").cuda()
+                                    prefix_cache=True, max_seq_len=4096, multi_rows=tuple(widths))
+    eng = server._engine
+    assert eng is not None and all(server._multi.get(w) is not None for w in widths)
+    dec = server._multi[widths[-1]]
+    base_ids = tok.encode(PROMPT)
+    body = tok.encode(PROMPT.split("\n\n", 1)[1] + " Fine.\n\nTeo: Fine.\n\n")
+
+    def prompt_ids(n: int) -> torch.Tensor:
+        out = list(base_ids)
+        while n and len(out) < n:
+            out = body + out
+        return torch.tensor([out[-n:] if n else out], device="cuda")
+
+    ids = prompt_ids(0)
     params = SamplingParams(temperature=0.75, repetition_penalty=1.2)
-    res: dict = {"rows": a.rows, "prompt_tokens": ids.shape[1], "steps": a.steps}
+    res: dict = {"rows": widths, "context_tokens": contexts, "steps": a.steps}
 
     def run_on_worker(fn):
         return server._generate_executor.submit(fn).result()  # compiled graphs live on the serving thread
@@ -70,20 +87,26 @@ def main() -> int:
     def bench() -> dict:
         out: dict = {}
         with torch.inference_mode():
-            logits = eng.prefill(ids)
-            t = eng.sample_first(logits, params)
-            for _ in range(8):
-                t = eng.step(t, params)
-            out["single_ms_per_token"] = 1000 * timed(lambda: eng.step(eng.cur_token, params), a.steps)
-            for n in sorted({2, 4, a.rows}):
-                logits = eng.prefill(ids)
-                dec.start(logits, params)
+            for ctx in contexts:
+                cids = prompt_ids(ctx)
+                tag = f"ctx{cids.shape[1]}"
+                logits = eng.prefill(cids)
+                t = eng.sample_first(logits, params)
                 for _ in range(8):
-                    dec.step(params)
-                ms = 1000 * timed(lambda: dec.step(params), a.steps)
-                out[f"batched_ms_per_step_rows{a.rows}_as_n{n}"] = ms
-                out[f"tok_s_n{n}"] = n * 1000 / ms
-            out["tok_s_single"] = 1000 / out["single_ms_per_token"]
+                    t = eng.step(t, params)
+                single = 1000 * timed(lambda: eng.step(eng.cur_token, params), a.steps)
+                out[f"{tag}_single_ms_per_token"] = single
+                for w in widths:
+                    d = server._multi[w]
+                    logits = eng.prefill(cids)
+                    d.start(logits, params)
+                    for _ in range(8):
+                        d.step(params)
+                    ms = 1000 * timed(lambda: d.step(params), a.steps)
+                    out[f"{tag}_rows{w}_ms_per_step"] = ms
+                    out[f"{tag}_rows{w}_tok_s"] = w * 1000 / ms
+                    out[f"{tag}_rows{w}_step_vs_single"] = ms / single
+                logger.info("%s: %s", tag, {k: round(v, 2) for k, v in out.items() if k.startswith(tag)})
         return out
 
     def agreement() -> dict:
