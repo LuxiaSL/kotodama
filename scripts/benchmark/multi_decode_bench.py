@@ -75,6 +75,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch._dynamo
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
@@ -289,8 +290,6 @@ def main() -> int:
     server._rope_fp32_override = a.rope_fp32
     if a.cascade == "both":
         # every decoder compiles the same step function once; two sets of buckets pass dynamo's default limit (8)
-        import torch._dynamo
-
         torch._dynamo.config.recompile_limit = 64
     _model, tok = server.load_model(a.checkpoint, "cuda", mode="base", model_size=a.model_size, engine="fast",
                                     prefix_cache=True, max_seq_len=4096, multi_rows=tuple(widths),
