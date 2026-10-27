@@ -65,6 +65,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
+from kotodama.posttrain import compliance
 from kotodama.posttrain.selfplay import (Complete, PromptTooLong, SeedSpec, SelfPlayConfig, evaluate, next_speaker,
                                          novelty, oai_completer, parse_seed, parse_steer, speech_key, split_completion)
 from kotodama.posttrain.transcript import Transcript, Turn, render_prompt, stop_sequences, to_row
@@ -383,24 +384,20 @@ class Clean:
     turn from which at least half of the next 20 repeat (speech only) one of the 30 before them — so nothing inside a
     loop trains or serves as context. ``untrain_repeats`` N: a turn whose speech repeats one of the previous N turns is
     context, not a target. ``untrain_format``: a turn carrying another speaker's line under a non-cast name, or
-    opening with a bracket tag ("[MFT]"), is context. ``drop_minor_explicit``: a document with a turn that names a
-    minor and an explicit sexual term is dropped."""
+    opening with a bracket tag ("[MFT]"), is context. ``drop_minor_explicit``: a document with a turn that
+    ``kotodama.posttrain.compliance`` flags ``minor_explicit`` is dropped; ``blocklist``: so is one with a turn whose
+    ``compliance.turn_hash`` is listed. ``redact_pii``: PII in the document's turns becomes placeholders."""
 
     truncate_loops: bool = False
     untrain_repeats: int = 0
     untrain_format: bool = False
     drop_minor_explicit: bool = False
+    blocklist: frozenset[str] = frozenset()
+    redact_pii: bool = False
 
 
 _LABEL_LINE = re.compile(r"^\s*([A-Z][\w.'-]*(?: [A-Z][\w.'-]*){0,2}):\s", re.M)
 _TAG_OPEN = re.compile(r"^\s*\[[A-Z]{2,6}\]")
-_MINOR = re.compile(r"\b(child|children|kids?|little (girl|boy)|underage|minor|toddler|preteen|schoolgirl|schoolboy|"
-                    r"(1[0-7]|[1-9]|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen)[- ]years?[- ]old)\b",
-                    re.I)
-_EXPLICIT = re.compile(r"\b(sex|sexual|naked|nude|undress\w*|underwear|panties|breasts?|nipples?|cock|penis|dick|"
-                       r"vagina|pussy|orgasm|cum|cums|fuck\w*|masturbat\w*|erection|aroused|horny)\b", re.I)
-
-
 def loop_onset(turns: list[dict[str, Any]], back: int = 30, span: int = 20) -> int:
     """Index of the first repeated turn (speech only, against the ``back`` turns before it) in the first window of
     ``span`` turns at least half of which are repeats; ``len(turns)`` when there is none."""
@@ -484,13 +481,18 @@ def assemble(paths: list[dict[str, Any]], max_chars: int, train_chars: int, max_
                 start -= 1
                 size += _turn_chars(body[start])
             trains = [k >= i and trainable(k) for k in range(start, j)]
-            if sum(trains) >= min_new and not (clean.drop_minor_explicit and any(
-                    _MINOR.search(body[k]["text"]) and _EXPLICIT.search(body[k]["text"]) for k in range(start, j))):
+            blocked = any(
+                (clean.drop_minor_explicit and "minor_explicit" in compliance.classify(body[k]["text"]))
+                or (clean.blocklist and compliance.turn_hash(body[k]["text"]) in clean.blocklist)
+                for k in range(start, j))
+            if sum(trains) >= min_new and not blocked:
                 turns = [dict(t, train=False) for t in prefix]
                 for k, tr in zip(range(start, j), trains):
                     turns.append(dict(body[k], train=tr))
                     if tr:
                         uses[ids[k - n_hist]] = uses.get(ids[k - n_hist], 0) + 1
+                if clean.redact_pii:
+                    turns = [dict(t, text=compliance.redact_pii(t["text"])) for t in turns]
                 docs.append({"header": p.get("header", ""), "turns": turns,
                              "source": {"tree": p["tree"], "leaf": p["leaf"], "history": n_hist,
                                         "from": start - n_hist, "to": j - n_hist}})
@@ -555,7 +557,10 @@ def assemble_main(argv: list[str]) -> int:
     ap.add_argument("--untrain_format", action="store_true",
                     help="turns with a non-cast speaker label inside, or a leading [TAG], are context")
     ap.add_argument("--drop_minor_explicit", action="store_true",
-                    help="drop documents with a turn naming a minor and an explicit sexual term")
+                    help="drop documents with a turn kotodama.posttrain.compliance flags minor_explicit")
+    ap.add_argument("--blocklist", default="", help="drop documents with a turn whose hash is in this file "
+                                                  "(python -m kotodama.posttrain.compliance scan)")
+    ap.add_argument("--redact_pii", action="store_true", help="replace PII in documents with placeholders")
     a = ap.parse_args(argv)
     paths = []
     for ri, r in enumerate(a.runs):  # tree ids restart in every run directory: namespace them by run
@@ -568,7 +573,8 @@ def assemble_main(argv: list[str]) -> int:
                 p["tree"], p["leaf"] = f"{ri}:{p['tree']}", f"{ri}:{p['leaf']}"
                 paths.append(p)
     docs = assemble(paths, a.max_chars, a.train_chars or a.max_chars // 2, a.max_uses, a.min_new, a.seed,
-                    Clean(a.truncate_loops, a.untrain_repeats, a.untrain_format, a.drop_minor_explicit))
+                    Clean(a.truncate_loops, a.untrain_repeats, a.untrain_format, a.drop_minor_explicit,
+                          compliance.load_blocklist(a.blocklist) if a.blocklist else frozenset(), a.redact_pii))
     with open(a.out, "w", encoding="utf-8") as f:
         for d in docs:
             f.write(json.dumps(d, ensure_ascii=False) + "\n")
