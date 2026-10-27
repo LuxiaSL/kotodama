@@ -202,6 +202,8 @@ class XBatchRunner:
         if info is not None:
             timing["prefix_cache_hit"] = float(bool(info.get("prefix_hit")))
             timing["prefix_common_tokens"] = float(info.get("common_prefix", 0))
+            if "pool_tokens" in info:
+                timing["prefix_pool_tokens"] = float(info["pool_tokens"])
         timing["batched_rows"] = float(dec.rows)
         timing["rows_at_admission"] = float(len(rows))
         # A stop string that first appears at this token ends inside its text, so decoding a tail that holds the

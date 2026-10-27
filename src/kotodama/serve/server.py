@@ -72,6 +72,7 @@ from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 try:
     from kotodama.model.decode_engine import DecodeEngine, SamplingParams as EngineSamplingParams
     from kotodama.model.multi_decode import MultiSampleDecoder, decode_rows
+    from kotodama.model.prefix_cache import PrefixKVCache
     from kotodama.serve.xbatch import XBatchJob, XBatchRunner, XBatchScheduler
     _ENGINE_AVAILABLE = True
 except Exception as _engine_exc:
@@ -189,6 +190,9 @@ _multi: "dict[int, MultiSampleDecoder]" = {}
 _xbatch: "XBatchScheduler | None" = None
 # Prefix caching (engine extend-from-pos prefill); set by load_model.
 _prefix_cache = False
+# Multi-entry prefix KV pool (--prefix_pool_tokens): recent prompts' KV in fixed-size token blocks, so a prompt that
+# shares a prefix with any pooled prompt (not only the previous request's) prefills only its suffix. None = off.
+_prefix_pool: "PrefixKVCache | None" = None
 # Residual steering (--steer-npz, comma-separated banks); set by load_model.
 # The bank maps key -> (site_layer, UNIT vector fp32 on-device); per-site
 # median norms are keyed by LAYER. The engine receives a per-request WRITES
@@ -230,6 +234,8 @@ def _engine_prefill(input_ids: "torch.Tensor") -> tuple["torch.Tensor", dict | N
     Returns (last-position logits, prefix-cache info dict or None).
     """
     assert _engine is not None
+    if _prefix_pool is not None:
+        return _prefix_pool.prefill(input_ids)
     if _prefix_cache:
         return _engine.prefill_cached(input_ids)
     return _engine.prefill(input_ids), None
@@ -306,8 +312,8 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False) -> tuple[KotodamaModel, AutoTokenizer]:
-    global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16) -> tuple[KotodamaModel, AutoTokenizer]:
+    global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
@@ -459,6 +465,28 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             eng.reset()
             return dec
 
+        def _build_and_warm_pool(eng: "DecodeEngine", n_tokens: int, block: int) -> "PrefixKVCache":
+            pool = PrefixKVCache(eng, n_tokens, block_size=block)
+            if not prefix_cache and _max_seq_len > 112:
+                # The pool extends through prefill_cached; warm its eager extend like --prefix-cache does.
+                base_ids = torch.randint(4, config.vocab_size, (1, 64), device=_device)
+                eng.prefill(base_ids)
+                eng.prefill_cached(torch.cat([base_ids, torch.randint(4, config.vocab_size, (1, 48),
+                                                                      device=_device)], dim=1))
+            with torch.inference_mode():
+                # One store and one load (pool hit onto another prompt in the engine) warm the gather/scatter
+                # kernels; the pool is emptied afterwards.
+                n = min(4 * block + 8, _max_seq_len - 1)
+                ids = torch.randint(4, config.vocab_size, (1, n), device=_device)
+                pool.prefill(ids)
+                eng.prefill(torch.randint(4, config.vocab_size, (1, 32), device=_device))
+                pool.prefill(ids)
+                torch.cuda.synchronize(_device)
+            pool.clear()
+            pool.stats.update({k: 0 for k in pool.stats})
+            eng.reset()
+            return pool
+
         # Build/compile/capture on the SAME single worker thread that serves all
         # generation (_generate_executor). max-autotune uses inductor's
         # cudagraph_trees, whose tree-manager containers live in THREAD-LOCAL
@@ -492,9 +520,13 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         # FALLBACK path (non-engine requests) avoids cuDNN's ~300ms per-shape
         # plan-selection stalls by dispatching to pytorch flash instead.
         torch.backends.cuda.enable_cudnn_sdp(False)
-        _prefix_cache = prefix_cache
+        _prefix_cache = prefix_cache or prefix_pool_tokens > 0  # the pool extends through prefill_cached
         if _prefix_cache:
             logger.info("Prefix caching ENABLED (engine extend-from-pos prefill)")
+        if prefix_pool_tokens > 0:
+            _prefix_pool = _generate_executor.submit(_build_and_warm_pool, _engine, prefix_pool_tokens,
+                                                     prefix_pool_block).result()
+            logger.info("Prefix KV pool ENABLED: %d blocks of %d tokens", _prefix_pool.n_blocks, prefix_pool_block)
         logger.info("Fast decode engine ready in %.1fs", time.time() - t0)
     elif _device.type == "cuda" and warmup_sdpa:
         # Reference path only: prime cuDNN plan cache so per-shape ~300ms
@@ -592,6 +624,7 @@ class ModelInfo(BaseModel):
     steering: dict | None = None
     default_repetition_penalty: float | None = None
     xbatch: dict | None = None
+    prefix_pool: dict | None = None
 
 
 # ── /logprobs: batched prefill-only scoring (the four-register rider battery) ──
@@ -973,6 +1006,8 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
             timing["prefix_cache_hit"] = pc_info["prefix_hit"]
             timing["prefix_common_tokens"] = pc_info["common_prefix"]
             timing["prefill_suffix_tokens"] = pc_info["suffix_len"]
+            if "pool_tokens" in pc_info:
+                timing["prefix_pool_tokens"] = pc_info["pool_tokens"]
 
         generated_ids: list[int] = []
         if token_id not in _stop_token_ids:
@@ -1270,6 +1305,8 @@ _steer_npz_arg: str | None = None
 _multi_rows_arg: tuple[int, ...] = ()
 _xbatch_rows_arg: tuple[int, ...] = ()
 _xbatch_refill_arg = False
+_prefix_pool_tokens_arg = 0
+_prefix_pool_block_arg = 16
 
 
 @asynccontextmanager
@@ -1284,6 +1321,8 @@ async def lifespan(app: FastAPI):
         multi_rows=_multi_rows_arg,
         xbatch_rows=_xbatch_rows_arg,
         xbatch_refill=_xbatch_refill_arg,
+        prefix_pool_tokens=_prefix_pool_tokens_arg,
+        prefix_pool_block=_prefix_pool_block_arg,
     )
     try:
         yield
@@ -1356,6 +1395,10 @@ async def info():
         xbatch=None if _xbatch is None else {"rows": sorted(_xbatch.runner.decoders),
                                              "refill": _xbatch.runner.refill,
                                              "stats": dict(_xbatch.runner.stats)},
+        prefix_pool=None if _prefix_pool is None else {"blocks": _prefix_pool.n_blocks,
+                                                       "block_size": _prefix_pool.block_size,
+                                                       "cached_blocks": len(_prefix_pool.index),
+                                                       "stats": dict(_prefix_pool.stats)},
     )
 
 
@@ -1855,6 +1898,13 @@ if __name__ == "__main__":
     parser.add_argument("--xbatch_refill", action="store_true",
                         help="With --xbatch_rows: refill rows freed by finished requests from the queue between "
                              "decode steps (continuous batching) instead of waiting for the batch's longest row")
+    parser.add_argument("--prefix_pool_tokens", type=int, default=0,
+                        help="Multi-entry prefix KV cache: pool this many prompt tokens of KV (fixed-size blocks, "
+                             "least recently used evicted) so a prompt sharing a prefix with ANY recently prefilled "
+                             "prompt prefills only its suffix (~0.22 MB per token on the 1B at bf16). Implies "
+                             "--prefix-cache. 0 = off")
+    parser.add_argument("--prefix_pool_block", type=int, default=16,
+                        help="Token block size of the prefix KV pool (>= 16): prefixes are shared in whole blocks")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
@@ -1904,6 +1954,14 @@ if __name__ == "__main__":
     if args.xbatch_refill and not _xbatch_rows_arg:
         parser.error("--xbatch_refill needs --xbatch_rows")
     _xbatch_refill_arg = args.xbatch_refill
+    if args.prefix_pool_tokens < 0 or args.prefix_pool_block < 16:
+        parser.error("--prefix_pool_tokens must be >= 0 and --prefix_pool_block >= 16")
+    if args.prefix_pool_tokens and _engine_arg != "fast":
+        parser.error("--prefix_pool_tokens requires --engine fast")
+    if 0 < args.prefix_pool_tokens < args.prefix_pool_block:
+        parser.error("--prefix_pool_tokens must hold at least one --prefix_pool_block")
+    _prefix_pool_tokens_arg = args.prefix_pool_tokens
+    _prefix_pool_block_arg = args.prefix_pool_block
 
     import uvicorn
 

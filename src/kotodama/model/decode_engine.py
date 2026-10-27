@@ -200,6 +200,11 @@ class DecodeEngine(nn.Module):
         )
         # Below this, an extend is not worth the bookkeeping — do a full prefill.
         self.min_cached_prefix = 16
+        # Leading cache positions whose KV a prefill or extend wrote (prompt positions). Decode steps write KV
+        # with steering injected, so a cache keyed by tokens alone (kotodama.model.prefix_cache) pools only
+        # positions below this mark. Host int; prefix-closed: an extend on top of decode-written KV attends to it,
+        # so the mark never moves past the first decode-written position.
+        self.prompt_kv_len = 0
 
         # RoPE tables (read-only).
         self.register_buffer("rope_cos_t", model.rope_cos.to(self.device), persistent=False)
@@ -673,6 +678,7 @@ class DecodeEngine(nn.Module):
         """
         self.pos.zero_()
         self._pos_cpu = 0
+        self.prompt_kv_len = 0
         self.attn_bias.fill_(float("-inf"))
         self.presence.zero_()
         for li in range(self.n_layers):
@@ -825,7 +831,9 @@ class DecodeEngine(nn.Module):
         )
         if plan is None:
             return self._prefill_reference_inner(input_ids, prompt_len)
-        return self._run_chunks(input_ids.to(self.device), plan)
+        logits = self._run_chunks(input_ids.to(self.device), plan)
+        self.prompt_kv_len = prompt_len
+        return logits
 
     @torch.inference_mode()
     def prefill_reference(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -856,9 +864,27 @@ class DecodeEngine(nn.Module):
         self.token_history[:prompt_len].copy_(input_ids[0])
         self.pos.fill_(prompt_len)
         self._pos_cpu = prompt_len
+        self.prompt_kv_len = prompt_len
         return out["logits"][0, -1:].float()
 
     # ── Prefix-cached prefill (extend-from-pos) ──────────────────────────────
+
+    def cached_prefix_len(self, input_ids: torch.Tensor) -> int:
+        """How many leading tokens of ``input_ids`` (1, S) the cache holds now (token-exact; one host sync)."""
+        return self._common_prefix_len(input_ids)
+
+    @torch.inference_mode()
+    def adopt_prefix(self, input_ids: torch.Tensor, n: int) -> None:
+        """Declare that cache positions [0, n) hold prefill-written KV of ``input_ids[0, :n]``: a caller that wrote
+        that KV itself (kotodama.model.prefix_cache loads pooled blocks) calls this, and the next ``prefill_cached``
+        of a prompt starting with those tokens extends from position n. Positions from n on are left as they are
+        (closed in the mask by the extend)."""
+        if not 0 < n < self.max_seq_len or n > input_ids.shape[1]:
+            raise ValueError(f"adopt_prefix: n={n} outside (0, {min(self.max_seq_len - 1, input_ids.shape[1])}]")
+        self.token_history[:n].copy_(input_ids[0, :n].to(self.device))
+        self.pos.fill_(n)
+        self._pos_cpu = n
+        self.prompt_kv_len = n
 
     def _common_prefix_len(self, input_ids: torch.Tensor) -> int:
         """Longest common prefix between the cached sequence and a new prompt.
@@ -904,6 +930,8 @@ class DecodeEngine(nn.Module):
         if common < self.min_cached_prefix:
             logits = self.prefill(input_ids)
             return logits, {"prefix_hit": False, "common_prefix": 0, "suffix_len": prompt_len}
+        # The suffix attends to the reused prefix, so its KV is prompt KV only when the whole prefix is.
+        prompt_kv_after = prompt_len if common <= self.prompt_kv_len else self.prompt_kv_len
 
         suffix = input_ids[:, common:].to(self.device)
         suffix_len = prompt_len - common
@@ -929,6 +957,7 @@ class DecodeEngine(nn.Module):
             self.pos.fill_(common)
             self._pos_cpu = common
             logits = self.step_logits(_graph_input(suffix))
+            self.prompt_kv_len = prompt_kv_after
             return logits[0, -1:].float(), {
                 "prefix_hit": True, "common_prefix": common, "suffix_len": 1,
             }
@@ -960,6 +989,7 @@ class DecodeEngine(nn.Module):
                     )
                     logits = self.prefill(input_ids)
                     return logits, {"prefix_hit": False, "common_prefix": 0, "suffix_len": prompt_len}
+                self.prompt_kv_len = prompt_kv_after
                 return logits, {
                     "prefix_hit": True, "common_prefix": common, "suffix_len": suffix_len,
                 }
@@ -1004,6 +1034,7 @@ class DecodeEngine(nn.Module):
         self.token_history[:prompt_len].copy_(input_ids[0])
         self.pos.fill_(prompt_len)
         self._pos_cpu = prompt_len
+        self.prompt_kv_len = prompt_kv_after
         return out["logits"][0, -1:].float(), {
             "prefix_hit": True, "common_prefix": common, "suffix_len": suffix_len,
         }

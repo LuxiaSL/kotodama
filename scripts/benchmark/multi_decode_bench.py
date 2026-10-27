@@ -16,8 +16,21 @@ against the engine's greedy continuation of its own prompt):
   * ``load``: concurrent ``/v1/completions`` requests through the server app (in-process ASGI, so every request
     takes the real handler, scheduler, engine lock and generation thread) with distinct long prompts, n candidates
     and stop sequences, per serving mode: ``current`` (the n-row decoder, one request at a time), ``xbatch``
-    (cross-request batches) and ``xbatch_refill`` (rows refilled as requests finish). Reports aggregate completion
-    tokens/s and request latency percentiles per mode and concurrency.
+    (cross-request batches), ``xbatch_refill`` (rows refilled as requests finish) and ``xbatch_refill_pool`` (the
+    same with the multi-entry prefix KV pool, ``--prefix_pool_tokens``, in front of every prefill; the pool starts
+    empty in each cell). Reports aggregate completion tokens/s, request latency percentiles, prefill seconds and the
+    fraction of prompt tokens whose KV was reused (and, with the pool, taken from it) per mode and concurrency.
+    With ``--load_trees_jsonl`` (a loom run's ``<out>/paths.jsonl``, kotodama.posttrain.loom) the requests are
+    tree-shaped, as the loom sends them: every distinct node of ``--load_trees`` trees over ``--load_tree_depths``
+    consecutive depths, rendered through the loom's own window (``--load_window_chars``), issued breadth-first and
+    interleaved across trees, so siblings share all but their last turn and several conversations compete for the
+    cache;
+  * ``poolparity``: a prompt prefilled from a pool hit (a sibling's blocks pooled, the engine holding an unrelated
+    prompt, only the suffix prefilled) vs the engine's full prefill of the same prompt, along the full prefill's
+    greedy continuation (per-step KL and top-1), beside both against one no-cache forward (the noise floor);
+  * ``xgreedy_pool``: ``xgreedy`` on prompt families that share long prefixes, interleaved, with the pool in front
+    of the batcher's prefill (every family member after the first extends from pooled blocks), replayed tie-proof
+    through the engine's full prefill.
 
 ``--rows`` takes a list (one compiled decoder per bucket) and ``--context_tokens`` a list of prompt lengths (the
 dialogue repeated to that many tokens), so batch width is measured where the loom decodes: deep in a long context.
@@ -30,6 +43,9 @@ Usage (node, GPU):
       --rope_fp32 --rows 8 [--context_tokens 0,3000] [--out results/multi_decode.json]
   tools/run_py.sh scripts/benchmark/multi_decode_bench.py ... --rows 8,16,32,64 --sections xparity,load \\
       --prompts_jsonl <paths.jsonl> --steer_npz <bank.npz>,<norms.npz> --load_concurrency 4,8 --load_requests 96
+  tools/run_py.sh scripts/benchmark/multi_decode_bench.py ... --rows 8,16,32,64 --prefix_pool_tokens 65536 \\
+      --sections poolparity,xgreedy_pool,load --load_trees_jsonl <loom run>/paths.jsonl \\
+      --load_modes xbatch_refill,xbatch_refill_pool --load_concurrency 16 --steer_npz <bank.npz>,<norms.npz>
 """
 
 from __future__ import annotations
@@ -49,6 +65,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from kotodama.model.decode_engine import SamplingParams  # noqa: E402
+from kotodama.posttrain.loom import window_turns  # noqa: E402
 from kotodama.posttrain.transcript import Transcript, parse_row, render_prompt, stop_sequences  # noqa: E402
 from kotodama.serve import server  # noqa: E402
 from kotodama.serve.xbatch import XBatchRunner, XBatchScheduler  # noqa: E402
@@ -127,6 +144,82 @@ def load_prompts(tok, path: str | None, count: int, lo: int, hi: int, seed: int)
     return out
 
 
+def load_tree_prompts(tok, path: str, n_trees: int, depths: int, window_chars: int, lo: int, hi: int
+                      ) -> tuple[list[tuple[str, list[str]]], list[tuple[str, int, str]]]:
+    """Loom requests rebuilt from a loom run's ``<out>/paths.jsonl``: for the first ``n_trees`` trees (in file order) whose
+    prompts reach ``lo`` tokens, every distinct node at ``depths`` consecutive depths (from the first depth whose
+    prompt reaches ``lo`` tokens; prompts over ``hi`` are left out), rendered as the loom renders the prompt that
+    expands the node (header + the loom's window + the next speaker's open turn). Returns (prompt, stops) pairs in
+    issue order (breadth-first per tree, round-robin across trees) and (tree, depth, node id) per prompt."""
+    import re
+
+    tree_re = re.compile(r'"tree": "([^"]+)"')
+    rows: dict[str, list[dict]] = {}
+    order: list[str] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            m = tree_re.search(line)
+            if m is None:
+                continue
+            t = m.group(1)
+            if t not in rows:
+                if len(order) >= 4 * n_trees:  # candidates: some trees never reach lo tokens
+                    continue
+                rows[t] = []
+                order.append(t)
+            try:
+                rows[t].append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    per_tree: list[list[tuple[str, list[str], int, str]]] = []
+    for t in order:
+        nodes: dict[str, tuple[int, str, list[str]]] = {}
+        for row in rows[t]:
+            tr = parse_row(row)
+            depth = row.get("depth")
+            if tr is None or not isinstance(depth, int):
+                continue
+            n0 = len(tr.turns) - depth  # turns before the loom's first generated one (seed turns + history)
+            parts = str(row.get("leaf", "")).split(".")
+            cast = row.get("cast") or list(dict.fromkeys(x.speaker for x in tr.turns))
+            n_seed = int(row.get("n_seed", 0))
+            for d in range(depth):  # the request that expanded the node at depth d (it drew turn n0 + d)
+                node = ".".join(parts[:d + 1])
+                if node in nodes:
+                    continue
+                seen = window_turns(tr.turns[:n0 + d], tr.header, n_seed, window_chars)
+                text = render_prompt(Transcript(seen, tr.header), tr.turns[n0 + d].speaker)
+                nodes[node] = (d, text, stop_sequences(cast))
+        if not nodes:
+            continue
+        by_depth: dict[int, list[tuple[str, str, list[str]]]] = {}
+        for node, (d, text, stops) in nodes.items():
+            by_depth.setdefault(d, []).append((node, text, stops))
+        lens = {d: len(tok.encode(v[0][1])) for d, v in by_depth.items()}
+        start = next((d for d in sorted(by_depth) if lens[d] >= lo), None)
+        if start is None:
+            continue
+        reqs = []
+        for d in range(start, start + depths):
+            for node, text, stops in sorted(by_depth.get(d, [])):
+                if len(tok.encode(text)) <= hi:
+                    reqs.append((text, stops, d, node))
+        if reqs:
+            per_tree.append(reqs)
+        if len(per_tree) >= n_trees:
+            break
+    if len(per_tree) < n_trees:
+        raise SystemExit(f"{path}: only {len(per_tree)} trees have prompts of {lo}..{hi} tokens (need {n_trees})")
+    texts, meta = [], []
+    for k in range(max(len(r) for r in per_tree)):
+        for i, reqs in enumerate(per_tree):
+            if k < len(reqs):
+                text, stops, d, node = reqs[k]
+                texts.append((text, stops))
+                meta.append((f"tree{i}", d, node))
+    return texts, meta
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
@@ -146,7 +239,18 @@ def main() -> int:
                          "row on one long prompt)")
     ap.add_argument("--load_requests", type=int, default=96, help="requests per (mode, concurrency) cell")
     ap.add_argument("--load_concurrency", default="4,8", help="comma list of requests in flight")
-    ap.add_argument("--load_modes", default="current,xbatch,xbatch_refill")
+    ap.add_argument("--load_modes", default="current,xbatch,xbatch_refill",
+                    help="comma list: current, xbatch, xbatch_refill, xbatch_refill_pool (needs --prefix_pool_tokens)")
+    ap.add_argument("--load_trees_jsonl", default=None,
+                    help="a loom run's paths.jsonl: tree-shaped load (the loom's own requests) instead of distinct "
+                         "prompts; also the source of poolparity's sibling pairs")
+    ap.add_argument("--load_trees", type=int, default=8, help="trees in the tree-shaped load")
+    ap.add_argument("--load_tree_depths", type=int, default=4, help="consecutive depths per tree")
+    ap.add_argument("--load_window_chars", type=int, default=11000, help="the loom's --window_chars")
+    ap.add_argument("--prefix_pool_tokens", type=int, default=0,
+                    help="the server's --prefix_pool_tokens (for xbatch_refill_pool, poolparity, xgreedy_pool)")
+    ap.add_argument("--prefix_pool_block", type=int, default=16)
+    ap.add_argument("--poolparity_pairs", type=int, default=8)
     ap.add_argument("--load_n", type=int, default=8)
     ap.add_argument("--load_max_tokens", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=0.75)
@@ -162,9 +266,15 @@ def main() -> int:
     server._rope_fp32_override = a.rope_fp32
     _model, tok = server.load_model(a.checkpoint, "cuda", mode="base", model_size=a.model_size, engine="fast",
                                     prefix_cache=True, max_seq_len=4096, multi_rows=tuple(widths),
-                                    steer_npz=a.steer_npz)
+                                    steer_npz=a.steer_npz, prefix_pool_tokens=a.prefix_pool_tokens,
+                                    prefix_pool_block=a.prefix_pool_block)
     server._model, server._tokenizer = _model, tok
     eng = server._engine
+    pool = server._prefix_pool
+    server._prefix_pool = None  # each section and load mode decides whether the pool is in front of the prefill
+    needs_pool = bool({"poolparity", "xgreedy_pool"} & sections) or ("load" in sections and "pool" in a.load_modes)
+    if needs_pool and pool is None:
+        raise SystemExit("poolparity / xgreedy_pool / xbatch_refill_pool need --prefix_pool_tokens > 0")
     assert eng is not None and all(server._multi.get(w) is not None for w in widths)
     dec = server._multi[widths[-1]]
     base_ids = tok.encode(PROMPT)
@@ -303,22 +413,38 @@ def main() -> int:
                 "xparity_truth_vs_engine_kl_max_per_step_mean": sum(kl_t_eng) / len(kl_t_eng),
                 "xparity_truth_vs_engine_top1": sum(top1_t_eng) / len(top1_t_eng)}
 
-    def xgreedy() -> dict:
+    def xgreedy(use_pool: bool = False) -> dict:
         """The batcher end to end on the GPU (refill, candidate restarts and the pipelined step loop included): 24
         requests of n=3 on short prompts of different lengths (where the batched and single-stream greedy agree),
         decoded at a near-zero temperature through a refilling runner on the narrowest bucket, each candidate
         against the engine's greedy continuation of its own prompt (matching prefix; 40 = the whole continuation)
-        and, tie-proof, replayed through the engine token by token (each token's distance below the top logit)."""
+        and, tie-proof, replayed through the engine token by token (each token's distance below the top logit).
+        ``use_pool``: 6 families of 4 prompts (a shared 300-600-token trunk, each member its own closing turns),
+        issued round-robin across families, with the prefix KV pool in front of the batcher's prefill."""
         from kotodama.serve.xbatch import XBatchJob
 
         steps, n_req = 40, 24
-        texts = load_prompts(tok, None, n_req, 64, 700, a.seed + 2)
-        pids = [tok.encode(t) for t, _ in texts]
+        if use_pool:
+            trunks = [tok.encode(t) for t, _ in load_prompts(tok, None, 6, 300, 600, a.seed + 3)]
+            tails = ["Teo: Fine. {k} times fine.", "Mara: Say that again, number {k}.", "Teo: Ask the captain ({k}).",
+                     "Mara: Then go. Go now, {k}."]
+            pids = [trunks[f] + tok.encode("\n\n" + tails[m].format(k=f * 4 + m) + "\n\nTeo:")
+                    for m in range(4) for f in range(6)]
+            assert pool is not None
+            pool.clear()
+            prefill = pool.prefill
+        else:
+            texts = load_prompts(tok, None, n_req, 64, 700, a.seed + 2)
+            pids = [tok.encode(t) for t, _ in texts]
+            prefill = None
         cold = SamplingParams(temperature=1e-4, repetition_penalty=1.0)
         with torch.inference_mode():
             want = [greedy_of(torch.tensor([p], device="cuda"), steps) for p in pids]
+            if use_pool:
+                eng.reset()  # greedy_of left the last prompt in the engine: the pool, not the engine, holds trunks
             # full prefills, as greedy_of makes (a prefix-cache extend rounds differently and can flip a near-tie)
-            runner = XBatchRunner({widths[0]: server._multi[widths[0]]}, prefill=lambda i: (eng.prefill(i), None),
+            runner = XBatchRunner({widths[0]: server._multi[widths[0]]},
+                                  prefill=prefill or (lambda i: (eng.prefill(i), None)),
                                   set_steer=eng.set_steer, decode=lambda i: tok.decode(i, skip_special_tokens=True),
                                   stop_ids=frozenset(), max_seq_len=server._max_seq_len,
                                   device=torch.device("cuda"), refill=True)
@@ -344,18 +470,95 @@ def main() -> int:
                         gaps.append(float(logits.max() - logits[tok_id]))
                         if t + 1 < len(row):
                             logits = eng.step_logits(torch.tensor([[tok_id]], device="cuda"))[0, -1].float()
-        return {"xgreedy_tokens": len(gaps), "xgreedy_argmax_rate": sum(g == 0 for g in gaps) / len(gaps),
-                "xgreedy_gap_max": max(gaps), "xgreedy_gap_over_0p25": sum(g > 0.25 for g in gaps),
-                "xgreedy_served": served, "xgreedy_refilled": runner.stats["refilled"],
-                "xgreedy_restarts": runner.stats["restarts"],
-                "xgreedy_bucket": widths[0], "xgreedy_prompt_tokens": [len(p) for p in pids],
-                "xgreedy_match_prefix": match}
+        out = {"xgreedy_tokens": len(gaps), "xgreedy_argmax_rate": sum(g == 0 for g in gaps) / len(gaps),
+               "xgreedy_gap_max": max(gaps), "xgreedy_gap_over_0p25": sum(g > 0.25 for g in gaps),
+               "xgreedy_served": served, "xgreedy_refilled": runner.stats["refilled"],
+               "xgreedy_restarts": runner.stats["restarts"],
+               "xgreedy_bucket": widths[0], "xgreedy_prompt_tokens": [len(p) for p in pids],
+               "xgreedy_match_prefix": match}
+        if use_pool:
+            out = {k.replace("xgreedy_", "xgreedy_pool_"): v for k, v in out.items()}
+            out["xgreedy_pool_stats"] = dict(pool.stats)
+        return out
+
+    def poolparity() -> dict:
+        """Pool hit vs full prefill of the same prompt. Pairs (A, B) are siblings from the tree-shaped load (or,
+        without ``--load_trees_jsonl``, a trunk with two different closing turns). Per pair: A goes through the pool
+        (its blocks pooled), an unrelated prompt is prefilled on the engine, then B through the pool (a hit: only
+        B's suffix past the pooled blocks is prefilled). B's continuation is the full prefill's greedy, forced on
+        both; the no-cache forward of B + continuation is the floor both are measured against."""
+        assert pool is not None
+        steps = 32
+        if a.load_trees_jsonl:
+            texts, meta = load_tree_prompts(tok, a.load_trees_jsonl, a.poolparity_pairs, 2, a.load_window_chars,
+                                            lo, hi)
+            by_parent: dict[tuple[str, int, str], list[str]] = {}
+            for (text, _), (tree, d, node) in zip(texts, meta):
+                by_parent.setdefault((tree, d, node.rsplit(".", 1)[0]), []).append(text)
+            pairs = [(v[0], v[1]) for v in by_parent.values() if len(v) >= 2][:a.poolparity_pairs]
+        else:
+            trunks = load_prompts(tok, None, a.poolparity_pairs, lo, hi, a.seed + 4)
+            pairs = [(t + " No.\n\nTeo: Then what?\n\nMara:", t + " Fine.\n\nTeo: Is it?\n\nMara:")
+                     for t, _ in trunks]
+        other = torch.tensor([tok.encode(PROMPT)], device="cuda")
+        kl_hf, t1_hf, kl_tf, t1_tf, kl_th, t1_th, pooled, plens = [], [], [], [], [], [], [], []
+        with torch.inference_mode():
+            for ta, tb in pairs:
+                ia = torch.tensor([tok.encode(ta)], device="cuda")
+                ib = torch.tensor([tok.encode(tb)], device="cuda")
+                g = greedy_of(ib, steps)
+                forced = [torch.tensor([[t]], device="cuda") for t in g[:-1]]
+                full = [eng.prefill(ib)[0].float()]
+                full += [eng.step_logits(t)[0, -1].float().clone() for t in forced]
+                pool.clear()
+                eng.reset()
+                pool.prefill(ia)
+                eng.prefill(other)
+                l0, info = pool.prefill(ib)
+                hit = [l0[0].float()] + [eng.step_logits(t)[0, -1].float().clone() for t in forced]
+                truth = _model(torch.cat([ib, torch.tensor([g[:-1]], device="cuda")], dim=1))["logits"][0].float()
+                truth = list(truth[ib.shape[1] - 1:])
+                for ref, got, kl_l, t1_l in ((full, hit, kl_hf, t1_hf), (truth, full, kl_tf, t1_tf),
+                                             (truth, hit, kl_th, t1_th)):
+                    kl, t1 = kl_top1([r.view(1, -1) for r in ref], [x.view(1, -1) for x in got])
+                    kl_l.append(sum(kl) / len(kl))
+                    t1_l.append(sum(t1) / len(t1))
+                pooled.append(int(info["pool_tokens"]))
+                plens.append(int(ib.shape[1]))
+
+        def mean(x: list[float]) -> float:
+            return sum(x) / len(x)
+
+        return {"poolparity_pairs": len(pairs), "poolparity_prompt_tokens": plens, "poolparity_pooled_tokens": pooled,
+                "poolparity_full_vs_hit_kl_per_step_mean": mean(kl_hf), "poolparity_full_vs_hit_kl_max": max(kl_hf),
+                "poolparity_full_vs_hit_top1": mean(t1_hf),
+                "poolparity_truth_vs_full_kl_per_step_mean": mean(kl_tf), "poolparity_truth_vs_full_top1": mean(t1_tf),
+                "poolparity_truth_vs_hit_kl_per_step_mean": mean(kl_th), "poolparity_truth_vs_hit_top1": mean(t1_th)}
 
     def load() -> dict:
         import httpx
 
-        texts = load_prompts(tok, a.prompts_jsonl, a.load_requests, lo, hi, a.seed + 1)
+        if a.load_trees_jsonl:
+            texts, meta = load_tree_prompts(tok, a.load_trees_jsonl, a.load_trees, a.load_tree_depths,
+                                            a.load_window_chars, lo, hi)
+        else:
+            texts, meta = load_prompts(tok, a.prompts_jsonl, a.load_requests, lo, hi, a.seed + 1), []
         prompt_lens = [len(tok.encode(t)) for t, _ in texts]
+        tally = {"prefills": 0, "prompt_tokens": 0, "reused_tokens": 0, "pool_tokens": 0, "prefill_s": 0.0}
+
+        def counted_prefill(ids: torch.Tensor):
+            # every admit's prefill, in every mode: how much of the prompt's KV was reused, and from where
+            t0 = time.perf_counter()
+            logits, info = server._engine_prefill(ids)
+            torch.cuda.synchronize()
+            tally["prefill_s"] += time.perf_counter() - t0
+            tally["prefills"] += 1
+            tally["prompt_tokens"] += int(ids.shape[1])
+            if info is not None:
+                tally["reused_tokens"] += int(info.get("common_prefix", 0))
+                tally["pool_tokens"] += int(info.get("pool_tokens", 0))
+            return logits, info
+
         steer = []
         for item in a.steer.split(","):
             if a.steer_npz and item.strip():
@@ -367,12 +570,13 @@ def main() -> int:
         def set_mode(mode: str) -> None:
             server._multi = {8: all_dec[8]} if 8 in all_dec else {}
             server._xbatch = None
+            server._prefix_pool = pool if mode.endswith("_pool") else None
             if mode.startswith("xbatch"):
-                runner = XBatchRunner({w: all_dec[w] for w in xrows}, prefill=server._engine_prefill,
+                runner = XBatchRunner({w: all_dec[w] for w in xrows}, prefill=counted_prefill,
                                       set_steer=eng.set_steer,
                                       decode=lambda i: tok.decode(i, skip_special_tokens=True),
                                       stop_ids=server._stop_token_ids, max_seq_len=server._max_seq_len,
-                                      device=torch.device("cuda"), refill=mode == "xbatch_refill")
+                                      device=torch.device("cuda"), refill=mode.startswith("xbatch_refill"))
                 server._xbatch = XBatchScheduler(runner, server._engine_lock, server._run_generation)
 
         async def cell(conc: int, reqs: list[int]) -> dict:
@@ -413,7 +617,11 @@ def main() -> int:
 
         out: dict = {"load_prompt_tokens": {"min": min(prompt_lens), "median": statistics.median(prompt_lens),
                                             "max": max(prompt_lens)},
+                     "load_requests": len(texts), "load_shape": "trees" if meta else "distinct",
                      "load_n": a.load_n, "load_steer": steer, "xbatch_rows": list(xrows)}
+        if meta:
+            out["load_trees"] = len({m[0] for m in meta})
+            out["load_tree_depths"] = sorted({m[1] for m in meta})
         idx = list(range(len(texts)))
 
         def warm_prefills() -> None:
@@ -433,7 +641,18 @@ def main() -> int:
             for conc in [int(x) for x in a.load_concurrency.split(",") if x.strip()]:
                 if server._xbatch is not None:
                     server._xbatch.runner.stats.update({k: 0 for k in server._xbatch.runner.stats})
+                # every cell starts cold: an empty pool and an engine holding nothing
+                run_on_worker(eng.reset)
+                if pool is not None:
+                    pool.clear()
+                    pool.stats.update({k: 0 for k in pool.stats})
+                tally.update({k: 0 for k in tally})
                 r = asyncio.run(cell(conc, idx))
+                r["prefill_tally"] = {k: round(v, 2) for k, v in tally.items()}
+                r["reused_frac"] = round(tally["reused_tokens"] / max(tally["prompt_tokens"], 1), 4)
+                r["pool_frac"] = round(tally["pool_tokens"] / max(tally["prompt_tokens"], 1), 4)
+                if server._prefix_pool is not None:
+                    r["pool_stats"] = {k: round(v, 3) for k, v in pool.stats.items()}
                 if server._xbatch is not None:
                     st = server._xbatch.runner.stats
                     r["batches"] = st["batches"]
@@ -445,6 +664,7 @@ def main() -> int:
                 out[f"load_{mode}_c{conc}"] = r
                 logger.info("load %s c=%d: %s", mode, conc, r)
         set_mode("current")
+        server._prefix_pool = None
         return out
 
     if "width" in sections:
@@ -457,6 +677,10 @@ def main() -> int:
             res.update({f"{k}_p{count}": v for k, v in out.items()})
     if "xgreedy" in sections:
         res.update(run_on_worker(xgreedy))
+    if "xgreedy_pool" in sections:
+        res.update(run_on_worker(lambda: xgreedy(use_pool=True)))
+    if "poolparity" in sections:
+        res.update(run_on_worker(poolparity))
     if "load" in sections:
         res.update(load())
     logger.info("RESULT %s", json.dumps(res, indent=1))

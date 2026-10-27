@@ -136,6 +136,19 @@ async def engagement(turns: tuple[Turn, ...], header: str, cast: list[str], cand
     return sum(lps[2 * i] - lps[2 * i + 1] for i in range(len(texts))) / len(texts)
 
 
+def window_turns(turns: tuple[Turn, ...], header: str, n_seed: int, window_chars: int) -> tuple[Turn, ...]:
+    """What the model sees of ``turns``: everything (``window_chars`` 0), or the first ``n_seed`` (seed) turns + the
+    latest turns that fit ``window_chars`` characters together with the header and the seed turns."""
+    if not window_chars:
+        return turns
+    budget = window_chars - len(header) - sum(len(t.speaker) + len(t.text) + 4 for t in turns[:n_seed])
+    k = len(turns)
+    while k > n_seed and budget - (len(turns[k - 1].speaker) + len(turns[k - 1].text) + 4) >= 0:
+        k -= 1
+        budget -= len(turns[k].speaker) + len(turns[k].text) + 4
+    return turns[:n_seed] + turns[k:]
+
+
 async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, sp: SelfPlayConfig,
                salt: str, emit: Callable[[str, dict[str, Any]], None], score: Optional[Score] = None) -> dict[str, Any]:
     """Grow one tree breadth-first; every candidate goes to ``emit("node", ...)``, every ended branch to
@@ -160,15 +173,7 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
     n_seed = len(seed.turns)
 
     def visible(turns: tuple[Turn, ...]) -> tuple[Turn, ...]:
-        """What the model sees: everything, or (with a window) the seed turns + the latest turns that fit."""
-        if not cfg.window_chars:
-            return turns
-        budget = cfg.window_chars - len(seed.header) - sum(len(t.speaker) + len(t.text) + 4 for t in turns[:n_seed])
-        k = len(turns)
-        while k > n_seed and budget - (len(turns[k - 1].speaker) + len(turns[k - 1].text) + 4) >= 0:
-            k -= 1
-            budget -= len(turns[k].speaker) + len(turns[k].text) + 4
-        return turns[:n_seed] + turns[k:]
+        return window_turns(turns, seed.header, n_seed, cfg.window_chars)
 
     async def expand(node: Node) -> list[Node]:
         speaker = next_speaker(seed.cast, list(node.turns))
