@@ -217,6 +217,13 @@ def resolve_oai_repetition_penalty(frequency_penalty: float | None) -> float:
     return _default_repetition_penalty
 
 
+def _engine_lock_contended() -> bool:
+    """Whether a coroutine waits on the engine lock (read from the generation thread: a length read of the lock's
+    waiter deque, which the lock creates lazily). The batcher never waits on the lock while it holds it, so a waiter
+    is a request outside the batch."""
+    return bool(getattr(_engine_lock, "_waiters", None))
+
+
 def _engine_prefill(input_ids: "torch.Tensor") -> tuple["torch.Tensor", dict | None]:
     """Engine prefill, via the prefix cache when enabled.
 
@@ -476,7 +483,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
                                   set_steer=_engine.set_steer,
                                   decode=lambda ids: _tokenizer.decode(ids, skip_special_tokens=True),
                                   stop_ids=_stop_token_ids, max_seq_len=_max_seq_len, device=_device,
-                                  refill=xbatch_refill)
+                                  refill=xbatch_refill, should_yield=_engine_lock_contended)
             _xbatch = XBatchScheduler(runner, _engine_lock, _run_generation)
             logger.info("Cross-request batched decode ENABLED: row buckets %s, refill %s", sorted(set(xbatch_rows)),
                         "on" if xbatch_refill else "off")

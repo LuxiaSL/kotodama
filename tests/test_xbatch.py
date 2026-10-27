@@ -219,6 +219,32 @@ def test_refill_serves_the_queue_in_one_batch_and_keeps_parity(model: KotodamaMo
     for i, p in enumerate(prompts):
         runner2.queue.put(rec2.job(f"j{i}", p, 2, max_new=3 + i))
     assert [runner2.run_batch() for _ in range(4)] == [2, 2, 1, 0]
+    # another engine user waiting: the batch stops growing and drains
+    runner3, rec3 = _runner(_engine(model), widths=(4,), refill=True), _Rec()
+    runner3.should_yield = lambda: True
+    for i, p in enumerate(prompts):
+        runner3.queue.put(rec3.job(f"j{i}", p, 2, max_new=3 + i))
+    assert runner3.run_batch() == 2 and runner3.stats["refilled"] == 0
+
+
+def test_engine_lock_contention_is_visible(monkeypatch) -> None:
+    from kotodama.serve import server
+
+    async def main() -> list[bool]:
+        lock = asyncio.Lock()
+        monkeypatch.setattr(server, "_engine_lock", lock)
+        seen = [server._engine_lock_contended()]
+        async with lock:
+            seen.append(server._engine_lock_contended())
+            waiter = asyncio.create_task(lock.acquire())
+            await asyncio.sleep(0)
+            seen.append(server._engine_lock_contended())
+        await waiter
+        lock.release()
+        seen.append(server._engine_lock_contended())
+        return seen
+
+    assert asyncio.run(main()) == [False, False, True, False]
 
 
 @torch.inference_mode()

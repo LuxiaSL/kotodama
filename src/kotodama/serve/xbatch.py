@@ -12,7 +12,8 @@ Two parts:
     oldest waiting request's key group from the queue (FIFO, as many requests as fit the widest bucket), decodes it
     on the narrowest bucket that holds the group's rows, and returns when every row has ended. With ``refill`` on,
     rows freed by finished requests are refilled from the queue between steps (continuous batching), until a request
-    with a different key is waiting; that one then gets the next batch.
+    with a different key is waiting or ``should_yield`` says another engine user is (the server passes "a request
+    outside the batcher waits on the engine lock"); those then get the engine when the batch drains.
   * ``XBatchScheduler`` is the asyncio side: ``submit`` enqueues a job and awaits its result, and one pump task
     runs batches (each under the engine lock, on the generation thread) while the queue is non-empty.
 
@@ -133,11 +134,13 @@ class XBatchRunner:
     """Runs batches on the generation thread. ``decoders`` maps bucket width -> decoder (all over one engine);
     ``prefill(ids (1, S)) -> (last logits (1, V), prefix-cache info or None)`` prefills the engine;
     ``set_steer(writes, **kwargs)`` installs the engine's steering rows (``None`` clears); ``decode(ids) -> str``
-    is the tokenizer's decode, for stop strings."""
+    is the tokenizer's decode, for stop strings; ``should_yield() -> bool``, polled between steps, stops refilling
+    so the engine passes to whoever waits for it once the batch drains."""
 
     def __init__(self, decoders: dict[int, MultiSampleDecoder], prefill: Callable[[torch.Tensor], tuple],
                  set_steer: Callable[..., None], decode: Callable[[list[int]], str], stop_ids: frozenset[int],
-                 max_seq_len: int, device: torch.device, refill: bool = False) -> None:
+                 max_seq_len: int, device: torch.device, refill: bool = False,
+                 should_yield: Optional[Callable[[], bool]] = None) -> None:
         if not decoders:
             raise ValueError("XBatchRunner needs at least one decoder bucket")
         self.decoders = dict(sorted(decoders.items()))
@@ -149,6 +152,7 @@ class XBatchRunner:
         self.max_seq_len = max_seq_len
         self.device = device
         self.refill = refill
+        self.should_yield = should_yield or (lambda: False)
         self.queue = XBatchQueue()
         self.stats: dict[str, float] = {"batches": 0, "steps": 0, "row_steps": 0, "useful_row_steps": 0,
                                         "admitted": 0, "refilled": 0}
@@ -237,7 +241,7 @@ class XBatchRunner:
                     active.remove(lv)
                     free.extend(lv.rows)
                     self._finish(lv)
-                if self.refill:
+                if self.refill and not self.should_yield():
                     while free:
                         job = self.queue.take_fitting(head.key, len(free))
                         if job is None:
