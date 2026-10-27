@@ -194,7 +194,10 @@ def oai_completer(endpoints: list[str], sampling: dict[str, float], max_tokens: 
                   model: str = "", transport: Any = None,
                   steer: Optional[list[dict[str, Any]]] = None,
                   steer_rule: str = "K") -> tuple[Complete, Callable[[], Awaitable[None]]]:
-    """A ``Complete`` over one or more ``/v1/completions`` endpoints (round-robin), and its async closer.
+    """A ``Complete`` over one or more ``/v1/completions`` endpoints, and its async closer. Requests rotate over the
+    endpoints, or go to ``endpoints[route]`` when the caller passes ``route=`` (one conversation per server, so its
+    prompts share that server's prefix cache); a failed request retries on the next endpoint. Every request has an
+    overall deadline of ``timeout`` seconds, so a connection that stalls without closing still fails.
     ``steer``: a residual steering stack sent with every request (the server's ``vectors``; it needs
     ``--steer-npz``). ``transport``: an httpx transport (tests pass a mock)."""
     import httpx
@@ -203,27 +206,30 @@ def oai_completer(endpoints: list[str], sampling: dict[str, float], max_tokens: 
     counter = {"i": 0}
     rep = float(sampling.get("repetition_penalty", 1.0))
 
-    async def complete(prompt: str, n: int, stops: list[str]) -> list[tuple[str, str, bool]]:
+    async def complete(prompt: str, n: int, stops: list[str],
+                       route: Optional[int] = None) -> list[tuple[str, str, bool]]:
         out: list[tuple[str, str, bool]] = []
         while len(out) < n:  # the server caps n at 8
             k = min(8, n - len(out))
-            url = endpoints[counter["i"] % len(endpoints)].rstrip("/") + "/v1/completions"
-            counter["i"] += 1
             body = {"prompt": prompt, "model": model, "n": k, "max_tokens": max_tokens,
                     "temperature": sampling["temperature"], "top_p": sampling.get("top_p", 0.0),
                     "frequency_penalty": max(0.0, rep - 1.0), "stop": stops, "return_token_ids": True}
             if steer:
                 body["vectors"] = steer
                 body["steer_rule"] = steer_rule
+            first = route if route is not None else counter["i"]
+            if route is None:
+                counter["i"] += 1
             for attempt in range(4):
+                url = endpoints[(first + attempt) % len(endpoints)].rstrip("/") + "/v1/completions"
                 try:
-                    r = await client.post(url, json=body)
+                    r = await asyncio.wait_for(client.post(url, json=body), timeout)
                     r.raise_for_status()
                     break
-                except (httpx.HTTPError, httpx.TimeoutException) as e:
+                except (httpx.HTTPError, asyncio.TimeoutError) as e:
                     if attempt == 3:
                         raise
-                    logger.warning("completion request failed (%s); retrying", e)
+                    logger.warning("completion request to %s failed (%r); retrying", url, e)
                     await asyncio.sleep(2 ** attempt)
             for ch in r.json()["choices"]:
                 ids = (ch.get("token_ids") or {}).get("completion") or []

@@ -23,7 +23,14 @@ Long conversations: ``--window_chars`` keeps each prompt to the header + seed tu
 character budget (early dialogue rotates out, so branches run past the context and drift apart), and
 ``--deep_after D --deep_width W`` narrows the tree after depth D (wide early for breadth, narrow later for depth).
 ``python -m kotodama.posttrain.loom assemble <runs> --out docs.jsonl`` cuts paths into training documents of up to
-~4K tokens in which no turn appears more than ``--max_uses`` times, so shared trunks are not overweighted.
+~4K tokens in which no turn appears more than ``--max_uses`` times, so shared trunks are not overweighted. Only
+finished trees (those with a row in ``<out>/trees.jsonl``) contribute paths.
+
+Runs resume: rerunning the same command skips seeds whose tree is already in ``<out>/trees.jsonl`` (and in any
+``--skip_done`` run directory) and first drops the records of trees that never finished. A tree's id is its seed's
+index in the seeds file, so a regrown tree keeps its id. With several endpoints each tree is pinned to one server —
+the least loaded when it starts — so its prompts, which share long prefixes, reuse that server's prefix cache; a
+failed request moves on to the next server. The exit code is 1 when any tree failed.
 
 Writes, under the run directory ``<out>``:
   ``<out>/nodes.jsonl``   every candidate drawn: tree, id, parent, depth, speaker, text, ended_by, vetoes, status
@@ -38,6 +45,7 @@ Writes, under the run directory ``<out>``:
 from __future__ import annotations
 
 import argparse
+import functools
 import asyncio
 import json
 import logging
@@ -263,24 +271,63 @@ def http_scorer(endpoints: list[str], timeout: float = 600.0, transport: Any = N
     return score, client.aclose
 
 
-async def run(seeds: list[SeedSpec], complete: Complete, cfg: LoomConfig, sp: SelfPlayConfig, out_dir: Path,
-              concurrency: int, seed: int, score: Optional[Score] = None) -> dict[str, Any]:
+def finished(run_dir: Path) -> dict[str, str]:
+    """{tree id: seed id} for the trees a run directory finished (rows of ``<out>/trees.jsonl``)."""
+    f = run_dir / "trees.jsonl"
+    if not f.exists():
+        return {}
+    rows = [json.loads(line) for line in f.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return {r["tree"]: r["seed"] for r in rows}
+
+
+def prune_unfinished(run_dir: Path) -> int:
+    """Drop node/state/path records of trees that never finished (an interrupted run); returns rows dropped."""
+    keep = set(finished(run_dir))
+    dropped = 0
+    for name in ("nodes", "states", "paths"):
+        f = run_dir / f"{name}.jsonl"
+        if not f.exists():
+            continue
+        lines = [line for line in f.read_text(encoding="utf-8").splitlines() if line.strip()]
+        kept = [line for line in lines if json.loads(line)["tree"] in keep]
+        if len(kept) != len(lines):
+            dropped += len(lines) - len(kept)
+            tmp = f.with_suffix(".jsonl.tmp")
+            tmp.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+            tmp.replace(f)
+    return dropped
+
+
+async def run(seeds: list[tuple[int, SeedSpec]], complete: Complete, cfg: LoomConfig, sp: SelfPlayConfig,
+              out_dir: Path, concurrency: int, seed: int, score: Optional[Score] = None,
+              routes: int = 0) -> dict[str, Any]:
+    """Grow one tree per (index, seed) pair, named by the zero-padded index. ``routes`` > 0: ``complete`` takes ``route=`` and each tree
+    is pinned to the least-loaded of that many endpoints."""
     out_dir.mkdir(parents=True, exist_ok=True)
     files = {k: (out_dir / f"{k}s.jsonl").open("a", encoding="utf-8") for k in ("node", "path", "tree")}
     states = (out_dir / "states.jsonl").open("a", encoding="utf-8")
     sem = asyncio.Semaphore(concurrency)
-    t0, done = time.time(), {"n": 0}
+    t0, done, failed = time.time(), {"n": 0}, {"n": 0}
+    load = [0] * routes
 
     def emit(kind: str, rec: dict[str, Any]) -> None:
         (states if kind == "state" else files[kind]).write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     async def one(i: int, s: SeedSpec) -> None:
         async with sem:
+            route = min(range(routes), key=load.__getitem__) if routes else None
+            tree_complete = complete if route is None else functools.partial(complete, route=route)
+            if route is not None:
+                load[route] += 1
             try:
-                st = await grow(s, f"t{i:05d}", complete, cfg, sp, f"{seed}:{s.id}:{i}", emit, score)
+                st = await grow(s, f"t{i:05d}", tree_complete, cfg, sp, f"{seed}:{s.id}:{i}", emit, score)
             except Exception as e:  # one tree's failure must not stop the run
+                failed["n"] += 1
                 logger.error("tree %d (seed %s) failed: %s", i, s.id, e)
                 return
+            finally:
+                if route is not None:
+                    load[route] -= 1
             files["tree"].write(json.dumps(st) + "\n")
             for f in (*files.values(), states):
                 f.flush()
@@ -289,11 +336,11 @@ async def run(seeds: list[SeedSpec], complete: Complete, cfg: LoomConfig, sp: Se
                         len(seeds), st["candidates"], st["children"], st["max_depth"], st["ended"], time.time() - t0)
 
     try:
-        await asyncio.gather(*(one(i, s) for i, s in enumerate(seeds)))
+        await asyncio.gather(*(one(i, s) for i, s in seeds))
     finally:
         for f in (*files.values(), states):
             f.close()
-    return {"trees": done["n"], "seconds": round(time.time() - t0, 1)}
+    return {"trees": done["n"], "failed": failed["n"], "seconds": round(time.time() - t0, 1)}
 
 
 def node_ids(leaf: str) -> list[str]:
@@ -366,9 +413,12 @@ def assemble_main(argv: list[str]) -> int:
     a = ap.parse_args(argv)
     paths = []
     for ri, r in enumerate(a.runs):  # tree ids restart in every run directory: namespace them by run
+        done = finished(Path(r))
         for line in (Path(r) / "paths.jsonl").read_text().splitlines():
             if line.strip():
                 p = json.loads(line)
+                if p["tree"] not in done:  # an interrupted tree's partial paths
+                    continue
                 p["tree"], p["leaf"] = f"{ri}:{p['tree']}", f"{ri}:{p['leaf']}"
                 paths.append(p)
     docs = assemble(paths, a.max_chars, a.lead_in, a.max_uses, a.min_new, a.seed)
@@ -414,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--steer", default="")
     ap.add_argument("--steer_rule", choices=["K", "N", "S"], default="K")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--skip_done", action="append", default=[],
+                    help="another run directory whose finished seeds are skipped (repeatable)")
     a = ap.parse_args(argv)
     sampling = dict(law(a.law))
     if a.temperature is not None:
@@ -424,6 +476,14 @@ def main(argv: list[str] | None = None) -> int:
     seeds = [s for s in (parse_seed(r, i) for i, r in enumerate(rows)) if s is not None]
     if a.limit:
         seeds = seeds[: a.limit]
+    out = Path(a.out)
+    if out.exists():
+        dropped = prune_unfinished(out)
+        if dropped:
+            logger.info("resume: dropped %d records of unfinished trees in %s", dropped, out)
+    done_seeds = {sd for d in (out, *map(Path, a.skip_done)) for sd in finished(d).values()}
+    todo = [(i, s) for i, s in enumerate(seeds) if s.id not in done_seeds]
+    logger.info("%d seeds, %d already grown, %d to grow", len(seeds), len(seeds) - len(todo), len(todo))
     cfg = LoomConfig(a.candidates, a.children, a.width, a.max_depth, a.min_turns, a.max_tokens,
                      window_chars=a.window_chars, deep_after=a.deep_after, deep_width=a.deep_width,
                      select=a.select, select_lambda=a.select_lambda, engage_replies=a.engage_replies,
@@ -431,13 +491,13 @@ def main(argv: list[str] | None = None) -> int:
     sp = SelfPlayConfig(candidates=a.candidates, max_tokens=a.max_tokens, min_turns=a.min_turns)
     complete, close = oai_completer(a.endpoint, sampling, a.max_tokens, steer=parse_steer(a.steer) or None,
                                     steer_rule=a.steer_rule)
-    out = Path(a.out)
 
     score, close_score = http_scorer(a.endpoint) if a.select == "engage" else (None, None)
 
     async def go() -> dict[str, Any]:
         try:
-            return await run(seeds, complete, cfg, sp, out, a.concurrency, a.seed, score)
+            return await run(todo, complete, cfg, sp, out, a.concurrency, a.seed, score,
+                             routes=len(a.endpoint) if len(a.endpoint) > 1 else 0)
         finally:
             await close()
             if close_score is not None:
@@ -448,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
                                               "steer_rule": a.steer_rule, "seed": a.seed, "seeds": a.seeds,
                                               "endpoints": a.endpoint, **summary}, indent=1))
     logger.info("done: %s", summary)
-    return 0
+    return 1 if summary["failed"] else 0
 
 
 if __name__ == "__main__":

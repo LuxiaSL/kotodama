@@ -180,3 +180,30 @@ def test_completer_sends_steering() -> None:
 
     asyncio.run(go())
     assert seen[0]["vectors"] == [{"name": "vrep", "alpha": -0.05}]
+
+
+def test_completer_route_pins_and_fails_over() -> None:
+    httpx = pytest.importorskip("httpx")
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if request.url.host == "b":
+            return httpx.Response(503)
+        return httpx.Response(200, json={"choices": [{"text": " a", "finish_reason": "stop"}]})
+
+    from kotodama.serve.laws import law
+
+    complete, close = sp.oai_completer(["http://a:1", "http://b:2", "http://c:3"], law("tsumugi"), 8,
+                                       transport=httpx.MockTransport(handler))
+
+    async def go():
+        try:
+            await complete("Mara:", 1, STOPS, route=2)
+            await complete("Mara:", 1, STOPS, route=2)
+            await complete("Mara:", 1, STOPS, route=1)  # b fails: retried on c
+        finally:
+            await close()
+
+    asyncio.run(go())
+    assert [u.split("/")[2] for u in seen] == ["c:3", "c:3", "b:2", "c:3"]

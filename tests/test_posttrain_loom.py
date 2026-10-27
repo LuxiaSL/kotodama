@@ -194,8 +194,70 @@ def test_assemble_main_namespaces_runs(tmp_path) -> None:
         p = {"tree": "t00000", "leaf": "t00000/r.0.0.0.0.0.0.0.0", "depth": 8, "header": name, "state": "depth",
              "turns": [{"speaker": "A" if k % 2 == 0 else "B", "text": f"{name}{k}"} for k in range(8)]}
         (d / "paths.jsonl").write_text(json.dumps(p) + "\n")
+        (d / "trees.jsonl").write_text(json.dumps({"tree": "t00000", "seed": name}) + "\n")
     out = tmp_path / "docs.jsonl"
     assert loom.main(["assemble", str(tmp_path / "a"), str(tmp_path / "b"), "--out", str(out), "--max_uses", "1",
                       "--min_new", "4"]) == 0
     docs = [json.loads(x) for x in out.read_text().splitlines()]
     assert {d["header"] for d in docs} == {"a", "b"}  # the second run's identical ids were not counted as used
+
+
+def test_resume_skips_finished_seeds_and_drops_unfinished_trees(tmp_path) -> None:
+    out = tmp_path / "run"
+    out.mkdir()
+    # an interrupted run: tree t00000 finished, t00001 left partial records behind
+    (out / "trees.jsonl").write_text(json.dumps({"tree": "t00000", "seed": "a"}) + "\n")
+    for name in ("nodes", "states", "paths"):
+        (out / f"{name}.jsonl").write_text("".join(json.dumps({"tree": t, "id": name}) + "\n"
+                                                   for t in ("t00000", "t00001", "t00001")))
+    assert loom.prune_unfinished(out) == 6
+    assert all(json.loads(x)["tree"] == "t00000" for n in ("nodes", "states", "paths")
+               for x in (out / f"{n}.jsonl").read_text().splitlines())
+    other = tmp_path / "older"
+    other.mkdir()
+    (other / "trees.jsonl").write_text(json.dumps({"tree": "t00007", "seed": "b"}) + "\n")
+    seeds = tmp_path / "seeds.jsonl"
+    seeds.write_text("".join(json.dumps({"id": i, "cast": ["Mara", "Teo"], "header": "h"}) + "\n" for i in "abc"))
+    grown = []
+
+    async def fake_run(todo, *args, **kw):
+        grown.extend(todo)
+        return {"trees": len(todo), "failed": 0, "seconds": 0.0}
+
+    real_run, loom.run = loom.run, fake_run
+    try:
+        assert loom.main(["--seeds", str(seeds), "--endpoint", "http://x:1", "--out", str(out),
+                          "--skip_done", str(other)]) == 0
+    finally:
+        loom.run = real_run
+    assert [(i, s.id) for i, s in grown] == [(2, "c")]  # ids follow the seed's index, so a regrown tree keeps its id
+
+
+def test_run_pins_each_tree_to_the_least_loaded_route(tmp_path) -> None:
+    routes: dict[str, set] = {}
+
+    async def complete(prompt: str, n: int, stops: list[str], route=None):
+        await asyncio.sleep(random.random() / 500)
+        routes.setdefault(prompt.split("\n")[0], set()).add(route)
+        return [(f"line {prompt.count(chr(10))}-{i}" + stops[0], "stop", False) for i in range(n)]
+
+    seeds = [(i, SeedSpec(f"s{i}", ["Mara", "Teo"], f"header {i}", [])) for i in range(6)]
+    cfg = loom.LoomConfig(candidates=3, children=2, width=3, max_depth=4, min_turns=2)
+    summary = asyncio.run(loom.run(seeds, complete, cfg, SelfPlayConfig(min_turns=2), tmp_path, concurrency=3,
+                                   seed=0, routes=3))
+    assert summary == {**summary, "trees": 6, "failed": 0}
+    assert all(len(r) == 1 for r in routes.values())  # every request of a tree went to one server
+    assert set().union(*routes.values()) == {0, 1, 2}  # three trees at once spread over three servers
+
+
+def test_assemble_main_ignores_unfinished_trees(tmp_path) -> None:
+    d = tmp_path / "a"
+    d.mkdir()
+    rows = [{"tree": t, "leaf": f"{t}/r.0.0.0.0.0.0", "depth": 6, "header": t, "state": "depth",
+             "turns": [{"speaker": "A" if k % 2 == 0 else "B", "text": f"{t}{k}"} for k in range(6)]}
+            for t in ("t00000", "t00001")]
+    (d / "paths.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (d / "trees.jsonl").write_text(json.dumps({"tree": "t00000", "seed": "a"}) + "\n")
+    out = tmp_path / "docs.jsonl"
+    assert loom.main(["assemble", str(d), "--out", str(out), "--min_new", "2"]) == 0
+    assert {json.loads(x)["header"] for x in out.read_text().splitlines()} == {"t00000"}
