@@ -190,6 +190,10 @@ def parse_steer(spec: str) -> list[dict[str, Any]]:
     return out
 
 
+class PromptTooLong(ValueError):
+    """The server refused a prompt longer than its context (a 400 naming the prompt length)."""
+
+
 def oai_completer(endpoints: list[str], sampling: dict[str, float], max_tokens: int, timeout: float = 600.0,
                   model: str = "", transport: Any = None,
                   steer: Optional[list[dict[str, Any]]] = None,
@@ -197,7 +201,8 @@ def oai_completer(endpoints: list[str], sampling: dict[str, float], max_tokens: 
     """A ``Complete`` over one or more ``/v1/completions`` endpoints, and its async closer. Requests rotate over the
     endpoints, or go to ``endpoints[route]`` when the caller passes ``route=`` (one conversation per server, so its
     prompts share that server's prefix cache); a failed request retries on the next endpoint. Every request has an
-    overall deadline of ``timeout`` seconds, so a connection that stalls without closing still fails.
+    overall deadline of ``timeout`` seconds, so a connection that stalls without closing still fails. A 4xx is
+    not retried; a prompt the server finds longer than its context raises ``PromptTooLong``.
     ``steer``: a residual steering stack sent with every request (the server's ``vectors``; it needs
     ``--steer-npz``). ``transport``: an httpx transport (tests pass a mock)."""
     import httpx
@@ -224,10 +229,12 @@ def oai_completer(endpoints: list[str], sampling: dict[str, float], max_tokens: 
                 url = endpoints[(first + attempt) % len(endpoints)].rstrip("/") + "/v1/completions"
                 try:
                     r = await asyncio.wait_for(client.post(url, json=body), timeout)
+                    if r.status_code == 400 and "too long" in r.text.lower():
+                        raise PromptTooLong(r.text)
                     r.raise_for_status()
                     break
                 except (httpx.HTTPError, asyncio.TimeoutError) as e:
-                    if attempt == 3:
+                    if attempt == 3 or (isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500):
                         raise
                     logger.warning("completion request to %s failed (%r); retrying", url, e)
                     await asyncio.sleep(2 ** attempt)

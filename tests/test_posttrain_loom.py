@@ -312,3 +312,17 @@ def test_extend_seeds_takes_deepest_finished_leaves(tmp_path) -> None:
     out = loom.extend_seeds([str(d)], per_tree=1, min_depth=2, seed=0)
     assert [r["id"] for r in out] == ["run:t0/r.0.0.0"]
     assert out[0]["turns"] == [{"speaker": "A", "text": "seed"}] and len(out[0]["history"]) == 3
+
+
+def test_prompt_too_long_ends_the_branch_not_the_tree() -> None:
+    from kotodama.posttrain.selfplay import PromptTooLong
+
+    async def complete(prompt: str, n: int, stops: list[str]):
+        if prompt.count("\n\n") >= 4:
+            raise PromptTooLong("Prompt too long")
+        return [(f"line {prompt.count(chr(10))}-{i}" + stops[0], "stop", False) for i in range(n)]
+
+    cfg = loom.LoomConfig(candidates=2, children=1, width=2, max_depth=10, min_turns=1)
+    st, recs = grow(cfg, complete)
+    assert st["ended"]["length_cap"] >= 1 and st["max_depth"] < 10
+    assert all(p["state"] in ("length_cap", "eos", "degraded", "pruned") for p in recs["path"])

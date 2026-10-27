@@ -207,3 +207,31 @@ def test_completer_route_pins_and_fails_over() -> None:
 
     asyncio.run(go())
     assert [u.split("/")[2] for u in seen] == ["c:3", "c:3", "b:2", "c:3"]
+
+
+def test_completer_does_not_retry_a_refused_request() -> None:
+    httpx = pytest.importorskip("httpx")
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if request.url.host == "a":
+            return httpx.Response(400, json={"detail": "Prompt too long: 5000 tokens (max 4096)"})
+        return httpx.Response(422, json={"detail": "bad field"})
+
+    from kotodama.serve.laws import law
+
+    complete, close = sp.oai_completer(["http://a:1", "http://b:2"], law("tsumugi"), 8,
+                                       transport=httpx.MockTransport(handler))
+
+    async def go():
+        try:
+            with pytest.raises(sp.PromptTooLong):
+                await complete("Mara:", 1, STOPS, route=0)
+            with pytest.raises(httpx.HTTPStatusError):
+                await complete("Mara:", 1, STOPS, route=1)
+        finally:
+            await close()
+
+    asyncio.run(go())
+    assert [u.split("/")[2] for u in seen] == ["a:1", "b:2"]  # one request each: a 4xx is never retried

@@ -65,8 +65,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-from kotodama.posttrain.selfplay import (Complete, SeedSpec, SelfPlayConfig, evaluate, next_speaker, oai_completer,
-                                         parse_seed, parse_steer, split_completion)
+from kotodama.posttrain.selfplay import (Complete, PromptTooLong, SeedSpec, SelfPlayConfig, evaluate, next_speaker,
+                                         oai_completer, parse_seed, parse_steer, split_completion)
 from kotodama.posttrain.transcript import Transcript, Turn, render_prompt, stop_sequences, to_row
 from kotodama.serve.laws import law
 
@@ -177,7 +177,11 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
         if len(prompt) > cfg.max_prompt_chars:
             end(node, "length_cap")
             return []
-        raw = await complete(prompt, cfg.candidates, stops)
+        try:
+            raw = await complete(prompt, cfg.candidates, stops)
+        except PromptTooLong:  # the character window can still exceed the context in tokens: end this branch only
+            end(node, "length_cap")
+            return []
         stats["requests"] += 1
         cands = [evaluate(*split_completion(t, stops, fr, hit)[:2], speaker, list(seen), seed.cast,
                           seed.header, sp) for t, fr, hit in raw]
