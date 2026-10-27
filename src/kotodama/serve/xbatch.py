@@ -19,6 +19,11 @@ Two parts:
   * ``XBatchScheduler`` is the asyncio side: ``submit`` enqueues a job and awaits its result, and one pump task
     runs batches (each under the engine lock, on the generation thread) while the queue is non-empty.
 
+A decoder whose rows share storage (``kotodama.model.multi_decode.CascadeDecoder``: one copy of a prompt's KV per
+group of rows) bounds admission too: the runner admits only as many rows as ``admit_capacity`` allows (a request
+that finds no room waits in the queue), hands rows back with ``release`` as soon as nobody will restart from them,
+and caps each candidate at ``token_room``.
+
 The runner knows nothing about HTTP: prompts arrive tokenized and validated, steering arrives as the engine's
 ``set_steer`` arguments, and stop strings are checked through a ``decode`` callable (the tokenizer's).
 """
