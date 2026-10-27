@@ -324,20 +324,26 @@ Every item also runs under few-shot conditions with exemplars.
     baselines scored on this same harness and places any model on the law as a
     parameter-equivalent size.
   - the `fluid` group: four batteries whose answers exist only in the prompt
-    (`fluid-v1-morph` invented inflection, `fluid-v1-algebra` invented
-    operators, `fluid-v1-rebind` reassignment chains in prose and code with a
+    (`fluid-v1-morph` invented inflection, `fluid-v2-algebra` invented
+    operators, `fluid-v2-rebind` reassignment chains in prose and code with a
     stale-value rate, `fluid-v1-seqind` abstract token patterns) and a
     crystallized control in the same few-shot frame (`cryst-v1`: capitals,
     chemical symbols, books, currencies). Each family climbs a difficulty
     ladder and is read by the ladder position where accuracy falls halfway to
     chance; `fluid` z-scores fluid and crystallized ability across the models
-    it is given.
-  - `formupdate-v1`: forming a binding vs updating it. Each base item binds K
+    it is given. The v2 algebra and rebind files control two shortcuts the v1
+    files leave open (copying a query operand; recency over the candidates);
+    `fluid-v1` names the v1 set, and `fluid --set v1` reads it.
+  - `formupdate-v2`: forming a binding vs updating it. Each base item binds K
     holders to values and asks about one; three conditions differ only in the
     U lines before the query (neutral filler, updates to other holders, or one
     update to the queried holder). `formupdate` reads form accuracy, the
     interference cost and the update cost, raw and normalized by headroom, with
-    paired-bootstrap intervals over base items, and the stale-value rate.
+    paired-bootstrap intervals over base items, and the stale-value rate. v2
+    matches where the gold sits among the candidates mentioned (first, middle or
+    last) across the three conditions, and reports the costs on the items where
+    it is a middle mention in all three, so a primacy or recency bias moves no
+    cost there; `formupdate-v1` keeps the earlier layout (`formupdate --battery`).
   `report` prints one scorecard row per model.
 
 Rider generation is byte-identical per seed and name pool, so banked grids stay

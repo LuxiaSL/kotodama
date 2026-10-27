@@ -239,6 +239,20 @@ def test_resolve_groups_and_pins(tmp_path):
         bt.path_for(bt.BATTERIES["swapdyn-v1"], tmp_path)
 
 
+BP_V32_RECIPE = {"seed": 2031, "per_cell": {"setbind": 64, "answer": 160, "adjacency": 225, "codevarmut": 100}}
+
+
+def test_bp_v32_regenerates_its_pin(tmp_path):
+    """bp-v3.2 is the bindprobes v3 families at their current versions, emitted with the battery's seed and sizes:
+    the emit is byte-identical to the pinned file."""
+    from kotodama.eval.bindprobes import items
+
+    b = bt.BATTERIES["bp-v3.2"]
+    path = items.emit(tmp_path, BP_V32_RECIPE["seed"], list(b.families), BP_V32_RECIPE["per_cell"])
+    assert bt.sha256(path) == b.sha256
+    assert bt.BATTERIES["bp-v3.1"].sha256 != b.sha256 and "bp-v3.2" in bt.GROUPS["bindprobes"]
+
+
 def test_report_cli(tmp_path, capsys):
     d = tmp_path / "scores" / "stage5-decomp-v1"
     d.mkdir(parents=True)

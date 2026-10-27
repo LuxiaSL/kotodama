@@ -19,7 +19,14 @@ from kotodama.eval.binding.__main__ import main as cli_main
 
 @pytest.fixture(scope="module")
 def full() -> list[dict[str, Any]]:
-    return fu.generate()
+    """formupdate-v1: the original design (most tests below read its schedules)."""
+    return fu.generate(version=fu.V1)
+
+
+@pytest.fixture(scope="module")
+def full2() -> list[dict[str, Any]]:
+    """formupdate-v2: the position-matched design (the default)."""
+    return fu.generate(version=fu.V2)
 
 
 def _bytes(rows: list[dict[str, Any]]) -> str:
@@ -35,25 +42,32 @@ def _groups(rows: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, Any]]]:
 
 # ── determinism, pin, registry, grid ──────────────────────────────────────────────────────────────────────────────
 
-def test_same_seed_same_bytes(full):
-    assert _bytes(fu.generate(base=5)) == _bytes(fu.generate(base=5))
-    assert _bytes(fu.generate()) == _bytes(full)
+def test_same_seed_same_bytes(full, full2):
+    for v in fu.VERSIONS:
+        assert _bytes(fu.generate(base=5, version=v)) == _bytes(fu.generate(base=5, version=v))
+    assert _bytes(fu.generate(version=fu.V1)) == _bytes(full)
+    assert _bytes(fu.generate()) == _bytes(full2) and fu.VERSION == fu.BATTERY == fu.V2
+    with pytest.raises(ValueError):
+        fu.generate(base=1, version="formupdate-v0")
 
 
-def test_gen_formupdate_reproduces_the_pin(tmp_path, capsys):
+def test_gen_formupdate_reproduces_the_pins(tmp_path, capsys):
     assert cli_main(["gen-formupdate", "--out", str(tmp_path)]) == 0
-    b = bt.BATTERIES[fu.BATTERY]
-    assert bt.sha256(tmp_path / b.file) == b.sha256
+    for v in fu.VERSIONS:
+        b = bt.BATTERIES[v]
+        assert bt.sha256(tmp_path / b.file) == b.sha256
     out = capsys.readouterr().out
-    assert "= pin" in out and "AUDIT" not in out
+    assert out.count("= pin") == len(fu.VERSIONS) and "AUDIT" not in out
 
 
 def test_registry_group_and_reader():
-    b = bt.BATTERIES["formupdate-v1"]
-    assert b.kind == "rows" and b.reader == fu.READER and b.reader in readers.READERS
-    assert re.fullmatch(r"[0-9a-f]{64}", b.sha256)
-    assert [x.name for x in bt.resolve("formupdate")] == ["formupdate-v1"]
-    assert "formupdate-v1" in bt.GROUPS["all"]
+    for v in fu.VERSIONS:
+        b = bt.BATTERIES[v]
+        assert b.kind == "rows" and b.reader == fu.READER and b.reader in readers.READERS
+        assert re.fullmatch(r"[0-9a-f]{64}", b.sha256) and v in bt.GROUPS["all"]
+    assert bt.BATTERIES[fu.V1].sha256 != bt.BATTERIES[fu.V2].sha256
+    assert [x.name for x in bt.resolve("formupdate")] == ["formupdate-v2"]
+    assert [x.name for x in bt.resolve("formupdate-v1")] == ["formupdate-v1"]
 
 
 def test_grid(full):
@@ -396,6 +410,93 @@ def test_predictions_on_toy_numbers():
         fu.predictions(sums, ["r1", "rel"], "rel", "ann")
     with pytest.raises(ValueError):
         fu.predictions(sums, [], "rel", "ann")
+
+
+# ── v2: the gold's mention position ───────────────────────────────────────────────────────────────────────────────
+
+def _order(r: dict[str, Any]) -> list[str]:
+    """The candidates the prompt text mentions, in order of first mention."""
+    pos = {}
+    for c in (x.strip() for x in r["candidates"]):
+        if m := re.search(rf"(?<!\w){re.escape(c)}(?!\w)", r["prompt"]):
+            pos[c] = m.start()
+    return sorted(pos, key=pos.__getitem__)
+
+
+def _place(r: dict[str, Any]) -> str:
+    o = _order(r)
+    return "first" if o[0] == r["gold"] else "last" if o[-1] == r["gold"] else "middle"
+
+
+def test_v2_contract_pairing_and_audits(full2):
+    assert len(full2) == 2160 and len({r["id"] for r in full2}) == 2160
+    assert all(r["base_id"].startswith(fu.V2 + "|") for r in full2)
+    assert {(r["K"], r["U"], r["register"]) for r in full2} == set(fu.CELLS)
+    assert fu.pairing_failures(full2) == [] and fu.audit_failures(fu.audit(full2)) == []
+    for r in full2:
+        ev, q = _replay(r)
+        cur = {h: v for kind, h, v in ev if kind != "filler"}
+        assert q == r["holder"] and cur[q] == r["gold"]
+        cands = [c.strip() for c in r["candidates"]]
+        assert len(set(cands)) == fu.N_CANDIDATES and r["gold"] in cands       # one gold, no duplicate answer
+        assert all(fl.count_word(r["prompt"], c) <= 1 for c in cands) and fl.count_word(r["prompt"], r["gold"]) == 1
+        o = _order(r)
+        assert r["position"] == _place(r) and r["gold_is_first"] == (o[0] == r["gold"])
+        assert r["recent_answer"] == o[-1]                  # recency is read on the candidates
+
+
+def test_v2_gold_position_is_matched_across_conditions(full2):
+    """No first- or last-candidate reader separates A from B anywhere, nor B from C at K ≥ 4 (C's designed recency
+    1/U aside); at K ≥ 4 the primacy reader scores 0 in every condition; at K = 2 A matches B (both first)."""
+    cells: dict[tuple[str, str], list[str]] = {}
+    for r in full2:
+        cells.setdefault((r["cell"], r["condition"]), []).append(_place(r))
+    for (cell, cond), places in cells.items():
+        k, u = (int(x) for x in re.match(r"K(\d+)\|U(\d+)", cell).groups())   # type: ignore[union-attr]
+        n = len(places)
+        first, last = places.count("first") / n, places.count("last") / n
+        if cond in "AB":
+            assert (first, last) == ((1.0, 0.0) if k == 2 else (0.0, 0.0)), (cell, cond)
+        else:
+            assert first == 0.0 and last == pytest.approx(1 / u), (cell, cond)
+        if k >= 4:
+            assert first <= 1.5 * fu.CHANCE
+    for cell in {c for c, _ in cells}:
+        assert cells[(cell, "A")] == cells[(cell, "B")]
+
+
+def test_v2_layout_anchor_and_closing_update(full2):
+    """K ≥ 4: a shown holder bound before Q keeps its binding in B, a shown holder is bound after Q, and B's last
+    update writes a candidate; Q's binding is never the first or the last binding line (K = 2: always the first)."""
+    for g in _groups(full2).values():
+        a, b = g["A"], g["B"]
+        k, p = a["K"], a["q_bind_pos"]
+        assert p == 0 if k == 2 else 1 <= p <= k - 2
+        if k == 2:
+            continue
+        ev_b, q = _replay(b)
+        cands_b = [x.strip() for x in b["candidates"]]
+        binds = [h for _, h, _ in ev_b[:k]]
+        updated = {h for _, h, _ in ev_b[k:]}
+        assert binds[p] == q
+        assert any(h not in updated and v in cands_b for _, h, v in ev_b[:p])
+        assert {x.strip() for x in a["candidates"]} & {v for _, _, v in _replay(a)[0][p + 1:k]}
+        assert ev_b[-1][2] in cands_b
+
+
+def test_v2_reader_position_matched_split(full, full2):
+    """A pure primacy reader (it picks the first candidate mentioned) fakes interference on v1 (B above A); on v2 it
+    scores A = B, and on the position-matched items it scores nothing in any condition."""
+    def primacy(r: dict[str, Any], b: int) -> str:
+        return _order(r)[0]
+
+    s1 = fu.summarize(_scored(full, primacy), n_boot=50)
+    assert s1.pooled["interference"] < -0.25 and "position_matched" not in s1.recency_split
+    s2 = fu.summarize(_scored(full2, primacy), n_boot=50)
+    assert s2.pooled["interference"] == pytest.approx(0.0)
+    m = s2.recency_split["position_matched"]
+    assert m["n"] == sum(1 for g in _groups(full2).values() if g["C"]["K"] >= 4 and not g["C"]["gold_is_recent"])
+    assert m["acc"] == {"A": 0.0, "B": 0.0, "C": 0.0}
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────────────────────────────────────────

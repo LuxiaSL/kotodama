@@ -4,8 +4,10 @@ Prompt files live under one prompts directory (``--prompts-dir``, else ``$KOTODA
 belong in site.env). Every file is pinned by sha256, and a run refuses a file that does not match its pin, so a
 number in the record always names the exact strings it was scored on. ``capacity-v1`` can be regenerated
 (``python -m kotodama.eval.binding gen-capacity``), and the pin then checks that the regeneration is byte-identical;
-so can the ``fluid`` group (``gen-fluid``, :mod:`kotodama.eval.binding.fluid`) and ``formupdate-v1``
-(``gen-formupdate``, :mod:`kotodama.eval.binding.formupdate`).
+so can every fluid battery (``gen-fluid``, :mod:`kotodama.eval.binding.fluid`) and both form-update versions
+(``gen-formupdate``, :mod:`kotodama.eval.binding.formupdate`). A new version of a battery is a new name and a new
+pinned file beside the old one, which stays scoreable; the ``fluid`` and ``formupdate`` groups name the current
+versions, ``fluid-v1`` and ``formupdate-v1`` the earlier ones.
 """
 
 from __future__ import annotations
@@ -56,6 +58,12 @@ BATTERIES: dict[str, Battery] = {b.name: b for b in (
     Battery("fluid-v1-rebind", "rows", "fluid-v1-rebind.jsonl",
             "7431ebb1dc74dca1ab1c656456a7371bdf0d0300317dbeff0a84149626f3a543", "fluid-rebind",
             "fluid F3: rebinding chains, prose + code (reassignments × distractors; stale-value rate)"),
+    Battery("fluid-v2-algebra", "rows", "fluid-v2-algebra.jsonl",
+            "7b5bc3983583b6a87e6e26c9771f10d51ed38174c1eacc953e8ca8048cf45add", "fluid-algebra",
+            "fluid F2 v2: symbol algebra, gold's place among the query operands controlled, one answer per row"),
+    Battery("fluid-v2-rebind", "rows", "fluid-v2-rebind.jsonl",
+            "4643c37d0366629beafa334bf051cadc515e5247e6c8a9a3801900ee8015d76c", "fluid-rebind",
+            "fluid F3 v2: rebinding chains, recency control on the most recent candidate"),
     Battery("fluid-v1-seqind", "rows", "fluid-v1-seqind.jsonl",
             "b2a1e6b54040500363909cf4d669f84ef968a60df6353127599e9f041a46e15a", "fluid-seqind",
             "fluid F4: nonce sequence induction (pattern length × gap)"),
@@ -65,6 +73,9 @@ BATTERIES: dict[str, Battery] = {b.name: b for b in (
     Battery("formupdate-v1", "rows", "formupdate-v1.jsonl",
             "7222046c4c63a4eca769212c6cca327eb64401d4909db58e675dc16a31a17d1f", "formupdate",
             "forming vs updating: static / update-other / update-target, paired per base item (K × U × register)"),
+    Battery("formupdate-v2", "rows", "formupdate-v2.jsonl",
+            "b99fbc549f8cc2cc8d773fcb578320988867f4499ca88601d1ee73f73061efbe", "formupdate",
+            "forming vs updating v2: the gold's first / middle / last mention position matched across A / B / C"),
     Battery("bp-deixis-lite", "bindprobes", "bindprobes-deixis-lite/items.jsonl",
             "229e7ac377ff2ec5ef298ecdee5c27667f9c97d86ba2337fb5e411aac9167c3e", None,
             "bindprobes deixis-lite (0shot / 3shot)", ("deixis",), ("0shot", "3shot")),
@@ -75,6 +86,10 @@ BATTERIES: dict[str, Battery] = {b.name: b for b in (
             "bc3496d3c68990b8a615f485ca38e43b917deca1315cc6207990454be1330f37", None,
             "bindprobes v3.1: setbind / answer / adjacency / codevarmut",
             ("setbind", "answer", "adjacency", "codevarmut")),
+    Battery("bp-v3.2", "bindprobes", "bindprobes-v3.2/items.jsonl",
+            "ee5e827bd4698623e96b906480a8652999c7d8884d69f783e29b072d8cfc13e5", None,
+            "bindprobes v3.2: setbind / answer / adjacency / codevarmut, controlled recency and role shortcuts",
+            ("setbind", "answer", "adjacency", "codevarmut")),
     Battery("bp-deixis-v2", "bindprobes", "bindprobes-deixis-v2-full/items.jsonl",
             "08151e66c4798288c7b1f471aaeb46d07e3d21acd5d279e8d8c137ba3bd35234", None,
             "bindprobes deixis v2 full", ("deixis",)),
@@ -84,10 +99,12 @@ BATTERIES: dict[str, Battery] = {b.name: b for b in (
 GROUPS: dict[str, tuple[str, ...]] = {
     "gauges": ("joinlite-v1", "swapdyn-v1"),
     "decomp": ("stage5-decomp-v1",),
-    "bindprobes": ("bp-deixis-lite", "bp-profile", "bp-v3.1", "bp-deixis-v2"),
+    "bindprobes": ("bp-deixis-lite", "bp-profile", "bp-v3.2", "bp-deixis-v2"),
     "scorecard": ("joinlite-v1", "swapdyn-v1", "stage5-decomp-v1", "capacity-v1"),
-    "fluid": ("fluid-v1-morph", "fluid-v1-algebra", "fluid-v1-rebind", "fluid-v1-seqind", "cryst-v1"),
-    "formupdate": ("formupdate-v1",),
+    "fluid": ("fluid-v1-morph", "fluid-v2-algebra", "fluid-v2-rebind", "fluid-v1-seqind", "cryst-v1"),
+    "fluid-v1": ("fluid-v1-morph", "fluid-v1-algebra", "fluid-v1-rebind", "fluid-v1-seqind", "cryst-v1"),
+    "formupdate": ("formupdate-v2",),
+    "formupdate-v1": ("formupdate-v1",),
     "all": tuple(BATTERIES),
 }
 

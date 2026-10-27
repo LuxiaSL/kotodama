@@ -65,6 +65,27 @@ Shortcut controls (recorded per row; :func:`audit`, :func:`audit_failures`):
   position / identity: exact balance (above), audited.
   pairing    :func:`pairing_failures` checks every base item's A / B / C rows against the invariants above.
 
+Versions. ``formupdate-v1`` is the design above. ``formupdate-v2`` (the default) fixes the gold's mention position
+among the candidates present in the prompt, because v1 left primacy free: in B every updated holder's value sits in
+an update line after the bindings, so Q's initial value (B's gold) was often the only candidate in the binding block
+and the first one mentioned (B .66, 1.00 at K = 2 and at K = 4 / U = 4; A .33; C 0). A primacy-biased model then
+scored B above A, a negative interference cost with no interference. v1's recency control also read the last line's
+value, not the last candidate's: at K = 8, C's gold was the last candidate .76 against the designed 1/U. v2:
+  - K ≥ 4: Q's binding sits on a line balanced over 2 … K − 1 (never the first or last binding line). An ANCHOR
+    holder bound before Q is shown as a candidate and never updated; a shown holder is bound after Q; B's updates
+    go to the other holders (the anchor excluded, so a holder is updated twice once U > K − 2), and B's LAST update
+    goes to a shown holder. So the gold is a middle candidate mention in every A and B row, and in C it is never the
+    first (the stale value precedes it) and the last on exactly 1/U of rows (Q's update closes C).
+  - K = 2: B's one other holder is always updated, so B's gold is always the first candidate mentioned. Q is bound
+    first in A as well, so A and B match (first on every row); C's gold is never first. The update contrast at
+    K = 2 stays primacy-confounded in both versions.
+  - recency is the most recent CANDIDATE mention (designed: A 0, B 0, C 1/U); rows add ``gold_is_first`` (designed
+    ``neutral_primacy``: 1 in A / B at K = 2, else 0, gated) and ``position`` (first / middle / last).
+  - :func:`summarize` adds ``recency_split["position_matched"]``: the base items whose gold is a middle mention in
+    all three conditions (K ≥ 4 with C's gold not last), where no first / last reader separates the conditions.
+  A reader that picks a middle candidate uniformly scores 1/2 in A and B at K ≥ 4 and 1/3 in C's middle rows; that is
+  a bias toward the middle of a list, the opposite of the primacy and recency biases language models show.
+
 Read-out (:func:`summarize`), per model, paired within base item:
   form              acc(A)
   interference cost acc(A) − acc(B)
@@ -91,8 +112,11 @@ from typing import Any, Literal, Mapping, Optional, Sequence
 from kotodama.eval.binding import capacity as cap
 from kotodama.eval.binding import fluid as fl
 
-VERSION = "formupdate-v1"
-BATTERY = "formupdate-v1"
+V1 = "formupdate-v1"
+V2 = "formupdate-v2"
+VERSIONS: tuple[str, ...] = (V1, V2)
+VERSION = V2                               # the current generation; ``generate(version=V1)`` rebuilds the old one
+BATTERY = V2
 READER = "formupdate"
 K_GRID: tuple[int, ...] = (2, 4, 8)
 U_GRID: tuple[int, ...] = (1, 2, 4)
@@ -143,11 +167,21 @@ class _CellSchedule:
     new: list[str]                        # the value C gives Q
 
 
-def _schedule(k: int, u: int, register: str, n: int) -> _CellSchedule:
-    rng = random.Random(f"{VERSION}:{cell_key(k, u, register)}:schedule")
+def q_bind_positions(k: int, version: str) -> range:
+    """The binding lines Q's binding may sit on. v1: any of the K. v2: never the first or the last at K ≥ 4 (a
+    shown holder is bound on each side of Q, so Q's value is neither the first nor the last candidate mentioned in
+    A or B); the first at K = 2, where B's one other holder is always updated and so Q's value is the first
+    candidate mentioned in B whatever its line: A matches B."""
+    if version == V1:
+        return range(k)
+    return range(1, k - 1) if k >= 4 else range(1)
+
+
+def _schedule(k: int, u: int, register: str, n: int, version: str = V1) -> _CellSchedule:
+    rng = random.Random(f"{version}:{cell_key(k, u, register)}:schedule")
     pairs = [(i, j) for i in range(N_CANDIDATES) for j in range(N_CANDIDATES) if i != j]
     slots = fl._balanced(rng, n, pairs)
-    q_bind = fl._balanced(rng, n, range(k))
+    q_bind = fl._balanced(rng, n, q_bind_positions(k, version))
     q_update = fl._balanced(rng, n, range(u))
     initial = fl._cycle(rng, VALUES, n)
     new = fl._cycle(rng, VALUES, n)
@@ -168,6 +202,19 @@ def _targets(rng: random.Random, others: Sequence[str], u: int) -> list[str]:
             r.append(r.pop(0))
         out.extend(r)
     return out[:u]
+
+
+def _targets_ending(rng: random.Random, pool: Sequence[str], last: str, u: int) -> list[str]:
+    """U update targets over ``pool`` in shuffled rounds (no holder twice in a row while another exists), the last
+    one ``last``: built from the end backwards."""
+    out = [last]
+    while len(out) < u:
+        r = list(pool)
+        rng.shuffle(r)
+        if len(r) > 1 and r[0] == out[-1]:
+            r.append(r.pop(0))
+        out.extend(r)
+    return out[:u][::-1]
 
 
 # A's U lines: events in the update family that name no holder and no value (a sentence in prose, a statement in code).
@@ -223,6 +270,7 @@ class BaseItem:
     fillers: tuple[str, ...]                    # A's U neutral lines
     # candidate slots: ("q", "initial" | "new"), ("other", holder) or ("absent", value)
     layout: tuple[tuple[str, str], ...]
+    version: str = V1
 
     def events(self, cond: Condition) -> list[tuple[str, Optional[str], Optional[str]]]:
         """(kind, holder, value) per line; kind ∈ bind / update / filler (a filler's holder is its text)."""
@@ -255,9 +303,13 @@ def render(register: str, events: Sequence[tuple[str, Optional[str], Optional[st
     raise ValueError(f"unknown register {register!r} (prose | code)")
 
 
-def _make_base(k: int, u: int, register: str, b: int, s: _CellSchedule) -> BaseItem:
+def _make_base(k: int, u: int, register: str, b: int, s: _CellSchedule, version: str = V1) -> BaseItem:
+    if version == V2:
+        return _make_base_v2(k, u, register, b, s)
+    if version != V1:
+        raise ValueError(f"unknown form-update version {version!r} (have: {', '.join(VERSIONS)})")
     cell = cell_key(k, u, register)
-    rng = random.Random(f"{VERSION}:{cell}:{b}")
+    rng = random.Random(f"{V1}:{cell}:{b}")
     holders = rng.sample(HOLDERS, k)
     q, others = holders[0], holders[1:]
     order = list(others)
@@ -277,10 +329,50 @@ def _make_base(k: int, u: int, register: str, b: int, s: _CellSchedule) -> BaseI
     layout: list[tuple[str, str]] = []
     for slot in range(N_CANDIDATES):
         layout.append(("q", "initial") if slot == first else ("q", "new") if slot == second else rest.pop(0))
-    base_id = f"{VERSION}|{cell}|b{b:02d}"
+    base_id = f"{V1}|{cell}|b{b:02d}"
     _fillers(rng, u)                        # the stream's last draw, kept so every earlier draw stays where it was
     return BaseItem(base_id, k, u, register, q, tuple(order), initial, v1, updates,
                     s.q_update[b], _events_for(register, base_id, u), tuple(layout))
+
+
+def _make_base_v2(k: int, u: int, register: str, b: int, s: _CellSchedule) -> BaseItem:
+    """v2: the candidate layout fixes the gold's mention position (module doc, "v2"). At K ≥ 4 an ANCHOR holder
+    bound before Q is shown and never updated, so Q's value is not the first candidate mentioned in A, B or C; a
+    shown holder is bound after Q, so Q's value is not the last one in A; B's last update goes to a shown holder
+    other than the anchor, so Q's value is not the last one in B, nor in C unless Q's update is C's last line."""
+    cell = cell_key(k, u, register)
+    rng = random.Random(f"{V2}:{cell}:{b}")
+    holders = rng.sample(HOLDERS, k)
+    q, others = holders[0], holders[1:]
+    order = list(others)
+    rng.shuffle(order)
+    p = s.q_bind[b]
+    order.insert(p, q)
+    before, after = order[:p], order[p + 1:]
+    if k >= 4:
+        anchor = rng.choice(before)
+        late = rng.choice(after)
+        shown = [anchor, late] + rng.sample([h for h in others if h not in (anchor, late)], OTHER_CANDIDATES - 2)
+        pool = [h for h in others if h != anchor]
+        updates_to = _targets_ending(rng, pool, rng.choice([h for h in shown if h != anchor]), u)
+    else:
+        shown = list(others)
+        updates_to = [others[0]] * u
+    v0, v1 = s.initial[b], s.new[b]
+    n_absent = max(0, OTHER_CANDIDATES - len(others))
+    draw = rng.sample([w for w in VALUES if w not in (v0, v1)], len(others) + u + n_absent)
+    initial = {q: v0, **dict(zip(others, draw[:len(others)]))}
+    writes = draw[len(others):len(others) + u]
+    absent = draw[len(others) + u:]
+    updates = tuple(zip(updates_to, writes))
+    rest: list[tuple[str, str]] = [("other", h) for h in shown] + [("absent", w) for w in absent]
+    rng.shuffle(rest)
+    first, second = s.slots[b]
+    layout = [("q", "initial") if slot == first else ("q", "new") if slot == second else rest.pop(0)
+              for slot in range(N_CANDIDATES)]
+    base_id = f"{V2}|{cell}|b{b:02d}"
+    return BaseItem(base_id, k, u, register, q, tuple(order), initial, v1, updates,
+                    s.q_update[b], _events_for(register, base_id, u), tuple(layout), V2)
 
 
 def _row(item: BaseItem, cond: Condition) -> Row:
@@ -321,26 +413,56 @@ def _row(item: BaseItem, cond: Condition) -> Row:
         "stale": v0 if cond == "C" else None, "q_bind_pos": item.order.index(item.q),
         "q_update_pos": item.q_update_pos, "n_lines": len(events),
     }
+    if item.version == V2:
+        order = mention_order(prompt, cands)
+        recent = order[-1]                  # the most recent CANDIDATE mention, not the last line's value
+        neutral = 0.0 if cond in "AB" else 1 / item.u
     row.update(fl._controls(prompt, cands, gold, recent))
     counts = [fl.count_word(prompt, w) for w in cands]
     present = sum(c > 0 for c in counts)
     row["neutral_recency"] = neutral
     row["max_count"] = max(counts)
     row["presence_follower"] = (1.0 / present) if row["gold_count"] > 0 else 0.0
+    if item.version == V2:
+        row["gold_is_first"] = order[0] == gold
+        row["neutral_primacy"] = 1.0 if item.k == 2 and cond in "AB" else 0.0
+        row["position"] = gold_position(prompt, cands, gold)
     return row
 
 
-def base_items(base: int = BASE_ITEMS) -> list[BaseItem]:
+def mention_order(prompt: str, cands: Sequence[str]) -> list[str]:
+    """The candidates present in ``prompt``, in the order of their first mention."""
+    pos = {}
+    for w in cands:
+        m = re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", prompt)
+        if m:
+            pos[w] = m.start()
+    return sorted(pos, key=pos.get)    # type: ignore[arg-type]
+
+
+def gold_position(prompt: str, cands: Sequence[str], gold: str) -> str:
+    """Where the gold sits among the candidates present in ``prompt``: first, middle or last (absent if not
+    mentioned)."""
+    order = mention_order(prompt, cands)
+    if gold not in order:
+        return "absent"
+    return "first" if order[0] == gold else "last" if order[-1] == gold else "middle"
+
+
+def base_items(base: int = BASE_ITEMS, version: str = VERSION) -> list[BaseItem]:
+    if version not in VERSIONS:
+        raise ValueError(f"unknown form-update version {version!r} (have: {', '.join(VERSIONS)})")
     out: list[BaseItem] = []
     for k, u, reg in CELLS:
-        s = _schedule(k, u, reg, base)
-        out.extend(_make_base(k, u, reg, b, s) for b in range(base))
+        s = _schedule(k, u, reg, base, version)
+        out.extend(_make_base(k, u, reg, b, s, version) for b in range(base))
     return out
 
 
-def generate(base: int = BASE_ITEMS) -> list[Row]:
-    """The battery's prompt rows, A / B / C of each base item in a row. Deterministic: no global RNG state."""
-    return [_row(item, c) for item in base_items(base) for c in CONDITIONS]
+def generate(base: int = BASE_ITEMS, version: str = VERSION) -> list[Row]:
+    """The battery's prompt rows (``version`` = its battery name), A / B / C of each base item in a row.
+    Deterministic: no global RNG state."""
+    return [_row(item, c) for item in base_items(base, version) for c in CONDITIONS]
 
 
 # ── audits ───────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -368,6 +490,9 @@ def audit(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
             "novelty": sum(r["novelty_follower"] for r in sub) / n,
             "position_max_dev": max(abs(pos.get(i, 0) / n - CHANCE) for i in range(N_CANDIDATES)),
         }
+        if all("gold_is_first" in r for r in sub):          # v2 rows: the primacy control
+            out[key]["primacy"] = sum(r["gold_is_first"] for r in sub) / n
+            out[key]["primacy_designed"] = sum(r["neutral_primacy"] for r in sub) / n
     for cond in CONDITIONS:
         cnt = Counter(r["gold"] for r in rows if r["condition"] == cond)
         if cnt:
@@ -378,8 +503,9 @@ def audit(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
 
 
 def audit_failures(aud: Mapping[str, Mapping[str, Any]], tol: float = BALANCE_TOL) -> list[str]:
-    """Recency within max(tol, 1/n) of its designed rate; no candidate mentioned twice and the gold exactly once;
-    gold positions within the same band of uniform; no gold identity above IDENTITY_MAX × the mean."""
+    """Recency (and on v2 rows primacy) within max(tol, 1/n) of its designed rate; no candidate mentioned twice and
+    the gold exactly once; gold positions within the same band of uniform; no gold identity above IDENTITY_MAX × the
+    mean."""
     bad: list[str] = []
     for key, a in aud.items():
         if key.startswith("identity|"):
@@ -389,6 +515,8 @@ def audit_failures(aud: Mapping[str, Mapping[str, Any]], tol: float = BALANCE_TO
         band = max(tol, 1 / a["n"]) + 1e-9
         if abs(a["recency"] - a["recency_designed"]) > band:
             bad.append(f"{key}: recency {a['recency']:.3f} vs designed {a['recency_designed']:.3f}")
+        if "primacy" in a and abs(a["primacy"] - a["primacy_designed"]) > band:
+            bad.append(f"{key}: primacy {a['primacy']:.3f} vs designed {a['primacy_designed']:.3f}")
         if a["max_count"] > 1 or a["gold_count"] != [1]:
             bad.append(f"{key}: a candidate mentioned {a['max_count']}× / gold mentioned {a['gold_count']}×")
         if a["position_max_dev"] > band:
@@ -474,6 +602,7 @@ class _Item:
     ok: tuple[bool, bool, bool]           # A, B, C correct
     stale: bool                           # C picks the stale value
     c_recent: bool                        # C's gold is the last mention
+    middle: bool = False                  # v2: the gold is a middle candidate mention in A, B and C
 
 
 def _stats(items: Sequence[_Item]) -> dict[str, Any]:
@@ -600,7 +729,8 @@ def summarize(rows: Sequence[Mapping[str, Any]], n_boot: int = BOOT, seed: int =
         rc = g["C"]
         items.append(_Item((int(rc["K"]), int(rc["U"]), str(rc["register"])),
                            tuple(picks[c] == g[c]["gold"] for c in CONDITIONS),  # type: ignore[arg-type]
-                           picks["C"] == rc["stale"], bool(rc["gold_is_recent"])))
+                           picks["C"] == rc["stale"], bool(rc["gold_is_recent"]),
+                           all(g[c].get("position") == "middle" for c in CONDITIONS)))
     if not items:
         raise ValueError("no base item has all three conditions")
     pooled = _stats(items)
@@ -621,6 +751,8 @@ def summarize(rows: Sequence[Mapping[str, Any]], n_boot: int = BOOT, seed: int =
     for k, u, reg in CELLS:
         s.by_cell[cell_key(k, u, reg)] = _stats([it for it in items if it.cell == (k, u, reg)])
     s.recency_split = {"c_gold_last": _stats([it for it in items if it.c_recent]), "c_gold_not_last": _stats(sub)}
+    if any(it.middle for it in items):
+        s.recency_split["position_matched"] = _stats([it for it in items if it.middle])
     return s
 
 

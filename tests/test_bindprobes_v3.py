@@ -10,6 +10,7 @@ import contextlib
 import io
 import math
 import random
+import re
 
 import pytest
 
@@ -103,6 +104,74 @@ def test_setbind_rejects_double_bind():
             "query": "A", "designated": "x"}
     with pytest.raises(ValueError):
         setbind.run(spec)
+
+
+@pytest.fixture(scope="module")
+def frozen(split):
+    """setbind and adjacency at their frozen per-cell sizes, on the battery's seed."""
+    return {f: items.generate_family(f, split, per_cell=V3[f].DEFAULT_PER_CELL, seed=2031)
+            for f in ("setbind", "adjacency")}
+
+
+def _mentions(text: str, words: list[str]) -> list[str]:
+    pat = re.compile(r"\b(" + "|".join(map(re.escape, sorted(words, key=len, reverse=True))) + r")\b")
+    return pat.findall(text)
+
+
+def test_setbind_recency_and_primacy_readers_near_chance(frozen):
+    """From the text alone: answering the last k (or the first k) objects mentioned is exactly the set no more
+    often than 1.5 × the exact@k chance (or one item), and the last object mentioned is in the set no more often
+    than 1.5 × the hit@1 chance."""
+    by: dict[tuple, list[Item]] = {}
+    for it in frozen["setbind"]:
+        by.setdefault(tuple(it.cell), []).append(it)
+    assert set(by) == set(setbind.CELLS)
+    for cell, its in by.items():
+        k, n = cell[0], len(its)
+        last_k = first_k = hit_last = 0
+        for it in its:
+            body = setbind.render(it, False).rsplit(" So ", 1)[0]
+            seq = _mentions(body, list(it.candidates))
+            gold = set(it.meta["gold_set"])
+            last_k += set(list(dict.fromkeys(reversed(seq)))[:k]) == gold
+            first_k += set(list(dict.fromkeys(seq))[:k]) == gold
+            hit_last += seq[-1] in gold
+        exact = 1 / math.comb(setbind.C_TOTAL, k)
+        assert last_k / n <= max(1.5 * exact, 1 / n) + 1e-9, (cell, last_k)
+        assert first_k / n <= max(1.5 * exact, 1 / n) + 1e-9, (cell, first_k)
+        assert hit_last / n <= 1.5 * k / setbind.C_TOTAL + 1e-9, (cell, hit_last)
+
+
+def test_adjacency_has_no_recency_solved_cell_and_balanced_critical_roles(frozen):
+    """No E = 1 cell; on the critical (scored) items of every variant and cell, the last-mentioned name, the
+    penultimate speaker, the last transfer's recipient and the most-mentioned name each pick the gold at most
+    1.5 × chance (1/3), read from the text."""
+    assert all(c[0] >= 2 for c in adjacency.CELLS)
+    by: dict[tuple, list[Item]] = {}
+    for base in frozen["adjacency"]:
+        for it in adjacency.expand(base):
+            if it.meta["critical"]:
+                by.setdefault((it.meta["variant"], tuple(it.cell)), []).append(it)
+    assert {v for v, _ in by} == set(adjacency.VARIANTS) and {c for _, c in by} == set(adjacency.CELLS)
+    for key, its in by.items():
+        n = len(its)
+        hits = {"last": 0.0, "penult_speaker": 0.0, "last_recipient": 0.0, "most_mentioned": 0.0}
+        for it in its:
+            text = adjacency.render(it, False)
+            body = text.rsplit("Now the ", 1)[0]
+            names = list(it.candidates)
+            seq = _mentions(body.split("\n", 1)[-1] if "\n" in body else body.split(". ", 1)[1], names)
+            assert not it.meta["queried_obj_in_last_transfer"]
+            hits["last"] += seq[-1] == it.gold
+            if it.meta["variant"] != "third":
+                speakers = [ln.split(":")[0] for ln in body.strip().split("\n")[1:]]
+                hits["penult_speaker"] += speakers[-2] == it.gold
+            hits["last_recipient"] += adjacency.transfers(it.spec)[-1]["recipient"] == it.gold
+            hits["most_mentioned"] += adjacency.most_frequent_credit(seq, it.gold)
+        for h, x in hits.items():
+            assert x / n <= 0.5 + 1e-9, (key, h, x / n)
+        roles = [it.meta["gold_role"] for it in its]
+        assert all(roles.count(r) == n // 3 for r in ("recipient", "giver", "bystander")), key
 
 
 # ── answer ───────────────────────────────────────────────────────────────────

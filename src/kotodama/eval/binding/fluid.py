@@ -86,6 +86,26 @@ families: a shortcut neither helps nor, by being scheduled at zero, becomes an e
              change answers with a form the prompt never shows, so it sits above chance there by design.
   position / identity: exact balance (above), audited.
 
+Versions. F2 and F3 have a v2 (``fluid-v2-algebra``, ``fluid-v2-rebind``, seeded ``fluid-v2``); F1, F4 and C0
+have one version. :data:`FLUID_SETS` names one battery per family; the ``fluid`` group and the read-out default to
+``v2``. Same ladders, cells, sizes, templates and readers; what v2 changes:
+  F2  v1 left the query's operands free: FIRST and SECOND copy an operand, so the gold was the query's last operand
+      on .39 of rows and an operand at all on .78 (chance 1/6), and a "copy the last operand" prior scored well
+      with no rule learned. v2 draws each row several times and keeps the draw whose operand class (the gold is the
+      first operand, the last operand, an inner one or none) is furthest below its cell target: first and last
+      each at 1/6 (:data:`F2_OPERAND_TARGET`). A one-operator query cannot escape its rule (FIRST answers the first
+      operand, SECOND the last, PARTNER twice the first: :func:`operand_forced`), so the k = 1 rungs keep those
+      rates (1/3 first and 1/3 last; 2/3 first at depth 2), and their other rows avoid operands. v2 also drops any
+      row with more than one defensible answer (:func:`f2_answers`: every pairing × every rule assignment, rules
+      may repeat); v1 had 13 (SECOND examples that also fit a pairing). Rows add ``gold_operand``,
+      ``operand_forced`` and ``operand_follower`` (the accuracy of copying a uniformly chosen operand); the audit
+      gates first / last against max(forced share, 1/6).
+  F3  v1's recency control recorded the last line's value, but a held-back reassignment's value could miss the
+      five candidates, leaving the gold as the most recent CANDIDATE on .40–.56 of R = N rows against the scheduled
+      .20. v2 always makes the closing line's value a candidate and records the most recent candidate mention
+      (:func:`last_candidate`) as ``recent_answer``, so the scheduled 1/5 is what a recency reader over the
+      candidates gets; ``last_line_value`` keeps the line's value.
+
 Read-out (:func:`summarize`), per family, per model:
   r(rung)   normalized accuracy (acc − chance) / (1 − chance): a fixed ceiling of 1, so a model that never reaches
             the top is not normalized up to it
@@ -107,6 +127,7 @@ import random
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from dataclasses import replace as dc_replace
 from typing import Any, Callable, Literal, Mapping, Optional, Sequence
 
 VERSION = "fluid-v1"
@@ -214,6 +235,7 @@ class Family:
     n_candidates: int
     trials: int                       # per seed per cell
     condition: Optional[str]          # a row field pooled inside every rung (reported separately)
+    version: str = "fluid-v1"         # seeds the generator streams
 
 
 F1_TIERS: tuple[str, ...] = ("suffix", "mid", "cond")
@@ -241,7 +263,17 @@ FAMILIES: dict[str, Family] = {f.key: f for f in (
     Family("C0", "cryst-v1", "cryst", tuple(f"shots{s}" for s in C0_SHOTS), 6, 16, "relation"),
 )}
 FLUID_KEYS: tuple[str, ...] = ("F1", "F2", "F3", "F4")
-BY_BATTERY: dict[str, Family] = {f.battery: f for f in FAMILIES.values()}
+# v2 of F2 and F3 (module doc, "v2"): same family keys, ladders and readers; new prompt files.
+FAMILIES_V2: dict[str, Family] = {f.key: f for f in (
+    dc_replace(FAMILIES["F2"], battery="fluid-v2-algebra", version="fluid-v2"),
+    dc_replace(FAMILIES["F3"], battery="fluid-v2-rebind", version="fluid-v2"),
+)}
+BY_BATTERY: dict[str, Family] = {f.battery: f for f in (*FAMILIES.values(), *FAMILIES_V2.values())}
+# One battery per family key: the set a read-out pools into fluid / crystallized scores.
+FLUID_SETS: dict[str, dict[str, str]] = {
+    "v1": {k: f.battery for k, f in FAMILIES.items()},
+    "v2": {k: (FAMILIES_V2.get(k) or f).battery for k, f in FAMILIES.items()},
+}
 
 Row = dict[str, Any]
 
@@ -340,9 +372,9 @@ def _run_cells(fam: Family, cells: Sequence[tuple[str, int, Any]], seeds: int, t
     rows: list[Row] = []
     for cell, rung, params in cells:
         n = seeds * trials
-        s = sched(random.Random(f"{VERSION}:{fam.key}:{cell}:schedule"), n, params)
+        s = sched(random.Random(f"{fam.version}:{fam.key}:{cell}:schedule"), n, params)
         for seed in range(seeds):
-            rng = random.Random(f"{VERSION}:{fam.key}:{cell}:{seed}")
+            rng = random.Random(f"{fam.version}:{fam.key}:{cell}:{seed}")
             for t in range(trials):
                 k = seed * trials + t
                 body = _draw(lambda: make(rng, params, s, k), f"{fam.battery} {cell} s{seed} t{t}")
@@ -581,6 +613,132 @@ def _gen_algebra(seeds: int, trials: int) -> list[Row]:
     return _run_cells(fam, cells, seeds, trials, _f2_sched, _f2_make)
 
 
+# v2: the gold's place among the query operands, and one answer per prompt.
+OPERAND_CLASSES: tuple[str, ...] = ("first", "last", "inner", "none")
+F2_OPERAND_TARGET = {"first": 1 / 6, "last": 1 / 6}     # each at most the chance 1/C of copying that operand
+F2_OPERAND_TRIES = 300                                  # draws per row from which the row's class is chosen
+
+
+def operand_class(gold: str, leaves: Sequence[str]) -> str:
+    """Where the gold sits among the query's operands: the first, the last, an inner one, or none of them."""
+    if gold == leaves[0]:
+        return "first"
+    if gold == leaves[-1]:
+        return "last"
+    return "inner" if gold in leaves else "none"
+
+
+def operand_forced(rules: Sequence[str], depth: int) -> Optional[str]:
+    """The operand class a one-operator query cannot escape: FIRST answers the first operand, SECOND the last, and
+    PARTNER applied twice (depth 2) gives the first operand back. None where the draw can move it."""
+    if len(rules) != 1:
+        return None
+    if rules[0] == "first" or (rules[0] == "partner" and depth == 2):
+        return "first"
+    return "last" if rules[0] == "second" else None
+
+
+def f2_answers(eqs: Sequence[tuple[int, str, int, int]], leaves: Sequence[int], ops: Sequence[str],
+               inventory: int = F2_INVENTORY, distinct_rules: bool = True) -> set[int]:
+    """Every answer some reading of the prompt supports: each pairing of the inventory and each assignment of rules
+    to the operators shown (distinct rules per operator if ``distinct_rules``) that fits every example line, then
+    the query evaluated left-nested. One element ⇔ the prompt has one defensible answer."""
+    def matchings(xs: list[int]) -> list[dict[int, int]]:
+        if not xs:
+            return [{}]
+        a, out = xs[0], []
+        for b in xs[1:]:
+            rest = [x for x in xs if x not in (a, b)]
+            for m in matchings(rest):
+                out.append({**m, a: b, b: a})
+        return out
+
+    syms = sorted({e[1] for e in eqs} | set(ops))
+    answers: set[int] = set()
+    pairings = matchings(list(range(inventory)))
+    for combo in _rule_assignments(len(syms), distinct_rules):
+        rule = dict(zip(syms, combo))
+        for partner in pairings:
+            if all(f2_apply(rule[op], a, b, partner) == r for a, op, b, r in eqs):
+                v = leaves[0]
+                for i, op in enumerate(ops):
+                    v = f2_apply(rule[op], v, leaves[i + 1], partner)
+                answers.add(v)
+    return answers
+
+
+def _rule_assignments(n: int, distinct: bool) -> list[tuple[str, ...]]:
+    out: list[tuple[str, ...]] = [()]
+    for _ in range(n):
+        out = [c + (r,) for c in out for r in F2_RULES if not (distinct and r in c)]
+    return out
+
+
+@dataclass
+class _F2Schedule(_Schedule):
+    """v2: the operand classes chosen so far in the cell (the next row prefers the class furthest below target)."""
+    classes: Counter[str] = field(default_factory=Counter)
+
+
+def _f2v2_sched(rng: random.Random, n: int, params: tuple[int, int]) -> _Schedule:
+    s = _f2_sched(rng, n, params)
+    return _F2Schedule(s.gold_index, s.ident, s.recent, s.freq, s.aux)
+
+
+def _f2v2_make(rng: random.Random, params: tuple[int, int], s: _Schedule, k: int) -> Optional[Row]:
+    """v1's draw, repeated: rows with more than one defensible answer (:func:`f2_answers`) are dropped, and among
+    the remaining draws the row takes the operand class (first / last operand vs inner / none) furthest below its
+    cell target so far: first and last operand each at most 1/6, except where the operator rule fixes the class
+    (:func:`operand_forced`)."""
+    assert isinstance(s, _F2Schedule)
+    _, depth = params
+    forced = operand_forced(s.aux[k], depth)
+    n_done = sum(s.classes.values())
+    want = {c: F2_OPERAND_TARGET.get(c, 1 - sum(F2_OPERAND_TARGET.values())) * (n_done + 1) - s.classes[c]
+            for c in ("first", "last", "rest")}
+    # at depth 1 without PARTNER the answer is always an operand: only first / last can be drawn
+    open_ = [c for c in want if not (c == "rest" and depth == 1 and "partner" not in s.aux[k])]
+    top = max(open_, key=lambda c: (want[c], c == "rest"))
+    found: dict[str, Row] = {}
+    for _ in range(F2_OPERAND_TRIES):
+        row = _f2_make(rng, params, s, k)
+        if row is None:
+            continue
+        t = {w: i for i, w in enumerate(row["partner"])}         # the six tokens, numbered (any numbering will do)
+        cls = operand_class(row["gold"], row["leaves"])
+        key = "rest" if cls in ("inner", "none") else cls
+        if key in found:
+            continue
+        lines = row["prompt"].split("\n")[1:-1]
+        eqs = []
+        for ln in lines:
+            a, op, b, _, r = ln.split(" ")
+            eqs.append((t[a], op, t[b], t[r]))
+        # one answer under every reading, operators sharing a rule included (the prompt does not say they differ)
+        answers = f2_answers(eqs, [t[x] for x in row["leaves"]], row["query_ops"], distinct_rules=False)
+        if len(answers) != 1:
+            continue
+        found[key] = row
+        if forced is not None or key == top or len(found) == 3:
+            break
+    if not found:
+        return None
+    key = max(found, key=lambda c: (want[c], c == "rest"))
+    s.classes[key] += 1
+    row = found[key]
+    leaves = row["leaves"]
+    row["gold_operand"] = operand_class(row["gold"], leaves)
+    row["operand_forced"] = forced
+    row["operand_follower"] = (1 / len(leaves)) if row["gold"] in leaves else 0.0
+    return row
+
+
+def _gen_algebra_v2(seeds: int, trials: int) -> list[Row]:
+    fam = FAMILIES_V2["F2"]
+    cells = [(f"k{k}|d{d}", fam.ladder.index(f"k{k}|d{d}") + 1, (k, d)) for k in F2_K for d in F2_DEPTH]
+    return _run_cells(fam, cells, seeds, trials, _f2v2_sched, _f2v2_make)
+
+
 # ── F3 rebinding chains ──────────────────────────────────────────────────────────────────────────────────────────
 
 def _f3_sched(rng: random.Random, n: int, params: tuple[int, int, str]) -> _Schedule:
@@ -652,14 +810,83 @@ def _f3_make(rng: random.Random, params: tuple[int, int, str], s: _Schedule, k: 
                            "n_lines": len(events)})
 
 
-def _gen_rebind(seeds: int, trials: int) -> list[Row]:
-    fam = FAMILIES["F3"]
+def last_candidate(prompt: str, cands: Sequence[str]) -> Optional[str]:
+    """The candidate whose last mention in ``prompt`` comes last (None if no candidate is mentioned)."""
+    best, at = None, -1
+    for w in cands:
+        for m in re.finditer(r"(?<!\w)" + re.escape(w) + r"(?!\w)", prompt):
+            if m.start() > at:
+                best, at = w, m.start()
+    return best
+
+
+def _f3v2_make(rng: random.Random, params: tuple[int, int, str], s: _Schedule, k: int) -> Optional[Row]:
+    """v1's chain, with the recency control on the candidates: when a held-back reassignment closes the prompt, its
+    value is always a candidate (v1 could leave it out, making the gold the most recent CANDIDATE), and the
+    recorded recent answer is the most recent candidate mention, so the scheduled 1/5 is the rate a recency reader
+    over the candidates gets."""
+    fam = FAMILIES_V2["F3"]
+    n, r, register = params
+    holders = rng.sample(HOLDERS, F3_HOLDERS)
+    target, others = holders[0], holders[1:]
+    n_values = (n + 1) + len(others) + r
+    gold: str = s.ident[k]
+    vals = [gold] + rng.sample([w for w in VALUES if w != gold], n_values - 1)
+    chain = vals[1:n + 1] + [gold]
+    rest = vals[n + 1:]
+    history: dict[str, list[str]] = {target: list(chain), **{h: [rest.pop()] for h in others}}
+    moves: list[tuple[str, str, bool]] = []
+    for _ in range(r):
+        h = rng.choice(others)
+        history[h].append(rest.pop())
+        moves.append((h, history[h][-1], True))
+    events: list[tuple[str, str, bool]] = [(h, history[h][0], False) for h in others]
+    hold = moves.pop() if r and not s.recent[k] else None
+    gaps = sorted(rng.randrange(n) for _ in moves)
+    mi = 0
+    for i, v in enumerate(chain):
+        events.append((target, v, i > 0))
+        while mi < len(moves) and gaps[mi] == i:
+            events.append(moves[mi])
+            mi += 1
+    if hold is not None:
+        events.append(hold)
+    stale = chain[-2]
+    roles: dict[str, str] = {gold: "gold", stale: "stale"}
+    if n >= 2:
+        roles[chain[-3]] = "older"
+    if hold is not None:
+        # the closing line's value: the held-back holder's current value (each value is assigned once)
+        roles[hold[1]] = "cross_current"
+    cross_now = [history[h][-1] for h in others]
+    cross_old = [v for h in others for v in history[h][:-1]]
+    rng.shuffle(cross_now)
+    rng.shuffle(cross_old)
+    for v in cross_now + cross_old + chain[:-3][::-1]:
+        if len(roles) >= fam.n_candidates:
+            break
+        roles.setdefault(v, "cross_current" if v in cross_now else "cross_old" if v in cross_old else "older")
+    prompt = _f3_render(register, events, target)
+    recent = last_candidate(prompt, list(roles))
+    neutral = 1 / fam.n_candidates if r else None
+    return _finish(fam, prompt, gold, roles, s.gold_index[k], rng, recent, neutral, neutral,
+                   {"N": n, "R": r, "register": register, "holder": target, "stale": stale,
+                    "n_lines": len(events), "last_line_value": events[-1][1]})
+
+
+def _gen_rebind_v2(seeds: int, trials: int) -> list[Row]:
+    return _gen_rebind(seeds, trials, FAMILIES_V2["F3"], _f3v2_make)
+
+
+def _gen_rebind(seeds: int, trials: int, fam: Optional[Family] = None,
+                make: Optional[Callable[[random.Random, Any, _Schedule, int], Optional[Row]]] = None) -> list[Row]:
+    fam = fam or FAMILIES["F3"]
     cells = []
     for n in F3_N:
         for rk, r in (("0", 0), ("N", n)):
             for reg in F3_REGISTERS:
                 cells.append((f"N{n}|R{rk}|{reg}", fam.ladder.index(f"N{n}|R{rk}") + 1, (n, r, reg)))
-    return _run_cells(fam, cells, seeds, trials, _f3_sched, _f3_make)
+    return _run_cells(fam, cells, seeds, trials, _f3_sched, make or _f3_make)
 
 
 # ── F4 nonce sequence induction ──────────────────────────────────────────────────────────────────────────────────
@@ -764,16 +991,19 @@ def _gen_cryst(seeds: int, trials: int) -> list[Row]:
 
 
 _GENERATORS: dict[str, Callable[[int, int], list[Row]]] = {
-    "F1": _gen_morph, "F2": _gen_algebra, "F3": _gen_rebind, "F4": _gen_seqind, "C0": _gen_cryst,
+    "fluid-v1-morph": _gen_morph, "fluid-v1-algebra": _gen_algebra, "fluid-v1-rebind": _gen_rebind,
+    "fluid-v1-seqind": _gen_seqind, "cryst-v1": _gen_cryst,
+    "fluid-v2-algebra": _gen_algebra_v2, "fluid-v2-rebind": _gen_rebind_v2,
 }
 
 
 def generate(battery: str, seeds: int = SEEDS, trials: Optional[int] = None) -> list[Row]:
-    """The prompt rows of one battery (``fluid-v1-morph`` … ``cryst-v1``). Deterministic: no global RNG state."""
+    """The prompt rows of one battery (``fluid-v1-morph`` … ``cryst-v1``, ``fluid-v2-*``). Deterministic: no global
+    RNG state."""
     if battery not in BY_BATTERY:
         raise KeyError(f"unknown fluid battery {battery!r} (have: {', '.join(BY_BATTERY)})")
     fam = BY_BATTERY[battery]
-    return _GENERATORS[fam.key](seeds, fam.trials if trials is None else trials)
+    return _GENERATORS[battery](seeds, fam.trials if trials is None else trials)
 
 
 # ── token checks ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -825,6 +1055,12 @@ def audit(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
             "novelty": sum(r["novelty_follower"] for r in sub) / n,
             "position_max_dev": max(abs(pos.get(i, 0) / n - 1 / c) for i in range(c)),
         }
+        if all("gold_operand" in r for r in sub):          # F2 v2: the operand-copy controls
+            for cls, target in F2_OPERAND_TARGET.items():
+                out[key][f"operand_{cls}"] = sum(r["gold_operand"] == cls for r in sub) / n
+                out[key][f"operand_{cls}_designed"] = max(
+                    sum(r["operand_forced"] == cls for r in sub) / n, target)
+            out[key]["operand_follower"] = sum(r["operand_follower"] for r in sub) / n
     fams: defaultdict[str, Counter[str]] = defaultdict(Counter)
     for r in rows:                                      # one identity pool per family (C0: per relation)
         fams[r["family"] + (f"/{r['relation']}" if "relation" in r else "")][r["gold"]] += 1
@@ -854,6 +1090,10 @@ def audit_failures(aud: Mapping[str, Mapping[str, Any]], tol: float = BALANCE_TO
                 bad.append(f"{key}: frequency {a['frequency']:.3f} vs neutral {a['frequency_neutral']:.3f}")
         if a["position_max_dev"] > max(tol, 1 / a["n"]) + 1e-9:
             bad.append(f"{key}: gold position off uniform by {a['position_max_dev']:.3f}")
+        for cls in F2_OPERAND_TARGET:
+            if f"operand_{cls}" in a and a[f"operand_{cls}"] > a[f"operand_{cls}_designed"] + max(tol, 1 / a["n"]):
+                bad.append(f"{key}: gold = {cls} operand {a[f'operand_{cls}']:.3f} vs designed "
+                           f"{a[f'operand_{cls}_designed']:.3f}")
     return bad
 
 

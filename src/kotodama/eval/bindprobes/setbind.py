@@ -26,8 +26,28 @@ family's metrics come from the per-candidate logprobs (``set_metrics``):
   exact@k the top-k candidates are exactly the set
   margin  min logp(held) − max logp(non-held)   (> 0 ⇔ exact@k)
 
-Shortcut control (scheduled, audited): ``last_in_set`` = the last-mentioned object
-before the query is in the set, at the chance rate k/8 (cycled by item index).
+Shortcut controls (scheduled, audited):
+  ``last_in_set``   the last-mentioned object before the query is in the set: the
+                    "last mention" reader's hit@1. Scheduled at the hit@1 chance k/8
+                    (cycled by item index), except in the static joint cells below.
+  ``last_k_is_set`` the k most recently mentioned objects are exactly the set: the
+                    "last k mentions" reader's exact@k. In a static joint item every
+                    object is mentioned once and the queried person's objects share one
+                    sentence, so the last mention is in the set exactly when that
+                    sentence closes the scene, and then the last k mentions ARE the set:
+                    the two controls are one event. Static joint cells with k ≥ 2 are
+                    read by exact@k (chance 1/C(8, k)), so they schedule that event at a
+                    budget matched to exact@k chance, ⌊n / C(8, k)⌋ items per n (the
+                    queried sentence closes the scene on those items only). Their hit@1
+                    "last mention" reader then scores below the hit@1 chance, and a
+                    reader that never picks the last mention scores k/7 (1.14 × k/8).
+                    Split layouts interleave the set and E = 2 ends on transfers, so
+                    there the last k mentions are the set only when the transfers close
+                    on exactly the set; those items are redrawn (rate 0).
+  ``first_k_is_set`` the k first-mentioned objects are exactly the set (the queried
+                    sentence opens the scene): the primacy reader's exact@k (at k = 1 its
+                    hit@1). Scheduled in every joint cell at the same budget (k = 1: 1/8),
+                    and at 0 in the split cells.
 Error types (for a top pick outside the set): ``wrong_owner`` (another person's
 object), ``stale`` (the queried person held it earlier, E = 2), ``distractor``,
 ``other``; a pick inside the set but not the designated gold is ``other_held``
@@ -44,7 +64,7 @@ from kotodama.eval.bindprobes.base import Cell, Item, rejection, the_list
 from kotodama.eval.bindprobes.pools import NON_COUNTABLE, Pools, countable, indefinite
 
 FAMILY = "setbind"
-VERSION = 2
+VERSION = 3
 KS = (1, 2, 3)
 LAYOUTS = ("joint", "split")
 ES = (0, 2)
@@ -179,15 +199,42 @@ def build(item_id: str, cell: Cell, spec: Spec) -> Item:
               meta={"setbind_version": VERSION, "k": len(gs), "gold_set": gs,
                     "n_candidates": len(cands),
                     "last_in_set": bool(mentions) and mentions[-1] in gs,
+                    "last_k_is_set": set(list(dict.fromkeys(reversed(mentions)))[:len(gs)])
+                    == set(gs),
+                    "first_k_is_set": set(list(dict.fromkeys(mentions))[:len(gs)]) == set(gs),
                     "n_transfers": sum(1 for s in spec["sentences"] if s[0] == "give"),
                     "layout": cell[1]})
     it.gold = simulate(it)
     return it
 
 
+def exact_matched(cell: Sequence[Any]) -> bool:
+    """A static joint cell with k ≥ 2: last_in_set and last_k_is_set are one event there,
+    scheduled at the exact@k budget (module doc)."""
+    return int(cell[0]) >= 2 and str(cell[1]) == "joint" and int(cell[2]) == 0
+
+
 def schedule_lm(cell: Sequence[Any], k_index: int) -> bool:
-    """last_in_set wanted for this test item: the first k of every C_TOTAL items."""
-    return (k_index % C_TOTAL) < int(cell[0])
+    """last_in_set wanted for this test item: the first k of every C_TOTAL items (hit@1
+    chance), or in an :func:`exact_matched` cell the last of every C(C_TOTAL, k) items
+    (at most the exact@k chance)."""
+    k = int(cell[0])
+    if exact_matched(cell):
+        m = math.comb(C_TOTAL, k)
+        return k_index % m == m - 1
+    return (k_index % C_TOTAL) < k
+
+
+def schedule_fk(cell: Sequence[Any], k_index: int) -> Optional[bool]:
+    """first_k_is_set wanted for this test item: in a joint cell on the middle item of
+    every C(C_TOTAL, k), so the primacy reader matches the exact@k chance (at k = 1 the
+    hit@1 chance 1/8); never in a split cell (its static items interleave the set, and
+    its transfers could otherwise assemble the set at the front now and then)."""
+    k = int(cell[0])
+    if str(cell[1]) != "joint":
+        return False
+    m = math.comb(C_TOTAL, k)
+    return k_index % m == m // 2
 
 
 def _counts_others(rng: random.Random, n_left: int) -> Optional[list[int]]:
@@ -200,7 +247,7 @@ def _counts_others(rng: random.Random, n_left: int) -> Optional[list[int]]:
 
 
 def _draw(rng: random.Random, cell: Cell, pools: Pools, item_id: str,
-          want_lm: Optional[bool]) -> Optional[Item]:
+          want_lm: Optional[bool], want_fk: Optional[bool] = None) -> Optional[Item]:
     k, layout, e = int(cell[0]), str(cell[1]), int(cell[2])
     people = rng.sample(pools.names, N_PEOPLE)
     q = rng.choice(people)
@@ -274,6 +321,10 @@ def _draw(rng: random.Random, cell: Cell, pools: Pools, item_id: str,
         return None
     if want_lm is not None and it.meta["last_in_set"] != want_lm:
         return None
+    if want_lm is not None and k >= 2 and not exact_matched(cell) and it.meta["last_k_is_set"]:
+        return None                     # transfers that happen to close on exactly the set
+    if want_fk is not None and it.meta["first_k_is_set"] != want_fk:
+        return None
     return it
 
 
@@ -283,8 +334,9 @@ def gen_item(rng: random.Random, cell: Cell, pools: Pools, item_id: str, k: int,
         raise ValueError(f"setbind: unknown cell {cell}")
     cell = tuple(cell)
     want: Optional[bool] = schedule_lm(cell, k) if template is None else None
-    return rejection(lambda: _draw(rng, cell, pools, item_id, want), f"setbind item {item_id}",
-                     tries=20000)
+    want_fk: Optional[bool] = schedule_fk(cell, k) if template is None else None
+    return rejection(lambda: _draw(rng, cell, pools, item_id, want, want_fk),
+                     f"setbind item {item_id}", tries=20000)
 
 
 def relabel(item: Item, mapping: Mapping[str, str], target: Optional[Item] = None) -> Item:
@@ -333,6 +385,8 @@ def validate_item(item: Item) -> None:
 
 
 def audit(items: Sequence[Item]) -> dict[str, dict[str, Any]]:
+    """Per cell: n, the hit@1 and exact@k chances, both recency controls and the rate the
+    schedule designs for ``last_in_set`` (the schedule's share over the cell's n items)."""
     out: dict[str, dict[str, Any]] = {}
     for c in CELLS:
         sub = [it for it in items if it.family == FAMILY and tuple(it.cell) == c]
@@ -341,16 +395,27 @@ def audit(items: Sequence[Item]) -> dict[str, dict[str, Any]]:
         n = len(sub)
         out["/".join(map(str, c))] = {
             "n": n, "chance_hit1": int(c[0]) / C_TOTAL,
-            "last_in_set": sum(it.meta["last_in_set"] for it in sub) / n}
+            "chance_exactk": 1.0 / math.comb(C_TOTAL, int(c[0])),
+            "last_in_set_designed": sum(schedule_lm(c, i) for i in range(n)) / n,
+            "last_in_set": sum(it.meta["last_in_set"] for it in sub) / n,
+            "last_k_is_set": sum(it.meta["last_k_is_set"] for it in sub) / n,
+            "first_k_is_set": sum(it.meta["first_k_is_set"] for it in sub) / n}
     return out
 
 
 def audit_failures(aud: Mapping[str, Mapping[str, Any]], tol: float = BALANCE_TOL) -> list[str]:
+    """last_in_set within max(tol, 1/n) of its designed rate; the exact@k recency and
+    primacy readers (last_k_is_set, first_k_is_set) at most 1.5 × the exact@k chance
+    (k = 1: the hit@1 chance), or at most one item."""
     bad = []
     for ck, a in aud.items():
         band = max(tol, 1.0 / a["n"]) + 1e-9
-        if abs(a["last_in_set"] - a["chance_hit1"]) > band:
-            bad.append(f"{ck}: last_in_set {a['last_in_set']:.3f} vs chance {a['chance_hit1']:.3f}")
+        if abs(a["last_in_set"] - a["last_in_set_designed"]) > band:
+            bad.append(f"{ck}: last_in_set {a['last_in_set']:.3f} vs designed "
+                       f"{a['last_in_set_designed']:.3f}")
+        for key in ("last_k_is_set", "first_k_is_set"):
+            if a[key] > max(1.5 * a["chance_exactk"], 1.0 / a["n"]) + 1e-9:
+                bad.append(f"{ck}: {key} {a[key]:.3f} vs exact@k chance {a['chance_exactk']:.3f}")
     return bad
 
 

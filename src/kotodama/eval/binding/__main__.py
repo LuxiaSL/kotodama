@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--ours", default="", help="comma names placed on the law instead of fitted into it")
     g = sub.add_parser("gen-capacity", help="write the capacity-v1 prompt rows")
     g.add_argument("--out", required=True)
-    gf = sub.add_parser("gen-fluid", help="write the fluid-v1-* and cryst-v1 prompt rows into a directory")
+    gf = sub.add_parser("gen-fluid", help="write every fluid battery's prompt rows (v1 and v2) into a directory")
     gf.add_argument("--out", required=True)
     fr = sub.add_parser("fluid", help="fluid / crystallized read-out: ladder midpoints, AUC, F3 stale rate, scores")
     fr.add_argument("--scores", required=True, help="a run --out directory")
@@ -66,12 +66,15 @@ def build_parser() -> argparse.ArgumentParser:
     fr.add_argument("--stat", choices=("midpoint", "auc"), default="midpoint")
     fr.add_argument("--order", choices=("mean_then_z", "z_then_mean"), default="mean_then_z")
     fr.add_argument("--json", default="", help="also write per-model summaries and scores here")
+    fr.add_argument("--set", default="v2", choices=("v1", "v2"),
+                    help="which battery per family (fluid.FLUID_SETS; v2 = the controlled F2 / F3)")
     ct = sub.add_parser("check-fluid-tokens", help="check the fluid answer pools are one token in every tokenizer")
     ct.add_argument("--tokenizers", default="", help="comma list of HF tokenizer names (default: the zoo)")
-    gu = sub.add_parser("gen-formupdate", help="write the formupdate-v1 prompt rows into a directory")
+    gu = sub.add_parser("gen-formupdate", help="write the formupdate-v1 and -v2 prompt rows into a directory")
     gu.add_argument("--out", required=True)
     fu = sub.add_parser("formupdate", help="form / interference / update costs with paired-bootstrap intervals")
-    fu.add_argument("--scores", required=True, help="a run --out directory (reads <scores>/formupdate-v1)")
+    fu.add_argument("--scores", required=True, help="a run --out directory (reads <scores>/<battery>)")
+    fu.add_argument("--battery", default="formupdate-v2", choices=("formupdate-v1", "formupdate-v2"))
     fu.add_argument("--models", default="", help="comma list (default: every model found)")
     fu.add_argument("--json", default="", help="also write per-model summaries (and predictions) here")
     fu.add_argument("--boot", type=int, default=10_000, help="bootstrap resamples")
@@ -233,15 +236,17 @@ def cmd_fluid(a: argparse.Namespace) -> int:
     from kotodama.eval.binding import fluid as fl
 
     scores = Path(a.scores)
+    chosen = fl.FLUID_SETS[a.set]                       # family key → battery
+    print(f"battery set {a.set}: " + ", ".join(chosen.values()))
     names = [m for m in a.models.split(",") if m] or sorted(
-        {p.stem for b in fl.BY_BATTERY for p in (scores / b).glob("*.jsonl")})
+        {p.stem for b in chosen.values() for p in (scores / b).glob("*.jsonl")})
     sums: dict[str, dict[str, fl.FamilySummary]] = {}
     for m in names:
-        for b, fam in fl.BY_BATTERY.items():
+        for key, b in chosen.items():
             f = scores / b / f"{m}.jsonl"
             rows = read_jsonl(f) if f.exists() else []
             if rows:
-                sums.setdefault(m, {})[fam.key] = fl.summarize(rows)
+                sums.setdefault(m, {})[key] = fl.summarize(rows)
     if not sums:
         print(f"no fluid rows under {scores}")
         return 1
@@ -289,18 +294,21 @@ def cmd_check_fluid_tokens(a: argparse.Namespace) -> int:
 def cmd_gen_formupdate(a: argparse.Namespace) -> int:
     from kotodama.eval.binding import formupdate as fu
 
-    rows = fu.generate()
-    bad = fu.audit_failures(fu.audit(rows)) + fu.pairing_failures(rows)
-    b = bt.BATTERIES[fu.BATTERY]
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    dest = out / b.file
-    dest.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    got = bt.sha256(dest)
-    same = got == b.sha256
-    print(f"{b.name} {len(rows)} rows → {dest}; sha256 {got} {'= pin' if same else f'≠ pin {b.sha256[:16]}…'}"
-          f"{'' if not bad else '; AUDIT: ' + '; '.join(bad)}")
-    return 0 if same and not bad else 1
+    ok = True
+    for version in fu.VERSIONS:
+        rows = fu.generate(version=version)
+        bad = fu.audit_failures(fu.audit(rows)) + fu.pairing_failures(rows)
+        b = bt.BATTERIES[version]
+        dest = out / b.file
+        dest.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        got = bt.sha256(dest)
+        same = got == b.sha256
+        ok = ok and same and not bad
+        print(f"{b.name} {len(rows)} rows → {dest}; sha256 {got} {'= pin' if same else f'≠ pin {b.sha256[:16]}…'}"
+              f"{'' if not bad else '; AUDIT: ' + '; '.join(bad)}")
+    return 0 if ok else 1
 
 
 def _ci(s: Any, stat: str) -> str:
@@ -312,7 +320,7 @@ def _ci(s: Any, stat: str) -> str:
 def cmd_formupdate(a: argparse.Namespace) -> int:
     from kotodama.eval.binding import formupdate as fu
 
-    root = Path(a.scores) / fu.BATTERY
+    root = Path(a.scores) / a.battery
     names = [m for m in a.models.split(",") if m] or sorted(p.stem for p in root.glob("*.jsonl"))
     sums: dict[str, fu.Summary] = {}
     for m in names:
@@ -321,7 +329,7 @@ def cmd_formupdate(a: argparse.Namespace) -> int:
         if rows:
             sums[m] = fu.summarize(rows, n_boot=a.boot)
     if not sums:
-        print(f"no {fu.BATTERY} rows under {root}")
+        print(f"no {a.battery} rows under {root}")
         return 1
     print(f"{'model':28} {'form [95% CI]':>24} {'interference':>24} {'update':>24} {'norm interf.':>24} "
           f"{'norm update':>24} {'stale':>6} {'stale/err':>9} {'upd C≠last':>24}")
@@ -331,6 +339,13 @@ def cmd_formupdate(a: argparse.Namespace) -> int:
               f"{_ci(s, 'norm_interference'):>24} {_ci(s, 'norm_update'):>24} {_fmt(st['stale_rate']):>6} "
               f"{_fmt(st['stale_of_errors']):>9} {_ci(s, 'update_nonrecent'):>24}"
               f"{'' if not s.incomplete else f'  ({s.incomplete} incomplete base items left out)'}")
+    matched = {m: s.recency_split["position_matched"] for m, s in sums.items()
+               if "position_matched" in s.recency_split}
+    if matched:
+        print("\nposition-matched base items (gold a middle mention in A, B and C):")
+        for m, x in matched.items():
+            print(f"{m:28} n {x['n']:4}  acc A/B/C " + "/".join(f"{x['acc'][c]:.3f}" for c in fu.CONDITIONS)
+                  + f"  interference {x['interference']:+.3f}  update {x['update']:+.3f}")
     print("\nacc A / B / C by K, U, register:")
     for m, s in sums.items():
         parts = [f"K{k} " + "/".join(f"{x['acc'][c]:.2f}" for c in fu.CONDITIONS) for k, x in s.by_k.items() if x["n"]]

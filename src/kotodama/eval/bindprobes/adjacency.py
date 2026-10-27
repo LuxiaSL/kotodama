@@ -19,16 +19,26 @@ transfer hands an object straight back (``deixis.gives_back``). This is the
 structural channel the other families leave unread (405B: .22 shortcut-free on
 vocative-free addressee items).
 
-Cell = (E, n_grant): (1,1), (2,1), (2,2) — E transfers, n_grant of them grants (the
-rest deixis vocative gives, rotated surfaces).
+Cell = (E, n_grant): (2,1), (2,2) — E transfers, n_grant of them grants (the rest deixis
+vocative gives, rotated surfaces). There is no E = 1 cell: with one transfer, a critical
+item's queried object IS the last transfer's object, so its gold is always the last
+transfer's recipient, who is also the requester (the penultimate speaker) and, with a
+vocative or in prose, the last name mentioned. No schedule can move that gold to the
+giver or the bystander, so an E = 1 cell would add a slice that recency alone solves.
 Paired variants (``meta.pair_id``):
   adj    grants without a vocative (the target)
   voc    identical events, each grant carrying the vocative (``Sure, Ben, you can have the cup.``)
   third  prose: ``Ben asks Ana for the cup. Ana gives the cup to Ben.``
 Query = the narrator owner query (``Now the cup is with``; the lite query; 3 names).
 Schedule (deixis owner): gold = the last transfer's recipient / its giver / the
-bystander, 1/3 each; E = 2: the queried object moved and is not in the last transfer.
-``meta.critical`` = the queried object's last move was a grant (the adjacency read).
+bystander, 1/3 each WITHIN the critical items and within the rest, so the role is
+balanced in the scored subset itself; the queried object moved and is not in the last
+transfer. ``meta.critical`` = the queried object's last move was a grant (the adjacency
+read); (2,1) is critical on 2/3 of items (the first transfer is the queried grant),
+(2,2) on all of them. The voc twin names a grant's requester twice (speaker and
+vocative), so on critical items the gold is the voc twin's single most-mentioned name
+only on the 1/3 of items the schedule allows (``meta.gold_most_frequent``, audited per
+variant at ≤ 1.5 × chance).
 Readouts: structural penalty = acc(voc) − acc(adj) [critical subset primary];
 deixis penalty = acc(third) − acc(voc).
 Error types: ``granter`` (the grant's speaker — "you" read as the speaker),
@@ -47,9 +57,9 @@ from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection
 from kotodama.eval.bindprobes.pools import PLURAL_FORM, singular
 
 FAMILY = "adjacency"
-VERSION = 2
-CELLS: list[Cell] = [(1, 1), (2, 1), (2, 2)]
-DEFAULT_PER_CELL = 150            # 450 base, 1350 with variants (critical-subset paired SE ~.03)
+VERSION = 3
+CELLS: list[Cell] = [(2, 1), (2, 2)]
+DEFAULT_PER_CELL = 225            # 450 base, 1350 with variants; 375 critical (paired SE ~.03)
 SEPARATOR = dx.SEPARATOR
 VARIANTS = ("adj", "voc", "third")
 N_PEOPLE = 3
@@ -66,6 +76,21 @@ GRANT_FORMS: dict[str, tuple[str, str]] = {
     "take": ("Sure, take the {o}.", "Sure, {v}, take the {o}."),
 }
 _OWNER_SCHED = ("recipient", "giver", "bystander")
+CRITICAL_SHARE_21 = (True, True, False)   # (2,1): critical on 2 of every 3 role rounds
+
+
+def schedule(cell: Sequence[Any], k: int) -> tuple[bool, str, bool]:
+    """(critical wanted, gold role wanted, gold the voc twin's most-mentioned name) for
+    test item k of a cell. The role cycles within every block of three, the critical
+    flag over blocks of three (so the role is balanced inside the critical subset and
+    outside it), and the frequency flag over blocks of nine (1/3 of each critical × role
+    group); (2,2) is critical by construction (both transfers are grants)."""
+    n = len(_OWNER_SCHED)
+    role = _OWNER_SCHED[k % n]
+    freq = (k // (n * n)) % n == 0
+    if tuple(cell) == (2, 2):
+        return True, role, freq
+    return CRITICAL_SHARE_21[(k // n) % len(CRITICAL_SHARE_21)], role, freq
 
 
 class Spec(TypedDict):
@@ -248,12 +273,21 @@ def build(item_id: str, cell: Cell, spec: Spec, pair_id: Optional[str] = None) -
         "queried_obj_moved": len(hist[o]) > 1,
         "queried_obj_in_last_transfer": tr[-1]["obj"] == o,
         "gold_is_last_mention": bool(it.mention_order) and it.mention_order[-1] == it.gold,
+        "gold_most_frequent": most_frequent_credit(it.mention_order, it.gold),
     })
     return it
 
 
+def most_frequent_credit(mentions: Sequence[str], gold: str) -> float:
+    """The accuracy of a reader that answers the most-mentioned name (ties split)."""
+    counts = {x: mentions.count(x) for x in set(mentions)}
+    top = max(counts.values(), default=0)
+    tied = [x for x, c in counts.items() if c == top]
+    return 1.0 / len(tied) if gold in tied else 0.0
+
+
 def _draw(rng: random.Random, cell: Cell, pools: Any, item_id: str,
-          template: Optional[Item], want: Optional[str]) -> Optional[Item]:
+          template: Optional[Item], want: Optional[tuple[bool, str, bool]]) -> Optional[Item]:
     e, n_grant = int(cell[0]), int(cell[1])
     people = rng.sample(pools.names, N_PEOPLE)
     objs0 = rng.sample(singular(pools.objects), rng.choice(N_OBJECTS))
@@ -285,25 +319,27 @@ def _draw(rng: random.Random, cell: Cell, pools: Any, item_id: str,
                   "query": {}}
     tr = transfers(spec)
     last = tr[-1]
-    pool = list(objs)
-    if e >= 2:
-        moved = {t["obj"] for t in tr}
-        pool = [o for o in pool if o in moved and o != last["obj"]]
-    role = want if want is not None else rng.choice(_OWNER_SCHED)
+    moved = {t["obj"] for t in tr}
+    pool = [o for o in objs if o in moved and o != last["obj"]]
+    want_crit, role = want[:2] if want is not None else (rng.random() < 0.5, rng.choice(_OWNER_SCHED))
     target = {"recipient": last["recipient"], "giver": last["giver"]}.get(role)
     if target is None:
         target = next(x for x in people if x not in (last["recipient"], last["giver"]))
-    pool = [o for o in pool if owner[o] == target]
+    pool = [o for o in pool if owner[o] == target
+            and ([t for t in tr if t["obj"] == o][-1]["kind"] == "grant") == want_crit]
     if not pool:
         return None
-    # prefer the adjacency-critical object when the schedule allows it (keeps the critical n up)
-    crit = [o for o in pool if [t for t in tr if t["obj"] == o] and
-            [t for t in tr if t["obj"] == o][-1]["kind"] == "grant"]
-    o = rng.choice(crit) if crit and rng.random() < 0.75 else rng.choice(pool)
+    o = rng.choice(pool)
     spec["query"] = {"obj": o}
     it = build(item_id, cell, spec)
     if template is not None and people.index(it.gold) == template.spec["people"].index(template.gold):
         return None
+    if want is not None and want[0]:
+        # the voc twin names the requester twice per grant: schedule its frequency reader at
+        # chance on the critical (scored) items
+        voc = build(item_id, cell, {**spec, "variant": "voc"})
+        if not want[2] and voc.meta["gold_most_frequent"] == 1.0:
+            return None
     return it
 
 
@@ -312,7 +348,7 @@ def gen_item(rng: random.Random, cell: Cell, pools: Any, item_id: str, k: int,
     if tuple(cell) not in CELLS:
         raise ValueError(f"adjacency: unknown cell {cell}")
     cell = tuple(cell)
-    want = _OWNER_SCHED[k % len(_OWNER_SCHED)] if template is None else None
+    want = schedule(cell, k) if template is None else None
     return rejection(lambda: _draw(rng, cell, pools, item_id, template, want),
                      f"adjacency item {item_id}", tries=20000)
 
@@ -361,8 +397,8 @@ def validate_item(item: Item) -> None:
         raise ValueError(f"{item.item_id}: adjacency_version mismatch")
     if item.meta["n_transfers"] != e or item.meta["n_grant"] != n_grant:
         raise ValueError(f"{item.item_id}: spec does not match cell {item.cell}")
-    if e >= 2 and (not item.meta["queried_obj_moved"] or item.meta["queried_obj_in_last_transfer"]):
-        raise ValueError(f"{item.item_id}: E>=2 queried object must have moved, not last")
+    if not item.meta["queried_obj_moved"] or item.meta["queried_obj_in_last_transfer"]:
+        raise ValueError(f"{item.item_id}: the queried object must have moved, not last")
     if set(item.spec["objects"]) & PLURAL_FORM:
         raise ValueError(f"{item.item_id}: plural-form object read with 'is'")
     dx.check_no_give_back([{"ev": "give", **t} for t in transfers(item.spec)],  # type: ignore[arg-type]
@@ -383,19 +419,28 @@ def check_family(items: Sequence[Item]) -> None:
 
 
 def audit(items: Sequence[Item]) -> dict[str, dict[str, Any]]:
+    """Per cell, over all base items and over the critical (scored) subset (``…/crit``):
+    the gold-role shares and, per variant, the share whose gold is the last-mentioned
+    name (``last_<variant>``; adj's last name is the last line's speaker)."""
     out: dict[str, dict[str, Any]] = {}
     for c in CELLS:
-        sub = [it for it in items if it.family == FAMILY and tuple(it.cell) == c
-               and it.meta["variant"] == "adj"]
-        if not sub:
-            continue
-        n = len(sub)
-        out["/".join(map(str, c))] = {
-            "n": n, "chance": 1 / 3,
-            "gold_recipient": sum(it.meta["gold_role"] == "recipient" for it in sub) / n,
-            "gold_giver": sum(it.meta["gold_role"] == "giver" for it in sub) / n,
-            "gold_is_last_mention": sum(it.meta["gold_is_last_mention"] for it in sub) / n,
-            "critical": sum(it.meta["critical"] for it in sub) / n}
+        fam = [it for it in items if it.family == FAMILY and tuple(it.cell) == c]
+        for tag, keep in (("", lambda it: True), ("/crit", lambda it: it.meta["critical"])):
+            sub = [it for it in fam if it.meta["variant"] == "adj" and keep(it)]
+            if not sub:
+                continue
+            n = len(sub)
+            row: dict[str, Any] = {
+                "n": n, "chance": 1 / 3,
+                "gold_recipient": sum(it.meta["gold_role"] == "recipient" for it in sub) / n,
+                "gold_giver": sum(it.meta["gold_role"] == "giver" for it in sub) / n,
+                "critical": sum(it.meta["critical"] for it in sub) / n}
+            for v in VARIANTS:
+                vs = [it for it in fam if it.meta["variant"] == v and keep(it)]
+                if vs:
+                    row[f"last_{v}"] = sum(it.meta["gold_is_last_mention"] for it in vs) / len(vs)
+                    row[f"freq_{v}"] = sum(it.meta["gold_most_frequent"] for it in vs) / len(vs)
+            out["/".join(map(str, c)) + tag] = row
     return out
 
 
@@ -403,9 +448,13 @@ def audit_failures(aud: Mapping[str, Mapping[str, Any]], tol: float = BALANCE_TO
     bad = []
     for ck, a in aud.items():
         band = max(tol, 1.0 / a["n"]) + 1e-9
-        for key in ("gold_recipient", "gold_giver", "gold_is_last_mention"):
-            if abs(a[key] - a["chance"]) > band:
+        for key in ("gold_recipient", "gold_giver", *(f"last_{v}" for v in VARIANTS)):
+            if key in a and abs(a[key] - a["chance"]) > band:
                 bad.append(f"{ck}: {key} {a[key]:.3f} vs chance {a['chance']:.3f}")
+        # the most-mentioned-name reader, on the scored (critical) subset: at most 1.5 × chance
+        for v in VARIANTS if ck.endswith("/crit") else ():
+            if a.get(f"freq_{v}", 0.0) > 1.5 * a["chance"] + 1e-9:
+                bad.append(f"{ck}: freq_{v} {a[f'freq_{v}']:.3f} vs 1.5 × chance")
     return bad
 
 

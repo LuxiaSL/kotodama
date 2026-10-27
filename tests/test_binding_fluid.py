@@ -4,6 +4,7 @@ the fluid / crystallized scores and the token-pool checker. CPU only; no network
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import random
@@ -45,8 +46,11 @@ def test_gen_fluid_reproduces_the_pinned_batteries(tmp_path, capsys):
 
 def test_registry_group_and_readers():
     names = [b.name for b in bt.resolve("fluid")]
-    assert names == ["fluid-v1-morph", "fluid-v1-algebra", "fluid-v1-rebind", "fluid-v1-seqind", "cryst-v1"]
-    for b in bt.resolve("fluid"):
+    assert names == ["fluid-v1-morph", "fluid-v2-algebra", "fluid-v2-rebind", "fluid-v1-seqind", "cryst-v1"]
+    assert names == list(fl.FLUID_SETS["v2"].values())
+    assert [b.name for b in bt.resolve("fluid-v1")] == list(fl.FLUID_SETS["v1"].values()) == [
+        "fluid-v1-morph", "fluid-v1-algebra", "fluid-v1-rebind", "fluid-v1-seqind", "cryst-v1"]
+    for b in bt.resolve("fluid,fluid-v1"):
         assert b.kind == "rows" and b.reader == fl.BY_BATTERY[b.name].reader and b.reader in readers.READERS
         assert re.fullmatch(r"[0-9a-f]{64}", b.sha256)
     assert set(names) <= set(bt.GROUPS["all"])
@@ -90,7 +94,8 @@ def test_every_ladder_cell_populated(full):
 
 
 def test_size_is_modest(full):
-    assert sum(len(v) for v in full.values()) == 5464
+    for battery_set in fl.FLUID_SETS.values():
+        assert sum(len(full[b]) for b in battery_set.values()) == 5464
 
 
 # ── per-family semantics, re-derived from the prompt text ─────────────────────────────────────────────────────────
@@ -197,6 +202,89 @@ def test_f3_replay_gives_gold_stale_and_recency(full):
                                        r["prompt"])))
         assert target_lines == r["N"] + 1
         assert r["n_lines"] == r["N"] + 1 + (fl.F3_HOLDERS - 1) + r["R"]
+
+
+def _last_candidate_in_text(r: dict[str, Any]) -> str:
+    cands = [c.strip() for c in r["candidates"]]
+    at = {c: max((m.start() for m in re.finditer(rf"(?<!\w){re.escape(c)}(?!\w)", r["prompt"])), default=-1)
+          for c in cands}
+    return max(cands, key=at.__getitem__)
+
+
+def test_f3_v2_recency_is_read_on_the_candidates(full):
+    """v2: the most recent candidate mention is the gold on exactly the scheduled 1/5 of R = N rows (v1: up to .56),
+    the closing line's value is a candidate whenever the target does not close, and the chain replays as in v1."""
+    by: dict[str, list[bool]] = {}
+    for r in full["fluid-v2-rebind"]:
+        gold, stale, last, _ = _f3_replay(r)
+        assert (gold, stale, last) == (r["gold"], r["stale"], r["last_line_value"])
+        recent = _last_candidate_in_text(r)
+        assert recent == r["recent_answer"] and r["gold_is_recent"] == (recent == r["gold"])
+        if not r["gold_is_recent"]:
+            assert last in [c.strip() for c in r["candidates"]]
+        if r["R"]:
+            by.setdefault(r["cell"], []).append(recent == r["gold"])
+    for cell, xs in by.items():
+        assert sum(xs) / len(xs) == pytest.approx(0.2), cell          # ≤ 1.5 × chance, and exactly the schedule
+    v1 = {}
+    for r in full["fluid-v1-rebind"]:
+        if r["R"]:
+            v1.setdefault(r["cell"], []).append(_last_candidate_in_text(r) == r["gold"])
+    assert max(sum(x) / len(x) for x in v1.values()) > 0.4          # the defect v2 removes
+
+
+def _f2_text_answers(r: dict[str, Any]) -> set[str]:
+    """Every answer a reading of the prompt text supports: each pairing of the six candidate tokens and each rule per
+    operator (rules may repeat) that fits every example line, applied to the query left-nested."""
+    ex, q = _body(r)
+    eqs = [tuple(e.split()) for e in ex]
+    toks = sorted(c.strip() for c in r["candidates"])
+    query = q.replace("(", " ").replace(")", " ").split()[:-1]
+    ops = sorted({e[1] for e in eqs} | set(query[1::2]))
+
+    def pairings(xs: list[str]) -> list[dict[str, str]]:
+        if not xs:
+            return [{}]
+        return [{**m, xs[0]: b, b: xs[0]} for b in xs[1:] for m in pairings([x for x in xs[1:] if x != b])]
+
+    def ap(rule: str, a: str, b: str, p: dict[str, str]) -> str:
+        return a if rule == "first" else b if rule == "second" else p[a]
+
+    out: set[str] = set()
+    for p in pairings(toks):
+        for combo in itertools.product(fl.F2_RULES, repeat=len(ops)):
+            rule = dict(zip(ops, combo))
+            if all(ap(rule[op], a, b, p) == res for a, op, b, _, res in eqs):
+                v = query[0]
+                for i in range(1, len(query), 2):
+                    v = ap(rule[query[i]], v, query[i + 1], p)
+                out.add(v)
+    return out
+
+
+def test_f2_v2_one_answer_and_operand_copy_controlled(full):
+    """v2: every row has one defensible answer (v1 had rows with two), and copying the first or the last query
+    operand beats chance by at most 1.5× wherever the operator rule leaves the operand free (k ≥ 2); one-operator
+    rungs keep the rate their rule forces."""
+    assert any(len(_f2_text_answers(r)) > 1 for r in full["fluid-v1-algebra"])
+    by: dict[str, list[dict[str, Any]]] = {}
+    for r in full["fluid-v2-algebra"]:
+        _f2_parse(r)
+        assert _f2_text_answers(r) == {r["gold"]}, r["id"]
+        ops = r["prompt"].split("\n")[-1].replace("(", " ").replace(")", " ").split()[:-1][::2]
+        assert ops == r["leaves"] and r["gold_operand"] == fl.operand_class(r["gold"], ops)
+        by.setdefault(r["cell"], []).append(r)
+    chance = 1 / fl.FAMILIES["F2"].n_candidates
+    for cell, rows in by.items():
+        n = len(rows)
+        first = sum(r["gold"] == r["leaves"][0] for r in rows) / n
+        last = sum(r["gold"] == r["leaves"][-1] for r in rows) / n
+        copy = sum((1 / len(r["leaves"])) if r["gold"] in r["leaves"] else 0 for r in rows) / n
+        if rows[0]["k_ops"] >= 2:
+            assert max(first, last, copy) <= 1.5 * chance, (cell, first, last, copy)
+        else:
+            assert first == pytest.approx(max(sum(r["operand_forced"] == "first" for r in rows) / n, 1 / 6))
+            assert last == pytest.approx(max(sum(r["operand_forced"] == "last" for r in rows) / n, 1 / 6))
 
 
 def test_f4_pattern_continues_to_gold(full):
