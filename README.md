@@ -1,5 +1,8 @@
 # Kotodama
 
+> Trained on compute provided by Anima Labs. Research, code and development: Luxia
+> ([@LuxiaSL](https://github.com/LuxiaSL)) and Claude (Anthropic).
+
 Kotodama is a from-scratch language-model pretraining stack in one Python
 package, `kotodama`. It trains Llama-style decoders with **Block Attention
 Residuals** (AttnRes) whose block boundaries are placed from the network's own
@@ -10,11 +13,24 @@ Around the trainer sit an evaluation suite (lm-eval, Uncheatable BPB, induction,
 judge-free binding batteries), per-layer telemetry, and an OpenAI-compatible
 serving stack.
 
-The shipped model is
-[kotodama-3b-base](https://huggingface.co/aethera-gp/kotodama-3b-base-final): a
-3B base model trained on 384B tokens (about 48B unique; see
-`--legacy_rank0_data` in `train.py` for the data-loader regime it ran under),
-with DD-3B AttnRes boundaries `0,1,3,7,15,19,24`. Its architecture is frozen.
+The released model is
+[kotodama-tsumugi-1b](https://huggingface.co/LuxiaSL/kotodama-tsumugi-1b): a
+1.42B base model run as 72 effective layers (a 20-layer core executed twice) with
+AttnRes boundaries fitted to its layer geometry, trained on 110B tokens. It was
+built around one question: whether a model reading *you* in a conversation knows
+who *you* is. Its full checkpoint trajectory, including every annealed branch, is
+published at
+[kotodama-tsumugi-1b-trajectory](https://huggingface.co/LuxiaSL/kotodama-tsumugi-1b-trajectory)
+(and a second seed at
+[kotodama-tsumugi-1b-seed7-trajectory](https://huggingface.co/LuxiaSL/kotodama-tsumugi-1b-seed7-trajectory)),
+and the [Binding Atlas](https://aetherawi.red/kotodama/binding-atlas) places it
+among public models on the binding batteries in this repository.
+
+An earlier model,
+[kotodama-3b-base](https://huggingface.co/aethera-gp/kotodama-3b-base-final), is a
+3B base trained on 384B tokens (about 48B unique; see `--legacy_rank0_data` in
+`train.py` for the data-loader regime it ran under) with DD-3B AttnRes boundaries
+`0,1,3,7,15,19,24`. Its architecture is frozen.
 
 ## Architecture
 
@@ -39,13 +55,13 @@ QK-norm, tied embeddings, z-loss weight) is a `KotodamaModelConfig` default in
 
 | shape | layers (effective) | width | notes |
 |---|---|---|---|
-| `3b` | 28 | 3072 | the shipped model; DD-3B boundaries |
+| `3b` | 28 | 3072 | the earlier 3B release; DD-3B boundaries |
 | `7b` | 32 | 4096 | throughput configs only |
 | `1b` | 28 | 2048 | ~1.42B; DD-3B boundaries verbatim |
 | `1b-deep` | 52 | 1536 | the `1b` parameter budget spent on depth |
 | `1b-deep-loop` | 52 from 28 unique | 1536 | 12-layer core run 3× |
 | `1b-deep-loopfit` | 52 from 42 unique | 1536 | 10-layer core run 2×; boundaries `CF52_FIT` |
-| `1b-tsumugi` | 72 from 52 unique | 1536 | 20-layer core run 2×; boundaries `TSUMUGI_LOOP` |
+| `1b-tsumugi` | 72 from 52 unique | 1536 | the released model; 20-layer core run 2×; boundaries `TSUMUGI_LOOP` |
 | `intermediate`, `proxy`, `smoke` | 28 / 28 / 4 | 1024 / 512 / 256 | small-scale and test shapes |
 
 ## Setup
