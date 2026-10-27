@@ -299,7 +299,12 @@ class MultiSampleDecoder(nn.Module):
         torch._dynamo.mark_static_address(self.cur_tokens)
         for buf in self._kv_buffers():
             torch._dynamo.mark_static_address(buf)
-        self._compiled_step = torch.compile(self._step_sampled, mode=mode, fullgraph=True)
+        self._compiled_step = torch.compile(self._step_sampled, mode=mode, fullgraph=True,
+                                            dynamic=self._compile_dynamic)
+
+    # torch.compile's ``dynamic``: None lets a second bucket width recompile the shared step function with symbolic
+    # row counts (automatic dynamic shapes).
+    _compile_dynamic: Optional[bool] = None
 
     def row_pos(self, row: int) -> int:
         """Row ``row``'s next write position (its prompt length plus the tokens it has been fed). A row at
@@ -398,6 +403,10 @@ class CascadeDecoder(MultiSampleDecoder):
 
     def _kv_buffers(self) -> list[torch.Tensor]:
         return self.prompt_ks + self.prompt_vs + self.tail_ks + self.tail_vs
+
+    # Every bucket compiles its own static graph: the symbolic-row-count graph a later bucket otherwise gets runs the
+    # 8-row step at about twice the static graph's time on the release shape.
+    _compile_dynamic = False
 
     def _attend(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         B, H, _, D = q.shape
