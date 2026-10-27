@@ -13,7 +13,7 @@ import random
 
 import pytest
 
-from kotodama.eval.bindprobes import adjacency, answer, codevarmut, items, setbind
+from kotodama.eval.bindprobes import adjacency, answer, codevarmut, items, pools, setbind
 from kotodama.eval.bindprobes.base import Item
 from kotodama.eval.bindprobes.pools import load_pools
 
@@ -70,7 +70,7 @@ def test_setbind_set_semantics(generated):
         k = it.cell[0]
         assert len(it.meta["gold_set"]) == k and it.gold in it.meta["gold_set"]
         assert len(it.candidates) == setbind.C_TOTAL
-        assert not set(it.candidates) & setbind.MASS_OBJECTS
+        assert not set(it.candidates) & pools.NON_COUNTABLE
         for c in it.meta["gold_set"]:
             if c != it.gold:
                 assert setbind.error_types(it, c) == ["other_held"]

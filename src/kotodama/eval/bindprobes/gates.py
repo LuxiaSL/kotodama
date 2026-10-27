@@ -5,7 +5,7 @@ every gate passes on the validation set.
                      pronoun resolves uniquely (``items.validate`` incl. the surface
                      addressee-rule check), pairs link (``deixis.check_pairs``), the
                      shortcut controls sit within ±5% (or one item) of the cell's
-                     chance rate (``deixis.audit_failures``; v2's neutral target,
+                     chance rate (``deixis.audit_failures``; the neutral target,
                      inside the outer "≤ 50% ± 5%" bound), every grid row's gold matches its
                      item, and no row carries a multi-token candidate.
   V2 chance          at the ``chance`` checkpoint (0.25B), deictic 3shot cc acc within
@@ -15,7 +15,7 @@ every gate passes on the validation set.
                      (default: every model in the grids except the chance one).
   V5 twin sanity     at the chance checkpoint, 3shot twin-pair joint accuracy ≤
                      chance² + .03 (chance² = mean over pairs of (1/C_x)(1/C_twin));
-                     v2: P = 3 pairs only (P = 2 items have no twin).
+                     P = 3 pairs only (P = 2 items have no twin).
 
 PILOT GATE (``--pilot``): on the pilot battery (``gen --families
 deixis --per-cell deixis=10``: 150 base items) scored at 0.25B and 30B tokens of one run,
@@ -25,8 +25,8 @@ other two; the decision itself rests on V2 ∧ V3). V4/V5 are printed for
 information only. Proceed to the full battery only on PILOT PASS; a failed pilot
 means the design, not the threshold, is what changes.
 
-Every deixis item and grid row must be generation v2 (``deixis_version``); older
-ones are refused with an error (``deixis.check_version``), never read.
+Every deixis item and grid row must be the current generation (``deixis_version`` =
+``deixis.VERSION``); others are refused with an error (``deixis.check_version``), never read.
 
 Model names are arguments (the grid's ``model`` field); nothing is hardcoded.
 CLI: ``python -m kotodama.eval.bindprobes gates --grids DIR --items items.jsonl
@@ -165,7 +165,7 @@ def gates(rows: Sequence[Row], items: Sequence[Item], chance_model: str, learn_m
           ge2b_models: Optional[Sequence[str]] = None, pilot: bool = False
           ) -> list[GateResult]:
     """V1–V5 over grid rows (any families; deixis is read) + the emitted items.
-    ``pilot``: V2 at ``PILOT_V2_TOL``. Raises on non-v2 deixis items/rows."""
+    ``pilot``: V2 at ``PILOT_V2_TOL``. Raises on deixis items/rows of another generation."""
     rows = list(rows)
     deixis.check_version([{**it.meta, "item_id": it.item_id} for it in items
                           if it.family == DEIXIS], "items")

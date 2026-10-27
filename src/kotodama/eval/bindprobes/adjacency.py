@@ -1,35 +1,37 @@
 """``adjacency`` (battery v3) — STRUCTURAL "you" at P = 3: resolved by reply adjacency.
 
-A 3-person chat; besides v2 declarations and vocative gives, objects move through
+A 3-person chat; besides deixis declarations and vocative gives, objects move through
 REQUEST -> GRANT pairs whose grant carries NO vocative::
 
     A chat between Ana, Ben and Cal.
     Ana: I have the cup.
-    Cal: The lamp is mine.
+    Cal: The lamp is in my hand.
     Ben: Can I have the cup?
-    Ana: Sure, the cup is yours.
+    Ana: Sure, you can have the cup.
     Now the cup is with
     -> " Ben"
 
-v2's unambiguity law forbids a vocative-free "you" at P = 3 (no derivable gold); here
-the gold IS derivable — a grant answers the request in the line right before it, so
-"yours"/"take the o" = the requester (``check_surface`` enforces the adjacency). This is
-the structural channel the other families leave unread (405B: .22 shortcut-free on
+The deixis unambiguity law forbids a vocative-free "you" at P = 3 (no derivable gold);
+here the gold IS derivable — a grant answers the request in the line right before it,
+so "you can have" / "take the o" address the requester (``check_surface`` enforces the
+adjacency). Grants use holding words, as deixis does, to match the "is with" query; no
+transfer hands an object straight back (``deixis.gives_back``). This is the
+structural channel the other families leave unread (405B: .22 shortcut-free on
 vocative-free addressee items).
 
 Cell = (E, n_grant): (1,1), (2,1), (2,2) — E transfers, n_grant of them grants (the
-rest v2 vocative gives, rotated surfaces).
+rest deixis vocative gives, rotated surfaces).
 Paired variants (``meta.pair_id``):
   adj    grants without a vocative (the target)
-  voc    identical events, each grant carrying the vocative (``Sure, Ben, the cup is yours.``)
+  voc    identical events, each grant carrying the vocative (``Sure, Ben, you can have the cup.``)
   third  prose: ``Ben asks Ana for the cup. Ana gives the cup to Ben.``
 Query = the narrator owner query (``Now the cup is with``; the lite query; 3 names).
-Schedule (deixis v2 owner): gold = the last transfer's recipient / its giver / the
+Schedule (deixis owner): gold = the last transfer's recipient / its giver / the
 bystander, 1/3 each; E = 2: the queried object moved and is not in the last transfer.
 ``meta.critical`` = the queried object's last move was a grant (the adjacency read).
 Readouts: structural penalty = acc(voc) − acc(adj) [critical subset primary];
 deixis penalty = acc(third) − acc(voc).
-Error types: ``granter`` (the grant's speaker — "yours" read as the speaker's),
+Error types: ``granter`` (the grant's speaker — "you" read as the speaker),
 ``previous_owner``, ``other_participant``.
 """
 
@@ -42,9 +44,10 @@ from typing import Any, Mapping, Optional, Sequence, TypedDict
 
 from kotodama.eval.bindprobes import deixis as dx
 from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection
+from kotodama.eval.bindprobes.pools import PLURAL_FORM, singular
 
 FAMILY = "adjacency"
-VERSION = 1
+VERSION = 2
 CELLS: list[Cell] = [(1, 1), (2, 1), (2, 2)]
 DEFAULT_PER_CELL = 150            # 450 base, 1350 with variants (critical-subset paired SE ~.03)
 SEPARATOR = dx.SEPARATOR
@@ -55,11 +58,11 @@ ERROR_TYPES = ("granter", "previous_owner", "other_participant")
 MAX_PROMPT_TOKENS = 1024
 BALANCE_TOL = 0.05
 REQUEST = "Can I have the {o}?"
-# (no vocative, with vocative {v}). The grant NAMES the object, as every v2 give line
+# (no vocative, with vocative {v}). The grant NAMES the object, as every deixis give line
 # does: otherwise "the speaker of the last line naming the object" = the requester =
-# gold on every critical item, a shortcut that skips resolving "yours"/"take".
+# gold on every critical item, a shortcut that skips resolving "you"/"take".
 GRANT_FORMS: dict[str, tuple[str, str]] = {
-    "yours": ("Sure, the {o} is yours.", "Sure, {v}, the {o} is yours."),
+    "have": ("Sure, you can have the {o}.", "Sure, {v}, you can have the {o}."),
     "take": ("Sure, take the {o}.", "Sure, {v}, take the {o}."),
 }
 _OWNER_SCHED = ("recipient", "giver", "bystander")
@@ -253,7 +256,7 @@ def _draw(rng: random.Random, cell: Cell, pools: Any, item_id: str,
           template: Optional[Item], want: Optional[str]) -> Optional[Item]:
     e, n_grant = int(cell[0]), int(cell[1])
     people = rng.sample(pools.names, N_PEOPLE)
-    objs0 = rng.sample(pools.objects, rng.choice(N_OBJECTS))
+    objs0 = rng.sample(singular(pools.objects), rng.choice(N_OBJECTS))
     first = {o: rng.choice(people) for o in objs0}
     objs = [o for x in people for o in objs0 if first[o] == x]
     owner = dict(first)
@@ -262,10 +265,15 @@ def _draw(rng: random.Random, cell: Cell, pools: Any, item_id: str,
     kinds = ["grant"] * n_grant + ["give"] * (e - n_grant)
     rng.shuffle(kinds)
     start = rng.randrange(len(dx.GIVE_ORDER))
+    prev: Optional[dict[str, Any]] = None
     for i, kind in enumerate(kinds):
         g = rng.choice([x for x in people if any(owner[o] == x for o in objs)])
         r = rng.choice([x for x in people if x != g])
-        o = rng.choice([o for o in objs if owner[o] == g])
+        own = [o for o in objs if owner[o] == g and not dx.gives_back(prev, g, r, o)]
+        if not own:
+            return None
+        o = rng.choice(own)
+        prev = {"ev": "give", "giver": g, "recipient": r, "obj": o}
         if kind == "grant":
             events.append({"ev": "grant", "requester": r, "granter": g, "obj": o,
                            "form": rng.choice(tuple(GRANT_FORMS))})
@@ -355,6 +363,10 @@ def validate_item(item: Item) -> None:
         raise ValueError(f"{item.item_id}: spec does not match cell {item.cell}")
     if e >= 2 and (not item.meta["queried_obj_moved"] or item.meta["queried_obj_in_last_transfer"]):
         raise ValueError(f"{item.item_id}: E>=2 queried object must have moved, not last")
+    if set(item.spec["objects"]) & PLURAL_FORM:
+        raise ValueError(f"{item.item_id}: plural-form object read with 'is'")
+    dx.check_no_give_back([{"ev": "give", **t} for t in transfers(item.spec)],  # type: ignore[arg-type]
+                          item.item_id)
     check_surface(item)
 
 

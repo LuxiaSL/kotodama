@@ -21,7 +21,7 @@ cc(deictic), TWIN CONSISTENCY (joint accuracy of x and twin(x); joint − produc
 of marginals; chance² for reference), self − addressee asymmetry, collision gap
 per variant, and error-type shares per variant. Validity gates V1–V5:
 ``bindprobes.gates``. Deixis rows must carry ``deixis_version`` = the current
-generation (v2); older rows are refused (``deixis.check_version``), never pooled.
+generation (``deixis.VERSION``); other rows are refused (``deixis.check_version``), never pooled.
 P = 2 deixis pairs have no twin, so twin consistency reads the P = 3 pairs.
 
 Input: a directory of grid JSONLs (``grid.run_grid`` output, one per model);

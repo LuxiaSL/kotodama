@@ -40,11 +40,11 @@ import math
 import random
 from typing import Any, Mapping, Optional, Sequence, TypedDict
 
-from kotodama.eval.bindprobes.base import Cell, Item, article, rejection, the_list
-from kotodama.eval.bindprobes.pools import Pools
+from kotodama.eval.bindprobes.base import Cell, Item, rejection, the_list
+from kotodama.eval.bindprobes.pools import NON_COUNTABLE, Pools, countable, indefinite
 
 FAMILY = "setbind"
-VERSION = 1
+VERSION = 2
 KS = (1, 2, 3)
 LAYOUTS = ("joint", "split")
 ES = (0, 2)
@@ -56,8 +56,8 @@ N_PEOPLE = 4
 N_DISTRACTORS = 2
 C_TOTAL = 8                       # objects in play per item
 ERROR_TYPES = ("wrong_owner", "stale", "distractor", "other", "other_held")
-# objects that take no singular indefinite article (gauntlet grammar flag)
-MASS_OBJECTS: frozenset[str] = frozenset({"dice", "glue", "chalk", "soap", "thread"})
+# Every object in play is a count noun (``pools.countable``): distractors take "A/An",
+# and drawing bound objects from the same nouns keeps the noun kind from marking a slot.
 BALANCE_TOL = 0.05
 
 
@@ -149,9 +149,7 @@ def _sentence(s: Sequence[Any]) -> str:
         return f"{s[1]}{also} has {the_list(list(s[2]))}."
     if s[0] == "free":
         o = s[1]
-        if o in MASS_OBJECTS:
-            raise ValueError(f"mass object {o!r} in an article context")
-        return f"{article(o).capitalize()} {o} lies on the shelf."
+        return f"{indefinite(o).capitalize()} {o} lies on the shelf."
     return f"{s[1]} gives the {s[2]} to {s[3]}."
 
 
@@ -206,7 +204,7 @@ def _draw(rng: random.Random, cell: Cell, pools: Pools, item_id: str,
     k, layout, e = int(cell[0]), str(cell[1]), int(cell[2])
     people = rng.sample(pools.names, N_PEOPLE)
     q = rng.choice(people)
-    objs = [o for o in pools.objects if o not in MASS_OBJECTS]
+    objs = list(countable(pools.objects))
     if len(objs) < C_TOTAL:
         raise ValueError(f"setbind: object pool too small ({len(objs)})")
     pick = rng.sample(objs, C_TOTAL)
@@ -330,8 +328,8 @@ def validate_item(item: Item) -> None:
     q_binds = [s for s in spec["sentences"] if s[0] == "bind" and s[1] == spec["query"]]
     if layout == "split" and e == 0 and len(q_binds) != k:
         raise ValueError(f"{item.item_id}: split layout needs {k} queried sentences")
-    if any(o in MASS_OBJECTS for o in item.candidates):
-        raise ValueError(f"{item.item_id}: mass object in play")
+    if any(o in NON_COUNTABLE for o in item.candidates):
+        raise ValueError(f"{item.item_id}: a non-count noun in play")
 
 
 def audit(items: Sequence[Item]) -> dict[str, dict[str, Any]]:

@@ -9,7 +9,7 @@
     python -m kotodama.eval.bindprobes gates --grids bindprobes/grids \
         --items bindprobes/items/items.jsonl --chance-model <0.25B ckpt> \
         --learn-model <30B-token ckpt> [--ge2b m1,m2,...] [--pilot] # deixis V1–V5
-    # deixis v2 PILOT: 10 base items/cell = 150 base, 390 texts
+    # deixis PILOT: 10 base items/cell = 150 base, 390 texts
     python -m kotodama.eval.bindprobes gen --out bindprobes/pilot --families deixis \
         --per-cell deixis=10 --verify
     python -m kotodama.eval.bindprobes run --model <M> --items bindprobes/pilot/items.jsonl \

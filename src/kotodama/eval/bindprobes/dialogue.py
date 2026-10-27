@@ -5,7 +5,7 @@ partly through pronouns that resolve only by tracking the scene::
 
     Lucy, Tom and Anna are sitting at a table. Lucy has the cup. Tom has the
     lamp and the bell. Lucy hands the cup to Tom. He passes it to Anna. Anna
-    asks Tom for the lamp, so he gives it to her. Now the cup is with
+    asks Tom for the lamp, so he gives it to her. Now the person with the cup is
     -> " Anna"
 
 Transfer forms (each counts as ONE transfer):
@@ -16,10 +16,20 @@ Transfer forms (each counts as ONE transfer):
          recipient (only emitted when their genders differ, so it is unique)
   ask    ``R asks G for the o, so <he|she> gives it to <him|her>.`` — only for a
          mixed-gender pair, so both pronouns are unique
+Language rules (generation and ``validate_item``):
+  * a sentence-initial He/She is written only when the previous sentence names
+    its referent after the last pronoun for them, or the scene holds no one else
+    of that gender (:func:`pronoun_hazard`); after an ask ("…so he gives it to
+    her.") with a second woman at the table the chain names the giver instead;
+  * no object goes straight back: a transfer never returns an object of the
+    previous transfer from its recipient to its giver (:func:`gives_back`);
+  * objects agree with "it" and "is" (``pools.singular``: no "dice").
 
 Cell = (n_people ∈ {3,4}, transfers ∈ {1,2,4}, query kind ∈ {holder, object}):
-  holder  ``Now the cup is with`` -> a name; candidates = every person. The
-          queried object has moved at least once.
+  holder  ``Now the person with the cup is`` -> a name; candidates = every
+          person. The queried object has moved at least once. The answer slot is
+          a subject complement, so a name is the natural next word even right
+          after "…gives it to her." (``…is with`` invites "her" there).
   object  ``Now Anna has the``   -> an object; candidates = every object. The
           queried person holds exactly one object, and their holdings changed.
 At transfers >= 2 every item has at least one pronoun transfer (chain or ask).
@@ -41,9 +51,11 @@ import random
 from typing import Any, Mapping, Optional, TypedDict
 
 from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection, the_list
-from kotodama.eval.bindprobes.pools import FEMALE_CANDIDATES, MALE_CANDIDATES, Gender, Pools
+from kotodama.eval.bindprobes.pools import (FEMALE_CANDIDATES, MALE_CANDIDATES, PLURAL_FORM,
+                                            Gender, Pools, singular)
 
 FAMILY = "dialogue"
+VERSION = 2                       # meta.dialogue_version; items' id/seed tag "dialogue-v2"
 N_PEOPLE = (3, 4)
 TRANSFERS = (1, 2, 4)
 QKINDS = ("holder", "object")
@@ -130,6 +142,40 @@ def resolve(spec: Spec) -> tuple[list[Resolved], dict[str, list[str]]]:
     return out, hist
 
 
+def gives_back(prev: Optional[Resolved], giver: str, recipient: str, objs: list[str]) -> bool:
+    """True when a transfer hands an object of the previous transfer straight back
+    (previous G -> R, this R -> G, a shared object): the ping-pong the generator
+    never writes."""
+    return (prev is not None and giver == prev["recipient"] and recipient == prev["giver"]
+            and bool(set(objs) & set(prev["objs"])))
+
+
+def _names_in(op: Mapping[str, Any]) -> list[str]:
+    """The people an op's sentence names (pronouns excluded), in text order."""
+    if op["form"] == "give":
+        return [op["giver"], op["recipient"]]
+    if op["form"] == "chain":
+        return ([op["subj"]] if op["subj"] not in PRON_GENDER else []) + [op["recipient"]]
+    return [op["asker"], op["askee"]]
+
+
+def pronoun_hazard(prev_op: Mapping[str, Any], referent: str,
+                   gender: Mapping[str, Gender]) -> Optional[str]:
+    """Why a sentence-initial He/She for ``referent`` after ``prev_op``'s sentence
+    would read as ambiguous, or None when it is clear. Unclear when the previous
+    sentence names two people of the referent's gender, or when its last mention of
+    the referent is itself a pronoun (an ask ends "…gives it to her.") and the scene
+    holds another person of that gender."""
+    g = gender[referent]
+    named = set(_names_in(prev_op))
+    if sum(1 for n in named if gender[n] == g) >= 2:
+        return f"the previous sentence names two people of gender {g!r}"
+    same = [n for n in gender if gender[n] == g]
+    if prev_op["form"] == "ask" and len(same) > 1:
+        return f"the referent {referent} was last a pronoun, with {len(same)} of gender {g!r} present"
+    return None
+
+
 def final_holdings(spec: Spec) -> dict[str, list[str]]:
     """person -> objects held at the end (people order; objects in intro order)."""
     _, hist = resolve(spec)
@@ -184,7 +230,7 @@ def _intro(spec: Spec) -> list[str]:
 
 def _lead(spec: Spec) -> str:
     q = spec["query"]
-    return (f"Now the {q['obj']} is with" if q["kind"] == "holder"
+    return (f"Now the person with the {q['obj']} is" if q["kind"] == "holder"
             else f"Now {q['person']} has the")
 
 
@@ -234,11 +280,33 @@ def build(item_id: str, cell: Cell, spec: Spec) -> Item:
     n_pron = sum(1 for o in ops if o["form"] in ("chain", "ask"))
     it = Item(item_id=item_id, family=FAMILY, cell=list(cell), spec=dict(spec), gold="",
               candidates=list(cands), mention_order=mentions,
-              meta={"qkind": spec["query"]["kind"], "n_pronoun_ops": n_pron,
+              meta={"dialogue_version": VERSION, "qkind": spec["query"]["kind"],
+                    "n_pronoun_ops": n_pron,
                     "forms": [o["form"] for o in ops], "gold_is_last_mention": False})
     it.gold = simulate(it)
     it.meta["gold_is_last_mention"] = bool(mentions) and mentions[-1] == it.gold
     return it
+
+
+def validate_item(item: Item) -> None:
+    """The language rules (module doc) on a generated item; raises ``ValueError``."""
+    spec: Spec = item.spec  # type: ignore[assignment]
+    if item.meta.get("dialogue_version") != VERSION:
+        raise ValueError(f"{item.item_id}: dialogue_version {item.meta.get('dialogue_version')!r} "
+                         f"!= {VERSION}")
+    plural = sorted({o for o, _ in spec["holdings0"]} & PLURAL_FORM)
+    if plural:
+        raise ValueError(f"{item.item_id}: plural-form object(s) {plural} read with 'it'/'is'")
+    gender: dict[str, Gender] = {n: g for n, g in spec["people"]}  # type: ignore[misc]
+    res, _ = resolve(spec)
+    ops = spec["ops"]
+    for k in range(1, len(ops)):
+        if gives_back(res[k - 1], res[k]["giver"], res[k]["recipient"], res[k]["objs"]):
+            raise ValueError(f"{item.item_id}: op {k} hands an object straight back")
+        if ops[k]["form"] == "chain" and ops[k]["subj"] in PRON_GENDER:
+            why = pronoun_hazard(ops[k - 1], res[k]["giver"], gender)
+            if why is not None:
+                raise ValueError(f"{item.item_id}: op {k} opens with an unclear pronoun: {why}")
 
 
 # ── Generation ─────────────────────────────────────────────────────────────────
@@ -274,7 +342,7 @@ def gen_item(rng: random.Random, cell: Cell, pools: Pools, item_id: str, k: int,
         mal = rng.sample(pools.male, genders.count("m"))
         names = [fem.pop() if g == "f" else mal.pop() for g in genders]
         gender = dict(zip(names, genders))
-        objs = rng.sample(pools.objects, N_OBJECTS)
+        objs = rng.sample(singular(pools.objects), N_OBJECTS)
         first = {o: rng.choice(names) for o in objs}
         holdings0 = [[o, w] for w in names for o in objs if first[o] == w]
         holder = dict(first)
@@ -294,22 +362,29 @@ def gen_item(rng: random.Random, cell: Cell, pools: Pools, item_id: str, k: int,
                 need = 1 if form == "give1" else 2
                 g = rng.choice([p for p in names if len(held[p]) >= need])
                 moved = rng.sample(held[g], need)
-                r = rng.choice([p for p in names if p != g])
+                r = rng.choice([p for p in names
+                                if p != g and not gives_back(prev, g, p, moved)])
                 ops.append({"form": "give", "giver": g, "recipient": r, "objs": moved})
             elif form == "chain":
                 assert prev is not None
                 g, moved = prev["recipient"], list(prev["objs"])
-                r = rng.choice([p for p in names if p != g])
+                r = rng.choice([p for p in names
+                                if p != g and not gives_back(prev, g, p, moved)])
                 subj = g
-                if gender[prev["giver"]] != gender[g] and rng.random() < 0.6:
+                if gender[prev["giver"]] != gender[g] \
+                        and pronoun_hazard(ops[-1], g, gender) is None and rng.random() < 0.6:
                     subj = SUBJ[gender[g]]
                 ops.append({"form": "chain", "subj": subj, "recipient": r,
                             "pronoun": "it" if len(moved) == 1 else "them"})
             else:
                 g = rng.choice([p for p in names if held[p]
                                 and any(gender[x] != gender[p] for x in names)])
-                r = rng.choice([p for p in names if gender[p] != gender[g]])
                 moved = [rng.choice(held[g])]
+                askers = [p for p in names
+                          if gender[p] != gender[g] and not gives_back(prev, g, p, moved)]
+                if not askers:
+                    return None
+                r = rng.choice(askers)
                 ops.append({"form": "ask", "asker": r, "askee": g, "obj": moved[0],
                             "subj_pron": SUBJ[gender[g]], "obj_pron": OBJ[gender[r]]})
             for o in moved:

@@ -79,10 +79,6 @@ class FamilyModule(Protocol):
     def error_types(self, item: Item, pick: str) -> list[str]: ...
 
 
-def article(word: str) -> str:
-    return "an" if word[:1].lower() in "aeiou" else "a"
-
-
 def the_list(objs: Sequence[str]) -> str:
     """``the cup``, ``the cup and the pen``, ``the cup, the pen and the key``."""
     parts = [f"the {o}" for o in objs]

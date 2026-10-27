@@ -73,6 +73,44 @@ SHOT_VARS: tuple[str, ...] = ("p", "q", "r", "s", "t", "u", "v", "w", "x", "y", 
 N_SHOT_NAMES_PER_GENDER = 8   # attr exemplars need up to 8 distinct names
 N_SHOT_OBJECTS = 16           # attr exemplars need up to 8 bound + 2 free objects
 
+# ── Object grammar ─────────────────────────────────────────────────────────────
+# Pool objects that are not singular count nouns: mass nouns ("A glue lies on the
+# shelf" is ungrammatical) and the plural-form "dice" ("the dice is", "passes it").
+# The pool itself stays whole, so the shot/item split and every family that never
+# puts an object in such a slot are unchanged; a family that does draws through
+# :func:`countable` or :func:`singular`.
+NON_COUNTABLE: frozenset[str] = frozenset({"dice", "glue", "chalk", "soap", "thread",
+                                           "tape", "wire", "straw"})
+PLURAL_FORM: frozenset[str] = frozenset({"dice"})
+# words whose spelling misleads the vowel rule (sound, not letter, picks the article)
+_AN_BEFORE_CONSONANT = ("hour", "honest", "honour", "heir")
+_A_BEFORE_VOWEL = ("uni", "use", "usu", "eu", "one", "once")
+
+
+def indefinite(noun: str) -> str:
+    """``"a"`` or ``"an"`` for a singular count noun; raises ``ValueError`` on a pool
+    object that takes no indefinite article (:data:`NON_COUNTABLE`)."""
+    w = noun.strip().lower()
+    if not w:
+        raise ValueError("indefinite article of an empty word")
+    if w in NON_COUNTABLE:
+        raise ValueError(f"{noun!r} is not a singular count noun: no indefinite article")
+    if w.startswith(_AN_BEFORE_CONSONANT):
+        return "an"
+    if w.startswith(_A_BEFORE_VOWEL):
+        return "a"
+    return "an" if w[0] in "aeiou" else "a"
+
+
+def countable(objects: Sequence[str]) -> tuple[str, ...]:
+    """The objects that read as singular count nouns ("a ___", "the ___ is", "it")."""
+    return tuple(o for o in objects if o not in NON_COUNTABLE)
+
+
+def singular(objects: Sequence[str]) -> tuple[str, ...]:
+    """The objects that agree with a singular verb and "it" (mass nouns kept)."""
+    return tuple(o for o in objects if o not in PLURAL_FORM)
+
 
 @dataclass(frozen=True)
 class Pools:

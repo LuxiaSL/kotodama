@@ -150,7 +150,7 @@ def test_dialogue_pronoun_chains():
     assert it.gold == "Anna"
     assert dialogue.render(it, False) == (
         "Lucy, Tom and Anna are sitting at a table. Lucy has the cup. Tom has the lamp and "
-        "the bell. Lucy hands the cup to Tom. He passes it to Anna. Now the cup is with")
+        "the bell. Lucy hands the cup to Tom. He passes it to Anna. Now the person with the cup is")
     assert it.mention_order == ["Lucy", "Tom", "Anna", "Lucy", "Tom", "Lucy", "Tom", "Anna"]
     # 'them' after a two-object give; then an ask with he/her
     ops2 = [{"form": "give", "giver": "Tom", "recipient": "Lucy", "objs": ["lamp", "bell"]},

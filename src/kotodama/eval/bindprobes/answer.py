@@ -1,12 +1,13 @@
 """``answer`` (battery v3) — PRODUCTION-side deixis: answer "who has it?" from a perspective.
 
-A 4-person chat transcript whose body is deixis v2 (declarations + gives, every
-you/imperative line opened by a vocative), ending in an in-register question/answer
-pair; the answerer must name the holder AS THEY WOULD SAY IT::
+A 4-person chat transcript whose body is a deixis transcript (declarations + gives,
+every you/imperative line opened by a vocative, holding words only, no give straight
+back), ending in an in-register question/answer pair; the answerer must name the
+holder AS THEY WOULD SAY IT::
 
     A chat between Ana, Ben, Cal and Dee.
     Ana: I have the cup.
-    Cal: The lamp is mine.
+    Cal: The lamp is in my hand.
     Ana: Here, Ben, take my cup.
     Dee: Who has the cup now?
     Ben: I think it's with
@@ -30,7 +31,11 @@ Gold ROLE schedule (cycled, per cell): me ¼, you ¼, other ½ (each name ¼) �
 constant answer is at chance (1/4). Independently cycled: the holder is the last
 body line's recipient ¼ / its speaker ¼ / neither ½ (names-level recency + last-
 speaker controls at chance). E = 2: the queried object moved and is not in the last
-body line (the v2 ownership-word rule).
+body line (the deixis ownership-word rule).
+Asker rule (roles me / other): the asker neither holds the queried object nor took
+part in its last event (gave it, or declared it when it never moved), so nobody asks
+where something is that they just handed over (``asker_is_party``). Role you cannot
+follow it: there the asker IS the holder, which is what the answer "you" names.
 
 Error types: ``perspective_flip`` (me<->you swapped), ``name_for_deixis`` (the holder
 is the answerer/asker but a name was picked), ``deixis_for_name`` (holder is another
@@ -46,9 +51,10 @@ from typing import Any, Mapping, Optional, Sequence, TypedDict
 
 from kotodama.eval.bindprobes import deixis as dx
 from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection
+from kotodama.eval.bindprobes.pools import PLURAL_FORM, singular
 
 FAMILY = "answer"
-VERSION = 2                       # v2 adds the null calibration variant
+VERSION = 3                       # null calibration variant; holding words; asker rule
 ES = (1, 2)
 CHANNELS = ("novoc", "voc")
 CELLS: list[Cell] = [(e, ch) for e in ES for ch in CHANNELS]
@@ -132,6 +138,23 @@ def role_of(spec: Spec) -> str:
     if t["asker"] == t["answerer"] or not {t["asker"], t["answerer"]} <= set(spec["people"]):
         raise ValueError(f"bad asker/answerer {t}")
     return "me" if h == t["answerer"] else "you" if h == t["asker"] else "other"
+
+
+def last_event_parties(spec: Spec) -> set[str]:
+    """Who took part in the queried object's last event: its last give's giver and
+    recipient, or its declarer when it never moved."""
+    o = spec["tail"]["obj"]
+    evs = [ev for ev in explicit_events(spec) if ev["obj"] == o]
+    if not evs:
+        raise ValueError(f"queried object {o!r} not in play")
+    last = evs[-1]
+    return {last["owner"]} if last["ev"] == "declare" else {last["giver"], last["recipient"]}
+
+
+def asker_is_party(spec: Spec) -> bool:
+    """The asker holds the queried object or took part in its last event."""
+    a = spec["tail"]["asker"]
+    return a == holder(spec) or a in last_event_parties(spec)
 
 
 def others(spec: Spec) -> list[str]:
@@ -249,6 +272,7 @@ def build(item_id: str, cell: Cell, spec: Spec, pair_id: Optional[str] = None) -
                     "holder_is_last_speaker": h == last["speaker"],
                     "queried_obj_moved": len(hist[spec["tail"]["obj"]]) > 1,
                     "queried_obj_in_last_line": spec["tail"]["obj"] in last["objs"],
+                    "asker_is_party": asker_is_party(spec),
                     "n_transfers": sum(1 for ev in spec["events"] if ev["ev"] == "give")})
     return it
 
@@ -257,7 +281,7 @@ def _draw(rng: random.Random, cell: Cell, pools: Any, item_id: str,
           template: Optional[Item], want: Optional[tuple[str, str]]) -> Optional[Item]:
     e, channel = int(cell[0]), str(cell[1])
     people = rng.sample(pools.names, N_PEOPLE)
-    objs0 = rng.sample(pools.objects, rng.choice(N_OBJECTS))
+    objs0 = rng.sample(singular(pools.objects), rng.choice(N_OBJECTS))
     first = {o: rng.choice(people) for o in objs0}
     objs = [o for x in people for o in objs0 if first[o] == x]
     owner = dict(first)
@@ -265,14 +289,21 @@ def _draw(rng: random.Random, cell: Cell, pools: Any, item_id: str,
                                      "form": rng.choice(tuple(dx.DECLARE_FORMS))} for o in objs]
     start = rng.randrange(len(dx.GIVE_ORDER))
     moved: list[str] = []
+    gave_last: dict[str, str] = {}          # object -> the giver of its last give
+    prev: Optional[dict[str, Any]] = None
     for i in range(e):
         s = rng.choice([x for x in people if any(owner[o] == x for o in objs)])
         a = rng.choice([x for x in people if x != s])
-        o = rng.choice([o for o in objs if owner[o] == s])
+        own = [o for o in objs if owner[o] == s and not dx.gives_back(prev, s, a, o)]
+        if not own:
+            return None
+        o = rng.choice(own)
         events.append({"ev": "give", "speaker": s, "voc": a, "obj": o,
                        "form": dx.GIVE_ORDER[(start + i) % len(dx.GIVE_ORDER)]})
         owner[o] = a
         moved.append(o)
+        gave_last[o] = s
+        prev = {"ev": "give", "giver": s, "recipient": a, "obj": o}
     last_give = events[-1]
     pool = list(objs)
     if e >= 2:
@@ -290,13 +321,15 @@ def _draw(rng: random.Random, cell: Cell, pools: Any, item_id: str,
         return None
     o = rng.choice(pool)
     h = owner[o]
+    # asker rule (module doc): outside role you, never the holder or the last giver
+    can_ask = [x for x in people if x != h and x != gave_last.get(o)]
     if role == "me":
-        answerer, asker = h, rng.choice([x for x in people if x != h])
+        answerer, asker = h, rng.choice(can_ask)
     elif role == "you":
         asker, answerer = h, rng.choice([x for x in people if x != h])
     else:
-        rest = [x for x in people if x != h]
-        asker, answerer = rng.sample(rest, 2)
+        asker = rng.choice(can_ask)
+        answerer = rng.choice([x for x in people if x not in (h, asker)])
         if role in ("otherA", "otherB"):
             oth = [x for x in people if x not in (asker, answerer)]
             if oth.index(h) != (0 if role == "otherA" else 1):
@@ -387,6 +420,12 @@ def validate_item(item: Item) -> None:
         raise ValueError(f"{item.item_id}: E>=2 queried object must have moved, not in the last line")
     if len(item.candidates) != 4:
         raise ValueError(f"{item.item_id}: {len(item.candidates)} candidates")
+    if item.meta["role"] != "you" and asker_is_party(spec):
+        raise ValueError(f"{item.item_id}: the asker holds the {spec['tail']['obj']} or took "
+                         f"part in its last event")
+    if set(spec["objects"]) & PLURAL_FORM:
+        raise ValueError(f"{item.item_id}: plural-form object read with 'is'")
+    dx.check_no_give_back(explicit_events(spec), item.item_id)
     check_surface(item)
 
 

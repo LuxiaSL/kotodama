@@ -1,25 +1,27 @@
-"""``deixis`` (v2) — conversational referent binding through I / you / my / your.
+"""``deixis`` (v3) — conversational referent binding through I / you / my / your.
 
 A non-assistant chat transcript (``Name: utterance`` lines, no ChatML, no
-User/Assistant) opened by a scene line; who owns what is stated ONLY through
+User/Assistant) opened by a scene line; who holds what is stated ONLY through
 speaker-relative reference::
 
     A chat between Ada, Ken and Rosa.
     Ada: I have the lamp.
-    Ken: The cup is mine.
+    Ken: The cup is in my hand.
     Rosa: I have the bell.
     Ken: Here, Rosa, take my cup.
-    Rosa: Ada, my bell is yours now.
+    Rosa: Ada, my bell is in your hand now.
     Now the cup is with
     -> " Rosa"
 
-Version 2 design: declarations + GIVE only, ≥ 3 candidates, a dialogue-worded
-third-person control. Items carry
-``meta.deixis_version = VERSION``; ``items`` ids/seeds carry ``-v2``; aggregate and
+Design: declarations + GIVE only, ≥ 3 candidates, a dialogue-worded third-person
+control. Every statement says who HAS or HOLDS an object (have / in my hand / take /
+giving), never who owns it ("mine", "yours"), because the queries ask about holding
+("is with", "holding") and the third twin narrates "has" / "gives … to". Items carry
+``meta.deixis_version = VERSION``; ``items`` ids/seeds carry ``-v<VERSION>``; aggregate and
 gates refuse deixis rows/items of any other version (:func:`check_version`).
 
 Addressee rule (the unambiguity law): P = 2 -> "you" is the other speaker and no
-utterance carries a vocative (two speakers need none, so v2 always drops it);
+utterance carries a vocative (two speakers need none, so it is always dropped);
 P = 3 -> EVERY utterance containing you/your/yours or
 an imperative opens with a vocative naming the addressee (``Here, Ben, take ...``
 counts: the vocative follows the interjection). ``resolve_addressee`` is the one
@@ -27,14 +29,16 @@ place pronoun semantics live; :func:`explicit_events` raises on any unresolvable
 or ambiguous "you", :func:`run` on every violated precondition.
 
 Events (deictic surface -> effect; precondition):
-  declare  ``I have the o.`` / ``The o is mine.``             owner(o)=speaker; o unowned
+  declare  ``I have the o.`` / ``The o is in my hand.``       owner(o)=speaker; o unowned
   give     rotated within an item (random start), P=3 / P=2 surfaces:
              giving  ``V, I'm giving you my o.`` / ``I'm giving you my o.``
              here    ``Here, V, take my o.``     / ``Here, take my o.``
-             yours   ``V, my o is yours now.``   / ``My o is yours now.``
+             hand    ``V, my o is in your hand now.`` / ``My o is in your hand now.``
                                                               owner(o)=addressee; owner(o)=speaker
-Declarations open the scene, grouped by declarer in scene order (each object
-declared once); then E ∈ {1, 2, 3} gives.
+("owner" in this module is the holder.) Declarations open the scene, grouped by
+declarer in scene order (each object declared once); then E ∈ {1, 2, 3} gives. No
+give hands an object straight back: the give after "A gives o to B" is never "B
+gives o to A" (:func:`gives_back`). Objects agree with "is" (``pools.singular``).
 
 Queries (the completion ends right before the scored single token, closer ``.``):
   owner      ``Now the o is with``            -> a name; P = 3 ONLY (3 candidates).
@@ -70,7 +74,7 @@ Paired variants — every base item ``x`` is emitted as linked variants
            hold for a P = 2 twin). Their pairs are (deictic, third).
 
 Shortcut controls (scheduled per cell on the deictic items; third mirrors them,
-the twin only audits; every variant records them in ``meta``). v2 schedules them
+the twin only audits; every variant records them in ``meta``). They are scheduled
 at the SHORTCUT-NEUTRAL rate (= chance 1/C) rather than 50%: with ≥ 3
 candidates a 50% "gold = last mention" rate is itself a recency shortcut worth
 cc ≈ .25–.33, and the outer bound is "≤ 50% ± 5%":
@@ -114,10 +118,10 @@ from collections import defaultdict
 from typing import Any, Mapping, Optional, Sequence, TypedDict
 
 from kotodama.eval.bindprobes.base import Cell, Item, cell_key, name_list, rejection, the_list
-from kotodama.eval.bindprobes.pools import Pools
+from kotodama.eval.bindprobes.pools import PLURAL_FORM, Pools, singular
 
 FAMILY = "deixis"
-VERSION = 2                       # meta.deixis_version; items' id/seed tag "deixis-v2"
+VERSION = 3                       # meta.deixis_version; items' id/seed tag "deixis-v3"
 PS = (2, 3)
 ES = (1, 2, 3)
 QKINDS = ("owner", "self", "addressee")
@@ -138,7 +142,7 @@ N_OBJECTS_HELD = (3, 4)           # self/addressee: 3–4 objects in play
 BALANCE_TOL = 0.05                # ± 5% per cell
 
 TRANSFERS = ("give",)
-GIVE_ORDER = ("giving", "here", "yours")
+GIVE_ORDER = ("giving", "here", "hand")
 _YOU = re.compile(r"\byou(?:r|rs|'re)?\b", re.IGNORECASE)
 _IMPERATIVE = re.compile(r"^(?:take|give)\b", re.IGNORECASE)
 _HERE = re.compile(r"^Here, ")
@@ -221,7 +225,7 @@ def explicit_events(spec: Spec) -> list[dict[str, Any]]:
             out.append({"ev": "give", "giver": s, "recipient": a, "obj": ev["obj"],
                         "form": ev.get("form")})
         else:
-            raise ValueError(f"event {k}: unknown event {kind!r} (v2: declare/give only)")
+            raise ValueError(f"event {k}: unknown event {kind!r} (declare/give only)")
     return out
 
 
@@ -291,7 +295,7 @@ def simulate(item: Item) -> str:
     owner, _ = run(spec)
     if q["kind"] == "owner":
         if len(spec["people"]) != 3:
-            raise ValueError(f"{item.item_id}: owner queries are P = 3 only (v2)")
+            raise ValueError(f"{item.item_id}: owner queries are P = 3 only")
         if q["obj"] not in owner:
             raise ValueError(f"{item.item_id}: queried object {q['obj']!r} not in play")
         return owner[q["obj"]]
@@ -337,13 +341,33 @@ def _fill(tmpl: str, **kw: str) -> Segment:
     return tmpl.format(**kw), slots
 
 
-DECLARE_FORMS = {"have": "I have the {o}.", "mine": "The {o} is mine."}
+# Holding words only (module doc): the queries ask who holds an object, so no form
+# states ownership alone ("mine", "yours").
+DECLARE_FORMS = {"have": "I have the {o}.", "hand": "The {o} is in my hand."}
 # give surfaces: (P = 3 with the vocative {v}, P = 2 without)
 GIVE_FORMS: dict[str, tuple[str, str]] = {
     "giving": ("{v}, I'm giving you my {o}.", "I'm giving you my {o}."),
     "here": ("Here, {v}, take my {o}.", "Here, take my {o}."),
-    "yours": ("{v}, my {o} is yours now.", "My {o} is yours now."),
+    "hand": ("{v}, my {o} is in your hand now.", "My {o} is in your hand now."),
 }
+
+
+def gives_back(prev: Optional[Mapping[str, Any]], giver: str, recipient: str, obj: str) -> bool:
+    """True when a give returns the previous give's object from its recipient to its
+    giver (``prev`` = an explicit give event, or None): the ping-pong no generator
+    writes."""
+    return (prev is not None and prev.get("ev") == "give" and giver == prev["recipient"]
+            and recipient == prev["giver"] and obj == prev["obj"])
+
+
+def check_no_give_back(explicit: Sequence[Mapping[str, Any]], what: str) -> None:
+    """Raise ``ValueError`` if any give in the explicit events hands its object
+    straight back (:func:`gives_back` against the event before it)."""
+    for k in range(1, len(explicit)):
+        ev = explicit[k]
+        if ev["ev"] == "give" and gives_back(explicit[k - 1], ev["giver"], ev["recipient"],
+                                             ev["obj"]):
+            raise ValueError(f"{what}: event {k} hands the {ev['obj']} straight back")
 
 
 def _deictic_line(ev: Mapping[str, Any]) -> Segment:
@@ -489,8 +513,8 @@ def exempt_ownership_word(cell: Sequence[Any]) -> bool:
     return str(cell[2]) != "owner" or int(cell[1]) == 1
 
 
-# Query phrasings for self/addressee (owner has one form). "a" = "…holding the" (the v2
-# battery); "b" = "the thing in my/your/X's hand … is the" — a paired re-phrasing of the
+# Query phrasings for self/addressee (owner has one form). "a" = "…holding the" (the
+# default); "b" = "the thing in my/your/X's hand … is the" — a paired re-phrasing of the
 # SAME items (same events, same gold) to check that a result is not tied to one sentence.
 QFORMS: tuple[str, ...] = ("a", "b")
 
@@ -578,20 +602,25 @@ def _draw(rng: random.Random, cell: Cell, pools: Pools, item_id: str,
         n_obj = int(want["n"])
     else:
         n_obj = rng.choice(N_OBJECTS_OWNER if kind == "owner" else N_OBJECTS_HELD)
-    objs0 = rng.sample(pools.objects, n_obj)
+    objs0 = rng.sample(singular(pools.objects), n_obj)
     first = {o: rng.choice(people) for o in objs0}
     objs = [o for x in people for o in objs0 if first[o] == x]   # declarations grouped
     owner = dict(first)
     events: list[dict[str, Any]] = [{"ev": "declare", "speaker": owner[o], "obj": o,
                                      "form": rng.choice(tuple(DECLARE_FORMS))} for o in objs]
     start = rng.randrange(len(GIVE_ORDER))
+    prev: Optional[dict[str, Any]] = None
     for i in range(e):
         s = rng.choice([x for x in people if any(owner[o] == x for o in objs)])
         a = rng.choice([x for x in people if x != s])
-        o = rng.choice([o for o in objs if owner[o] == s])
+        own = [o for o in objs if owner[o] == s and not gives_back(prev, s, a, o)]
+        if not own:
+            return None
+        o = rng.choice(own)
         events.append({"ev": "give", "speaker": s, "voc": a if p == 3 else None, "obj": o,
                        "form": GIVE_ORDER[(start + i) % len(GIVE_ORDER)]})
         owner[o] = a
+        prev = {"ev": "give", "giver": s, "recipient": a, "obj": o}
     spec: Spec = {"variant": "deictic", "people": people, "objects": objs, "events": events,
                   "query": {}, "sigma": None}
     _, hist = run(spec)
@@ -760,7 +789,7 @@ def approx_tokens(text: str) -> int:
 
 def check_version(records: Sequence[Mapping[str, Any]], what: str) -> None:
     """Refuse deixis records (item ``meta`` dicts or grid rows) not built by this
-    generation: v1 grids/items must never be silently mixed with v2."""
+    generation: grids/items of another version must never be silently mixed with it."""
     bad = [r for r in records if r.get("deixis_version") != VERSION]
     if bad:
         raise ValueError(f"{len(bad)} deixis {what} lack deixis_version={VERSION} (first: "
@@ -780,8 +809,11 @@ def validate_item(item: Item) -> None:
     if item.meta.get("variant") != spec["variant"] or spec["variant"] not in variants(item.cell):
         raise ValueError(f"{item.item_id}: variant {spec['variant']!r} invalid for {item.cell}")
     if len(item.candidates) < MIN_CANDIDATES:
-        raise ValueError(f"{item.item_id}: {len(item.candidates)} candidates (v2 needs "
+        raise ValueError(f"{item.item_id}: {len(item.candidates)} candidates (needs "
                          f">= {MIN_CANDIDATES})")
+    if set(spec["objects"]) & PLURAL_FORM:
+        raise ValueError(f"{item.item_id}: plural-form object read with 'is'")
+    check_no_give_back(explicit_events(spec), item.item_id)
     if kind != "owner" and len(spec["objects"]) not in N_OBJECTS_HELD:
         raise ValueError(f"{item.item_id}: {len(spec['objects'])} objects in an object cell")
     check_surface(item)

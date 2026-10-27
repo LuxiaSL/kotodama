@@ -45,8 +45,8 @@ def _build(spec: deixis.Spec, cell: tuple[int, int, str]) -> Item:
 
 # P=3 scene: Ken gives Rosa his cup; Rosa gives Ada her bell; Ada gives Ken the lamp.
 OBJS3 = ["lamp", "cup", "bell"]
-P3_EVENTS = [_decl("Ada", "lamp"), _decl("Ken", "cup", "mine"), _decl("Rosa", "bell"),
-             _give("Ken", "cup", "Rosa", "here"), _give("Rosa", "bell", "Ada", "yours"),
+P3_EVENTS = [_decl("Ada", "lamp"), _decl("Ken", "cup", "hand"), _decl("Rosa", "bell"),
+             _give("Ken", "cup", "Rosa", "here"), _give("Rosa", "bell", "Ada", "hand"),
              _give("Ada", "lamp", "Ken", "giving")]
 
 
@@ -59,10 +59,10 @@ def test_give_chain_and_exact_render_p3():
     assert deixis.render(it, False) == (
         "A chat between Ada, Ken and Rosa.\n"
         "Ada: I have the lamp.\n"
-        "Ken: The cup is mine.\n"
+        "Ken: The cup is in my hand.\n"
         "Rosa: I have the bell.\n"
         "Ken: Here, Rosa, take my cup.\n"
-        "Rosa: Ada, my bell is yours now.\n"
+        "Rosa: Ada, my bell is in your hand now.\n"
         "Ada: Ken, I'm giving you my lamp.\n"
         "Rosa: Right now I'm holding the")
     assert deixis.render(it, True).endswith("Rosa: Right now I'm holding the cup.")
@@ -87,14 +87,14 @@ def test_give_chain_and_exact_render_p3():
 
 
 def test_give_forms_p2_render():
-    ev = [_decl("Ada", "lamp"), _decl("Ada", "cup", "mine"), _decl("Ken", "bell"),
-          _give("Ada", "cup", form="here"), _give("Ken", "bell", form="yours")]
+    ev = [_decl("Ada", "lamp"), _decl("Ada", "cup", "hand"), _decl("Ken", "bell"),
+          _give("Ada", "cup", form="here"), _give("Ken", "bell", form="hand")]
     it = _build(_spec(P2, ["lamp", "cup", "bell"], ev,
                       {"kind": "addressee", "speaker": "Ada", "voc": None}), (2, 2, "addressee"))
     assert it.gold == "cup"            # "you" = Ken at P=2, who now holds only the cup
     text = deixis.render(it, False)
-    assert "Ada: The cup is mine.\nKen: I have the bell.\nAda: Here, take my cup.\n" \
-           "Ken: My bell is yours now.\nAda: Right now you're holding the" in text
+    assert "Ada: The cup is in my hand.\nKen: I have the bell.\nAda: Here, take my cup.\n" \
+           "Ken: My bell is in your hand now.\nAda: Right now you're holding the" in text
     ev2 = ev[:3] + [_give("Ada", "lamp", form="giving")]
     it2 = _build(_spec(P2, ["lamp", "cup", "bell"], ev2, {"kind": "self", "speaker": "Ada"}),
                  (2, 1, "self"))
@@ -158,7 +158,7 @@ def test_addressee_resolution_and_ambiguity():
     orig = deixis.render
     try:
         for a, b in (("Here, Rosa, take", "Here, take"),        # imperative, no vocative
-                     ("Rosa: Ada, my bell", "Rosa: My bell"),  # 'yours' without a vocative
+                     ("Rosa: Ada, my bell", "Rosa: My bell"),  # "your" without a vocative
                      ("Ken, I'm giving", "Ada, I'm giving"),   # vocative = the speaker
                      ("Now the cup is with", "(Now the cup is with")):   # parentheses
             deixis.render = functools.partial(_replaced, orig, a, b)
@@ -205,8 +205,8 @@ def test_twin_flips_exactly_as_simulated_p3():
     assert deixis.final_state(tw.spec) == {"lamp": "Rosa", "cup": "Ken", "bell": "Ada"}
     xl, wl = deixis.render(x, False).split("\n"), deixis.render(tw, False).split("\n")
     assert xl[0] == wl[0] and xl[-1] == wl[-1]                      # scene + query unchanged
-    assert wl[1:-1] == ["Ada: I have the lamp.", "Rosa: The cup is mine.", "Ken: I have the bell.",
-                        "Rosa: Here, Ken, take my cup.", "Ken: Ada, my bell is yours now.",
+    assert wl[1:-1] == ["Ada: I have the lamp.", "Rosa: The cup is in my hand.", "Ken: I have the bell.",
+                        "Rosa: Here, Ken, take my cup.", "Ken: Ada, my bell is in your hand now.",
                         "Ada: Rosa, I'm giving you my lamp."]
 
 
@@ -234,7 +234,7 @@ def test_counts_candidates_and_single_held(dx):
     assert len(dx) == 7 * (2 * len(deixis.CELLS) + n_p3)
     for it in dx:
         assert it.meta["deixis_version"] == deixis.VERSION
-        assert it.item_id.startswith("deixis-v2_")
+        assert it.item_id.startswith(f"deixis-v{deixis.VERSION}_")
         assert len(it.candidates) >= 3
         if it.meta["qkind"] == "owner":
             assert it.cell[0] == 3 and it.candidates == it.spec["people"]

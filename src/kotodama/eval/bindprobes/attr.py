@@ -13,7 +13,10 @@ meaningful at qpos=last; balanced 50/50 there): ``recency_control`` = the gold
 IS the last-mentioned object (no unbound sentence after its declaration).
 At qpos first/middle the gold is never the last mention.
 
-Candidates = the N bound objects + the unbound ones, in mention order.
+Candidates = the N bound objects + the unbound ones, in mention order. Every slot
+draws from the count nouns of the pool (``pools.countable``), so the unbound
+sentence "A/An o lies on the shelf." is grammatical and no slot is told apart by
+the kind of noun in it.
 Error types (priority order): ``wrong_binding`` (another entity's object; an
 ``adjacent`` tag is added when that entity was declared next to the queried one),
 ``distractor`` (an unbound object), ``other``.
@@ -24,10 +27,11 @@ from __future__ import annotations
 import random
 from typing import Any, Mapping, Optional, TypedDict
 
-from kotodama.eval.bindprobes.base import Cell, Item, article, rejection
-from kotodama.eval.bindprobes.pools import Pools
+from kotodama.eval.bindprobes.base import Cell, Item, rejection
+from kotodama.eval.bindprobes.pools import Pools, countable, indefinite
 
 FAMILY = "attr"
+VERSION = 2                       # meta.attr_version; items' id/seed tag "attr-v2"
 NS = (2, 4, 6, 8)
 QPOS = ("first", "middle", "last")
 CELLS: list[Cell] = [(n, q) for n in NS for q in QPOS if not (n == 2 and q == "middle")]
@@ -61,7 +65,7 @@ def _sentence(spec: Spec, kind: str, idx: int) -> str:
         name, obj = spec["entities"][idx]
         return f"{name} {spec['verb']} the {obj}."
     obj = spec["distractors"][idx]
-    return f"{article(obj).capitalize()} {obj} lies on the shelf."
+    return f"{indefinite(obj).capitalize()} {obj} lies on the shelf."
 
 
 def _mentions(spec: Spec) -> list[str]:
@@ -89,7 +93,7 @@ def build(item_id: str, cell: Cell, spec: Spec) -> Item:
     qidx = names.index(spec["query"])
     it = Item(item_id=item_id, family=FAMILY, cell=list(cell), spec=dict(spec), gold="",
               candidates=list(dict.fromkeys(mentions)), mention_order=mentions,
-              meta={"qpos": cell[1], "query_index": qidx,
+              meta={"attr_version": VERSION, "qpos": cell[1], "query_index": qidx,
                     "recency_control": False,
                     "n_distractors": len(spec["distractors"])})
     it.gold = simulate(it)
@@ -110,7 +114,7 @@ def gen_item(rng: random.Random, cell: Cell, pools: Pools, item_id: str, k: int,
     def draw() -> Optional[Item]:
         names = rng.sample(pools.names, n)
         nd = rng.choice((1, 2))
-        objs = rng.sample(pools.objects, n + nd)
+        objs = rng.sample(countable(pools.objects), n + nd)
         bound, free = objs[:n], objs[n:]
         qidx = {"first": 0, "last": n - 1}.get(qpos)
         if qidx is None:
