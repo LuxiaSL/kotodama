@@ -467,12 +467,9 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
 
         def _build_and_warm_pool(eng: "DecodeEngine", n_tokens: int, block: int) -> "PrefixKVCache":
             pool = PrefixKVCache(eng, n_tokens, block_size=block)
-            if 2 * block not in eng.block_buckets and 2 * block <= eng.block_span_max:
-                # A pool hit leaves a suffix of the prompt's last partial block plus whatever differs (often one
-                # short turn), mostly under two blocks: a two-block bucket extends it in one block replay where the
-                # smaller buckets take two (a replay's cost barely depends on its width at these sizes).
-                eng.block_buckets = tuple(sorted(set(eng.block_buckets) | {2 * block}, reverse=True))
-                eng.warm_blocks()
+            # A pool hit's suffix (the prompt's last partial block plus whatever differs, often one short turn)
+            # extends in one block replay.
+            eng.extend_single_chunk = True
             if not prefix_cache and _max_seq_len > 112:
                 # The pool extends through prefill_cached; warm its eager extend like --prefix-cache does.
                 base_ids = torch.randint(4, config.vocab_size, (1, 64), device=_device)

@@ -286,3 +286,18 @@ def test_server_prefill_goes_through_the_pool(monkeypatch, model: KotodamaModel)
     monkeypatch.setattr(server, "_prefix_pool", None)
     _, info = server._engine_prefill(ids)
     assert "pool_tokens" not in info and pool.stats["requests"] == 1  # off: the engine's own prefix cache only
+
+
+def test_one_chunk_extend_plan(model: KotodamaModel) -> None:
+    eng = _engine(model)
+    assert eng.block_buckets == (256, 64, 16)
+    greedy = {(100, 140): eng._chunk_plan(100, 140), (0, 40): eng._chunk_plan(0, 40)}
+    assert greedy[(100, 140)] == [(100, 16), (116, 16), (124, 16)]
+    eng.extend_single_chunk = True
+    assert eng._chunk_plan(100, 140) == [(76, 64)]  # one right-aligned chunk re-forwarding 24 cached tokens
+    assert eng._chunk_plan(100, 110) == [(94, 16)]
+    assert eng._chunk_plan(2000, 2200) == [(1944, 256)]
+    assert eng._chunk_plan(30, 40) == [(24, 16)]
+    assert eng._chunk_plan(10, 40) == [(10, 16), (24, 16)]  # no bucket of 30..40 tokens: the greedy cover
+    assert eng._chunk_plan(0, 40) == greedy[(0, 40)]  # a full prefill keeps the greedy cover
+    assert eng._chunk_plan(100, 400) == [(100, 256), (356, 16), (372, 16), (384, 16)]  # wider than any bucket

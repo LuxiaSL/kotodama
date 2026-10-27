@@ -302,6 +302,11 @@ class DecodeEngine(nn.Module):
         # rectangular-flash-to-prefix + causal-flash-within-chunk merged by
         # logsumexp — kills both the mask and the full-cache read.)
         self.block_span_max: int = 768
+        # Extends (start > 0) of a span the buckets hold in one chunk take that one chunk, right-aligned (it
+        # re-forwards up to bucket - span cached tokens), instead of the greedy cover: a block replay costs about the
+        # same at any bucket width here, so one replay beats several. Off keeps the greedy cover; the prefix KV pool
+        # (kotodama.model.prefix_cache), whose hits extend short suffixes, turns it on.
+        self.extend_single_chunk: bool = False
         self._compiled_block = None
         # CPU mirror of self.pos for bounds checking without device syncs.
         self._pos_cpu = 0
@@ -775,6 +780,11 @@ class DecodeEngine(nn.Module):
         prompt head, for the overlap) can't be covered — caller falls back
         to the eager reference path.
         """
+        if self.extend_single_chunk and start > 0:
+            fit = [B for B in self.block_buckets if end - start <= B <= end]
+            if fit:
+                B = min(fit)
+                return [(end - B, B)]
         b_min = self.block_buckets[-1]
         plan: list[tuple[int, int]] = []
         i = start

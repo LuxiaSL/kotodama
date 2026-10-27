@@ -29,8 +29,8 @@ against the engine's greedy continuation of its own prompt):
     prompt, only the suffix prefilled) vs the engine's full prefill of the same prompt, along the full prefill's
     greedy continuation (per-step KL and top-1), beside both against one no-cache forward (the noise floor);
   * ``poolcost``: on an idle GPU, the time of a pool hit (load + suffix extend + store) against a full prefill of
-    the same prompt, by suffix length, with the engine's block buckets as built and without the pool's two-block
-    bucket (the time a hit saves, apart from any batch decoding around it);
+    the same prompt, by suffix length, with the engine's one-chunk extends (as the pool runs it) and with the greedy
+    chunk cover (the time a hit saves, apart from any batch decoding around it);
   * ``xgreedy_pool``: ``xgreedy`` on prompt families that share long prefixes, interleaved, with the pool in front
     of the batcher's prefill (every family member after the first extends from pooled blocks), replayed tie-proof
     through the engine's full prefill.
@@ -487,7 +487,7 @@ def main() -> int:
     def poolcost() -> dict:
         """Median ms over 5 repeats of: a full prefill of a ``hi``-token prompt, and pool hits on it whose suffix past
         the pooled blocks is 1..300 tokens (the engine holding an unrelated prompt), each timed between device syncs,
-        with the buckets as built and without the two-block bucket the pool adds."""
+        with one-chunk extends and with the greedy chunk cover."""
         assert pool is not None
         b = pool.block_size
         base = load_prompts(tok, None, 1, hi, hi, a.seed + 5)[0][0]
@@ -511,12 +511,9 @@ def main() -> int:
         out: dict = {"poolcost_prompt_tokens": len(ids), "poolcost_buckets": list(eng.block_buckets)}
         with torch.inference_mode():
             out["poolcost_full_prefill_ms"] = ms(lambda: eng.prefill(full_ids))
-            built = eng.block_buckets
-            variants = [("built", built)]
-            if 2 * b in built:
-                variants.append(("no2block", tuple(x for x in built if x != 2 * b)))
-            for name, buckets in variants:
-                eng.block_buckets = buckets
+            built = eng.extend_single_chunk
+            for name, single in (("onechunk", True), ("greedy", False)):
+                eng.extend_single_chunk = single
                 for suffix in (1, 8, 20, 40, 100, 300):
                     # the pooled prefix ends on a block boundary, ``suffix`` tokens before the prompt's end
                     cut = len(ids) - suffix
@@ -531,7 +528,7 @@ def main() -> int:
 
                     out[f"poolcost_{name}_suffix{len(ids) - len(pooled)}_hit_ms"] = round(
                         ms(lambda: pool.prefill(full_ids), setup), 3)
-            eng.block_buckets = built
+            eng.extend_single_chunk = built
             pool.clear()
             eng.reset()
         return out
