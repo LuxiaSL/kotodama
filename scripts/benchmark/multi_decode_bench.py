@@ -399,6 +399,18 @@ def main() -> int:
                                             "max": max(prompt_lens)},
                      "load_n": a.load_n, "load_steer": steer, "xbatch_rows": list(xrows)}
         idx = list(range(len(texts)))
+
+        def warm_prefills() -> None:
+            # the first prefill at a new prompt length pays a one-time cost (about a second, measured here at
+            # 1.5-2.6K tokens); paying it once for every prompt keeps it out of whichever mode runs first
+            with torch.inference_mode():
+                for text, _ in texts:
+                    eng.prefill(torch.tensor([tok.encode(text)], device="cuda"))
+                eng.reset()
+
+        t0 = time.perf_counter()
+        run_on_worker(warm_prefills)
+        out["load_warm_prefill_s"] = round(time.perf_counter() - t0, 1)
         for mode in [m.strip() for m in a.load_modes.split(",") if m.strip()]:
             set_mode(mode)
             asyncio.run(cell(2, idx[:4]))  # warm the path (first-request lazy work) outside the measurement
