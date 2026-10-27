@@ -72,6 +72,7 @@ from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 try:
     from kotodama.model.decode_engine import DecodeEngine, SamplingParams as EngineSamplingParams
     from kotodama.model.multi_decode import MultiSampleDecoder, decode_rows
+    from kotodama.serve.xbatch import XBatchJob, XBatchRunner, XBatchScheduler
     _ENGINE_AVAILABLE = True
 except Exception as _engine_exc:
     DecodeEngine = None  # type: ignore[assignment,misc]
@@ -182,6 +183,10 @@ _engine_lock = asyncio.Lock()
 # and a pure-temperature law decodes its n candidates in lockstep after one prefill, on the smallest bucket that fits
 # (a step costs about the same at any row count, so the bucket sets the throughput). Empty = every candidate is serial.
 _multi: "dict[int, MultiSampleDecoder]" = {}
+# Cross-request batched decoding (--xbatch_rows 16,32,64): concurrent pure-temperature requests that share a sampling
+# law and a steering config decode together, each request's rows filled from its own prefill (kotodama.serve.xbatch).
+# None = off: every request takes the paths above.
+_xbatch: "XBatchScheduler | None" = None
 # Prefix caching (engine extend-from-pos prefill); set by load_model.
 _prefix_cache = False
 # Residual steering (--steer-npz, comma-separated banks); set by load_model.
@@ -294,8 +299,8 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = ()) -> tuple[KotodamaModel, AutoTokenizer]:
-    global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False) -> tuple[KotodamaModel, AutoTokenizer]:
+    global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
@@ -432,8 +437,9 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             eng.reset()
             return eng
 
-        def _build_and_warm_multi(eng: "DecodeEngine", rows: int) -> "MultiSampleDecoder":
-            dec = MultiSampleDecoder(eng, rows)
+        def _build_and_warm_multi(eng: "DecodeEngine", rows: int,
+                                  kv_from: "MultiSampleDecoder | None" = None) -> "MultiSampleDecoder":
+            dec = MultiSampleDecoder(eng, rows, kv_from=kv_from)
             dec.compile_step(mode="max-autotune")
             with torch.inference_mode():
                 params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2)
@@ -455,11 +461,25 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         # replica). load_model is sync (called
         # from lifespan before serving starts), so block on the future.
         _engine = _generate_executor.submit(_build_and_warm_engine).result()
-        for rows in sorted(set(multi_rows)):
+        # One decoder per row width (--multi_rows and --xbatch_rows together); the narrower ones view the widest
+        # one's KV storage, since only one decoder holds live rows at a time (the engine lock).
+        decoders: dict[int, MultiSampleDecoder] = {}
+        for rows in sorted(set(multi_rows) | set(xbatch_rows), reverse=True):
             # Same thread as the engine: its cudagraph trees are thread-local too.
-            _multi[rows] = _generate_executor.submit(_build_and_warm_multi, _engine, rows).result()
+            widest = decoders[max(decoders)] if decoders else None
+            decoders[rows] = _generate_executor.submit(_build_and_warm_multi, _engine, rows, widest).result()
+        _multi = {r: decoders[r] for r in sorted(set(multi_rows))}
         if _multi:
             logger.info("Batched multi-sample decode ENABLED: row buckets %s", sorted(_multi))
+        if xbatch_rows:
+            runner = XBatchRunner({r: decoders[r] for r in sorted(set(xbatch_rows))}, prefill=_engine_prefill,
+                                  set_steer=_engine.set_steer,
+                                  decode=lambda ids: _tokenizer.decode(ids, skip_special_tokens=True),
+                                  stop_ids=_stop_token_ids, max_seq_len=_max_seq_len, device=_device,
+                                  refill=xbatch_refill)
+            _xbatch = XBatchScheduler(runner, _engine_lock, _run_generation)
+            logger.info("Cross-request batched decode ENABLED: row buckets %s, refill %s", sorted(set(xbatch_rows)),
+                        "on" if xbatch_refill else "off")
         # Disable cuDNN SDPA only AFTER the engine compiled: the captured
         # decode graph keeps its baked cuDNN flash kernels, while the eager
         # FALLBACK path (non-engine requests) avoids cuDNN's ~300ms per-shape
@@ -564,6 +584,7 @@ class ModelInfo(BaseModel):
     prefix_cache: bool = False
     steering: dict | None = None
     default_repetition_penalty: float | None = None
+    xbatch: dict | None = None
 
 
 # ── /logprobs: batched prefill-only scoring (the four-register rider battery) ──
@@ -1240,6 +1261,8 @@ _prefix_cache_arg = False
 _warmup_sdpa_arg = False
 _steer_npz_arg: str | None = None
 _multi_rows_arg: tuple[int, ...] = ()
+_xbatch_rows_arg: tuple[int, ...] = ()
+_xbatch_refill_arg = False
 
 
 @asynccontextmanager
@@ -1252,6 +1275,8 @@ async def lifespan(app: FastAPI):
         steer_npz=_steer_npz_arg,
         max_seq_len=_max_seq_len_arg,
         multi_rows=_multi_rows_arg,
+        xbatch_rows=_xbatch_rows_arg,
+        xbatch_refill=_xbatch_refill_arg,
     )
     try:
         yield
@@ -1321,6 +1346,9 @@ async def info():
         prefix_cache=_prefix_cache,
         steering=steering,
         default_repetition_penalty=_default_repetition_penalty,
+        xbatch=None if _xbatch is None else {"rows": sorted(_xbatch.runner.decoders),
+                                             "refill": _xbatch.runner.refill,
+                                             "stats": dict(_xbatch.runner.stats)},
     )
 
 
@@ -1474,6 +1502,59 @@ def _multi_compatible(request: GenerateRequest, n: int) -> bool:
                                                                  top_k=request.top_k, top_p=request.top_p)))
 
 
+def _xbatch_compatible(request: GenerateRequest, n: int) -> bool:
+    return (_xbatch is not None and 1 <= n <= _xbatch.runner.max_rows
+            and MultiSampleDecoder.supports(EngineSamplingParams(temperature=request.temperature,
+                                                                 top_k=request.top_k, top_p=request.top_p)))
+
+
+def _xbatch_key(request: GenerateRequest, steered: bool) -> tuple:
+    """Requests with equal keys may share a batch: the same sampling law and the same steering config."""
+    steer = None
+    if steered:
+        steer = (tuple((v.name, v.alpha) for v in request.vectors or ()), request.steer_model, request.steer_alpha,
+                 request.steer_rule)
+    return (request.temperature, request.repetition_penalty, steer)
+
+
+async def engine_generate_xbatch(request: GenerateRequest, n: int) -> list[GenerateResponse]:
+    """n candidates of one prompt through the cross-request batcher: same tokenization, steering, stop and capacity
+    rules as engine_generate per candidate. Bad prompts and steering stacks 400 before the request queues."""
+    assert _xbatch is not None and _tokenizer is not None
+    t0 = time.perf_counter()
+    prompt_text = _resolve_prompt(request, _tokenizer)
+    prompt_ids = _tokenizer.encode(prompt_text)
+    if len(prompt_ids) >= _max_seq_len:
+        raise HTTPException(400, f"Prompt too long: {len(prompt_ids)} tokens (max {_max_seq_len})")
+    steer_writes = _compose_steer_writes(request)
+    steer_kwargs = _steer_rule_kwargs(request) if steer_writes is not None else {}
+    params = EngineSamplingParams(temperature=request.temperature, repetition_penalty=request.repetition_penalty)
+    job = XBatchJob(key=_xbatch_key(request, steer_writes is not None), prompt_ids=prompt_ids, n=n,
+                    max_new_tokens=request.max_new_tokens, params=params, done=lambda _outcome: None,
+                    stop_strings=tuple(request.stop_strings), steer_writes=steer_writes, steer_kwargs=steer_kwargs)
+    result = await _xbatch.submit(job)
+    elapsed = time.perf_counter() - t0
+    timing = dict(result.timing)
+    if steer_writes is not None:
+        timing["steered"] = 1.0
+    total = sum(len(r) for r in result.rows)
+    tps = round(total / elapsed, 1) if elapsed > 0 else 0.0
+    return [GenerateResponse(text=_tokenizer.decode(r, skip_special_tokens=True), prompt_tokens=len(prompt_ids),
+                             completion_tokens=len(r), tokens_per_second=tps, timing=dict(timing),
+                             prompt_ids=list(prompt_ids), completion_ids=list(r)) for r in result.rows]
+
+
+async def _batched_candidates(request: GenerateRequest, n: int) -> list[GenerateResponse]:
+    """All n candidates from one batched path (cross-request batcher, else the n-row decoder), or [] when neither
+    takes the request and the caller generates candidates one at a time."""
+    if _xbatch_compatible(request, n):
+        return await engine_generate_xbatch(request, n)
+    if _multi_compatible(request, n):
+        async with _engine_lock:
+            return await _run_generation(engine_generate_multi, request, n)
+    return []
+
+
 def oai_completion_to_generate(request: OAICompletionRequest) -> GenerateRequest:
     """The /generate request one /v1/completions choice runs: sampling, stops and steering carried over."""
     stop_strings: list[str] = []
@@ -1502,10 +1583,7 @@ async def oai_completions(request: OAICompletionRequest):
 
     choices = []
     gen_req = oai_completion_to_generate(request)
-    batched: list[GenerateResponse] = []
-    if _multi_compatible(gen_req, request.n):
-        async with _engine_lock:
-            batched = await _run_generation(engine_generate_multi, gen_req, request.n)
+    batched = await _batched_candidates(gen_req, request.n)
     for i in range(request.n):
         if batched:
             result = batched[i]
@@ -1672,10 +1750,7 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
         repetition_penalty=repetition_penalty,
         stop_strings=stop_strings,
     )
-    batched: list[GenerateResponse] = []
-    if _multi_compatible(gen_req, request.n):
-        async with _engine_lock:
-            batched = await _run_generation(engine_generate_multi, gen_req, request.n)
+    batched = await _batched_candidates(gen_req, request.n)
     for i in range(request.n):
         if batched:
             result = batched[i]
@@ -1764,6 +1839,15 @@ if __name__ == "__main__":
                         help="Batched multi-sample decode for OpenAI-route n > 1 (pure-temperature laws): comma row "
                              "buckets, e.g. 4,8 — n candidates decode in lockstep after one prefill on the smallest "
                              "bucket that fits (~0.9 GB of KV per row at 4096 context on the 1B). Empty = off (serial)")
+    parser.add_argument("--xbatch_rows", default="",
+                        help="Cross-request batched decode for the OpenAI routes (pure-temperature laws): comma row "
+                             "buckets, e.g. 16,32,64 — concurrent requests with the same sampling law and steering "
+                             "config decode together, each filled from its own prefill, on the narrowest bucket that "
+                             "holds their rows. All buckets (and --multi_rows) share the widest one's KV memory. "
+                             "Empty = off")
+    parser.add_argument("--xbatch_refill", action="store_true",
+                        help="With --xbatch_rows: refill rows freed by finished requests from the queue between "
+                             "decode steps (continuous batching) instead of waiting for the batch's longest row")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
@@ -1802,6 +1886,17 @@ if __name__ == "__main__":
         parser.error("--multi_rows buckets must be >= 2")
     if _multi_rows_arg and _engine_arg != "fast":
         parser.error("--multi_rows requires --engine fast")
+    try:
+        _xbatch_rows_arg = tuple(int(x) for x in args.xbatch_rows.split(",") if x.strip())
+    except ValueError:
+        parser.error(f"--xbatch_rows: comma-separated ints, got {args.xbatch_rows!r}")
+    if any(r < 2 for r in _xbatch_rows_arg):
+        parser.error("--xbatch_rows buckets must be >= 2")
+    if _xbatch_rows_arg and _engine_arg != "fast":
+        parser.error("--xbatch_rows requires --engine fast")
+    if args.xbatch_refill and not _xbatch_rows_arg:
+        parser.error("--xbatch_refill needs --xbatch_rows")
+    _xbatch_refill_arg = args.xbatch_refill
 
     import uvicorn
 
