@@ -404,8 +404,8 @@ class CascadeDecoder(MultiSampleDecoder):
     def _kv_buffers(self) -> list[torch.Tensor]:
         return self.prompt_ks + self.prompt_vs + self.tail_ks + self.tail_vs
 
-    # Every bucket compiles its own static graph: the symbolic-row-count graph a later bucket otherwise gets runs the
-    # 8-row step at about twice the static graph's time on the release shape.
+    # Every bucket compiles its own static graph: the symbolic-row-count graph a later bucket otherwise gets is slower
+    # (the 1B's 8-row step: 13.5 ms symbolic, 9.7 ms static).
     _compile_dynamic = False
 
     def _attend(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:

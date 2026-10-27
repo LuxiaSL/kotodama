@@ -1957,7 +1957,9 @@ if __name__ == "__main__":
                         help="Row decoders (--multi_rows, --xbatch_rows) share each prompt's KV among its rows and "
                              "attend to it once per group (cascade attention, merged by log-sum-exp): less attention "
                              "time per step and KV memory per row. A row then generates at most "
-                             "--cascade_tail_tokens tokens; requests asking for more take the serial path")
+                             "--cascade_tail_tokens tokens; requests asking for more take the serial path. Start the "
+                             "buckets at 16: on the 1B the 8-row cascade step compiles to a slower step than the "
+                             "16-row one")
     parser.add_argument("--cascade_groups", type=int, default=0,
                         help="With --cascade_attn: prompts the widest bucket holds at once (each up to 32 rows; "
                              "~0.9 GB of KV per prompt slot on the 1B at 4096 context). 0 = rows // 4")
