@@ -279,6 +279,8 @@ def main() -> int:
     ap.add_argument("--width_n", default="8",
                     help="comma list: rows per prompt in the width section (keys of the first plain, of the others "
                          "suffixed _n<n>)")
+    ap.add_argument("--width_profile", action="store_true",
+                    help="width: also log the top CUDA kernels over 20 steps of each measurement (torch.profiler)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -373,6 +375,15 @@ def main() -> int:
                             d.step(params)
                         ms = 1000 * timed(lambda: d.step(params), a.steps)
                         key = f"{tag}_rows{w}" + (f"_n{n_req}" if i else "")
+                        if a.width_profile:
+                            from torch.profiler import ProfilerActivity, profile
+
+                            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                                for _ in range(20):
+                                    d.step(params)
+                                torch.cuda.synchronize()
+                            table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=15)
+                            logger.info("%s kernels (20 steps):\n%s", key, table)
                         out[f"{key}_ms_per_step"] = ms
                         out[f"{key}_tok_s"] = w * 1000 / ms
                         out[f"{key}_step_vs_single"] = ms / single
