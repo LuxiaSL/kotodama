@@ -71,7 +71,7 @@ from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 # Fast decode engine (static cache + compiled/CUDA-graphed step). Optional.
 try:
     from kotodama.model.decode_engine import DecodeEngine, SamplingParams as EngineSamplingParams
-    from kotodama.model.multi_decode import MultiSampleDecoder, decode_rows
+    from kotodama.model.multi_decode import CascadeDecoder, MultiSampleDecoder, decode_rows
     from kotodama.model.prefix_cache import PrefixKVCache
     from kotodama.serve.xbatch import XBatchJob, XBatchRunner, XBatchScheduler
     _ENGINE_AVAILABLE = True
@@ -188,6 +188,11 @@ _multi: "dict[int, MultiSampleDecoder]" = {}
 # law and a steering config decode together, each request's rows filled from its own prefill (kotodama.serve.xbatch).
 # None = off: every request takes the paths above.
 _xbatch: "XBatchScheduler | None" = None
+# Cascade attention in the row decoders (--cascade_attn): rows of one prompt share one copy of its KV and each row
+# keeps only the KV it decodes, at most this many tokens; a request asking for more takes the serial path. 0 = the
+# row decoders hold whole-context rows (no cap).
+_row_token_cap: int = 0
+_cascade_info: dict | None = None
 # Prefix caching (engine extend-from-pos prefill); set by load_model.
 _prefix_cache = False
 # Multi-entry prefix KV pool (--prefix_pool_tokens): recent prompts' KV in fixed-size token blocks, so a prompt that
@@ -312,8 +317,9 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16) -> tuple[KotodamaModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
+    global _row_token_cap, _cascade_info
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
@@ -450,21 +456,6 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             eng.reset()
             return eng
 
-        def _build_and_warm_multi(eng: "DecodeEngine", rows: int,
-                                  kv_from: "MultiSampleDecoder | None" = None) -> "MultiSampleDecoder":
-            dec = MultiSampleDecoder(eng, rows, kv_from=kv_from)
-            dec.compile_step(mode="max-autotune")
-            with torch.inference_mode():
-                params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2)
-                for plen in sorted({min(plen, _max_seq_len - 8) for plen in [16, 256]}):
-                    logits = eng.prefill(torch.randint(4, config.vocab_size, (1, plen), device=_device))
-                    dec.start(logits, params)
-                    for _ in range(4):
-                        dec.step(params)
-                torch.cuda.synchronize(_device)
-            eng.reset()
-            return dec
-
         def _build_and_warm_pool(eng: "DecodeEngine", n_tokens: int, block: int) -> "PrefixKVCache":
             pool = PrefixKVCache(eng, n_tokens, block_size=block)
             # A pool hit's suffix (the prompt's last partial block plus whatever differs, often one short turn)
@@ -505,8 +496,19 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         for rows in sorted(set(multi_rows) | set(xbatch_rows), reverse=True):
             # Same thread as the engine: its cudagraph trees are thread-local too.
             widest = decoders[max(decoders)] if decoders else None
-            decoders[rows] = _generate_executor.submit(_build_and_warm_multi, _engine, rows, widest).result()
+            decoders[rows] = _generate_executor.submit(
+                build_and_warm_row_decoder, _engine, rows, widest,
+                (cascade_groups, cascade_tail_tokens) if cascade_attn else None).result()
         _multi = {r: decoders[r] for r in sorted(set(multi_rows))}
+        if cascade_attn and decoders:
+            widest = decoders[max(decoders)]
+            assert isinstance(widest, CascadeDecoder)
+            _row_token_cap = widest.tail_tokens
+            _cascade_info = {"groups": {r: d.groups for r, d in sorted(decoders.items())},
+                             "group_rows": {r: d.group_rows for r, d in sorted(decoders.items())},
+                             "tail_tokens": widest.tail_tokens, "attention": widest.attend_backend,
+                             "kv_gb": round(widest.kv_bytes() / 1e9, 2)}
+            logger.info("Cascade attention ENABLED: %s", _cascade_info)
         if _multi:
             logger.info("Batched multi-sample decode ENABLED: row buckets %s", sorted(_multi))
         if xbatch_rows:
@@ -628,6 +630,7 @@ class ModelInfo(BaseModel):
     default_repetition_penalty: float | None = None
     xbatch: dict | None = None
     prefix_pool: dict | None = None
+    cascade: dict | None = None
 
 
 # ── /logprobs: batched prefill-only scoring (the four-register rider battery) ──
@@ -1310,6 +1313,9 @@ _xbatch_rows_arg: tuple[int, ...] = ()
 _xbatch_refill_arg = False
 _prefix_pool_tokens_arg = 0
 _prefix_pool_block_arg = 16
+_cascade_attn_arg = False
+_cascade_groups_arg = 0
+_cascade_tail_tokens_arg = 1024
 
 
 @asynccontextmanager
@@ -1326,6 +1332,9 @@ async def lifespan(app: FastAPI):
         xbatch_refill=_xbatch_refill_arg,
         prefix_pool_tokens=_prefix_pool_tokens_arg,
         prefix_pool_block=_prefix_pool_block_arg,
+        cascade_attn=_cascade_attn_arg,
+        cascade_groups=_cascade_groups_arg,
+        cascade_tail_tokens=_cascade_tail_tokens_arg,
     )
     try:
         yield
@@ -1402,6 +1411,7 @@ async def info():
                                                        "block_size": _prefix_pool.block_size,
                                                        "cached_blocks": len(_prefix_pool.index),
                                                        "stats": dict(_prefix_pool.stats)},
+        cascade=_cascade_info,
     )
 
 
@@ -1549,14 +1559,49 @@ def _multi_bucket(n: int) -> "MultiSampleDecoder | None":
     return _multi[min(fits)] if fits else None
 
 
+def build_cascade_decoder(eng: "DecodeEngine", rows: int, groups: int, tail_tokens: int,
+                          kv_from: "MultiSampleDecoder | None" = None) -> "CascadeDecoder":
+    """A cascade row decoder of ``rows`` rows. ``groups`` (0 = rows // 4) is the widest bucket's group count; a
+    narrower bucket viewing it (``kv_from``) keeps the same rows per group, within the widest one's groups."""
+    if kv_from is not None:
+        assert isinstance(kv_from, CascadeDecoder)
+        groups = min(kv_from.groups, max(1, kv_from.groups * rows // kv_from.rows))
+    return CascadeDecoder(eng, rows, groups=groups, tail_tokens=tail_tokens, kv_from=kv_from)
+
+
+def build_and_warm_row_decoder(eng: "DecodeEngine", rows: int, kv_from: "MultiSampleDecoder | None" = None,
+                               cascade: tuple[int, int] | None = None) -> "MultiSampleDecoder":
+    """A compiled, warmed row decoder over ``eng`` (call on the generation thread: its CUDA graphs are thread-local).
+    ``cascade`` = (groups, tail_tokens) builds a ``CascadeDecoder`` (``build_cascade_decoder``), None a per-row one."""
+    if cascade is not None:
+        dec = build_cascade_decoder(eng, rows, cascade[0], cascade[1], kv_from)
+    else:
+        dec = MultiSampleDecoder(eng, rows, kv_from=kv_from)
+    dec.compile_step(mode="max-autotune")
+    with torch.inference_mode():
+        params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2)
+        for plen in sorted({min(plen, eng.max_seq_len - 8) for plen in [16, 256]}):
+            logits = eng.prefill(torch.randint(4, eng.config.vocab_size, (1, plen), device=eng.device))
+            dec.start(logits, params)
+            for _ in range(4):
+                dec.step(params)
+        torch.cuda.synchronize(eng.device)
+    eng.reset()
+    return dec
+
+
+def _within_row_cap(request: GenerateRequest) -> bool:
+    return not _row_token_cap or request.max_new_tokens <= _row_token_cap
+
+
 def _multi_compatible(request: GenerateRequest, n: int) -> bool:
-    return (n > 1 and _multi_bucket(n) is not None
+    return (n > 1 and _multi_bucket(n) is not None and _within_row_cap(request)
             and MultiSampleDecoder.supports(EngineSamplingParams(temperature=request.temperature,
                                                                  top_k=request.top_k, top_p=request.top_p)))
 
 
 def _xbatch_compatible(request: GenerateRequest, n: int) -> bool:
-    return (_xbatch is not None and 1 <= n <= _xbatch.runner.max_rows
+    return (_xbatch is not None and 1 <= n <= _xbatch.runner.max_rows and _within_row_cap(request)
             and MultiSampleDecoder.supports(EngineSamplingParams(temperature=request.temperature,
                                                                  top_k=request.top_k, top_p=request.top_p)))
 
@@ -1908,6 +1953,16 @@ if __name__ == "__main__":
                              "--prefix-cache. 0 = off")
     parser.add_argument("--prefix_pool_block", type=int, default=16,
                         help="Token block size of the prefix KV pool (>= 16): prefixes are shared in whole blocks")
+    parser.add_argument("--cascade_attn", action="store_true",
+                        help="Row decoders (--multi_rows, --xbatch_rows) share each prompt's KV among its rows and "
+                             "attend to it once per group (cascade attention, merged by log-sum-exp): less attention "
+                             "time per step and KV memory per row. A row then generates at most "
+                             "--cascade_tail_tokens tokens; requests asking for more take the serial path")
+    parser.add_argument("--cascade_groups", type=int, default=0,
+                        help="With --cascade_attn: prompts the widest bucket holds at once (each up to 32 rows; "
+                             "~0.9 GB of KV per prompt slot on the 1B at 4096 context). 0 = rows // 4")
+    parser.add_argument("--cascade_tail_tokens", type=int, default=1024,
+                        help="With --cascade_attn: tokens a row can generate (its own KV slot)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     args = parser.parse_args()
@@ -1965,6 +2020,13 @@ if __name__ == "__main__":
         parser.error("--prefix_pool_tokens must hold at least one --prefix_pool_block")
     _prefix_pool_tokens_arg = args.prefix_pool_tokens
     _prefix_pool_block_arg = args.prefix_pool_block
+    if args.cascade_attn and not (_multi_rows_arg or _xbatch_rows_arg):
+        parser.error("--cascade_attn needs --multi_rows or --xbatch_rows")
+    if args.cascade_groups < 0 or args.cascade_tail_tokens < 1:
+        parser.error("--cascade_groups must be >= 0 and --cascade_tail_tokens >= 1")
+    _cascade_attn_arg = args.cascade_attn
+    _cascade_groups_arg = args.cascade_groups
+    _cascade_tail_tokens_arg = args.cascade_tail_tokens
 
     import uvicorn
 

@@ -100,6 +100,11 @@ class XBatchQueue:
                 self._jobs.remove(job)
             return taken
 
+    def requeue(self, jobs: list[XBatchJob]) -> None:
+        """Put ``jobs`` back at the head of the queue, in their order (taken but not admitted)."""
+        with self._lock:
+            self._jobs[:0] = jobs
+
     def drain(self) -> list[XBatchJob]:
         """Remove and return every waiting job."""
         with self._lock:
@@ -190,7 +195,7 @@ class XBatchRunner:
         try:
             ids = torch.tensor([job.prompt_ids], dtype=torch.long, device=self.device)
             logits, info = self.prefill(ids)
-            m = min(job.n, len(free))
+            m = min(job.n, len(free), dec.admit_capacity())
             rows = free[:m]
             first = dec.admit(rows, logits, job.params)
             del free[:m]
@@ -209,7 +214,7 @@ class XBatchRunner:
         # A stop string that first appears at this token ends inside its text, so decoding a tail that holds the
         # longest stop several times over finds it without re-decoding the whole row every step.
         window = 4 * max((len(x) for x in job.stop_strings), default=0) + 16
-        budget = min(job.max_new_tokens, self.max_seq_len - len(job.prompt_ids))
+        budget = min(job.max_new_tokens, self.max_seq_len - len(job.prompt_ids), dec.token_room(len(job.prompt_ids)))
         lv = _Live(job, logits, len(job.prompt_ids), budget, window, timing, t0, out=[[] for _ in range(job.n)],
                    home=frozenset(rows))
         self._start(lv, rows, first)
@@ -273,7 +278,8 @@ class XBatchRunner:
             busy = {row for lv in active for row in lv.running}
             reserved = {row for lv in active if lv.started < lv.job.n for row in lv.home}
             free[:] = [r for r in range(dec.rows) if r not in busy and r not in reserved]
-            if not (free and self.refill) or self.should_yield():
+            dec.release(free)  # nobody restarts from these rows: storage they shared goes back to the decoder
+            if not (free and self.refill) or self.should_yield() or not dec.admit_capacity():
                 return taken
             job = self.queue.take_next(head.key)
             if job is None:
@@ -293,12 +299,16 @@ class XBatchRunner:
         head = jobs[0]
         dec = self.bucket_for(sum(j.n for j in jobs))
         free = list(range(dec.rows))
+        dec.release(free)  # whatever the decoder's rows held belongs to an earlier batch
         active: list[_Live] = []
         served = 0
         try:
             if head.steer_writes:
                 self.set_steer(head.steer_writes, **head.steer_kwargs)
-            for job in jobs:
+            for i, job in enumerate(jobs):
+                if not dec.admit_capacity():  # the decoder's shared storage is taken: the rest wait in the queue
+                    self.queue.requeue(jobs[i:])
+                    break
                 lv = self._admit(dec, job, free)
                 served += 1
                 if lv is not None:

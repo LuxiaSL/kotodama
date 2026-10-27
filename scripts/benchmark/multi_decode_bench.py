@@ -33,7 +33,16 @@ against the engine's greedy continuation of its own prompt):
     chunk cover (the time a hit saves, apart from any batch decoding around it);
   * ``xgreedy_pool``: ``xgreedy`` on prompt families that share long prefixes, interleaved, with the pool in front
     of the batcher's prefill (every family member after the first extends from pooled blocks), replayed tie-proof
-    through the engine's full prefill.
+    through the engine's full prefill;
+  * ``cascade_kernel``: the cascade part kernel the decoder runs (kotodama.model.cascade_attn, flash-attn on the GPU)
+    against the fp32 reference at the decode shapes (a group's packed queries over a long prompt slot, one query
+    per row over a tail), on random data: output and log-sum-exp error.
+
+``--cascade`` picks the row decoders: ``off`` per-row KV slots (kotodama.model.multi_decode.MultiSampleDecoder),
+``on`` cascade decoders (``CascadeDecoder``: one KV copy per prompt group, cascade attention), ``both`` the two
+sets side by side (``--cascade_rows`` widths for the cascade set), every section run on each, the cascade set's keys
+suffixed ``_cascade``. ``width`` admits rows ``--width_n`` at a time from one prefill (one group per admit), as a
+request's n candidates arrive, and reports each set's KV memory.
 
 ``--rows`` takes a list (one compiled decoder per bucket) and ``--context_tokens`` a list of prompt lengths (the
 dialogue repeated to that many tokens), so batch width is measured where the loom decodes: deep in a long context.
@@ -49,6 +58,8 @@ Usage (node, GPU):
   tools/run_py.sh scripts/benchmark/multi_decode_bench.py ... --rows 8,16,32,64 --prefix_pool_tokens 65536 \\
       --sections poolparity,xgreedy_pool,load --load_trees_jsonl <loom run>/paths.jsonl \\
       --load_modes xbatch_refill,xbatch_refill_pool --load_concurrency 16 --steer_npz <bank.npz>,<norms.npz>
+  tools/run_py.sh scripts/benchmark/multi_decode_bench.py ... --rows 8,16,32,64 --cascade both \\
+      --cascade_rows 8,16,32,64,128 --sections cascade_kernel,width,xparity,xgreedy --context_tokens 0,1500,3000
 """
 
 from __future__ import annotations
@@ -259,6 +270,12 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=0.75)
     ap.add_argument("--repetition_penalty", type=float, default=1.2)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--cascade", choices=["off", "on", "both"], default="off",
+                    help="row decoders: per-row KV (off), cascade (on), or both sets side by side")
+    ap.add_argument("--cascade_rows", default="", help="widths of the cascade set with --cascade both (default --rows)")
+    ap.add_argument("--cascade_groups", type=int, default=0, help="the server's --cascade_groups")
+    ap.add_argument("--cascade_tail_tokens", type=int, default=1024, help="the server's --cascade_tail_tokens")
+    ap.add_argument("--width_n", type=int, default=8, help="rows per prompt in the width section")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -270,7 +287,8 @@ def main() -> int:
     _model, tok = server.load_model(a.checkpoint, "cuda", mode="base", model_size=a.model_size, engine="fast",
                                     prefix_cache=True, max_seq_len=4096, multi_rows=tuple(widths),
                                     steer_npz=a.steer_npz, prefix_pool_tokens=a.prefix_pool_tokens,
-                                    prefix_pool_block=a.prefix_pool_block)
+                                    prefix_pool_block=a.prefix_pool_block, cascade_attn=a.cascade == "on",
+                                    cascade_groups=a.cascade_groups, cascade_tail_tokens=a.cascade_tail_tokens)
     server._model, server._tokenizer = _model, tok
     eng = server._engine
     pool = server._prefix_pool
@@ -279,7 +297,6 @@ def main() -> int:
     if needs_pool and pool is None:
         raise SystemExit("poolparity / xgreedy_pool / xbatch_refill_pool need --prefix_pool_tokens > 0")
     assert eng is not None and all(server._multi.get(w) is not None for w in widths)
-    dec = server._multi[widths[-1]]
     base_ids = tok.encode(PROMPT)
     body = tok.encode(PROMPT.split("\n\n", 1)[1] + " Fine.\n\nTeo: Fine.\n\n")
 
@@ -296,6 +313,35 @@ def main() -> int:
     def run_on_worker(fn):
         return server._generate_executor.submit(fn).result()  # compiled graphs live on the serving thread
 
+    # decoder sets: key suffix -> {width: decoder}
+    sets: dict[str, dict] = {"_cascade" if a.cascade == "on" else "": dict(server._multi)}
+    if a.cascade == "both":
+        cwidths = sorted({int(x) for x in (a.cascade_rows or a.rows).split(",") if x.strip()})
+
+        def build_cascade_set() -> dict:
+            out: dict = {}
+            for w in sorted(cwidths, reverse=True):
+                out[w] = server.build_and_warm_row_decoder(eng, w, out[max(out)] if out else None,
+                                                           (a.cascade_groups, a.cascade_tail_tokens))
+            return dict(sorted(out.items()))
+
+        sets["_cascade"] = run_on_worker(build_cascade_set)
+
+    def use_set(suffix: str) -> None:
+        """Route the server (and every section) through one decoder set."""
+        decs = sets[suffix]
+        server._multi = dict(decs)
+        server._row_token_cap = getattr(decs[max(decs)], "tail_tokens", 0)
+
+    for suffix, decs in sets.items():
+        widest = decs[max(decs)]
+        res[f"kv_gb{suffix}"] = round(widest.kv_bytes() / 1e9, 2)
+        res[f"widths{suffix}"] = sorted(decs)
+        if hasattr(widest, "groups"):
+            res[f"groups{suffix}"] = {w: d.groups for w, d in decs.items()}
+            res[f"tail_tokens{suffix}"] = widest.tail_tokens
+            res[f"attention{suffix}"] = widest.attend_backend
+
     def bench() -> dict:
         out: dict = {}
         with torch.inference_mode():
@@ -308,10 +354,13 @@ def main() -> int:
                     t = eng.step(t, params)
                 single = 1000 * timed(lambda: eng.step(eng.cur_token, params), a.steps)
                 out[f"{tag}_single_ms_per_token"] = single
-                for w in widths:
+                for w in sorted(server._multi):
                     d = server._multi[w]
                     logits = eng.prefill(cids)
-                    d.start(logits, params)
+                    n = min(a.width_n, w)
+                    d.release(range(w))  # groups an earlier section left held
+                    for lo_row in range(0, w, n):  # one admit per request's n candidates (a group each)
+                        d.admit(range(lo_row, min(lo_row + n, w)), logits, params)
                     for _ in range(8):
                         d.step(params)
                     ms = 1000 * timed(lambda: d.step(params), a.steps)
@@ -329,6 +378,7 @@ def main() -> int:
         return greedy
 
     def agreement() -> dict:
+        dec = server._multi[max(server._multi)]
         with torch.inference_mode():
             # a model-written continuation (the engine's greedy) is a fairer probe than random ids
             greedy = greedy_of(ids, 64)
@@ -362,6 +412,7 @@ def main() -> int:
         steps = 32
         texts = load_prompts(tok, a.prompts_jsonl, count, lo, hi, a.seed)
         pids = [torch.tensor([tok.encode(t)], device="cuda") for t, _ in texts]
+        dec = server._multi[max(server._multi)]
         P, B = len(pids), dec.rows
         with torch.inference_mode():
             greedy = [greedy_of(p, steps) for p in pids]
@@ -380,6 +431,7 @@ def main() -> int:
                 truth.append(list(full[p.shape[1] - 1:]))
             cold = SamplingParams(temperature=1e-4, repetition_penalty=1.0)
             first: dict[int, torch.Tensor] = {}
+            dec.release(range(B))  # groups an earlier section left held
             for p in range(P):
                 rows = list(range(p, B, P))
                 l0 = eng.prefill(pids[p])
@@ -447,7 +499,8 @@ def main() -> int:
             if use_pool:
                 eng.reset()  # greedy_of left the last prompt in the engine: the pool, not the engine, holds trunks
             # full prefills, as greedy_of makes (a prefix-cache extend rounds differently and can flip a near-tie)
-            runner = XBatchRunner({widths[0]: server._multi[widths[0]]},
+            narrow = min(server._multi)
+            runner = XBatchRunner({narrow: server._multi[narrow]},
                                   prefill=prefill or (lambda i: (eng.prefill(i), None)),
                                   set_steer=eng.set_steer, decode=lambda i: tok.decode(i, skip_special_tokens=True),
                                   stop_ids=frozenset(), max_seq_len=server._max_seq_len,
@@ -478,7 +531,7 @@ def main() -> int:
                "xgreedy_gap_max": max(gaps), "xgreedy_gap_over_0p25": sum(g > 0.25 for g in gaps),
                "xgreedy_served": served, "xgreedy_refilled": runner.stats["refilled"],
                "xgreedy_restarts": runner.stats["restarts"],
-               "xgreedy_bucket": widths[0], "xgreedy_prompt_tokens": [len(p) for p in pids],
+               "xgreedy_bucket": narrow, "xgreedy_prompt_tokens": [len(p) for p in pids],
                "xgreedy_match_prefix": match}
         if use_pool:
             out = {k.replace("xgreedy_", "xgreedy_pool_"): v for k, v in out.items()}
@@ -618,7 +671,7 @@ def main() -> int:
                 name, alpha = item.split(":")
                 steer.append({"name": name, "alpha": float(alpha)})
         all_dec = dict(server._multi)
-        xrows = tuple(w for w in widths if w >= 8)
+        xrows = tuple(w for w in sorted(all_dec) if w >= 8)
 
         def set_mode(mode: str) -> None:
             server._multi = {8: all_dec[8]} if 8 in all_dec else {}
@@ -718,26 +771,83 @@ def main() -> int:
                 logger.info("load %s c=%d: %s", mode, conc, r)
         set_mode("current")
         server._prefix_pool = None
+        server._multi = all_dec
         return out
 
+    def cascade_kernel() -> dict:
+        """flash-attn's part kernel vs the fp32 reference at the decode shapes, on random bf16 data."""
+        from kotodama.model.cascade_attn import (attend_for, attend_reference, merge, pack_group_queries,
+                                                 unpack_group_outputs)
+
+        name, fn = attend_for(torch.device("cuda"), torch.bfloat16)
+        cfg = eng.config
+        hq, hk, d, S = cfg.num_attention_heads, cfg.num_kv_heads, cfg.head_dim, eng.max_seq_len
+        g = torch.Generator(device="cuda").manual_seed(a.seed)
+        out: dict = {"cascade_kernel_backend": name}
+
+        def err(x: torch.Tensor, y: torch.Tensor) -> float:
+            return float((x.float() - y.float()).norm() / y.float().norm())
+
+        with torch.inference_mode():
+            for groups, m, rows, tail in ((8, 8, 64, 200), (2, 32, 64, 17), (16, 8, 128, 900)):
+                q = torch.randn((rows, hq, d), device="cuda", dtype=torch.bfloat16, generator=g)
+                pk, pv = (torch.randn((groups, S, hk, d), device="cuda", dtype=torch.bfloat16, generator=g)
+                          for _ in range(2))
+                tk, tv = (torch.randn((rows, tail + 8, hk, d), device="cuda", dtype=torch.bfloat16, generator=g)
+                          for _ in range(2))
+                plens = torch.randint(1500, 3000, (groups,), device="cuda", generator=g).to(torch.int32)
+                plens[-1] = 0  # an empty group
+                tlens = torch.randint(1, tail, (rows,), device="cuda", generator=g).to(torch.int32)
+                members = torch.arange(groups * m, device="cuda").remainder(rows).view(groups, m)
+                slot = torch.arange(rows, device="cuda")  # row r sits at slot r (group r // m)
+                qg = pack_group_queries(q, members, hk)
+                got = {}
+                for tag, f in (("got", fn), ("ref", attend_reference)):
+                    o1, l1 = f(qg, pk, pv, plens)
+                    o1, l1 = unpack_group_outputs(o1, l1, m)
+                    o2, l2 = f(q.unsqueeze(1), tk, tv, tlens)
+                    got[tag] = (o1[slot], l1[slot], o2[:, 0], l2[:, :, 0])
+                go1, gl1, go2, gl2 = got["got"]
+                ro1, rl1, ro2, rl2 = got["ref"]
+                live = torch.isfinite(rl1).all(-1)  # rows of non-empty groups
+                key = f"cascade_kernel_g{groups}_m{m}_rows{rows}"
+                out[f"{key}_shared_rel_err"] = err(go1[live], ro1[live])
+                out[f"{key}_shared_lse_max_abs"] = float((gl1[live] - rl1[live]).abs().max())
+                out[f"{key}_empty_group_lse_is_neg_inf"] = bool(torch.isneginf(gl1[~live]).all())
+                out[f"{key}_tail_rel_err"] = err(go2, ro2)
+                out[f"{key}_tail_lse_max_abs"] = float((gl2 - rl2).abs().max())
+                out[f"{key}_merged_rel_err"] = err(merge(go1, gl1, go2, gl2), merge(ro1, rl1, ro2, rl2))
+        logger.info("cascade_kernel: %s", out)
+        return out
+
+    def per_set(fn) -> dict:
+        """Run ``fn`` once per decoder set, its keys suffixed with the set's."""
+        merged: dict = {}
+        for suffix in sets:
+            use_set(suffix)
+            merged.update({f"{k}{suffix}": v for k, v in fn().items()})
+        use_set(next(iter(sets)))
+        return merged
+
+    if "cascade_kernel" in sections:
+        res.update(run_on_worker(cascade_kernel))
     if "width" in sections:
-        res.update(run_on_worker(bench))
+        res.update(per_set(lambda: run_on_worker(bench)))
     if "agreement" in sections:
-        res.update(run_on_worker(agreement))
+        res.update(per_set(lambda: run_on_worker(agreement)))
     if "xparity" in sections:
         for count in [int(x) for x in a.xparity_prompts.split(",") if x.strip()]:
-            out = run_on_worker(lambda: xparity(count))
-            res.update({f"{k}_p{count}": v for k, v in out.items()})
+            res.update(per_set(lambda: {f"{k}_p{count}": v for k, v in run_on_worker(lambda: xparity(count)).items()}))
     if "xgreedy" in sections:
-        res.update(run_on_worker(xgreedy))
+        res.update(per_set(lambda: run_on_worker(xgreedy)))
     if "poolcost" in sections:
         res.update(run_on_worker(poolcost))
     if "xgreedy_pool" in sections:
-        res.update(run_on_worker(lambda: xgreedy(use_pool=True)))
+        res.update(per_set(lambda: run_on_worker(lambda: xgreedy(use_pool=True))))
     if "poolparity" in sections:
         res.update(run_on_worker(poolparity))
     if "load" in sections:
-        res.update(load())
+        res.update(per_set(load))
     logger.info("RESULT %s", json.dumps(res, indent=1))
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
