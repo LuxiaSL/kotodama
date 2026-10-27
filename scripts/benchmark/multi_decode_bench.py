@@ -42,7 +42,7 @@ against the engine's greedy continuation of its own prompt):
 ``on`` cascade decoders (``CascadeDecoder``: one KV copy per prompt group, cascade attention), ``both`` the two
 sets side by side (``--cascade_rows`` widths for the cascade set), every section run on each, the cascade set's keys
 suffixed ``_cascade``. ``width`` admits rows ``--width_n`` at a time from one prefill (one group per admit), as a
-request's n candidates arrive, and reports each set's KV memory.
+request's n candidates arrive (a list measures each), and reports each set's KV memory.
 
 ``--rows`` takes a list (one compiled decoder per bucket) and ``--context_tokens`` a list of prompt lengths (the
 dialogue repeated to that many tokens), so batch width is measured where the loom decodes: deep in a long context.
@@ -275,15 +275,23 @@ def main() -> int:
     ap.add_argument("--cascade_rows", default="", help="widths of the cascade set with --cascade both (default --rows)")
     ap.add_argument("--cascade_groups", type=int, default=0, help="the server's --cascade_groups")
     ap.add_argument("--cascade_tail_tokens", type=int, default=1024, help="the server's --cascade_tail_tokens")
-    ap.add_argument("--width_n", type=int, default=8, help="rows per prompt in the width section")
+    ap.add_argument("--width_n", default="8",
+                    help="comma list: rows per prompt in the width section (keys of the first plain, of the others "
+                         "suffixed _n<n>)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
     widths = sorted({int(x) for x in a.rows.split(",") if x.strip()})
     contexts = [int(x) for x in a.context_tokens.split(",") if x.strip()]
     sections = {x.strip() for x in a.sections.split(",") if x.strip()}
+    width_ns = [int(x) for x in a.width_n.split(",") if x.strip()]
     lo, hi = (int(x) for x in a.prompt_tokens.split(","))
     server._rope_fp32_override = a.rope_fp32
+    if a.cascade == "both":
+        # every decoder compiles the same step function once; two sets of buckets pass dynamo's default limit (8)
+        import torch._dynamo
+
+        torch._dynamo.config.recompile_limit = 64
     _model, tok = server.load_model(a.checkpoint, "cuda", mode="base", model_size=a.model_size, engine="fast",
                                     prefix_cache=True, max_seq_len=4096, multi_rows=tuple(widths),
                                     steer_npz=a.steer_npz, prefix_pool_tokens=a.prefix_pool_tokens,
@@ -356,17 +364,19 @@ def main() -> int:
                 out[f"{tag}_single_ms_per_token"] = single
                 for w in sorted(server._multi):
                     d = server._multi[w]
-                    logits = eng.prefill(cids)
-                    n = min(a.width_n, w)
-                    d.release(range(w))  # groups an earlier section left held
-                    for lo_row in range(0, w, n):  # one admit per request's n candidates (a group each)
-                        d.admit(range(lo_row, min(lo_row + n, w)), logits, params)
-                    for _ in range(8):
-                        d.step(params)
-                    ms = 1000 * timed(lambda: d.step(params), a.steps)
-                    out[f"{tag}_rows{w}_ms_per_step"] = ms
-                    out[f"{tag}_rows{w}_tok_s"] = w * 1000 / ms
-                    out[f"{tag}_rows{w}_step_vs_single"] = ms / single
+                    for i, n_req in enumerate(width_ns):
+                        logits = eng.prefill(cids)
+                        n = min(n_req, w)
+                        d.release(range(w))  # groups an earlier measurement left held
+                        for lo_row in range(0, w, n):  # one admit per request's n candidates (a group each)
+                            d.admit(range(lo_row, min(lo_row + n, w)), logits, params)
+                        for _ in range(8):
+                            d.step(params)
+                        ms = 1000 * timed(lambda: d.step(params), a.steps)
+                        key = f"{tag}_rows{w}" + (f"_n{n_req}" if i else "")
+                        out[f"{key}_ms_per_step"] = ms
+                        out[f"{key}_tok_s"] = w * 1000 / ms
+                        out[f"{key}_step_vs_single"] = ms / single
                 logger.info("%s: %s", tag, {k: round(v, 2) for k, v in out.items() if k.startswith(tag)})
         return out
 
