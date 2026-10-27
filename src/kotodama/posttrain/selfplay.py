@@ -209,10 +209,23 @@ _STOP = frozenset("the a an and or but to of in on at for with is are was were b
                   "would can could dont im its youre thats there here well oh okay know like get got go going".split())
 
 
-def novelty(text: str, prior: list[Turn], window: int = 30) -> float:
+def spoken_text(text: str, cast: Optional[list[str]] = None) -> str:
+    """A turn's speech only: its first paragraph plus later paragraphs that ``kotodama.posttrain.narration`` does not
+    call narration (stage directions are stripped later by ``speech_key``)."""
+    from kotodama.posttrain.narration import classify_paragraph, split_turn
+
+    paras = split_turn(text)
+    keep = paras[:1] + [b for a, b in zip(paras, paras[1:]) if classify_paragraph(b, a, cast)[0] != "narr"]
+    return "\n\n".join(keep)
+
+
+def novelty(text: str, prior: list[Turn], window: int = 30, speech_only: bool = False,
+            cast: Optional[list[str]] = None) -> float:
     """Share of the candidate's content words (3+ letters, not stopwords) that none of the last ``window`` turns
-    used; 0 for a turn without content words."""
-    words = {w for w in speech_key(text).split() if len(w) >= 3 and w not in _STOP}
+    used; 0 for a turn without content words. ``speech_only``: narration paragraphs earn nothing (prose is word-rich,
+    so counting it rewards narration over speech)."""
+    words = {w for w in speech_key(spoken_text(text, cast) if speech_only else text).split()
+             if len(w) >= 3 and w not in _STOP}
     if not words:
         return 0.0
     seen = {w for t in prior[-window:] for w in speech_key(t.text).split()}

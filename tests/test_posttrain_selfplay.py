@@ -276,3 +276,13 @@ def test_novelty_and_vetoes_wire_into_evaluate() -> None:
         or "repeat_turn" in sp.evaluate("I'll go.\n\nB:", "stop", "A", loop, ["A", "B"], "", cfg).vetoes
     off = sp.SelfPlayConfig(repeat_window=0)
     assert "cycle" not in sp.evaluate("I'll go.", "stop", "A", loop, ["A", "B"], "", off).vetoes
+
+
+def test_novelty_speech_only_ignores_narration() -> None:
+    from kotodama.posttrain.transcript import Turn
+
+    prior = [Turn("A", "The harbour was cold that night.")]
+    prose = "Cold harbour.\n\nMeanwhile the lighthouse keeper rowed toward the distant orchard islands."
+    assert sp.novelty(prose, prior) > 0.5  # the narration paragraph brings many new words
+    assert sp.novelty(prose, prior, speech_only=True, cast=["A", "B"]) == 0.0  # the spoken part brings none
+    assert sp.spoken_text("Hello.\n\nAnd another thing, you never asked me.", ["A", "B"]).count("\n\n") == 1

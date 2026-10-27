@@ -88,6 +88,7 @@ class LoomConfig:
     deep_width: int = 0
     select: str = "uniform"  # uniform | engage | novel
     select_lambda: float = 0.0
+    novelty_speech_only: bool = False  # novel: narration paragraphs earn no novelty
     engage_replies: int = 2
     overlong: str = "veto"  # veto | keep
 
@@ -208,7 +209,8 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
                 logger.warning("node %s: engagement scoring failed (%s); choosing uniformly", node.id, e)
                 stats["engage_failures"] = stats.get("engage_failures", 0) + 1
         if cfg.select == "novel" and len(survivors) > cfg.children:
-            nov = {i: novelty(cands[i].text, list(seen)) for i in survivors}
+            nov = {i: novelty(cands[i].text, list(seen), speech_only=cfg.novelty_speech_only, cast=seed.cast)
+                   for i in survivors}
             mu = sum(nov.values()) / len(nov)
             sd = (sum((v - mu) ** 2 for v in nov.values()) / len(nov)) ** 0.5 or 1.0
             w = [math.exp(cfg.select_lambda * (nov[i] - mu) / sd) for i in survivors]
@@ -615,6 +617,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--select_lambda", type=float, default=0.0,
                     help="engage: >0 leans to turns that hand the next speaker something, <0 to self-contained ones; "
                          "novel: >0 leans to turns whose content words the last 30 turns did not use")
+    ap.add_argument("--novelty_speech_only", action="store_true",
+                    help="novel: count only speech (narration paragraphs and stage directions earn no novelty)")
     ap.add_argument("--cycle_window", type=int, default=0,
                     help="veto a turn that repeats an adjacent pair of turns said in the last N turns (speech only)")
     ap.add_argument("--template_window", type=int, default=0,
@@ -649,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = LoomConfig(a.candidates, a.children, a.width, a.max_depth, a.min_turns, a.max_tokens,
                      window_chars=a.window_chars, deep_after=a.deep_after, deep_width=a.deep_width,
                      select=a.select, select_lambda=a.select_lambda, engage_replies=a.engage_replies,
-                     overlong=a.overlong)
+                     overlong=a.overlong, novelty_speech_only=a.novelty_speech_only)
     sp = SelfPlayConfig(candidates=a.candidates, max_tokens=a.max_tokens, min_turns=a.min_turns,
                         cycle_window=a.cycle_window, template_window=a.template_window, template_max=a.template_max)
     complete, close = oai_completer(a.endpoint, sampling, a.max_tokens, steer=parse_steer(a.steer) or None,
