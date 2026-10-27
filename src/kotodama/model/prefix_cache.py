@@ -184,7 +184,8 @@ class PrefixKVCache:
     ``prefill(input_ids)`` has ``DecodeEngine.prefill_cached``'s contract (the engine holds the prompt's KV and
     position afterwards; returns last-position logits (1, V) fp32 and an info dict) and adds to the info dict
     ``pool_tokens`` (prompt tokens whose KV came from the pool) and ``stored_blocks``. ``stats`` accumulates
-    requests, hits, prompt/reused/pooled tokens, stored/evicted blocks and the time spent loading and storing.
+    requests, hits, prompt/reused/pooled tokens, stored/evicted blocks and host time spent matching and loading,
+    in the engine's prefill or extend, and storing (host time: the GPU work is waited on only where a step syncs).
     """
 
     def __init__(self, engine: DecodeEngine, n_tokens: int, block_size: int = 16) -> None:
@@ -203,7 +204,7 @@ class PrefixKVCache:
         self._offsets = torch.arange(self.block_size, device=engine.device, dtype=torch.long)
         self.stats: dict[str, float] = {"requests": 0, "hits": 0, "prompt_tokens": 0, "reused_tokens": 0,
                                         "pool_tokens": 0, "stored_blocks": 0, "evicted_blocks": 0,
-                                        "dropped_blocks": 0, "load_s": 0.0, "store_s": 0.0}
+                                        "dropped_blocks": 0, "load_s": 0.0, "extend_s": 0.0, "store_s": 0.0}
         logger.info("PrefixKVCache: %d blocks x %d tokens, %.1f GB", n_blocks, self.block_size,
                     2 * self.k.numel() * self.k.element_size() / 1e9)
 
@@ -295,6 +296,7 @@ class PrefixKVCache:
         st["pool_tokens"] += loaded
         st["stored_blocks"] += stored
         st["load_s"] += t1 - t0
+        st["extend_s"] += t2 - t1
         st["store_s"] += t3 - t2
         info = {**info, "pool_tokens": loaded, "stored_blocks": stored}
         return logits, info

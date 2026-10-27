@@ -163,7 +163,7 @@ def load_tree_prompts(tok, path: str, n_trees: int, depths: int, window_chars: i
                 continue
             t = m.group(1)
             if t not in rows:
-                if len(order) >= 4 * n_trees:  # candidates: some trees never reach lo tokens
+                if len(order) >= 8 * n_trees:  # candidates: some trees never reach lo tokens
                     continue
                 rows[t] = []
                 order.append(t)

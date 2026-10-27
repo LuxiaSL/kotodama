@@ -182,22 +182,25 @@ class MultiSampleDecoder(nn.Module):
     @torch.inference_mode()
     def admit(self, rows: Sequence[int], prefill_logits: torch.Tensor, params: SamplingParams) -> list[int]:
         """Fill ``rows`` from the engine's prefilled prompt and sample each row's first token from the prompt's
-        last-position logits (1, V). The whole KV slot is copied, so a row keeps nothing from what it decoded
-        before. Writes the first tokens into ``cur_tokens[rows]`` (the next step feeds them) and returns them."""
+        last-position logits (1, V). The prompt's KV positions are copied and the mask is the engine's (open on the
+        prompt only), so a row attends to nothing it decoded before: its later positions are closed until its own
+        decode steps rewrite and open them. Writes the first tokens into ``cur_tokens[rows]`` (the next step feeds
+        them) and returns them."""
         eng = self.engine
         rows = self._check_rows(rows)
         if eng._pos_cpu <= 0 or eng._pos_cpu >= self.max_seq_len:
             raise RuntimeError(f"engine position {eng._pos_cpu} is not a prefilled prompt")
         self._sync_sampling(params)
         n = len(rows)
+        p = eng._pos_cpu
         idx = torch.tensor(rows, device=self.pos.device, dtype=torch.long)
         contiguous = rows == list(range(rows[0], rows[0] + n))
         for li in range(self.n_layers):
             for dst, src in ((self.k_caches[li], eng.k_caches[li]), (self.v_caches[li], eng.v_caches[li])):
                 if contiguous:
-                    dst[rows[0]:rows[0] + n].copy_(src.expand(n, -1, -1, -1))
-                else:
-                    dst.index_copy_(0, idx, src.expand(n, -1, -1, -1).contiguous())
+                    dst[rows[0]:rows[0] + n, :, :p].copy_(src[:, :, :p].expand(n, -1, -1, -1))
+                else:  # one indexed write, the prompt broadcast over the rows (no materialized copies)
+                    dst[:, :, :p].index_put_((idx,), src[:, :, :p].expand(n, -1, -1, -1))
         self.attn_bias.index_copy_(0, idx, eng.attn_bias.expand(n, -1, -1, -1).contiguous())
         return self._seed(rows, idx, eng._pos_cpu, prefill_logits)
 
