@@ -5,7 +5,7 @@ partly through pronouns that resolve only by tracking the scene::
 
     Lucy, Tom and Anna are sitting at a table. Lucy has the cup. Tom has the
     lamp and the bell. Lucy hands the cup to Tom. He passes it to Anna. Anna
-    asks Tom for the lamp, so he gives it to her. Now the person with the cup is
+    asks Tom for the lamp, so he hands it over. Now the cup is with
     -> " Anna"
 
 Transfer forms (each counts as ONE transfer):
@@ -15,7 +15,10 @@ Transfer forms (each counts as ONE transfer):
          to the one person of that gender among the previous transfer's giver and
          recipient (only emitted when their genders differ, so it is unique)
   ask    ``R asks G for the o, so <he|she> gives it to <him|her>.`` — only for a
-         mixed-gender pair, so both pronouns are unique
+         mixed-gender pair, so both pronouns are unique. As the last sentence of a
+         holder item (the rule below) it names the gold: ``…, so G gives it to
+         <him|her>.`` when the gold is G, ``R asks G for the o, so <he|she> hands it
+         over.`` (``surface: "over"``; the recipient slot holds R) when the gold is R
 Language rules (generation and ``validate_item``):
   * a sentence-initial He/She is written only when the previous sentence names
     its referent after the last pronoun for them, or the scene holds no one else
@@ -23,13 +26,17 @@ Language rules (generation and ``validate_item``):
     her.") with a second woman at the table the chain names the giver instead;
   * no object goes straight back: a transfer never returns an object of the
     previous transfer from its recipient to its giver (:func:`gives_back`);
-  * objects agree with "it" and "is" (``pools.singular``: no "dice").
+  * objects agree with "it" and "is" (``pools.singular``: no "dice");
+  * the last sentence never refers to a holder query's gold with a pronoun
+    (:func:`final_pronoun_for`, :func:`name_final_gold`), so the query "…is with"
+    never follows a "him"/"her" that names the answer. Each rewrite keeps the
+    sentence's last-mentioned name, so the recency control is drawn as before:
+    "…hands it over." leaves the giver (not the gold) last, as "…gives it to
+    her." does, keeps the giver's pronoun and ends on no person pronoun.
 
 Cell = (n_people ∈ {3,4}, transfers ∈ {1,2,4}, query kind ∈ {holder, object}):
-  holder  ``Now the person with the cup is`` -> a name; candidates = every
-          person. The queried object has moved at least once. The answer slot is
-          a subject complement, so a name is the natural next word even right
-          after "…gives it to her." (``…is with`` invites "her" there).
+  holder  ``Now the cup is with`` -> a name; candidates = every person. The
+          queried object has moved at least once.
   object  ``Now Anna has the``   -> an object; candidates = every object. The
           queried person holds exactly one object, and their holdings changed.
 At transfers >= 2 every item has at least one pronoun transfer (chain or ask).
@@ -55,9 +62,14 @@ from kotodama.eval.bindprobes.pools import (FEMALE_CANDIDATES, MALE_CANDIDATES, 
                                             Gender, Pools, singular)
 
 FAMILY = "dialogue"
-VERSION = 2                       # meta.dialogue_version; items' id/seed tag "dialogue-v2"
-# the holder query's lead-in per generation (the object query has one form)
-HOLDER_LEADS: dict[int, str] = {1: "Now the {o} is with", 2: "Now the person with the {o} is"}
+VERSION = 3                       # meta.dialogue_version; items' id/seed tag "dialogue-v3"
+# The holder query's lead-in per generation (the object query has one form). v2's subject-
+# complement frame ("the person with the o is") renders v2 items only: it is a harder question
+# for every model whether or not the gold is the last name mentioned, so it does not control
+# the "her" that "…is with" invites after "…gives it to her."; v3 keeps that pronoun out of
+# the last sentence instead.
+HOLDER_LEADS: dict[int, str] = {1: "Now the {o} is with", 2: "Now the person with the {o} is",
+                                3: "Now the {o} is with"}
 N_PEOPLE = (3, 4)
 TRANSFERS = (1, 2, 4)
 QKINDS = ("holder", "object")
@@ -127,7 +139,8 @@ def resolve(spec: Spec) -> tuple[list[Resolved], dict[str, list[str]]]:
             recip = op["recipient"]
         elif form == "ask":
             pair = [op["asker"], op["askee"]]
-            giver, recip = unique(op["subj_pron"], pair), unique(op["obj_pron"], pair)
+            # a slot holds a pronoun, or (the last sentence's gold) the name itself
+            giver, recip = [x if x in pair else unique(x, pair) for x in (op["subj_pron"], op["obj_pron"])]
             if (giver, recip) != (op["askee"], op["asker"]):
                 raise ValueError(f"op {k}: ask pronouns do not resolve askee -> asker")
             objs = [op["obj"]]
@@ -158,7 +171,14 @@ def _names_in(op: Mapping[str, Any]) -> list[str]:
         return [op["giver"], op["recipient"]]
     if op["form"] == "chain":
         return ([op["subj"]] if op["subj"] not in PRON_GENDER else []) + [op["recipient"]]
-    return [op["asker"], op["askee"]]
+    return [op["asker"], op["askee"]] + _ask_named(op)
+
+
+def _ask_named(op: Mapping[str, Any]) -> list[str]:
+    """The names an ask writes in its pronoun slots, in text order (the "over" surface
+    writes no recipient slot: its recipient is the asker, named first)."""
+    slots = ("subj_pron",) if op.get("surface") == "over" else ("subj_pron", "obj_pron")
+    return [op[k] for k in slots if op[k] not in PRON_GENDER]
 
 
 def pronoun_hazard(prev_op: Mapping[str, Any], referent: str,
@@ -173,9 +193,44 @@ def pronoun_hazard(prev_op: Mapping[str, Any], referent: str,
     if sum(1 for n in named if gender[n] == g) >= 2:
         return f"the previous sentence names two people of gender {g!r}"
     same = [n for n in gender if gender[n] == g]
-    if prev_op["form"] == "ask" and len(same) > 1:
+    if prev_op["form"] == "ask" and prev_op["obj_pron"] in PRON_GENDER and len(same) > 1:
         return f"the referent {referent} was last a pronoun, with {len(same)} of gender {g!r} present"
     return None
+
+
+def final_pronoun_for(spec: Spec) -> Optional[str]:
+    """The pronoun the last transfer sentence uses for a holder query's gold, or None (an
+    object query, or a last sentence that names the gold or does not mention them)."""
+    if spec["query"].get("kind") != "holder" or not spec["ops"]:
+        return None
+    res, hist = resolve(spec)
+    gold = hist[spec["query"]["obj"]][-1]
+    op, last = spec["ops"][-1], res[-1]
+    if op["form"] == "chain" and op["subj"] in PRON_GENDER and last["giver"] == gold:
+        return str(op["subj"])
+    if op["form"] == "ask":
+        if op["subj_pron"] in PRON_GENDER and last["giver"] == gold:
+            return str(op["subj_pron"])
+        if op["obj_pron"] in PRON_GENDER and last["recipient"] == gold:
+            return str(op["obj_pron"])
+    return None
+
+
+def name_final_gold(spec: Spec) -> Spec:
+    """``spec`` with the last sentence naming a holder query's gold where it used a pronoun
+    (:func:`final_pronoun_for`); the transfers and the gold are unchanged."""
+    if final_pronoun_for(spec) is None:
+        return spec
+    res, hist = resolve(spec)
+    gold = hist[spec["query"]["obj"]][-1]
+    op = dict(spec["ops"][-1])
+    if op["form"] == "chain":
+        op["subj"] = gold
+    elif res[-1]["giver"] == gold:
+        op["subj_pron"] = gold
+    else:
+        op.update(surface="over", obj_pron=gold)
+    return {**spec, "ops": spec["ops"][:-1] + [op]}  # type: ignore[typeddict-item]
 
 
 def final_holdings(spec: Spec) -> dict[str, list[str]]:
@@ -214,6 +269,11 @@ def _op_sentence(op: dict[str, Any]) -> str:
         subj = op["subj"]
         subj = subj.capitalize() if subj in PRON_GENDER else subj
         return f"{subj} passes {op['pronoun']} to {op['recipient']}."
+    if form == "ask" and op.get("surface") == "over":
+        if op["obj_pron"] != op["asker"]:
+            raise ValueError(f"an 'over' ask holds the asker in its recipient slot, not {op['obj_pron']!r}")
+        return (f"{op['asker']} asks {op['askee']} for the {op['obj']}, so "
+                f"{op['subj_pron']} hands it over.")
     if form == "ask":
         return (f"{op['asker']} asks {op['askee']} for the {op['obj']}, so "
                 f"{op['subj_pron']} gives it to {op['obj_pron']}.")
@@ -256,7 +316,7 @@ def _mentions(spec: Spec) -> list[str]:
             elif op["form"] == "chain":
                 out += ([op["subj"]] if op["subj"] in names else []) + [op["recipient"]]
             else:
-                out += [op["asker"], op["askee"]]
+                out += [op["asker"], op["askee"]] + _ask_named(op)
         return out
     out = [o for n in names for o, w in spec["holdings0"] if w == n]
     for op in spec["ops"]:
@@ -311,6 +371,9 @@ def validate_item(item: Item) -> None:
             why = pronoun_hazard(ops[k - 1], res[k]["giver"], gender)
             if why is not None:
                 raise ValueError(f"{item.item_id}: op {k} opens with an unclear pronoun: {why}")
+    pron = final_pronoun_for(spec)
+    if pron is not None:
+        raise ValueError(f"{item.item_id}: the last sentence calls the gold {pron!r}")
 
 
 # ── Generation ─────────────────────────────────────────────────────────────────
@@ -404,6 +467,7 @@ def gen_item(rng: random.Random, cell: Cell, pools: Pools, item_id: str, k: int,
             if not choices:
                 return None
             spec["query"] = {"kind": "holder", "obj": rng.choice(choices)}
+            spec = name_final_gold(spec)
         else:
             fin = final_holdings(spec)
             choices = [p for p in names if len(fin[p]) == 1
@@ -449,7 +513,7 @@ def relabel(item: Item, mapping: Mapping[str, str], target: Optional[Item] = Non
     ops = []
     for op in spec["ops"]:
         o = dict(op)
-        for key in ("giver", "recipient", "subj", "asker", "askee"):
+        for key in ("giver", "recipient", "subj", "asker", "askee", "subj_pron", "obj_pron"):
             if key in o:
                 o[key] = m(o[key])
         ops.append(o)

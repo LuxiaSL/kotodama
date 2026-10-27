@@ -123,7 +123,7 @@ def test_dialogue_validate_rejects_give_back_and_unclear_pronoun():
     named = _dl([ask, {"form": "chain", "subj": "Lucy", "pronoun": "it", "recipient": "Anna"}],
                 {"kind": "holder", "obj": "lamp"})
     dialogue.validate_item(named)
-    assert "Lucy passes it to Anna. Now the person with the lamp is" in dialogue.render(named, False)
+    assert "Lucy passes it to Anna. Now the lamp is with" in dialogue.render(named, False)
     # the same pronoun is clear when no other woman is in the scene
     duo = dialogue.build("d1", (3, 2, "holder"), {
         "people": [["Lucy", "f"], ["Tom", "m"], ["Ben", "m"]],
@@ -145,7 +145,7 @@ def test_pronoun_hazard_rules():
     assert dialogue.pronoun_hazard(ask, "Anna", {"Anna": "f", "Tom": "m", "Ben": "m"}) is None
 
 
-def test_dialogue_pronouns_clear_and_holder_slot_name_shaped(gen):
+def test_dialogue_pronouns_clear_and_no_pronoun_for_the_gold_before_the_query(gen):
     n_pron = 0
     for it in _with_shots(gen["dialogue"]):
         s: Any = it.spec
@@ -156,9 +156,10 @@ def test_dialogue_pronouns_clear_and_holder_slot_name_shaped(gen):
                 n_pron += 1
                 assert dialogue.pronoun_hazard(s["ops"][k - 1], res[k]["giver"], gender) is None
         text = dialogue.render(it, False)
-        assert not text.endswith(" is with")
+        assert it.meta["dialogue_version"] == dialogue.VERSION
+        assert dialogue.final_pronoun_for(s) is None, it.item_id
         if s["query"]["kind"] == "holder":
-            assert text.endswith(f"Now the person with the {s['query']['obj']} is")
+            assert text.endswith(f". Now the {s['query']['obj']} is with")
     assert n_pron > 20
 
 
@@ -212,17 +213,56 @@ def test_deixis_check_no_give_back():
     deixis.check_no_give_back(evs[:2] + [{**evs[2], "recipient": "Rosa"}], "x")
 
 
+# ── dialogue v3: the last sentence names a holder query's gold ─────────────────
+
+def _final(ops: list[dict[str, Any]], obj: str) -> Item:
+    return _dl(ops, {"kind": "holder", "obj": obj}, (3, len(ops), "holder"))
+
+
+@pytest.mark.parametrize("ops,obj,pron,named", [
+    # chain: "He" is Tom, who still holds the lamp
+    ([{"form": "give", "giver": "Lucy", "recipient": "Tom", "objs": ["cup"]},
+      {"form": "chain", "subj": "he", "pronoun": "it", "recipient": "Anna"}], "lamp", "he",
+     "Lucy hands the cup to Tom. Tom passes it to Anna."),
+    # ask, the gold is the giver (Tom keeps the lamp)
+    ([{"form": "ask", "asker": "Lucy", "askee": "Tom", "obj": "bell", "subj_pron": "he", "obj_pron": "her"}],
+     "lamp", "he", "Lucy asks Tom for the bell, so Tom gives it to her."),
+    # ask, the gold is the recipient
+    ([{"form": "ask", "asker": "Lucy", "askee": "Tom", "obj": "lamp", "subj_pron": "he", "obj_pron": "her"}],
+     "lamp", "her", "Lucy asks Tom for the lamp, so he hands it over."),
+])
+def test_dialogue_last_sentence_names_the_gold(ops, obj, pron, named):
+    it = _final(ops, obj)
+    assert dialogue.final_pronoun_for(it.spec) == pron  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="calls the gold"):
+        dialogue.validate_item(it)
+    fixed = dialogue.build("d0", tuple(it.cell), dialogue.name_final_gold(it.spec))  # type: ignore[arg-type]
+    dialogue.validate_item(fixed)
+    assert dialogue.final_pronoun_for(fixed.spec) is None  # type: ignore[arg-type]
+    assert fixed.gold == it.gold
+    # the rewrite keeps the sentence's last-mentioned name: the recency control is unchanged
+    assert fixed.meta["gold_is_last_mention"] == it.meta["gold_is_last_mention"]
+    assert fixed.mention_order[-1] == it.mention_order[-1]
+    assert dialogue.render(fixed, False).endswith(f"{named} Now the {obj} is with")
+    items.validate(fixed)
+    # a collide re-label carries the named slot through the map
+    mapping = {"Lucy": "Emma", "Tom": "Ben", "Anna": "Kate"}
+    out = dialogue.relabel(fixed, mapping)
+    assert out.gold == mapping[fixed.gold]
+    assert dialogue.final_pronoun_for(out.spec) is None  # type: ignore[arg-type]
+
+
 def test_dialogue_renders_each_generation_with_its_own_holder_lead():
-    it = _dl([{"form": "give", "giver": "Lucy", "recipient": "Tom", "objs": ["cup"]}],
-             {"kind": "holder", "obj": "cup"}, (3, 1, "holder"))
+    it = _final([{"form": "give", "giver": "Lucy", "recipient": "Tom", "objs": ["cup"]}], "cup")
     leads = {v: dialogue.render(dialogue.build("d0", tuple(it.cell), it.spec, version=v), False)  # type: ignore[arg-type]
-             for v in (1, 2)}
-    assert leads[1].endswith("Now the cup is with")
+             for v in (1, 2, 3)}
+    assert leads[1].endswith("Now the cup is with") and leads[3] == leads[1]
     assert leads[2].endswith("Now the person with the cup is")
     v1 = dialogue.build("d0", tuple(it.cell), it.spec, version=1)  # type: ignore[arg-type]
     del v1.meta["dialogue_version"]                 # the first generation carried no key
     assert dialogue.render(v1, False) == leads[1]
-    assert dialogue.relabel(v1, {"Lucy": "Emma", "Tom": "Ben", "Anna": "Kate"}).meta["dialogue_version"] == 1
+    v2 = dialogue.build("d0", tuple(it.cell), it.spec, version=2)  # type: ignore[arg-type]
+    assert dialogue.relabel(v2, {"Lucy": "Emma", "Tom": "Ben", "Anna": "Kate"}).meta["dialogue_version"] == 2
     with pytest.raises(ValueError, match="no renderer for version 9"):
         dialogue.render(dialogue.build("d0", tuple(it.cell), it.spec, version=9), False)  # type: ignore[arg-type]
 
