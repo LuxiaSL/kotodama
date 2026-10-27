@@ -130,6 +130,7 @@ class _Live:
     out: list[list[int]] = field(default_factory=list)
     running: dict[int, int] = field(default_factory=dict)  # row -> candidate
     started: int = 0
+    home: frozenset[int] = frozenset()  # the rows admitted from this job's prompt: only they can restart it
 
     @property
     def done(self) -> bool:
@@ -207,7 +208,8 @@ class XBatchRunner:
         # longest stop several times over finds it without re-decoding the whole row every step.
         window = 4 * max((len(x) for x in job.stop_strings), default=0) + 16
         budget = min(job.max_new_tokens, self.max_seq_len - len(job.prompt_ids))
-        lv = _Live(job, logits, len(job.prompt_ids), budget, window, timing, t0, out=[[] for _ in range(job.n)])
+        lv = _Live(job, logits, len(job.prompt_ids), budget, window, timing, t0, out=[[] for _ in range(job.n)],
+                   home=frozenset(rows))
         self._start(lv, rows, first)
         self.stats["admitted"] += 1
         self.stats["prefill_s"] += time.perf_counter() - t0
@@ -245,26 +247,30 @@ class XBatchRunner:
         self._deliver(lv.job, XBatchResult(rows=lv.out, timing=lv.timing))
 
     def _fill(self, dec: MultiSampleDecoder, active: list[_Live], free: list[int], head: XBatchJob) -> int:
-        """Hand free rows out: unstarted candidates of admitted jobs first (oldest job first), then, with refill
-        on and nobody else waiting for the engine, new jobs of the batch's key. Delivers jobs that end. Returns the
-        number of jobs taken from the queue."""
+        """Hand free rows out: a job's unstarted candidates restart in the job's own free rows (the only rows that
+        hold its prompt), which stay reserved for it until every candidate has started; the other free rows go,
+        with refill on and nobody else waiting for the engine, to new jobs of the batch's key. Delivers jobs that
+        end. Returns the number of jobs taken from the queue."""
         taken = 0
         while True:
-            # rows whose candidate ended (at a first token, or in the last step) go back to the pool
-            busy = {row for lv in active for row in lv.running}
-            free[:] = [r for r in range(dec.rows) if r not in busy]
-            for lv in active:
-                want = lv.job.n - lv.started
-                if want and free:
-                    rows = free[:want]
-                    del free[:len(rows)]
-                    self._start(lv, rows, dec.restart(rows, lv.prompt_len, lv.logits, lv.job.params))
-                    self.stats["restarts"] += len(rows)
+            progress = True
+            while progress:  # a restarted candidate can end at its first token and free its row again
+                progress = False
+                busy = {row for lv in active for row in lv.running}
+                for lv in active:
+                    want = lv.job.n - lv.started
+                    rows = [r for r in sorted(lv.home) if r not in busy][:want]
+                    if rows:
+                        busy.update(rows)
+                        self._start(lv, rows, dec.restart(rows, lv.prompt_len, lv.logits, lv.job.params))
+                        self.stats["restarts"] += len(rows)
+                        progress = True
             for lv in [lv for lv in active if lv.done]:
                 active.remove(lv)
                 self._finish(lv)
             busy = {row for lv in active for row in lv.running}
-            free[:] = [r for r in range(dec.rows) if r not in busy]
+            reserved = {row for lv in active if lv.started < lv.job.n for row in lv.home}
+            free[:] = [r for r in range(dec.rows) if r not in busy and r not in reserved]
             if not (free and self.refill) or self.should_yield():
                 return taken
             job = self.queue.take_next(head.key)

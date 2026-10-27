@@ -235,21 +235,74 @@ def test_refill_serves_the_queue_in_one_batch_and_keeps_parity(model: KotodamaMo
     assert runner3.run_batch() == 2 and runner3.stats["refilled"] == 0
 
 
+def _penalized_greedy(model: KotodamaModel, prompt: list[int], steps: int, rp: float) -> list[int]:
+    """Single-stream greedy under a repetition penalty over the generated tokens: the penalty makes each token
+    depend on the whole continuation, so a row decoding on the wrong prompt or position cannot match it."""
+    eng = _engine(model)
+    logits = eng.prefill_reference(torch.tensor([prompt]))[0]
+    out: list[int] = []
+    for _ in range(steps):
+        pen = torch.where(logits > 0, logits / rp, logits * rp)
+        mask = torch.zeros_like(logits, dtype=torch.bool)
+        mask[out] = True
+        tok = int(torch.where(mask, pen, logits).argmax())
+        out.append(tok)
+        logits = eng.step_logits(torch.tensor([[tok]]))[0, -1].float()
+    return out
+
+
+@torch.inference_mode()
+def test_restart_rewinds_a_row_to_its_own_prompt(model: KotodamaModel) -> None:
+    eng = _engine(model)
+    dec = MultiSampleDecoder(eng, 2)
+    params = SamplingParams(temperature=0.8, repetition_penalty=1.0)
+    a, b = _ids(17, 70), _ids(9, 71)
+    la = eng.prefill_reference(torch.tensor([a]))
+    dec.admit([0, 1], la, params)
+    for t in _ids(5, 72):  # row 0 decodes past its prompt; then row 1 takes another prompt
+        dec.step_logits(torch.tensor([[t], [t]]))
+    dec.admit([1], eng.prefill_reference(torch.tensor([b])), params)
+    dec.step_logits(torch.tensor([[5], [6]]))
+    dec.restart([0], len(a), la, params)  # row 0: a fresh candidate of prompt a, no prefill
+    assert dec.row_pos(0) == len(a) and dec.row_pos(1) == len(b) + 1
+    forced = torch.tensor([_ids(6, 73), _ids(6, 74)])
+    got = torch.stack([dec.step_logits(forced[:, t:t + 1]).float() for t in range(6)], dim=1)  # (2, 6, V)
+    want0 = model(torch.cat([torch.tensor([a]), forced[:1]], dim=1))["logits"][0, len(a):].float()
+    want1 = model(torch.tensor([b + [6] + forced[1].tolist()]))["logits"][0, len(b) + 1:].float()
+    assert torch.allclose(got[0], want0, atol=2e-4, rtol=1e-4), (got[0] - want0).abs().max()
+    assert torch.allclose(got[1], want1, atol=2e-4, rtol=1e-4), (got[1] - want1).abs().max()
+
+
 @torch.inference_mode()
 def test_candidates_restart_in_their_own_rows(model: KotodamaModel) -> None:
-    # bucket 4, n=3 twice: the second request is refilled into the one free row, and its other two candidates
-    # start (rewinding to its prompt, no prefill) in rows its own finished candidates and the first request free
+    # bucket 4, n=3 each: the first request takes rows 0-2, the second is refilled into row 3 alone and starts
+    # its other candidates there (rewinding to its prompt, no prefill) while rows 0-2 go to the third request
     prompts = [_ids(13, 60), _ids(30, 61), _ids(7, 62)]
+    steps = [4, 7, 10]
+    cold = SamplingParams(temperature=1e-4, repetition_penalty=1.5)
     eng = _engine(model)
     runner, rec = _runner(eng, widths=(4,), refill=True), _Rec()
+    dec = runner.decoders[4]
+    holds: dict[int, int] = {}  # row -> length of the prompt it was admitted from
+    real_admit, real_restart = dec.admit, dec.restart
+
+    def admit(rows, logits, params):
+        holds.update({r: eng._pos_cpu for r in rows})
+        return real_admit(rows, logits, params)
+
+    def restart(rows, plen, logits, params):
+        assert all(holds[r] == plen for r in rows), (rows, plen, holds)  # a row restarts only its own prompt
+        return real_restart(rows, plen, logits, params)
+
+    dec.admit, dec.restart = admit, restart
     for i, p in enumerate(prompts):
-        runner.queue.put(rec.job(f"j{i}", p, 3, max_new=4 + 3 * i))
-    assert runner.run_batch() == 3 and runner.stats["restarts"] >= 2
+        runner.queue.put(rec.job(f"j{i}", p, 3, max_new=steps[i], params=cold))
+    assert runner.run_batch() == 3 and runner.stats["restarts"] == 2
     assert rec.out["j1"].timing["rows_at_admission"] == 1.0
-    ref = _engine(model)
-    for i, p in enumerate(prompts):
-        want = ref.generate_greedy(torch.tensor([p]), 4 + 3 * i)
-        assert rec.out[f"j{i}"].rows == [want] * 3, i
+    wants = [_penalized_greedy(model, p, k, 1.5) for p, k in zip(prompts, steps)]
+    assert len({tuple(w[1:]) for w in wants}) == 3  # the reference really depends on the prompt
+    for i in range(3):
+        assert rec.out[f"j{i}"].rows == [wants[i]] * 3, i
     hot = SamplingParams(temperature=1.4, repetition_penalty=1.3)  # restarted candidates sample independently
     runner2, rec2 = _runner(_engine(model), widths=(2,), refill=True), _Rec()
     runner2.queue.put(rec2.job("h", prompts[0], 2, max_new=12, params=hot))
