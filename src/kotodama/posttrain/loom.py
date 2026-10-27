@@ -19,6 +19,12 @@ the other speaker something to answer. λ > 0 leans toward engaging turns (quest
 self-contained ones (narration, scene-setting, monologue); nothing is vetoed by it. ``--overlong keep`` lets a turn
 that reaches the token cap live (flagged) instead of vetoing it.
 
+Long conversations: ``--window_chars`` keeps each prompt to the header + seed turns + the latest turns within a
+character budget (early dialogue rotates out, so branches run past the context and drift apart), and
+``--deep_after D --deep_width W`` narrows the tree after depth D (wide early for breadth, narrow later for depth).
+``python -m kotodama.posttrain.loom assemble <runs> --out docs.jsonl`` cuts paths into training documents of up to
+~4K tokens in which no turn appears more than ``--max_uses`` times, so shared trunks are not overweighted.
+
 Writes, under the run directory ``<out>``:
   ``<out>/nodes.jsonl``   every candidate drawn: tree, id, parent, depth, speaker, text, ended_by, vetoes, status
                 (child | vetoed | unchosen — a survivor beyond --children). Siblings = the rows sharing
@@ -38,6 +44,7 @@ import logging
 import math
 import random
 import re
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -60,6 +67,9 @@ class LoomConfig:
     min_turns: int = 6
     max_tokens: int = 256
     max_prompt_chars: int = 12000
+    window_chars: int = 0  # > 0: the model sees the header + seed turns + only the latest turns that fit this budget
+    deep_after: int = 0  # from this depth on, at most deep_width live nodes (wide early, narrow and deep later)
+    deep_width: int = 0
     select: str = "uniform"  # uniform | engage
     select_lambda: float = 0.0
     engage_replies: int = 2
@@ -131,15 +141,29 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
             emit("path", {**to_row(Transcript(node.turns, seed.header)), "tree": tree, "seed": seed.id,
                           "leaf": node.id, "state": state, "depth": node.depth, "cast": seed.cast})
 
+    n_seed = len(seed.turns)
+
+    def visible(turns: tuple[Turn, ...]) -> tuple[Turn, ...]:
+        """What the model sees: everything, or (with a window) the seed turns + the latest turns that fit."""
+        if not cfg.window_chars:
+            return turns
+        budget = cfg.window_chars - len(seed.header) - sum(len(t.speaker) + len(t.text) + 4 for t in turns[:n_seed])
+        k = len(turns)
+        while k > n_seed and budget - (len(turns[k - 1].speaker) + len(turns[k - 1].text) + 4) >= 0:
+            k -= 1
+            budget -= len(turns[k].speaker) + len(turns[k].text) + 4
+        return turns[:n_seed] + turns[k:]
+
     async def expand(node: Node) -> list[Node]:
         speaker = next_speaker(seed.cast, list(node.turns))
-        prompt = render_prompt(Transcript(node.turns, seed.header), speaker)
+        seen = visible(node.turns)
+        prompt = render_prompt(Transcript(seen, seed.header), speaker)
         if len(prompt) > cfg.max_prompt_chars:
             end(node, "length_cap")
             return []
         raw = await complete(prompt, cfg.candidates, stops)
         stats["requests"] += 1
-        cands = [evaluate(*split_completion(t, stops, fr, hit)[:2], speaker, list(node.turns), seed.cast,
+        cands = [evaluate(*split_completion(t, stops, fr, hit)[:2], speaker, list(seen), seed.cast,
                           seed.header, sp) for t, fr, hit in raw]
         if cfg.overlong == "keep":
             for c in cands:
@@ -192,9 +216,10 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
         nxt: list[Node] = []
         for kids in await asyncio.gather(*(expand(n) for n in frontier)):
             nxt.extend(kids)
-        if len(nxt) > cfg.width:
+        width = cfg.deep_width if cfg.deep_after and nxt and nxt[0].depth >= cfg.deep_after else cfg.width
+        if len(nxt) > width:
             nxt.sort(key=lambda n: n.id)
-            keep = set(random.Random(f"{salt}:{tree}:{nxt[0].depth}").sample(range(len(nxt)), cfg.width))
+            keep = set(random.Random(f"{salt}:{tree}:{nxt[0].depth}").sample(range(len(nxt)), width))
             for i, n in enumerate(nxt):
                 if i not in keep:
                     end(n, "pruned")
@@ -271,8 +296,91 @@ async def run(seeds: list[SeedSpec], complete: Complete, cfg: LoomConfig, sp: Se
     return {"trees": done["n"], "seconds": round(time.time() - t0, 1)}
 
 
+def node_ids(leaf: str) -> list[str]:
+    """The ids of the nodes on a leaf's path, root's child first ("t0/r.1.5.3" -> t0/r.1, t0/r.1.5, t0/r.1.5.3)."""
+    head, _, rest = leaf.partition("/r.")
+    parts = rest.split(".") if rest else []
+    return [f"{head}/r." + ".".join(parts[: i + 1]) for i in range(len(parts))]
+
+
+def assemble(paths: list[dict[str, Any]], max_chars: int, lead_in: int, max_uses: int, min_new: int,
+             seed: int) -> list[dict[str, Any]]:
+    """Training documents from loom paths without leaning on the shared trunk.
+
+    Each document is the path's header (and seed turns) + a contiguous run of its generated turns within
+    ``max_chars``. Paths are taken in random order; a document starts at the first turn trained fewer than
+    ``max_uses`` times so far, preceded by up to ``lead_in`` turns marked ``"train": false`` (context the model
+    conditions on, no loss), and a path keeps yielding consecutive documents until its end. Every turn therefore
+    TRAINS in at most ``max_uses`` documents however many leaves share it, and deep paths give several documents.
+    Turns already at the cap inside a document are context too. A document training fewer than ``min_new`` turns is
+    dropped."""
+    rng = random.Random(seed)
+    order = list(range(len(paths)))
+    rng.shuffle(order)
+    uses: dict[str, int] = {}
+    docs: list[dict[str, Any]] = []
+    for pi in order:
+        p = paths[pi]
+        n_seed = len(p["turns"]) - p["depth"]
+        prefix, gen = p["turns"][:n_seed], p["turns"][n_seed:]
+        ids = node_ids(p["leaf"])
+        if len(ids) != len(gen):
+            continue
+        fixed = len(p.get("header", "")) + sum(len(t["text"]) + len(t["speaker"]) + 4 for t in prefix)
+        i = 0
+        while i < len(gen):
+            while i < len(gen) and uses.get(ids[i], 0) >= max_uses:
+                i += 1
+            if i >= len(gen):
+                break
+            start = max(0, i - lead_in)
+            j, size = start, fixed
+            while j < len(gen) and size + len(gen[j]["text"]) + len(gen[j]["speaker"]) + 4 <= max_chars:
+                size += len(gen[j]["text"]) + len(gen[j]["speaker"]) + 4
+                j += 1
+            if j <= i:  # a single turn larger than the budget
+                i += 1
+                continue
+            trains = [k >= i and uses.get(ids[k], 0) < max_uses for k in range(start, j)]
+            if sum(trains) >= min_new:
+                turns = [dict(t, train=False) for t in prefix]
+                for k, tr in zip(range(start, j), trains):
+                    turns.append(dict(gen[k], train=tr))
+                    if tr:
+                        uses[ids[k]] = uses.get(ids[k], 0) + 1
+                docs.append({"header": p.get("header", ""), "turns": turns,
+                             "source": {"tree": p["tree"], "leaf": p["leaf"], "from": start, "to": j}})
+            i = j
+    return docs
+
+
+def assemble_main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description="loom paths -> training documents (python -m kotodama.posttrain.loom assemble)")
+    ap.add_argument("runs", nargs="+")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--max_chars", type=int, default=14000, help="~4K tokens of English text")
+    ap.add_argument("--lead_in", type=int, default=4)
+    ap.add_argument("--max_uses", type=int, default=2)
+    ap.add_argument("--min_new", type=int, default=6)
+    ap.add_argument("--seed", type=int, default=0)
+    a = ap.parse_args(argv)
+    paths = [json.loads(line) for r in a.runs for line in (Path(r) / "paths.jsonl").read_text().splitlines()
+             if line.strip()]
+    docs = assemble(paths, a.max_chars, a.lead_in, a.max_uses, a.min_new, a.seed)
+    with open(a.out, "w", encoding="utf-8") as f:
+        for d in docs:
+            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+    n_turns = sum(len(d["turns"]) for d in docs)
+    logger.info("%d paths -> %d documents, %d turns (%.1f per document)", len(paths), len(docs), n_turns,
+                n_turns / max(len(docs), 1))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [loom] %(message)s", datefmt="%H:%M:%S")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["assemble"]:
+        return assemble_main(argv[1:])
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--seeds", required=True)
     ap.add_argument("--endpoint", action="append", required=True)
@@ -288,6 +396,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--law", default="tsumugi")
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--repetition_penalty", type=float, default=None)
+    ap.add_argument("--window_chars", type=int, default=0,
+                    help="> 0: prompts keep the header + seed turns + the latest turns within this many characters "
+                         "(early dialogue rotates out), so branches can run past the context")
+    ap.add_argument("--deep_after", type=int, default=0, help="from this depth on, cap live nodes at --deep_width")
+    ap.add_argument("--deep_width", type=int, default=0)
     ap.add_argument("--select", choices=["uniform", "engage"], default="uniform")
     ap.add_argument("--select_lambda", type=float, default=0.0,
                     help="engage: >0 leans to turns that hand the next speaker something, <0 to self-contained ones")
@@ -307,6 +420,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.limit:
         seeds = seeds[: a.limit]
     cfg = LoomConfig(a.candidates, a.children, a.width, a.max_depth, a.min_turns, a.max_tokens,
+                     window_chars=a.window_chars, deep_after=a.deep_after, deep_width=a.deep_width,
                      select=a.select, select_lambda=a.select_lambda, engage_replies=a.engage_replies,
                      overlong=a.overlong)
     sp = SelfPlayConfig(candidates=a.candidates, max_tokens=a.max_tokens, min_turns=a.min_turns)

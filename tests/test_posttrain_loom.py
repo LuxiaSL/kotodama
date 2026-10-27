@@ -142,3 +142,46 @@ def test_echo_question() -> None:
     assert not loom.echo_question("What kind of house?", "for his house.")  # 'what', 'kind' are new words
     assert not loom.echo_question("A job.", "a job")  # not a question
     assert not loom.echo_question("So what would you pay me for the job?", "a job")  # too long
+
+
+def test_window_and_deep_width() -> None:
+    prompts: list[str] = []
+
+    async def complete(prompt, n, stops):
+        prompts.append(prompt)
+        d = prompt.count("\n\n")
+        words = ["harbour", "lantern", "orchard", "violin", "gravel", "sparrow", "kettle", "meadow", "copper", "thistle"]
+        rng = random.Random(len(prompts) * 10 + 1)
+        return [(" ".join(rng.choice(words) + str(rng.randint(0, 999)) for _ in range(12)) + stops[0], "stop", False)
+                for i in range(n)]
+
+    cfg = loom.LoomConfig(candidates=3, children=2, width=4, max_depth=30, min_turns=2, window_chars=600,
+                          deep_after=5, deep_width=1)
+    st, recs = grow(cfg, complete)
+    assert st["max_depth"] == 30
+    assert max(len(p) for p in prompts) <= 600 + 40  # header + latest turns + the open tag
+    assert all(p.startswith("Two siblings on a ferry.") for p in prompts)  # the header always stays
+    deep = [r for r in recs["node"] if r["status"] == "child" and r["depth"] > 6]
+    assert len({r["depth"] for r in deep}) == len(deep) // 2 or all(
+        sum(1 for x in deep if x["depth"] == d) <= 2 for d in {r["depth"] for r in deep})  # 1 live node -> <=2 kids
+
+
+def test_assemble_bounds_trunk_reuse() -> None:
+    def path(leaf, n):
+        return {"tree": "t0", "leaf": leaf, "depth": n, "header": "H",
+                "turns": [{"speaker": "A" if k % 2 == 0 else "B", "text": f"x{k}"} for k in range(n)]}
+
+    trunk = "t0/r." + ".".join(["0"] * 10)
+    paths = [path(trunk + f".{b}" + ".0" * 9, 20) for b in range(5)]  # five leaves sharing a 10-turn trunk
+    docs = loom.assemble(paths, max_chars=10_000, lead_in=2, max_uses=2, min_new=3, seed=0)
+    uses: dict[str, int] = {}
+    for d in docs:
+        src = d["source"]
+        ids = loom.node_ids(src["leaf"])[src["from"]:src["to"]]
+        for i, t in zip(ids, d["turns"]):
+            uses[i] = uses.get(i, 0) + bool(t["train"])
+    assert max(uses.values()) <= 2  # no turn TRAINS more than max_uses times; lead-in is context
+    assert any(not t["train"] for d in docs for t in d["turns"])  # lead-in / capped turns are context
+    assert all(d["header"] == "H" for d in docs) and len(docs) >= 5
+    small = loom.assemble(paths[:1], max_chars=60, lead_in=0, max_uses=1, min_new=1, seed=0)
+    assert len(small) > 1 and all(len(d["turns"]) * 6 <= 60 for d in small)  # a deep path yields several windows
