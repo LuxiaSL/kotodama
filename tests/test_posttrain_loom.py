@@ -9,6 +9,7 @@ import random
 
 from kotodama.posttrain import loom
 from kotodama.posttrain.selfplay import SeedSpec, SelfPlayConfig
+from kotodama.posttrain.transcript import Turn
 
 SEED = SeedSpec("s0", ["Mara", "Teo"], "Two siblings on a ferry.", [])
 
@@ -173,7 +174,7 @@ def test_assemble_bounds_trunk_reuse() -> None:
 
     trunk = "t0/r." + ".".join(["0"] * 10)
     paths = [path(trunk + f".{b}" + ".0" * 9, 20) for b in range(5)]  # five leaves sharing a 10-turn trunk
-    docs = loom.assemble(paths, max_chars=10_000, lead_in=2, max_uses=2, min_new=3, seed=0)
+    docs = loom.assemble(paths, max_chars=10_000, train_chars=5_000, max_uses=2, min_new=3, seed=0)
     uses: dict[str, int] = {}
     for d in docs:
         src = d["source"]
@@ -183,7 +184,7 @@ def test_assemble_bounds_trunk_reuse() -> None:
     assert max(uses.values()) <= 2  # no turn TRAINS more than max_uses times; lead-in is context
     assert any(not t["train"] for d in docs for t in d["turns"])  # lead-in / capped turns are context
     assert all(d["header"] == "H" for d in docs) and len(docs) >= 5
-    small = loom.assemble(paths[:1], max_chars=60, lead_in=0, max_uses=1, min_new=1, seed=0)
+    small = loom.assemble(paths[:1], max_chars=60, train_chars=30, max_uses=1, min_new=1, seed=0)
     assert len(small) > 1 and all(len(d["turns"]) * 6 <= 60 for d in small)  # a deep path yields several windows
 
 
@@ -261,3 +262,53 @@ def test_assemble_main_ignores_unfinished_trees(tmp_path) -> None:
     out = tmp_path / "docs.jsonl"
     assert loom.main(["assemble", str(d), "--out", str(out), "--min_new", "2"]) == 0
     assert {json.loads(x)["header"] for x in out.read_text().splitlines()} == {"t00000"}
+
+
+def test_history_seed_continues_a_conversation() -> None:
+    hist = [Turn("Mara" if k % 2 == 0 else "Teo", f"old {k} " + "w" * 40) for k in range(10)]
+    seed = SeedSpec("x", ["Mara", "Teo"], "Two siblings on a ferry.", [Turn("Mara", "seed line")], hist)
+    prompts = []
+
+    async def complete(prompt: str, n: int, stops: list[str]):
+        prompts.append(prompt)
+        return [(f"new {prompt.count(chr(10))}-{i}" + stops[0], "stop", False) for i in range(n)]
+
+    cfg = loom.LoomConfig(candidates=2, children=1, width=1, max_depth=3, min_turns=1, window_chars=300)
+    recs = {"node": [], "path": [], "state": []}
+    st = asyncio.run(loom.grow(seed, "t0", complete, cfg, SelfPlayConfig(min_turns=1), "s",
+                               lambda k, r: recs[k].append(r)))
+    assert st["max_depth"] == 3  # depth counts only the new turns
+    path = recs["path"][0]
+    assert path["n_seed"] == 1 and len(path["turns"]) == 1 + 10 + 3
+    assert all("seed line" in pr for pr in prompts)  # the window keeps the original seed turns
+    assert "old 0 " not in prompts[-1] and "old 9 " in prompts[0]  # and rotates the history out
+
+
+def test_assemble_backfills_context_and_steps_through_long_paths() -> None:
+    n = 40
+    path = {"tree": "t0", "leaf": "t0/r" + ".0" * n, "depth": n, "header": "H", "n_seed": 1,
+            "turns": [{"speaker": "A", "text": "seed"}] + [{"speaker": "B", "text": f"h{k}"} for k in range(5)]
+                     + [{"speaker": "A" if k % 2 else "B", "text": f"g{k:02d}"} for k in range(n)]}
+    docs = loom.assemble([path], max_chars=120, train_chars=40, max_uses=1, min_new=1, seed=0)
+    assert len(docs) > 3  # consecutive documents step forward through the path
+    trained = [t["text"] for d in docs for t in d["turns"] if t["train"]]
+    assert sorted(trained) == [f"g{k:02d}" for k in range(n)]  # every generated turn trains exactly once
+    assert not any(t["text"].startswith("h") and t["train"] for d in docs for t in d["turns"])  # history = context
+    assert all(d["turns"][0]["text"] == "seed" and not d["turns"][0]["train"] for d in docs)
+    later = docs[1:]
+    assert all(not d["turns"][1]["train"] for d in later)  # later documents open with preceding context
+    assert all(sum(len(t["text"]) + len(t["speaker"]) + 4 for t in d["turns"]) + 1 <= 120 for d in docs)
+
+
+def test_extend_seeds_takes_deepest_finished_leaves(tmp_path) -> None:
+    d = tmp_path / "run"
+    d.mkdir()
+    def path(tree, leaf, state, depth):
+        return {"tree": tree, "leaf": leaf, "state": state, "depth": depth, "cast": ["A", "B"], "header": "H",
+                "turns": [{"speaker": "A", "text": "seed"}] + [{"speaker": "B", "text": f"g{k}"} for k in range(depth)]}
+    rows = [path("t0", "t0/r.0.0.0", "depth", 3), path("t0", "t0/r.1", "pruned", 1), path("t1", "t1/r.0.0.0", "depth", 3)]
+    (d / "paths.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (d / "trees.jsonl").write_text(json.dumps({"tree": "t0", "seed": "s"}) + "\n")  # t1 never finished
+    out = loom.extend_seeds([str(d)], per_tree=1, min_depth=2, seed=0)
+    assert [r["id"] for r in out] == ["run:t0/r.0.0.0"]
+    assert out[0]["turns"] == [{"speaker": "A", "text": "seed"}] and len(out[0]["history"]) == 3

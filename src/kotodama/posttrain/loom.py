@@ -23,8 +23,15 @@ Long conversations: ``--window_chars`` keeps each prompt to the header + seed tu
 character budget (early dialogue rotates out, so branches run past the context and drift apart), and
 ``--deep_after D --deep_width W`` narrows the tree after depth D (wide early for breadth, narrow later for depth).
 ``python -m kotodama.posttrain.loom assemble <runs> --out docs.jsonl`` cuts paths into training documents of up to
-~4K tokens in which no turn appears more than ``--max_uses`` times, so shared trunks are not overweighted. Only
-finished trees (those with a row in ``<out>/trees.jsonl``) contribute paths.
+~4K tokens in which no turn trains more than ``--max_uses`` times, so shared trunks are not overweighted. Each
+document trains a run of new turns and fills the rest of its budget with the conversation just before them
+(context, no loss), so a long path becomes consecutive documents that step forward through it. Only finished trees
+(those with a row in ``<out>/trees.jsonl``) contribute paths.
+
+Growing deeper: ``python -m kotodama.posttrain.loom extend-seeds <runs> --out seeds.jsonl`` turns each finished
+tree's deepest leaves into seeds whose ``history`` is the conversation so far; a loom run over them continues those
+conversations (the window keeps the original seed turns and rotates the history out like any generated turn), and
+``--max_depth`` counts only the new turns.
 
 Runs resume: rerunning the same command skips seeds whose tree is already in ``<out>/trees.jsonl`` (and in any
 ``--skip_done`` run directory) and first drops the records of trees that never finished. A tree's id is its seed's
@@ -135,7 +142,7 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
     ``emit("path", ...)``. Choices are seeded per node (``salt`` + node id), so a tree does not depend on the order
     concurrent requests return in. Returns the tree's stats."""
     stops = stop_sequences(seed.cast)
-    root = Node(f"{tree}/r", None, 0, tuple(seed.turns))
+    root = Node(f"{tree}/r", None, 0, tuple(seed.turns) + tuple(seed.history))
     frontier = [root]
     stats = {"tree": tree, "seed": seed.id, "requests": 0, "candidates": 0, "children": 0,
              "ended": {"eos": 0, "degraded": 0, "pruned": 0, "depth": 0, "length_cap": 0}, "max_depth": 0}
@@ -147,7 +154,8 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
         emit("state", {"tree": tree, "id": node.id, "state": state})
         if node.parent is not None:
             emit("path", {**to_row(Transcript(node.turns, seed.header)), "tree": tree, "seed": seed.id,
-                          "leaf": node.id, "state": state, "depth": node.depth, "cast": seed.cast})
+                          "leaf": node.id, "state": state, "depth": node.depth, "cast": seed.cast,
+                          "n_seed": len(seed.turns)})
 
     n_seed = len(seed.turns)
 
@@ -350,17 +358,21 @@ def node_ids(leaf: str) -> list[str]:
     return [f"{head}/r." + ".".join(parts[: i + 1]) for i in range(len(parts))]
 
 
-def assemble(paths: list[dict[str, Any]], max_chars: int, lead_in: int, max_uses: int, min_new: int,
+def _turn_chars(t: dict[str, Any]) -> int:
+    return len(t["text"]) + len(t["speaker"]) + 4
+
+
+def assemble(paths: list[dict[str, Any]], max_chars: int, train_chars: int, max_uses: int, min_new: int,
              seed: int) -> list[dict[str, Any]]:
     """Training documents from loom paths without leaning on the shared trunk.
 
-    Each document is the path's header (and seed turns) + a contiguous run of its generated turns within
-    ``max_chars``. Paths are taken in random order; a document starts at the first turn trained fewer than
-    ``max_uses`` times so far, preceded by up to ``lead_in`` turns marked ``"train": false`` (context the model
-    conditions on, no loss), and a path keeps yielding consecutive documents until its end. Every turn therefore
-    TRAINS in at most ``max_uses`` documents however many leaves share it, and deep paths give several documents.
-    Turns already at the cap inside a document are context too. A document training fewer than ``min_new`` turns is
-    dropped."""
+    A path is its header and seed turns (always in the document, never trained), then any ``history`` an earlier run
+    generated (context only), then this run's turns. Paths are taken in random order. A document trains a run of
+    turns, starting at the first one trained fewer than ``max_uses`` times so far and spanning up to ``train_chars``,
+    and fills the rest of ``max_chars`` backwards with the turns just before it, marked ``"train": false``. The path
+    then continues from the end of that run, so a long path becomes consecutive documents that each condition on the
+    conversation behind them. Every turn TRAINS in at most ``max_uses`` documents however many leaves share it; turns
+    already at the cap inside a run are context too. A document training fewer than ``min_new`` turns is dropped."""
     rng = random.Random(seed)
     order = list(range(len(paths)))
     rng.shuffle(order)
@@ -368,37 +380,87 @@ def assemble(paths: list[dict[str, Any]], max_chars: int, lead_in: int, max_uses
     docs: list[dict[str, Any]] = []
     for pi in order:
         p = paths[pi]
-        n_seed = len(p["turns"]) - p["depth"]
-        prefix, gen = p["turns"][:n_seed], p["turns"][n_seed:]
+        n_seed = p.get("n_seed", len(p["turns"]) - p["depth"])
+        prefix, body = p["turns"][:n_seed], p["turns"][n_seed:]
+        n_hist = len(body) - p["depth"]
         ids = node_ids(p["leaf"])
-        if len(ids) != len(gen):
+        if n_hist < 0 or len(ids) != p["depth"]:
             continue
-        fixed = len(p.get("header", "")) + sum(len(t["text"]) + len(t["speaker"]) + 4 for t in prefix)
-        i = 0
-        while i < len(gen):
-            while i < len(gen) and uses.get(ids[i], 0) >= max_uses:
+        budget = max_chars - len(p.get("header", "")) - sum(_turn_chars(t) for t in prefix)
+
+        def trainable(k: int) -> bool:
+            return k >= n_hist and uses.get(ids[k - n_hist], 0) < max_uses
+
+        i = n_hist
+        while i < len(body):
+            while i < len(body) and not trainable(i):
                 i += 1
-            if i >= len(gen):
+            if i >= len(body):
                 break
-            start = max(0, i - lead_in)
-            j, size = start, fixed
-            while j < len(gen) and size + len(gen[j]["text"]) + len(gen[j]["speaker"]) + 4 <= max_chars:
-                size += len(gen[j]["text"]) + len(gen[j]["speaker"]) + 4
+            j, size = i, 0
+            while j < len(body) and size + _turn_chars(body[j]) <= min(train_chars, budget):
+                size += _turn_chars(body[j])
                 j += 1
             if j <= i:  # a single turn larger than the budget
                 i += 1
                 continue
-            trains = [k >= i and uses.get(ids[k], 0) < max_uses for k in range(start, j)]
+            start = i
+            while start > 0 and size + _turn_chars(body[start - 1]) <= budget:
+                start -= 1
+                size += _turn_chars(body[start])
+            trains = [k >= i and trainable(k) for k in range(start, j)]
             if sum(trains) >= min_new:
                 turns = [dict(t, train=False) for t in prefix]
                 for k, tr in zip(range(start, j), trains):
-                    turns.append(dict(gen[k], train=tr))
+                    turns.append(dict(body[k], train=tr))
                     if tr:
-                        uses[ids[k]] = uses.get(ids[k], 0) + 1
+                        uses[ids[k - n_hist]] = uses.get(ids[k - n_hist], 0) + 1
                 docs.append({"header": p.get("header", ""), "turns": turns,
-                             "source": {"tree": p["tree"], "leaf": p["leaf"], "from": start, "to": j}})
+                             "source": {"tree": p["tree"], "leaf": p["leaf"], "history": n_hist,
+                                        "from": start - n_hist, "to": j - n_hist}})
             i = j
     return docs
+
+
+def extend_seeds(runs: list[str], per_tree: int, min_depth: int, seed: int) -> list[dict[str, Any]]:
+    """Seeds that continue each finished tree's deepest conversations: up to ``per_tree`` leaves that reached the
+    tree's depth cap (and at least ``min_depth``), each as {cast, header, turns: the original seed turns, history: the
+    generated turns so far}."""
+    rng = random.Random(seed)
+    rows: list[dict[str, Any]] = []
+    for r in runs:
+        done = finished(Path(r))
+        by_tree: dict[str, list[dict[str, Any]]] = {}
+        for line in (Path(r) / "paths.jsonl").read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            p = json.loads(line)
+            if p["tree"] in done and p["state"] == "depth" and p["depth"] >= min_depth:
+                by_tree.setdefault(p["tree"], []).append(p)
+        for tree in sorted(by_tree):
+            leaves = sorted(by_tree[tree], key=lambda p: p["leaf"])
+            for p in rng.sample(leaves, min(per_tree, len(leaves))):
+                n_seed = p.get("n_seed", len(p["turns"]) - p["depth"])
+                rows.append({"id": f"{Path(r).name}:{p['leaf']}", "cast": p["cast"], "header": p.get("header", ""),
+                             "turns": p["turns"][:n_seed], "history": p["turns"][n_seed:]})
+    return rows
+
+
+def extend_seeds_main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description="deepest leaves of finished trees -> seeds that continue them "
+                                             "(python -m kotodama.posttrain.loom extend-seeds)")
+    ap.add_argument("runs", nargs="+")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--per_tree", type=int, default=1)
+    ap.add_argument("--min_depth", type=int, default=1)
+    ap.add_argument("--seed", type=int, default=0)
+    a = ap.parse_args(argv)
+    rows = extend_seeds(a.runs, a.per_tree, a.min_depth, a.seed)
+    with open(a.out, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    logger.info("%d seeds from %d runs", len(rows), len(a.runs))
+    return 0
 
 
 def assemble_main(argv: list[str]) -> int:
@@ -406,7 +468,8 @@ def assemble_main(argv: list[str]) -> int:
     ap.add_argument("runs", nargs="+")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max_chars", type=int, default=14000, help="~4K tokens of English text")
-    ap.add_argument("--lead_in", type=int, default=4)
+    ap.add_argument("--train_chars", type=int, default=0,
+                    help="new turns trained per document (0 = half of --max_chars; the rest is preceding context)")
     ap.add_argument("--max_uses", type=int, default=2)
     ap.add_argument("--min_new", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
@@ -421,7 +484,7 @@ def assemble_main(argv: list[str]) -> int:
                     continue
                 p["tree"], p["leaf"] = f"{ri}:{p['tree']}", f"{ri}:{p['leaf']}"
                 paths.append(p)
-    docs = assemble(paths, a.max_chars, a.lead_in, a.max_uses, a.min_new, a.seed)
+    docs = assemble(paths, a.max_chars, a.train_chars or a.max_chars // 2, a.max_uses, a.min_new, a.seed)
     with open(a.out, "w", encoding="utf-8") as f:
         for d in docs:
             f.write(json.dumps(d, ensure_ascii=False) + "\n")
@@ -436,6 +499,8 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["assemble"]:
         return assemble_main(argv[1:])
+    if argv[:1] == ["extend-seeds"]:
+        return extend_seeds_main(argv[1:])
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--seeds", required=True)
     ap.add_argument("--endpoint", action="append", required=True)

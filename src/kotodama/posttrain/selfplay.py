@@ -245,15 +245,19 @@ class SeedSpec:
     cast: list[str]
     header: str = ""
     turns: list[Turn] = field(default_factory=list)
+    history: list[Turn] = field(default_factory=list)  # turns an earlier run generated: context, never re-seeded
 
 
 def parse_seed(row: dict[str, Any], idx: int) -> Optional[SeedSpec]:
     cast = row.get("cast")
     if not isinstance(cast, list) or len(cast) < 2 or not all(isinstance(c, str) and c.strip() for c in cast):
         return None
-    turns = [Turn(t["speaker"], t["text"]) for t in row.get("turns", [])
-             if isinstance(t, dict) and isinstance(t.get("speaker"), str) and isinstance(t.get("text"), str)]
-    return SeedSpec(str(row.get("id", idx)), [c.strip() for c in cast], str(row.get("header", "")).strip(), turns)
+    def turns_of(key: str) -> list[Turn]:
+        return [Turn(t["speaker"], t["text"]) for t in row.get(key, [])
+                if isinstance(t, dict) and isinstance(t.get("speaker"), str) and isinstance(t.get("text"), str)]
+
+    return SeedSpec(str(row.get("id", idx)), [c.strip() for c in cast], str(row.get("header", "")).strip(),
+                    turns_of("turns"), turns_of("history"))
 
 
 async def play(seed: SeedSpec, complete: Complete, cfg: SelfPlayConfig, rng: random.Random,
