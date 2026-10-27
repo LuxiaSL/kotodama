@@ -435,6 +435,7 @@ def main() -> int:
                     for m in range(4) for f in range(6)]
             assert pool is not None
             pool.clear()
+            pool.stats.update({k: 0 for k in pool.stats})
             prefill = pool.prefill
         else:
             texts = load_prompts(tok, None, n_req, 64, 700, a.seed + 2)
