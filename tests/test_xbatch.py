@@ -134,9 +134,9 @@ def test_queue_groups_by_key_fifo_and_fit() -> None:
         q.put(rec.job(name, [5], n, key=key))
     got = q.take_group(max_rows=4)  # a1 (2) + a3 (2): a2 (3) does not fit after a1, b1 is another key
     assert [j.n for j in got] == [2, 2] and len(q) == 2
-    assert q.take_fitting("A", free_rows=8) is None  # B is now the head: a running A batch stops growing
+    assert q.take_next("A") is None  # B is now the head: a running A batch stops growing
     assert [j.key for j in q.take_group(max_rows=4)] == ["B"]
-    assert q.take_fitting("A", free_rows=2) is None and q.take_fitting("A", free_rows=3).n == 3
+    assert q.take_next("A").n == 3 and q.take_next("A") is None
     assert len(q.drain()) == 0
 
 
@@ -233,6 +233,30 @@ def test_refill_serves_the_queue_in_one_batch_and_keeps_parity(model: KotodamaMo
     for i, p in enumerate(prompts):
         runner3.queue.put(rec3.job(f"j{i}", p, 2, max_new=3 + i))
     assert runner3.run_batch() == 2 and runner3.stats["refilled"] == 0
+
+
+@torch.inference_mode()
+def test_candidates_restart_in_their_own_rows(model: KotodamaModel) -> None:
+    # bucket 4, n=3 twice: the second request is refilled into the one free row, and its other two candidates
+    # start (rewinding to its prompt, no prefill) in rows its own finished candidates and the first request free
+    prompts = [_ids(13, 60), _ids(30, 61), _ids(7, 62)]
+    eng = _engine(model)
+    runner, rec = _runner(eng, widths=(4,), refill=True), _Rec()
+    for i, p in enumerate(prompts):
+        runner.queue.put(rec.job(f"j{i}", p, 3, max_new=4 + 3 * i))
+    assert runner.run_batch() == 3 and runner.stats["restarts"] >= 2
+    assert rec.out["j1"].timing["rows_at_admission"] == 1.0
+    ref = _engine(model)
+    for i, p in enumerate(prompts):
+        want = ref.generate_greedy(torch.tensor([p]), 4 + 3 * i)
+        assert rec.out[f"j{i}"].rows == [want] * 3, i
+    hot = SamplingParams(temperature=1.4, repetition_penalty=1.3)  # restarted candidates sample independently
+    runner2, rec2 = _runner(_engine(model), widths=(2,), refill=True), _Rec()
+    runner2.queue.put(rec2.job("h", prompts[0], 2, max_new=12, params=hot))
+    runner2.queue.put(rec2.job("w", prompts[1], 2, max_new=12, params=hot))
+    torch.manual_seed(3)
+    runner2.run_batch()
+    assert len({tuple(r) for r in rec2.out["w"].rows}) == 2
 
 
 def test_engine_lock_contention_is_visible(monkeypatch) -> None:

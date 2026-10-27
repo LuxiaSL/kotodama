@@ -11,9 +11,11 @@ Two parts:
   * ``XBatchRunner.run_batch`` runs on the server's generation thread, with the engine lock held. It takes the
     oldest waiting request's key group from the queue (FIFO, as many requests as fit the widest bucket), decodes it
     on the narrowest bucket that holds the group's rows, and returns when every row has ended. With ``refill`` on,
-    rows freed by finished requests are refilled from the queue between steps (continuous batching), until a request
-    with a different key is waiting or ``should_yield`` says another engine user is (the server passes "a request
-    outside the batcher waits on the engine lock"); those then get the engine when the batch drains.
+    rows freed by ended candidates are refilled between steps (continuous batching): first with the unstarted
+    candidates of admitted requests, then with new requests from the queue (a request may start with fewer rows
+    than its n), until a request with a different key is waiting or ``should_yield`` says another engine user is
+    (the server passes "a request outside the batcher waits on the engine lock"); those then get the engine when
+    the batch drains.
   * ``XBatchScheduler`` is the asyncio side: ``submit`` enqueues a job and awaits its result, and one pump task
     runs batches (each under the engine lock, on the generation thread) while the queue is non-empty.
 
@@ -104,31 +106,34 @@ class XBatchQueue:
             jobs, self._jobs = self._jobs, []
             return jobs
 
-    def take_fitting(self, key: Hashable, free_rows: int) -> Optional[XBatchJob]:
-        """The oldest job of ``key`` with n <= ``free_rows``, or None. Returns None while any job of another key
-        waits at the head, so a running batch stops growing once a different request is due."""
+    def take_next(self, key: Hashable) -> Optional[XBatchJob]:
+        """The oldest job, when it has ``key``; None otherwise (also while a job of another key waits at the head,
+        so a running batch stops growing once a different request is due)."""
         with self._lock:
             if not self._jobs or self._jobs[0].key != key:
                 return None
-            for job in self._jobs:
-                if job.key == key and job.n <= free_rows:
-                    self._jobs.remove(job)
-                    return job
-            return None
+            return self._jobs.pop(0)
 
 
 @dataclass
 class _Live:
-    """A job decoding in the batch: its rows, each row's output and liveness, and its token budget."""
+    """A job decoding in the batch: each candidate's output, which candidates run in which rows, how many have
+    started, and the prompt state a row needs to start another candidate (its length and last-position logits)."""
 
     job: XBatchJob
-    rows: list[int]
-    out: list[list[int]]
-    live: list[bool]
+    logits: torch.Tensor
+    prompt_len: int
     budget: int
+    stop_window: int
     timing: dict[str, float]
     t_admit: float
-    stop_window: int
+    out: list[list[int]] = field(default_factory=list)
+    running: dict[int, int] = field(default_factory=dict)  # row -> candidate
+    started: int = 0
+
+    @property
+    def done(self) -> bool:
+        return self.started == self.job.n and not self.running
 
 
 class XBatchRunner:
@@ -136,7 +141,13 @@ class XBatchRunner:
     ``prefill(ids (1, S)) -> (last logits (1, V), prefix-cache info or None)`` prefills the engine;
     ``set_steer(writes, **kwargs)`` installs the engine's steering rows (``None`` clears); ``decode(ids) -> str``
     is the tokenizer's decode, for stop strings; ``should_yield() -> bool``, polled between steps, stops refilling
-    so the engine passes to whoever waits for it once the batch drains."""
+    so the engine passes to whoever waits for it once the batch drains.
+
+    Rows hold candidates, not requests. A request admitted with fewer free rows than its n starts its remaining
+    candidates in rows its own finished candidates free: such a row still holds the request's prompt in its first
+    cache slots, so it rewinds to the prompt's end and samples a fresh first token (``MultiSampleDecoder.restart``,
+    no prefill and no KV copy). Freed rows go first to admitted requests' unstarted candidates, then (with
+    ``refill``) to new requests from the queue."""
 
     def __init__(self, decoders: dict[int, MultiSampleDecoder], prefill: Callable[[torch.Tensor], tuple],
                  set_steer: Callable[..., None], decode: Callable[[list[int]], str], stop_ids: frozenset[int],
@@ -156,8 +167,8 @@ class XBatchRunner:
         self.should_yield = should_yield or (lambda: False)
         self.queue = XBatchQueue()
         self.stats: dict[str, float] = {"batches": 0, "steps": 0, "row_steps": 0, "useful_row_steps": 0,
-                                        "admitted": 0, "refilled": 0, "prefill_s": 0.0, "step_s": 0.0,
-                                        "host_s": 0.0}
+                                        "admitted": 0, "refilled": 0, "restarts": 0, "prefill_s": 0.0,
+                                        "step_s": 0.0, "host_s": 0.0}
 
     def bucket_for(self, rows: int) -> MultiSampleDecoder:
         """The narrowest decoder that holds ``rows`` rows (the widest when none does)."""
@@ -171,16 +182,17 @@ class XBatchRunner:
             logger.exception("xbatch: result callback failed")
 
     def _admit(self, dec: MultiSampleDecoder, job: XBatchJob, free: list[int]) -> Optional[_Live]:
-        """Prefill ``job`` and fill ``job.n`` free rows from it; process each row's first token. Returns None (the
-        job already failed) when the prefill raises."""
+        """Prefill ``job`` and start its first candidates in up to ``job.n`` free rows (taken from ``free``).
+        Returns None (the job already failed) when the prefill raises."""
         t0 = time.perf_counter()
         timing: dict[str, float] = {"queue_ms": round((t0 - job.t_enqueue) * 1000, 2)}
         try:
             ids = torch.tensor([job.prompt_ids], dtype=torch.long, device=self.device)
             logits, info = self.prefill(ids)
-            rows = free[:job.n]
+            m = min(job.n, len(free))
+            rows = free[:m]
             first = dec.admit(rows, logits, job.params)
-            del free[:job.n]
+            del free[:m]
         except Exception as exc:
             logger.warning("xbatch: prefill/admit failed for a %d-token prompt: %r", len(job.prompt_ids), exc)
             self._deliver(job, exc)
@@ -190,48 +202,79 @@ class XBatchRunner:
             timing["prefix_cache_hit"] = float(bool(info.get("prefix_hit")))
             timing["prefix_common_tokens"] = float(info.get("common_prefix", 0))
         timing["batched_rows"] = float(dec.rows)
-        budget = min(job.max_new_tokens, self.max_seq_len - len(job.prompt_ids))
+        timing["rows_at_admission"] = float(len(rows))
         # A stop string that first appears at this token ends inside its text, so decoding a tail that holds the
         # longest stop several times over finds it without re-decoding the whole row every step.
         window = 4 * max((len(x) for x in job.stop_strings), default=0) + 16
-        lv = _Live(job, rows, [[] for _ in rows], [True] * len(rows), budget, timing, t0, window)
-        self._consume(lv, first)
+        budget = min(job.max_new_tokens, self.max_seq_len - len(job.prompt_ids))
+        lv = _Live(job, logits, len(job.prompt_ids), budget, window, timing, t0, out=[[] for _ in range(job.n)])
+        self._start(lv, rows, first)
         self.stats["admitted"] += 1
         self.stats["prefill_s"] += time.perf_counter() - t0
         return lv
 
-    def _consume(self, lv: _Live, toks: list[int]) -> None:
-        """Process one sampled token per row of ``lv`` (``toks[i]`` for ``lv.rows[i]``), ending rows at a stop
-        token (not kept), a stop string or the token budget. The budget is capped at the context room left after
-        the prompt, so a live row never steps past the last cache slot."""
+    def _start(self, lv: _Live, rows: list[int], first: list[int]) -> None:
+        """Bind the next candidates of ``lv`` to ``rows`` and process their first tokens."""
+        for row, tok in zip(rows, first):
+            lv.running[row] = lv.started
+            lv.started += 1
+            self._consume(lv, row, tok)
+
+    def _consume(self, lv: _Live, row: int, tok: int) -> None:
+        """Process one sampled token of the candidate in ``row``, ending it at a stop token (not kept), a stop
+        string or the token budget (capped at the context room left after the prompt, so a live row never steps
+        past the last cache slot). An ended candidate releases its row (``lv.running`` drops it)."""
+        cand = lv.running[row]
+        if tok in self.stop_ids:
+            del lv.running[row]
+            return
+        out = lv.out[cand]
+        out.append(tok)
+        self.stats["useful_row_steps"] += 1
         stops = lv.job.stop_strings
-        for i, tok in enumerate(toks):
-            if not lv.live[i]:
-                continue
-            if tok in self.stop_ids:
-                lv.live[i] = False
-                continue
-            out = lv.out[i]
-            out.append(tok)
-            self.stats["useful_row_steps"] += 1
-            if len(out) >= lv.budget:
-                lv.live[i] = False
-            elif stops:
-                tail = self.decode(out[-lv.stop_window:])
-                if any(s in tail for s in stops):
-                    lv.live[i] = False
+        if len(out) >= lv.budget:
+            del lv.running[row]
+        elif stops:
+            tail = self.decode(out[-lv.stop_window:])
+            if any(s in tail for s in stops):
+                del lv.running[row]
 
     def _finish(self, lv: _Live) -> None:
         lv.timing["decode_ms"] = round((time.perf_counter() - lv.t_admit) * 1000 - lv.timing["prefill_ms"], 2)
         lv.timing["total_ms"] = round((time.perf_counter() - lv.job.t_enqueue) * 1000, 2)
         self._deliver(lv.job, XBatchResult(rows=lv.out, timing=lv.timing))
 
-    def _retire(self, active: list[_Live], free: list[int]) -> None:
-        """Deliver every job whose rows have all ended and free its rows."""
-        for lv in [lv for lv in active if not any(lv.live)]:
-            active.remove(lv)
-            free.extend(lv.rows)
-            self._finish(lv)
+    def _fill(self, dec: MultiSampleDecoder, active: list[_Live], free: list[int], head: XBatchJob) -> int:
+        """Hand free rows out: unstarted candidates of admitted jobs first (oldest job first), then, with refill
+        on and nobody else waiting for the engine, new jobs of the batch's key. Delivers jobs that end. Returns the
+        number of jobs taken from the queue."""
+        taken = 0
+        while True:
+            # rows whose candidate ended (at a first token, or in the last step) go back to the pool
+            busy = {row for lv in active for row in lv.running}
+            free[:] = [r for r in range(dec.rows) if r not in busy]
+            for lv in active:
+                want = lv.job.n - lv.started
+                if want and free:
+                    rows = free[:want]
+                    del free[:len(rows)]
+                    self._start(lv, rows, dec.restart(rows, lv.prompt_len, lv.logits, lv.job.params))
+                    self.stats["restarts"] += len(rows)
+            for lv in [lv for lv in active if lv.done]:
+                active.remove(lv)
+                self._finish(lv)
+            busy = {row for lv in active for row in lv.running}
+            free[:] = [r for r in range(dec.rows) if r not in busy]
+            if not (free and self.refill) or self.should_yield():
+                return taken
+            job = self.queue.take_next(head.key)
+            if job is None:
+                return taken
+            taken += 1
+            self.stats["refilled"] += 1
+            lv = self._admit(dec, job, free)
+            if lv is not None:
+                active.append(lv)
 
     def run_batch(self) -> int:
         """Decode one batch from the queue to completion; returns the number of requests it served (0 when the
@@ -254,27 +297,17 @@ class XBatchRunner:
                     active.append(lv)
             self.stats["batches"] += 1
             # Software pipeline: step k+1 is launched before step k's tokens are read back and processed, so the
-            # host work (stop checks, retiring and admitting requests) overlaps the GPU step. A row that ended at
-            # step k runs one extra step whose token is ignored; a row admitted while a step is in flight joins
-            # from the next launch (its admission is stream-ordered after the in-flight step, and that step's
-            # token for the row is ignored because the step's snapshot predates the admission).
+            # host work (stop checks, retiring, starting candidates, admitting requests) overlaps the GPU step. A
+            # row whose candidate ended at step k runs one extra step whose token is ignored; a row (re)started
+            # while a step is in flight joins from the next launch: its start is stream-ordered after the in-flight
+            # step, and that step's token for the row is ignored because the step's snapshot of which candidate
+            # runs where predates the start.
             cuda = dec.cur_tokens.is_cuda
             bufs = [torch.empty(dec.rows, dtype=torch.long, pin_memory=cuda) for _ in range(2)]
-            pending: Optional[tuple[torch.Tensor, Any, list[_Live]]] = None
+            pending: Optional[tuple[torch.Tensor, Any, list[tuple[int, _Live, int]]]] = None
             k = 0
             while True:
-                self._retire(active, free)
-                if self.refill and not self.should_yield():
-                    while free:
-                        job = self.queue.take_fitting(head.key, len(free))
-                        if job is None:
-                            break
-                        lv = self._admit(dec, job, free)
-                        served += 1
-                        self.stats["refilled"] += 1
-                        if lv is not None:
-                            active.append(lv)
-                    self._retire(active, free)  # a refill may end at its first token
+                served += self._fill(dec, active, free, head)
                 if not active and pending is None:
                     break
                 t0 = time.perf_counter()
@@ -286,7 +319,7 @@ class XBatchRunner:
                     ev = torch.cuda.Event() if cuda else None
                     if ev is not None:
                         ev.record()
-                    launched = (buf, ev, list(active))
+                    launched = (buf, ev, [(row, lv, cand) for lv in active for row, cand in lv.running.items()])
                     k += 1
                     self.stats["steps"] += 1
                     self.stats["row_steps"] += dec.rows
@@ -296,9 +329,9 @@ class XBatchRunner:
                         ev.synchronize()
                     t1 = time.perf_counter()
                     toks = buf.tolist()
-                    for lv in snapshot:
-                        if any(lv.live):
-                            self._consume(lv, [toks[r] for r in lv.rows])
+                    for row, lv, cand in snapshot:
+                        if lv.running.get(row) == cand:
+                            self._consume(lv, row, toks[row])
                     self.stats["step_s"] += t1 - t0
                     self.stats["host_s"] += time.perf_counter() - t1
                 pending = launched

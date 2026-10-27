@@ -304,10 +304,10 @@ def main() -> int:
                 "xparity_truth_vs_engine_top1": sum(top1_t_eng) / len(top1_t_eng)}
 
     def xgreedy() -> dict:
-        """The batcher end to end on the GPU (refill and the pipelined step loop included): 24 requests of n=2 on
-        short prompts of different lengths (where the batched and single-stream greedy agree), decoded at a
-        near-zero temperature through a refilling runner on the narrowest bucket, each row against the engine's
-        greedy continuation of its own prompt (matching prefix; 40 = the whole continuation)."""
+        """The batcher end to end on the GPU (refill, candidate restarts and the pipelined step loop included): 24
+        requests of n=3 on short prompts of different lengths (where the batched and single-stream greedy agree),
+        decoded at a near-zero temperature through a refilling runner on the narrowest bucket, each candidate
+        against the engine's greedy continuation of its own prompt (matching prefix; 40 = the whole continuation)."""
         from kotodama.serve.xbatch import XBatchJob
 
         steps, n_req = 40, 24
@@ -316,13 +316,14 @@ def main() -> int:
         cold = SamplingParams(temperature=1e-4, repetition_penalty=1.0)
         with torch.inference_mode():
             want = [greedy_of(torch.tensor([p], device="cuda"), steps) for p in pids]
-            runner = XBatchRunner({widths[0]: server._multi[widths[0]]}, prefill=server._engine_prefill,
+            # full prefills, as greedy_of makes (a prefix-cache extend rounds differently and can flip a near-tie)
+            runner = XBatchRunner({widths[0]: server._multi[widths[0]]}, prefill=lambda i: (eng.prefill(i), None),
                                   set_steer=eng.set_steer, decode=lambda i: tok.decode(i, skip_special_tokens=True),
                                   stop_ids=frozenset(), max_seq_len=server._max_seq_len,
                                   device=torch.device("cuda"), refill=True)
             got: dict[int, list[list[int]]] = {}
             for i, p in enumerate(pids):
-                runner.queue.put(XBatchJob(key="g", prompt_ids=p, n=2, max_new_tokens=steps, params=cold,
+                runner.queue.put(XBatchJob(key="g", prompt_ids=p, n=3, max_new_tokens=steps, params=cold,
                                            done=lambda o, i=i: got.__setitem__(i, o.rows)))
             served = runner.run_batch()
         match = []
@@ -330,6 +331,7 @@ def main() -> int:
             for row in got[i]:
                 match.append(next((k for k, (x, y) in enumerate(zip(row, want[i])) if x != y), len(row)))
         return {"xgreedy_served": served, "xgreedy_refilled": runner.stats["refilled"],
+                "xgreedy_restarts": runner.stats["restarts"],
                 "xgreedy_bucket": widths[0], "xgreedy_prompt_tokens": [len(p) for p in pids],
                 "xgreedy_match_prefix": match}
 
@@ -410,7 +412,7 @@ def main() -> int:
                     r["refilled"] = st["refilled"]
                     r["row_steps"] = st["row_steps"]
                     r["slot_efficiency"] = round(st["useful_row_steps"] / max(st["row_steps"], 1), 3)
-                    for k in ("steps", "prefill_s", "step_s", "host_s"):
+                    for k in ("steps", "restarts", "prefill_s", "step_s", "host_s"):
                         r[k] = round(st[k], 2)
                 out[f"load_{mode}_c{conc}"] = r
                 logger.info("load %s c=%d: %s", mode, conc, r)

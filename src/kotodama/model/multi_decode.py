@@ -185,9 +185,7 @@ class MultiSampleDecoder(nn.Module):
         last-position logits (1, V). The whole KV slot is copied, so a row keeps nothing from what it decoded
         before. Writes the first tokens into ``cur_tokens[rows]`` (the next step feeds them) and returns them."""
         eng = self.engine
-        rows = [int(r) for r in rows]
-        if not rows or len(set(rows)) != len(rows) or not all(0 <= r < self.rows for r in rows):
-            raise ValueError(f"rows must be distinct indices in [0, {self.rows}), got {rows}")
+        rows = self._check_rows(rows)
         if eng._pos_cpu <= 0 or eng._pos_cpu >= self.max_seq_len:
             raise RuntimeError(f"engine position {eng._pos_cpu} is not a prefilled prompt")
         self._sync_sampling(params)
@@ -201,7 +199,33 @@ class MultiSampleDecoder(nn.Module):
                 else:
                     dst.index_copy_(0, idx, src.expand(n, -1, -1, -1).contiguous())
         self.attn_bias.index_copy_(0, idx, eng.attn_bias.expand(n, -1, -1, -1).contiguous())
-        self.pos.index_fill_(0, idx, eng._pos_cpu)
+        return self._seed(rows, idx, eng._pos_cpu, prefill_logits)
+
+    @torch.inference_mode()
+    def restart(self, rows: Sequence[int], prompt_len: int, prefill_logits: torch.Tensor,
+                params: SamplingParams) -> list[int]:
+        """Start a fresh candidate in ``rows``, which already hold a ``prompt_len``-token prompt in their first
+        cache slots (they were admitted from it and have only decoded since): the rows rewind to the prompt's end
+        (positions past it are closed in the mask and rewritten as decoding proceeds) and sample a first token from
+        that prompt's last-position logits (1, V). Costs no KV copy. Returns the first tokens."""
+        rows = self._check_rows(rows)
+        if not 0 < prompt_len < self.max_seq_len:
+            raise ValueError(f"prompt_len {prompt_len} outside (0, {self.max_seq_len})")
+        self._sync_sampling(params)
+        idx = torch.tensor(rows, device=self.pos.device, dtype=torch.long)
+        self.attn_bias[idx, :, :, prompt_len:] = float("-inf")
+        return self._seed(rows, idx, prompt_len, prefill_logits)
+
+    def _check_rows(self, rows: Sequence[int]) -> list[int]:
+        rows = [int(r) for r in rows]
+        if not rows or len(set(rows)) != len(rows) or not all(0 <= r < self.rows for r in rows):
+            raise ValueError(f"rows must be distinct indices in [0, {self.rows}), got {rows}")
+        return rows
+
+    def _seed(self, rows: list[int], idx: torch.Tensor, pos: int, prefill_logits: torch.Tensor) -> list[int]:
+        """Put ``rows`` at position ``pos`` with an empty presence set and their first token sampled."""
+        n = len(rows)
+        self.pos.index_fill_(0, idx, pos)
         # A fresh row's presence set is empty, so the penalty is the identity on its first token.
         scaled = prefill_logits.reshape(1, -1).float().expand(n, -1) * self.inv_temp
         u = torch.rand_like(scaled)
@@ -211,7 +235,7 @@ class MultiSampleDecoder(nn.Module):
         self.presence.index_put_((idx, first.view(-1)), torch.ones(n, dtype=torch.bool, device=idx.device))
         self.cur_tokens.index_copy_(0, idx, first)
         for r in rows:
-            self._pos_host[r] = eng._pos_cpu
+            self._pos_host[r] = pos
         return first.view(-1).tolist()
 
     @torch.inference_mode()
