@@ -140,7 +140,9 @@ def main() -> int:
     ap.add_argument("--steer_rule", default="N")
     ap.add_argument("--prompts_jsonl", default=None)
     ap.add_argument("--prompt_tokens", default="1500,3000", help="lo,hi prompt length for xparity and load")
-    ap.add_argument("--xparity_prompts", type=int, default=16, help="distinct prompts across the widest bucket")
+    ap.add_argument("--xparity_prompts", default="16",
+                    help="comma list: distinct prompts across the widest bucket, one xparity run each (1 = every "
+                         "row on one long prompt)")
     ap.add_argument("--load_requests", type=int, default=96, help="requests per (mode, concurrency) cell")
     ap.add_argument("--load_concurrency", default="4,8", help="comma list of requests in flight")
     ap.add_argument("--load_modes", default="current,xbatch,xbatch_refill")
@@ -241,10 +243,10 @@ def main() -> int:
         return {"kl_max_per_step_mean": sum(kl) / len(kl), "kl_max_overall": max(kl),
                 "top1_agreement": sum(top1) / len(top1), "compiled_greedy_match_prefix": match}
 
-    def xparity() -> dict:
+    def xparity(count: int) -> dict:
         """Rows hold different prompts (row r: prompt r mod P), each forced along its own prompt's greedy."""
         steps = 32
-        texts = load_prompts(tok, a.prompts_jsonl, a.xparity_prompts, lo, hi, a.seed)
+        texts = load_prompts(tok, a.prompts_jsonl, count, lo, hi, a.seed)
         pids = [torch.tensor([tok.encode(t)], device="cuda") for t, _ in texts]
         P, B = len(pids), dec.rows
         with torch.inference_mode():
@@ -256,6 +258,12 @@ def main() -> int:
                 for t in g[:-1]:
                     seq.append(eng.step_logits(torch.tensor([[t]], device="cuda"))[0, -1].float().clone())
                 refs.append(seq)
+            # the noise floor: one full forward of prompt + continuation (no cache), the parity oracle both the
+            # engine and the rows are measured against
+            truth = []
+            for p, g in zip(pids, greedy):
+                full = _model(torch.cat([p, torch.tensor([g[:-1]], device="cuda")], dim=1))["logits"][0].float()
+                truth.append(list(full[p.shape[1] - 1:]))
             cold = SamplingParams(temperature=1e-4, repetition_penalty=1.0)
             first: dict[int, torch.Tensor] = {}
             for p in range(P):
@@ -270,6 +278,9 @@ def main() -> int:
                 got.append(dec.step_logits(forced[:, t:t + 1].contiguous()).float())
             ref = [torch.stack([refs[r % P][t] for r in range(B)]) for t in range(steps)]
             kl, top1 = kl_top1(ref, got)
+            tru = [torch.stack([truth[r % P][t] for r in range(B)]) for t in range(steps)]
+            kl_t_rows, top1_t_rows = kl_top1(tru, got)
+            kl_t_eng, top1_t_eng = kl_top1(tru, ref)
             # compiled near-greedy with every row at its own prompt
             toks = []
             for p in range(P):
@@ -285,7 +296,11 @@ def main() -> int:
         return {"xparity_prompts": P, "xparity_prompt_tokens": [int(p.shape[1]) for p in pids],
                 "xparity_rows": B, "xparity_kl_max_per_step_mean": sum(kl) / len(kl),
                 "xparity_kl_max_overall": max(kl), "xparity_top1_agreement": sum(top1) / len(top1),
-                "xparity_compiled_greedy_match_prefix": match}
+                "xparity_compiled_greedy_match_prefix": match,
+                "xparity_truth_vs_rows_kl_max_per_step_mean": sum(kl_t_rows) / len(kl_t_rows),
+                "xparity_truth_vs_rows_top1": sum(top1_t_rows) / len(top1_t_rows),
+                "xparity_truth_vs_engine_kl_max_per_step_mean": sum(kl_t_eng) / len(kl_t_eng),
+                "xparity_truth_vs_engine_top1": sum(top1_t_eng) / len(top1_t_eng)}
 
     def load() -> dict:
         import httpx
@@ -374,7 +389,9 @@ def main() -> int:
     if "agreement" in sections:
         res.update(run_on_worker(agreement))
     if "xparity" in sections:
-        res.update(run_on_worker(xparity))
+        for count in [int(x) for x in a.xparity_prompts.split(",") if x.strip()]:
+            out = run_on_worker(lambda: xparity(count))
+            res.update({f"{k}_p{count}": v for k, v in out.items()})
     if "load" in sections:
         res.update(load())
     logger.info("RESULT %s", json.dumps(res, indent=1))
