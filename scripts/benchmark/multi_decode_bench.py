@@ -307,7 +307,8 @@ def main() -> int:
         """The batcher end to end on the GPU (refill, candidate restarts and the pipelined step loop included): 24
         requests of n=3 on short prompts of different lengths (where the batched and single-stream greedy agree),
         decoded at a near-zero temperature through a refilling runner on the narrowest bucket, each candidate
-        against the engine's greedy continuation of its own prompt (matching prefix; 40 = the whole continuation)."""
+        against the engine's greedy continuation of its own prompt (matching prefix; 40 = the whole continuation)
+        and, tie-proof, replayed through the engine token by token (each token's distance below the top logit)."""
         from kotodama.serve.xbatch import XBatchJob
 
         steps, n_req = 40, 24
@@ -330,7 +331,22 @@ def main() -> int:
         for i in range(n_req):
             for row in got[i]:
                 match.append(next((k for k, (x, y) in enumerate(zip(row, want[i])) if x != y), len(row)))
-        return {"xgreedy_served": served, "xgreedy_refilled": runner.stats["refilled"],
+        # bf16 logits tie often, and a near-zero temperature breaks a tie at random where argmax takes the lower
+        # id, so a diverging prefix is not by itself an error. The tie-proof check: replay every candidate through
+        # the engine and measure, at each of its tokens, how far below the engine's top logit the chosen token
+        # sits (0 = an argmax).
+        gaps: list[float] = []
+        with torch.inference_mode():
+            for i in range(n_req):
+                for row in got[i]:
+                    logits = eng.prefill(torch.tensor([pids[i]], device="cuda"))[0]
+                    for t, tok_id in enumerate(row):
+                        gaps.append(float(logits.max() - logits[tok_id]))
+                        if t + 1 < len(row):
+                            logits = eng.step_logits(torch.tensor([[tok_id]], device="cuda"))[0, -1].float()
+        return {"xgreedy_tokens": len(gaps), "xgreedy_argmax_rate": sum(g == 0 for g in gaps) / len(gaps),
+                "xgreedy_gap_max": max(gaps), "xgreedy_gap_over_0p25": sum(g > 0.25 for g in gaps),
+                "xgreedy_served": served, "xgreedy_refilled": runner.stats["refilled"],
                 "xgreedy_restarts": runner.stats["restarts"],
                 "xgreedy_bucket": widths[0], "xgreedy_prompt_tokens": [len(p) for p in pids],
                 "xgreedy_match_prefix": match}
