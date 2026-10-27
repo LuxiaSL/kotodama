@@ -28,6 +28,9 @@ against the engine's greedy continuation of its own prompt):
   * ``poolparity``: a prompt prefilled from a pool hit (a sibling's blocks pooled, the engine holding an unrelated
     prompt, only the suffix prefilled) vs the engine's full prefill of the same prompt, along the full prefill's
     greedy continuation (per-step KL and top-1), beside both against one no-cache forward (the noise floor);
+  * ``poolcost``: on an idle GPU, the time of a pool hit (load + suffix extend + store) against a full prefill of
+    the same prompt, by suffix length, with the engine's block buckets as built and without the pool's two-block
+    bucket (the time a hit saves, apart from any batch decoding around it);
   * ``xgreedy_pool``: ``xgreedy`` on prompt families that share long prefixes, interleaved, with the pool in front
     of the batcher's prefill (every family member after the first extends from pooled blocks), replayed tie-proof
     through the engine's full prefill.
@@ -272,7 +275,7 @@ def main() -> int:
     eng = server._engine
     pool = server._prefix_pool
     server._prefix_pool = None  # each section and load mode decides whether the pool is in front of the prefill
-    needs_pool = bool({"poolparity", "xgreedy_pool"} & sections) or ("load" in sections and "pool" in a.load_modes)
+    needs_pool = bool({"poolparity", "poolcost", "xgreedy_pool"} & sections) or ("load" in sections and "pool" in a.load_modes)
     if needs_pool and pool is None:
         raise SystemExit("poolparity / xgreedy_pool / xbatch_refill_pool need --prefix_pool_tokens > 0")
     assert eng is not None and all(server._multi.get(w) is not None for w in widths)
@@ -481,6 +484,58 @@ def main() -> int:
             out["xgreedy_pool_stats"] = dict(pool.stats)
         return out
 
+    def poolcost() -> dict:
+        """Median ms over 5 repeats of: a full prefill of a ``hi``-token prompt, and pool hits on it whose suffix past
+        the pooled blocks is 1..300 tokens (the engine holding an unrelated prompt), each timed between device syncs,
+        with the buckets as built and without the two-block bucket the pool adds."""
+        assert pool is not None
+        b = pool.block_size
+        base = load_prompts(tok, None, 1, hi, hi, a.seed + 5)[0][0]
+        ids = tok.encode(base)
+        g = torch.Generator().manual_seed(a.seed)
+        other = torch.randint(4, eng.config.vocab_size, (1, 64), generator=g).cuda()  # shares nothing with ids
+        full_ids = torch.tensor([ids], device="cuda")
+
+        def ms(fn, setup=None) -> float:
+            vals = []
+            for _ in range(5):
+                if setup is not None:
+                    setup()
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                fn()
+                torch.cuda.synchronize()
+                vals.append((time.perf_counter() - t0) * 1000)
+            return statistics.median(vals)
+
+        out: dict = {"poolcost_prompt_tokens": len(ids), "poolcost_buckets": list(eng.block_buckets)}
+        with torch.inference_mode():
+            out["poolcost_full_prefill_ms"] = ms(lambda: eng.prefill(full_ids))
+            built = eng.block_buckets
+            variants = [("built", built)]
+            if 2 * b in built:
+                variants.append(("no2block", tuple(x for x in built if x != 2 * b)))
+            for name, buckets in variants:
+                eng.block_buckets = buckets
+                for suffix in (1, 8, 20, 40, 100, 300):
+                    # the pooled prefix ends on a block boundary, ``suffix`` tokens before the prompt's end
+                    cut = len(ids) - suffix
+                    pooled = ids[:cut - cut % b]
+                    primer = torch.tensor([pooled + [5] * b], device="cuda")  # pools ``pooled`` (and a decoy block)
+
+                    def setup() -> None:
+                        pool.clear()
+                        eng.reset()
+                        pool.prefill(primer)
+                        eng.prefill(other)  # the engine holds nothing of the prompt: the hit comes from the pool
+
+                    out[f"poolcost_{name}_suffix{len(ids) - len(pooled)}_hit_ms"] = round(
+                        ms(lambda: pool.prefill(full_ids), setup), 3)
+            eng.block_buckets = built
+            pool.clear()
+            eng.reset()
+        return out
+
     def poolparity() -> dict:
         """Pool hit vs full prefill of the same prompt. Pairs (A, B) are siblings from the tree-shaped load (or,
         without ``--load_trees_jsonl``, a trunk with two different closing turns). Per pair: A goes through the pool
@@ -677,6 +732,8 @@ def main() -> int:
             res.update({f"{k}_p{count}": v for k, v in out.items()})
     if "xgreedy" in sections:
         res.update(run_on_worker(xgreedy))
+    if "poolcost" in sections:
+        res.update(run_on_worker(poolcost))
     if "xgreedy_pool" in sections:
         res.update(run_on_worker(lambda: xgreedy(use_pool=True)))
     if "poolparity" in sections:
