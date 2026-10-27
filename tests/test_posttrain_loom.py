@@ -326,3 +326,17 @@ def test_prompt_too_long_ends_the_branch_not_the_tree() -> None:
     st, recs = grow(cfg, complete)
     assert st["ended"]["length_cap"] >= 1 and st["max_depth"] < 10
     assert all(p["state"] in ("length_cap", "eos", "degraded", "pruned") for p in recs["path"])
+
+
+def test_novel_selection_prefers_turns_with_new_content() -> None:
+    fresh = ["lighthouse keeper rowed", "harbour master waited", "ferry captain shouted", "orchard thieves fled",
+             "winter market opened", "copper kettle whistled"]
+
+    def script(prompt, i):  # a different set of content words at every depth, so the new turn is always novel
+        return "Okay." if i < 4 else f"The {fresh[prompt.count(chr(10)) // 2 % len(fresh)]} at dawn."
+
+    cfg = loom.LoomConfig(candidates=6, children=1, width=1, max_depth=4, min_turns=1, select="novel",
+                          select_lambda=4.0)
+    st, recs = grow(cfg, fake(script)[0])
+    chosen = [r for r in recs["node"] if r["status"] == "child"]
+    assert chosen and all(r["text"].startswith("The ") for r in chosen)

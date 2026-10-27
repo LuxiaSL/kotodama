@@ -235,3 +235,44 @@ def test_completer_does_not_retry_a_refused_request() -> None:
 
     asyncio.run(go())
     assert [u.split("/")[2] for u in seen] == ["a:1", "b:2"]  # one request each: a 4xx is never retried
+
+
+def test_cycle_veto_catches_loops_of_any_period_and_narration_tails() -> None:
+    from kotodama.posttrain.transcript import Turn
+
+    loop = ["You hate me.", "No.", "Yes.", "You do.", "I don't know.", "You do, Richard. I hate you."]
+    prior = [Turn("P" if k % 2 == 0 else "R", loop[k % 6]) for k in range(12)]
+    assert sp.is_cycle(loop[0], prior, 30)  # period 6: the pair (last turn, candidate) was said before
+    assert not sp.is_cycle("Then tell me why you stayed.", prior, 30)
+    assert not sp.is_cycle(loop[0], prior, 4)  # outside the window
+    bye = [Turn("A", "Goodbye. *She smiles and waves.*"), Turn("B", "Goodbye. (He nods.)")]
+    assert sp.is_cycle("Goodbye. (He drives home.)", bye + [Turn("A", "Goodbye. *She makes coffee.*")], 30)
+    assert not sp.is_cycle("Yes.", [Turn("A", "Are you coming?")], 30)  # an isolated short answer stays legal
+
+
+def test_template_veto_catches_a_refilled_frame() -> None:
+    from kotodama.posttrain.transcript import Turn
+
+    prior = []
+    for thing in ("color", "food", "city", "song"):
+        prior += [Turn("A", f"What is your favorite {thing}?"), Turn("B", f"My favorite {thing} is a secret one.")]
+    prior.append(Turn("A", "What is your favorite band?"))
+    assert sp.is_template("My favorite band is the loud one.", prior, 30, 3)  # 4 earlier (q, a) pairs > 3
+    assert not sp.is_template("My favorite band is the loud one.", prior, 30, 4)
+    assert not sp.is_template("Probably the one my brother liked.", prior, 30, 3)
+    assert not sp.is_template("My favorite.", prior, 30, 3)  # under 4 spoken words: left to the cycle veto
+
+
+def test_novelty_and_vetoes_wire_into_evaluate() -> None:
+    from kotodama.posttrain.transcript import Turn
+
+    prior = [Turn("A", "The harbour was cold that night."), Turn("B", "Cold and empty, like the harbour always is.")]
+    assert sp.novelty("The lighthouse keeper never came back.", prior) == 1.0
+    assert sp.novelty("Cold harbour.", prior) == 0.0
+    assert sp.novelty("Yes.", prior) == 0.0
+    loop = [Turn("A" if k % 2 == 0 else "B", ["I'll go.", "You can't go."][k % 2]) for k in range(6)]
+    cfg = sp.SelfPlayConfig(cycle_window=30)
+    assert "cycle" in sp.evaluate("I'll go.\n\nB:", "stop", "A", loop[:-1] + [loop[-1]], ["A", "B"], "", cfg).vetoes \
+        or "repeat_turn" in sp.evaluate("I'll go.\n\nB:", "stop", "A", loop, ["A", "B"], "", cfg).vetoes
+    off = sp.SelfPlayConfig(repeat_window=0)
+    assert "cycle" not in sp.evaluate("I'll go.", "stop", "A", loop, ["A", "B"], "", off).vetoes

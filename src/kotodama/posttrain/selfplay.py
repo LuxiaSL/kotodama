@@ -71,6 +71,14 @@ class SelfPlayConfig:
     # a turn identical (case and punctuation aside) to one of the last N turns, whoever spoke it, at any length —
     # the short cross-speaker ping-pong ("*Sigh*" / "*Sigh*") that self-copy and echo spans are too short to see
     repeat_window: int = 4
+    # cycles of any period up to N turns: the candidate's speech (stage directions stripped) after the previous
+    # turn's speech is an adjacent pair already said within the last N turns ("You do." / "I don't." ...); 0 = off
+    cycle_window: int = 0
+    # template lock: the (previous turn, candidate) pair of turn openings (first two words of speech) already seen
+    # more than template_max times within the last template_window turns ("What is your favorite X?" / "My favorite
+    # X is ..."); only candidates of 4+ words; 0 = off
+    template_window: int = 0
+    template_max: int = 3
     selfcopy: selfcopy.SelfCopyConfig = field(default_factory=selfcopy.SelfCopyConfig)
 
 
@@ -143,6 +151,10 @@ def evaluate(raw_text: str, ended_by: str, speaker: str, prior: list[Turn], cast
     key = _norm_turn(text)
     if key and cfg.repeat_window and any(key == _norm_turn(t.text) for t in prior[-cfg.repeat_window:]):
         c.vetoes.append("repeat_turn")
+    if cfg.cycle_window and prior and is_cycle(text, prior, cfg.cycle_window):
+        c.vetoes.append("cycle")
+    if cfg.template_window and prior and is_template(text, prior, cfg.template_window, cfg.template_max):
+        c.vetoes.append("template")
     own = "\n\n".join(t.text for t in prior if t.speaker == speaker)
     others = "\n\n".join([header] + [t.text for t in prior if t.speaker != speaker])
     rep = selfcopy.score(text, context=own, prompt=others, cfg=cfg.selfcopy)
@@ -156,6 +168,55 @@ def evaluate(raw_text: str, ended_by: str, speaker: str, prior: list[Turn], cast
 
 def _norm_turn(text: str) -> str:
     return re.sub(r"[^a-z0-9 ]+", "", text.lower()).strip()
+
+
+_STAGE = re.compile(r"\([^)]*\)|\[[^\]]*\]|\*[^*]*\*")
+
+
+def speech_key(text: str) -> str:
+    """A turn's spoken words, normalised: stage directions in (), [] and ** removed, lowercase, letters and digits."""
+    return " ".join(_norm_turn(_STAGE.sub(" ", text)).split())
+
+
+def is_cycle(text: str, prior: list[Turn], window: int) -> bool:
+    """The candidate repeats, after the previous turn, an adjacent pair of turns already said in the last ``window``
+    turns (speech only): a loop of any period up to the window, whatever narration is appended."""
+    cand, prev = speech_key(text), speech_key(prior[-1].text)
+    if not cand:
+        return False
+    keys = [speech_key(t.text) for t in prior[-window - 1:]]
+    return any(keys[i] == prev and keys[i + 1] == cand for i in range(len(keys) - 2))
+
+
+def _opening(key: str) -> str:
+    return " ".join(key.split()[:2])
+
+
+def is_template(text: str, prior: list[Turn], window: int, max_repeats: int) -> bool:
+    """The (previous turn, candidate) pair of openings (first two spoken words) already occurred more than
+    ``max_repeats`` times as adjacent turns in the last ``window`` turns: a fixed question/answer frame refilled with
+    new words. Candidates under 4 spoken words are left to the cycle veto."""
+    cand = speech_key(text)
+    if len(cand.split()) < 4:
+        return False
+    pair = (_opening(speech_key(prior[-1].text)), _opening(cand))
+    keys = [_opening(speech_key(t.text)) for t in prior[-window - 1:]]
+    return sum((keys[i], keys[i + 1]) == pair for i in range(len(keys) - 1)) > max_repeats
+
+
+_STOP = frozenset("the a an and or but to of in on at for with is are was were be been it its this that you your i "
+                  "me my we our he she his her they them their what do does did not no yes so just have has had will "
+                  "would can could dont im its youre thats there here well oh okay know like get got go going".split())
+
+
+def novelty(text: str, prior: list[Turn], window: int = 30) -> float:
+    """Share of the candidate's content words (3+ letters, not stopwords) that none of the last ``window`` turns
+    used; 0 for a turn without content words."""
+    words = {w for w in speech_key(text).split() if len(w) >= 3 and w not in _STOP}
+    if not words:
+        return 0.0
+    seen = {w for t in prior[-window:] for w in speech_key(t.text).split()}
+    return len(words - seen) / len(words)
 
 
 def next_speaker(cast: list[str], turns: list[Turn]) -> str:

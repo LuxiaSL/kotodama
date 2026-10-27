@@ -66,7 +66,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from kotodama.posttrain.selfplay import (Complete, PromptTooLong, SeedSpec, SelfPlayConfig, evaluate, next_speaker,
-                                         oai_completer, parse_seed, parse_steer, split_completion)
+                                         novelty, oai_completer, parse_seed, parse_steer, split_completion)
 from kotodama.posttrain.transcript import Transcript, Turn, render_prompt, stop_sequences, to_row
 from kotodama.serve.laws import law
 
@@ -85,7 +85,7 @@ class LoomConfig:
     window_chars: int = 0  # > 0: the model sees the header + seed turns + only the latest turns that fit this budget
     deep_after: int = 0  # from this depth on, at most deep_width live nodes (wide early, narrow and deep later)
     deep_width: int = 0
-    select: str = "uniform"  # uniform | engage
+    select: str = "uniform"  # uniform | engage | novel
     select_lambda: float = 0.0
     engage_replies: int = 2
     overlong: str = "veto"  # veto | keep
@@ -206,7 +206,13 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
             except Exception as e:  # a failed scoring round costs this node its weighting, not the tree
                 logger.warning("node %s: engagement scoring failed (%s); choosing uniformly", node.id, e)
                 stats["engage_failures"] = stats.get("engage_failures", 0) + 1
-        if eng:
+        if cfg.select == "novel" and len(survivors) > cfg.children:
+            nov = {i: novelty(cands[i].text, list(seen)) for i in survivors}
+            mu = sum(nov.values()) / len(nov)
+            sd = (sum((v - mu) ** 2 for v in nov.values()) / len(nov)) ** 0.5 or 1.0
+            w = [math.exp(cfg.select_lambda * (nov[i] - mu) / sd) for i in survivors]
+            chosen = {survivors[j] for j in weighted_choice(rng, w, cfg.children)}
+        elif eng:
             vals = [eng[i] for i in survivors]
             mu = sum(vals) / len(vals)
             sd = (sum((v - mu) ** 2 for v in vals) / len(vals)) ** 0.5 or 1.0
@@ -530,9 +536,16 @@ def main(argv: list[str] | None = None) -> int:
                          "(early dialogue rotates out), so branches can run past the context")
     ap.add_argument("--deep_after", type=int, default=0, help="from this depth on, cap live nodes at --deep_width")
     ap.add_argument("--deep_width", type=int, default=0)
-    ap.add_argument("--select", choices=["uniform", "engage"], default="uniform")
+    ap.add_argument("--select", choices=["uniform", "engage", "novel"], default="uniform")
     ap.add_argument("--select_lambda", type=float, default=0.0,
-                    help="engage: >0 leans to turns that hand the next speaker something, <0 to self-contained ones")
+                    help="engage: >0 leans to turns that hand the next speaker something, <0 to self-contained ones; "
+                         "novel: >0 leans to turns whose content words the last 30 turns did not use")
+    ap.add_argument("--cycle_window", type=int, default=0,
+                    help="veto a turn that repeats an adjacent pair of turns said in the last N turns (speech only)")
+    ap.add_argument("--template_window", type=int, default=0,
+                    help="veto a 4+-word turn whose opening pair with the previous turn's recurs > --template_max "
+                         "times in the last N turns")
+    ap.add_argument("--template_max", type=int, default=3)
     ap.add_argument("--engage_replies", type=int, default=2)
     ap.add_argument("--overlong", choices=["veto", "keep"], default="veto")
     ap.add_argument("--steer", default="")
@@ -562,7 +575,8 @@ def main(argv: list[str] | None = None) -> int:
                      window_chars=a.window_chars, deep_after=a.deep_after, deep_width=a.deep_width,
                      select=a.select, select_lambda=a.select_lambda, engage_replies=a.engage_replies,
                      overlong=a.overlong)
-    sp = SelfPlayConfig(candidates=a.candidates, max_tokens=a.max_tokens, min_turns=a.min_turns)
+    sp = SelfPlayConfig(candidates=a.candidates, max_tokens=a.max_tokens, min_turns=a.min_turns,
+                        cycle_window=a.cycle_window, template_window=a.template_window, template_max=a.template_max)
     complete, close = oai_completer(a.endpoint, sampling, a.max_tokens, steer=parse_steer(a.steer) or None,
                                     steer_rule=a.steer_rule)
 
