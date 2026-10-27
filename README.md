@@ -309,8 +309,10 @@ Every item also runs under few-shot conditions with exemplars.
 - **The binding suite** (`kotodama.eval.binding`): one runner for every battery
   above and below. It loads a model once (a kotodama checkpoint or any Hugging Face
   model), scores each requested battery in-process with the same scorer as
-  `/logprobs`, and writes resumable rows. Prompt files are pinned by sha256, so a
-  recorded number always names its exact strings. Beyond the bindprobes families
+  `/logprobs`, and writes resumable rows. Prompt files are pinned by sha256, and a
+  bindprobes item file also by the sha256 of every prompt it renders (each item
+  renders with the templates of the generation that built it), so a recorded
+  number always names its exact strings. Beyond the bindprobes families
   it carries:
   - stage gauges `joinlite-v1` (static I / you and a speaker-swap counterfactual)
     and `swapdyn-v1` (the swap on transfer dialogues). A shift above +.02 at the

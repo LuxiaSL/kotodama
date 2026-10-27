@@ -50,12 +50,14 @@ from __future__ import annotations
 import random
 from typing import Any, Mapping, Optional, TypedDict
 
-from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection, the_list
+from kotodama.eval.bindprobes.base import Cell, Item, for_version, name_list, rejection, the_list, version_of
 from kotodama.eval.bindprobes.pools import (FEMALE_CANDIDATES, MALE_CANDIDATES, PLURAL_FORM,
                                             Gender, Pools, singular)
 
 FAMILY = "dialogue"
 VERSION = 2                       # meta.dialogue_version; items' id/seed tag "dialogue-v2"
+# the holder query's lead-in per generation (the object query has one form)
+HOLDER_LEADS: dict[int, str] = {1: "Now the {o} is with", 2: "Now the person with the {o} is"}
 N_PEOPLE = (3, 4)
 TRANSFERS = (1, 2, 4)
 QKINDS = ("holder", "object")
@@ -228,16 +230,16 @@ def _intro(spec: Spec) -> list[str]:
     return out
 
 
-def _lead(spec: Spec) -> str:
+def _lead(spec: Spec, version: int) -> str:
     q = spec["query"]
-    return (f"Now the person with the {q['obj']} is" if q["kind"] == "holder"
+    return (for_version(HOLDER_LEADS, version, FAMILY).format(o=q["obj"]) if q["kind"] == "holder"
             else f"Now {q['person']} has the")
 
 
 def render(item: Item, with_answer: bool) -> str:
     spec: Spec = item.spec  # type: ignore[assignment]
     body = " ".join(_intro(spec) + [_op_sentence(o) for o in spec["ops"]])
-    lead = f"{body} {_lead(spec)}"
+    lead = f"{body} {_lead(spec, version_of(item))}"
     return f"{lead} {item.gold}." if with_answer else lead
 
 
@@ -269,7 +271,9 @@ def labels(item: Item) -> list[str]:
     return [n for n, _ in item.spec["people"]]
 
 
-def build(item_id: str, cell: Cell, spec: Spec) -> Item:
+def build(item_id: str, cell: Cell, spec: Spec, version: int = VERSION) -> Item:
+    """Item from a spec; ``version`` is the generation it renders as (``relabel`` keeps the
+    source item's)."""
     names = [n for n, _ in spec["people"]]
     objs_intro = [o for n in names for o, w in spec["holdings0"] if w == n]
     if [o for o, _ in spec["holdings0"]] != objs_intro:
@@ -280,7 +284,7 @@ def build(item_id: str, cell: Cell, spec: Spec) -> Item:
     n_pron = sum(1 for o in ops if o["form"] in ("chain", "ask"))
     it = Item(item_id=item_id, family=FAMILY, cell=list(cell), spec=dict(spec), gold="",
               candidates=list(cands), mention_order=mentions,
-              meta={"dialogue_version": VERSION, "qkind": spec["query"]["kind"],
+              meta={"dialogue_version": version, "qkind": spec["query"]["kind"],
                     "n_pronoun_ops": n_pron,
                     "forms": [o["form"] for o in ops], "gold_is_last_mention": False})
     it.gold = simulate(it)
@@ -455,7 +459,7 @@ def relabel(item: Item, mapping: Mapping[str, str], target: Optional[Item] = Non
     new: Spec = {"people": [[mapping[n], g] for n, g in spec["people"]],
                  "holdings0": [[o, mapping[w]] for o, w in spec["holdings0"]],
                  "ops": ops, "query": q}
-    out = build(f"{item.item_id}_collide", tuple(item.cell), new)
+    out = build(f"{item.item_id}_collide", tuple(item.cell), new, version=version_of(item))
     expect = mapping[item.gold] if q["kind"] == "holder" else item.gold
     if out.gold != expect:
         raise ValueError(f"{item.item_id}: re-label changed the gold")

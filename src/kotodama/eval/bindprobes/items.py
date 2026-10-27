@@ -19,6 +19,7 @@ UTF-8 bytes, so this bounds the token count without a tokenizer).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import re
@@ -201,6 +202,20 @@ def build_prompt(item: Item, condition: str) -> str:
     blocks = [fam.render(s, True) for s in condition_shots(item, condition)]
     blocks.append(fam.render(item, False))
     return fam.SEPARATOR.join(blocks)
+
+
+def render_sha256(items: Sequence[Item]) -> str:
+    """The digest of every prompt ``items`` render: per condition (``CONDITIONS`` order), the
+    sha256 over each prompt's sha256 in item order; then the sha256 over those. A bindprobes
+    battery pins it (``binding.batteries.Battery.render_sha256``), because the file pin covers
+    only the specs the prompts are rendered from."""
+    per = []
+    for c in CONDITIONS:
+        h = hashlib.sha256()
+        for it in items:
+            h.update(hashlib.sha256(build_prompt(it, c).encode("utf-8")).digest())
+        per.append(h.digest())
+    return hashlib.sha256(b"".join(per)).hexdigest()
 
 
 # ── Validation ─────────────────────────────────────────────────────────────────

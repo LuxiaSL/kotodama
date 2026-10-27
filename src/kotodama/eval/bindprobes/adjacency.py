@@ -53,7 +53,7 @@ from collections import defaultdict
 from typing import Any, Mapping, Optional, Sequence, TypedDict
 
 from kotodama.eval.bindprobes import deixis as dx
-from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection
+from kotodama.eval.bindprobes.base import Cell, Item, for_version, name_list, rejection, version_of
 from kotodama.eval.bindprobes.pools import PLURAL_FORM, singular
 
 FAMILY = "adjacency"
@@ -75,6 +75,14 @@ GRANT_FORMS: dict[str, tuple[str, str]] = {
     "have": ("Sure, you can have the {o}.", "Sure, {v}, you can have the {o}."),
     "take": ("Sure, take the {o}.", "Sure, {v}, take the {o}."),
 }
+# the first generation's grants stated ownership; its item files render with them
+OWNING_GRANT_FORMS: dict[str, tuple[str, str]] = {
+    "yours": ("Sure, the {o} is yours.", "Sure, {v}, the {o} is yours."),
+    "take": GRANT_FORMS["take"],
+}
+# version -> (deixis.WORDINGS key, grant forms)
+WORDING: dict[int, tuple[str, dict[str, tuple[str, str]]]] = {
+    1: ("owning", OWNING_GRANT_FORMS), 2: ("holding", GRANT_FORMS), 3: ("holding", GRANT_FORMS)}
 _OWNER_SCHED = ("recipient", "giver", "bystander")
 CRITICAL_SHARE_21 = (True, True, False)   # (2,1): critical on 2 of every 3 role rounds
 
@@ -152,14 +160,17 @@ def simulate(item: Item) -> str:
 
 # ── Rendering ──────────────────────────────────────────────────────────────────
 
-def _lines(spec: Spec) -> list[str]:
+def _lines(spec: Spec, version: int) -> list[str]:
+    wording, grants = for_version(WORDING, version, FAMILY)
     out: list[str] = []
     for ev in spec["events"]:
         if ev["ev"] in ("declare", "give"):
-            out.append(dx._deictic_line(ev)[0])
+            out.append(dx._deictic_line(ev, wording)[0])
             continue
         r, g = ev["requester"], ev["granter"]
-        bare, with_v = GRANT_FORMS[ev["form"]]
+        if ev["form"] not in grants:
+            raise ValueError(f"grant form {ev['form']!r} is not in adjacency v{version}'s wording")
+        bare, with_v = grants[ev["form"]]
         out.append(f"{r}: " + REQUEST.format(o=ev["obj"]))
         out.append(f"{g}: " + (with_v.format(v=r, o=ev["obj"]) if spec["variant"] == "voc"
                                else bare.format(o=ev["obj"])))
@@ -199,16 +210,17 @@ def _third(spec: Spec) -> list[str]:
     return out
 
 
-def _rendered(spec: Spec) -> str:
+def _rendered(spec: Spec, version: int = VERSION) -> str:
+    """The prompt without the answer, in generation ``version``'s wording."""
     people = spec["people"]
     lead = f"Now the {spec['query']['obj']} is with"
     if spec["variant"] == "third":
         return " ".join([f"{name_list(people)} are sitting at a table."] + _third(spec) + [lead])
-    return "\n".join([f"A chat between {name_list(people)}."] + _lines(spec) + [lead])
+    return "\n".join([f"A chat between {name_list(people)}."] + _lines(spec, version) + [lead])
 
 
 def render(item: Item, with_answer: bool) -> str:
-    text = _rendered(item.spec)  # type: ignore[arg-type]
+    text = _rendered(item.spec, version_of(item))  # type: ignore[arg-type]
     return f"{text} {item.gold}." if with_answer else text
 
 
@@ -221,7 +233,7 @@ def check_surface(item: Item) -> None:
     matching request by another participant; every other addressed line has a valid
     vocative. voc: every addressed line has one. third: pronoun-free prose."""
     spec: Spec = item.spec  # type: ignore[assignment]
-    text = _rendered(spec)
+    text = _rendered(spec, version_of(item))
     if "(" in text or ")" in text:
         raise ValueError(f"{item.item_id}: parentheses")
     if spec["variant"] == "third":
@@ -252,13 +264,15 @@ def check_surface(item: Item) -> None:
 
 # ── Items ──────────────────────────────────────────────────────────────────────
 
-def build(item_id: str, cell: Cell, spec: Spec, pair_id: Optional[str] = None) -> Item:
+def build(item_id: str, cell: Cell, spec: Spec, pair_id: Optional[str] = None, version: int = VERSION) -> Item:
+    """Item from a spec; ``version`` is the generation it renders as (``relabel`` keeps the
+    source item's)."""
     people = list(spec["people"])
-    text = _rendered(spec)
+    text = _rendered(spec, version)
     pat = re.compile(r"\b(" + "|".join(map(re.escape, people)) + r")\b")
     it = Item(item_id=item_id, family=FAMILY, cell=list(cell), spec=dict(spec), gold="",
               candidates=people, mention_order=pat.findall(text),
-              meta={"adjacency_version": VERSION, "variant": spec["variant"],
+              meta={"adjacency_version": version, "variant": spec["variant"],
                     "pair_id": pair_id or item_id})
     it.gold = simulate(it)
     tr = transfers(spec)
@@ -383,7 +397,7 @@ def relabel(item: Item, mapping: Mapping[str, str], target: Optional[Item] = Non
     if target is not None and sorted(new["people"]) == sorted(target.spec["people"]):
         new["people"] = list(target.spec["people"])
     out = build(f"{item.item_id}_collide", tuple(item.cell), new,
-                pair_id=str(item.meta.get("pair_id", item.item_id)))
+                pair_id=str(item.meta.get("pair_id", item.item_id)), version=version_of(item))
     if out.gold != m[item.gold]:
         raise ValueError(f"{item.item_id}: re-label changed the gold")
     return out

@@ -58,13 +58,15 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Any, Mapping, Optional, Sequence, TypedDict
+from typing import Any, Callable, Mapping, Optional, Sequence, TypedDict
 
-from kotodama.eval.bindprobes.base import Cell, Item, rejection, the_list
-from kotodama.eval.bindprobes.pools import NON_COUNTABLE, Pools, countable, indefinite
+from kotodama.eval.bindprobes.base import Cell, Item, for_version, rejection, the_list, version_of
+from kotodama.eval.bindprobes.pools import NON_COUNTABLE, Pools, countable, indefinite, letter_article
 
 FAMILY = "setbind"
 VERSION = 3
+# the article of a distractor sentence, per generation
+ARTICLE: dict[int, Callable[[str], str]] = {1: letter_article, 2: indefinite, 3: indefinite}
 KS = (1, 2, 3)
 LAYOUTS = ("joint", "split")
 ES = (0, 2)
@@ -163,13 +165,13 @@ def simulate(item: Item) -> str:
 
 # ── Rendering ──────────────────────────────────────────────────────────────────
 
-def _sentence(s: Sequence[Any]) -> str:
+def _sentence(s: Sequence[Any], version: int = VERSION) -> str:
     if s[0] == "bind":
         also = " also" if s[3] else ""
         return f"{s[1]}{also} has {the_list(list(s[2]))}."
     if s[0] == "free":
         o = s[1]
-        return f"{indefinite(o).capitalize()} {o} lies on the shelf."
+        return f"{for_version(ARTICLE, version, FAMILY)(o).capitalize()} {o} lies on the shelf."
     return f"{s[1]} gives the {s[2]} to {s[3]}."
 
 
@@ -180,7 +182,8 @@ def _lead(spec: Spec) -> str:
 
 def render(item: Item, with_answer: bool) -> str:
     spec: Spec = item.spec  # type: ignore[assignment]
-    text = " ".join(_sentence(s) for s in spec["sentences"]) + " " + _lead(spec)
+    v = version_of(item)
+    text = " ".join(_sentence(s, v) for s in spec["sentences"]) + " " + _lead(spec)
     return f"{text} {item.gold}." if with_answer else text
 
 
@@ -190,13 +193,15 @@ def labels(item: Item) -> list[str]:
 
 # ── Items ──────────────────────────────────────────────────────────────────────
 
-def build(item_id: str, cell: Cell, spec: Spec) -> Item:
+def build(item_id: str, cell: Cell, spec: Spec, version: int = VERSION) -> Item:
+    """Item from a spec; ``version`` is the generation it renders as (``relabel`` keeps the
+    source item's)."""
     mentions = _mentions(spec)
     cands = list(dict.fromkeys(mentions))
     gs = gold_set(spec)
     it = Item(item_id=item_id, family=FAMILY, cell=list(cell), spec=dict(spec), gold="",
               candidates=cands, mention_order=[m for m in mentions if m in cands],
-              meta={"setbind_version": VERSION, "k": len(gs), "gold_set": gs,
+              meta={"setbind_version": version, "k": len(gs), "gold_set": gs,
                     "n_candidates": len(cands),
                     "last_in_set": bool(mentions) and mentions[-1] in gs,
                     "last_k_is_set": set(list(dict.fromkeys(reversed(mentions)))[:len(gs)])
@@ -355,7 +360,7 @@ def relabel(item: Item, mapping: Mapping[str, str], target: Optional[Item] = Non
     new: Spec = {"people": [m[p] for p in spec["people"]],
                  "sentences": [ren(s) for s in spec["sentences"]], "query": m[spec["query"]],
                  "designated": spec["designated"]}
-    out = build(f"{item.item_id}_collide", tuple(item.cell), new)
+    out = build(f"{item.item_id}_collide", tuple(item.cell), new, version=version_of(item))
     if set(out.meta["gold_set"]) != set(item.meta["gold_set"]):
         raise ValueError(f"{item.item_id}: re-label changed the gold set")
     return out

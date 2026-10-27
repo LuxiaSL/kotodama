@@ -102,6 +102,12 @@ def indefinite(noun: str) -> str:
     return "an" if w[0] in "aeiou" else "a"
 
 
+def letter_article(noun: str) -> str:
+    """``"an"`` before a written vowel, else ``"a"``: the article of the first ``attr`` and
+    ``setbind`` generations, kept so that their item files render as they were scored."""
+    return "an" if noun[:1].lower() in "aeiou" else "a"
+
+
 def countable(objects: Sequence[str]) -> tuple[str, ...]:
     """The objects that read as singular count nouns ("a ___", "the ___ is", "it")."""
     return tuple(o for o in objects if o not in NON_COUNTABLE)

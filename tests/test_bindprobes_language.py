@@ -210,3 +210,30 @@ def test_deixis_check_no_give_back():
     with pytest.raises(ValueError, match="straight back"):
         deixis.check_no_give_back(evs, "x")
     deixis.check_no_give_back(evs[:2] + [{**evs[2], "recipient": "Rosa"}], "x")
+
+
+def test_dialogue_renders_each_generation_with_its_own_holder_lead():
+    it = _dl([{"form": "give", "giver": "Lucy", "recipient": "Tom", "objs": ["cup"]}],
+             {"kind": "holder", "obj": "cup"}, (3, 1, "holder"))
+    leads = {v: dialogue.render(dialogue.build("d0", tuple(it.cell), it.spec, version=v), False)  # type: ignore[arg-type]
+             for v in (1, 2)}
+    assert leads[1].endswith("Now the cup is with")
+    assert leads[2].endswith("Now the person with the cup is")
+    v1 = dialogue.build("d0", tuple(it.cell), it.spec, version=1)  # type: ignore[arg-type]
+    del v1.meta["dialogue_version"]                 # the first generation carried no key
+    assert dialogue.render(v1, False) == leads[1]
+    assert dialogue.relabel(v1, {"Lucy": "Emma", "Tom": "Ben", "Anna": "Kate"}).meta["dialogue_version"] == 1
+    with pytest.raises(ValueError, match="no renderer for version 9"):
+        dialogue.render(dialogue.build("d0", tuple(it.cell), it.spec, version=9), False)  # type: ignore[arg-type]
+
+
+def test_chat_wordings_per_generation():
+    own = {"ev": "declare", "speaker": "Ada", "obj": "cup", "form": "mine"}
+    assert deixis._deictic_line(own, "owning")[0] == "Ada: The cup is mine."
+    with pytest.raises(ValueError, match="not in the 'holding' wording"):
+        deixis._deictic_line(own, "holding")
+    give = {"ev": "give", "speaker": "Ada", "voc": "Ken", "obj": "cup", "form": "yours"}
+    assert deixis._deictic_line(give, "owning")[0] == "Ada: Ken, my cup is yours now."
+    assert deixis.WORDING == {2: "owning", 3: "holding"} and answer.WORDING == {2: "owning", 3: "holding"}
+    assert adjacency.WORDING[1][0] == "owning" and "yours" in adjacency.WORDING[1][1]
+    assert pools.letter_article("hour") == "a" and pools.indefinite("hour") == "an"

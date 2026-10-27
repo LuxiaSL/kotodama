@@ -8,6 +8,12 @@ so can every fluid battery (``gen-fluid``, :mod:`kotodama.eval.binding.fluid`) a
 (``gen-formupdate``, :mod:`kotodama.eval.binding.formupdate`). A new version of a battery is a new name and a new
 pinned file beside the old one, which stays scoreable; the ``fluid`` and ``formupdate`` groups name the current
 versions, ``fluid-v1`` and ``formupdate-v1`` the earlier ones.
+
+A bindprobes file stores item specs, and its prompts are rendered at scoring time, so its file pin alone does
+not fix the strings: each bindprobes battery also carries ``render_sha256``, the digest of every prompt it
+renders (:func:`kotodama.eval.bindprobes.items.render_sha256`), and a run refuses a file whose rendering under
+the current code differs (:func:`check_render`). The families render each item with the templates of the
+generation that built it, so a new wording leaves pinned files as they were scored.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ class Battery:
     what: str
     families: tuple[str, ...] = field(default_factory=tuple)     # bindprobes only
     conditions: tuple[str, ...] = field(default_factory=tuple)   # bindprobes only
+    render_sha256: Optional[str] = None                          # bindprobes only: the rendered prompts
 
 
 BATTERIES: dict[str, Battery] = {b.name: b for b in (
@@ -78,21 +85,26 @@ BATTERIES: dict[str, Battery] = {b.name: b for b in (
             "forming vs updating v2: the gold's first / middle / last mention position matched across A / B / C"),
     Battery("bp-deixis-lite", "bindprobes", "bindprobes-deixis-lite/items.jsonl",
             "229e7ac377ff2ec5ef298ecdee5c27667f9c97d86ba2337fb5e411aac9167c3e", None,
-            "bindprobes deixis-lite (0shot / 3shot)", ("deixis",), ("0shot", "3shot")),
+            "bindprobes deixis-lite (0shot / 3shot)", ("deixis",), ("0shot", "3shot"),
+            render_sha256="71fd836f43ed7732a17d70c738d4bacba7f6ae74b56692e438f45fe6eda4111a"),
     Battery("bp-profile", "bindprobes", "bindprobes-items/items.jsonl",
             "7bfab8bff499667846fd9c9522cfbb4147476626bdd37bb7d702a2f55f4f9776", None,
-            "bindprobes profile (attr / codevar / dialogue …, all conditions)"),
+            "bindprobes profile (attr / codevar / dialogue …, all conditions)",
+            render_sha256="58e1b17bf606dcfa6bcb336b86c4aca205bc546e550f5b92c65481da7818421b"),
     Battery("bp-v3.1", "bindprobes", "bindprobes-v3.1/items.jsonl",
             "bc3496d3c68990b8a615f485ca38e43b917deca1315cc6207990454be1330f37", None,
             "bindprobes v3.1: setbind / answer / adjacency / codevarmut",
-            ("setbind", "answer", "adjacency", "codevarmut")),
+            ("setbind", "answer", "adjacency", "codevarmut"),
+            render_sha256="765f81db6c0d77fc7f833fb91c846116d610a61ef4c4304b17416f3a02fe41e1"),
     Battery("bp-v3.2", "bindprobes", "bindprobes-v3.2/items.jsonl",
             "ee5e827bd4698623e96b906480a8652999c7d8884d69f783e29b072d8cfc13e5", None,
             "bindprobes v3.2: setbind / answer / adjacency / codevarmut, controlled recency and role shortcuts",
-            ("setbind", "answer", "adjacency", "codevarmut")),
+            ("setbind", "answer", "adjacency", "codevarmut"),
+            render_sha256="1d12e4f3a8702379aceef5b18593e8f10850054c4e27081dda73e62dd8abca3b"),
     Battery("bp-deixis-v2", "bindprobes", "bindprobes-deixis-v2-full/items.jsonl",
             "08151e66c4798288c7b1f471aaeb46d07e3d21acd5d279e8d8c137ba3bd35234", None,
-            "bindprobes deixis v2 full", ("deixis",)),
+            "bindprobes deixis v2 full", ("deixis",),
+            render_sha256="2b3330a1c32ac92e8c3bbba8e4a8d50b1d8d3ca999c837347fbe95ae763c2345"),
 )}
 
 # Named sets for the CLI: `--batteries gauges,capacity` etc.
@@ -138,6 +150,24 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def check_render(b: Battery, path: Path) -> None:
+    """Raise :class:`PinError` unless a bindprobes file renders to its ``render_sha256`` pin (every item, every
+    condition, under the current code); prompt-row batteries store their strings, so their file pin covers them."""
+    if b.kind != "bindprobes":
+        return
+    if b.render_sha256 is None:
+        raise PinError(f"{b.name}: a bindprobes battery needs a render_sha256 pin")
+    from kotodama.eval.bindprobes.items import load_items, render_sha256
+
+    try:
+        got = render_sha256(load_items(Path(path)))
+    except (ValueError, KeyError, TypeError) as exc:
+        raise PinError(f"{b.name}: {path} does not render under this code: {exc}") from exc
+    if got != b.render_sha256:
+        raise PinError(f"{b.name}: {path} renders to sha256 {got[:16]}… ≠ render pin {b.render_sha256[:16]}… "
+                       "(the prompt strings changed)")
 
 
 def path_for(b: Battery, root: Path, check: bool = True) -> Path:

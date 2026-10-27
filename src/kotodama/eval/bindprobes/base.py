@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence, TypeVar
 
 from kotodama.eval.bindprobes.pools import Pools
 
@@ -77,6 +77,29 @@ class FamilyModule(Protocol):
         ``target`` = the item whose labels these are (dialogue reads genders)."""
         ...
     def error_types(self, item: Item, pick: str) -> list[str]: ...
+
+
+def version_of(item: Item) -> int:
+    """The generation that built ``item``: ``meta["<family>_version"]``, or 1 when the key is
+    absent (a family's first generation carried none).
+
+    Rendering reads it: an item file's sha256 pin covers its specs, not its prompts, so every
+    family renders an item with the templates of the generation that built it, and a new
+    wording reaches only new items. ``relabel`` carries it onto the re-labeled exemplars."""
+    v = item.meta.get(f"{item.family}_version", 1)
+    if not isinstance(v, int):
+        raise ValueError(f"{item.item_id}: {item.family}_version {v!r} is not an int")
+    return v
+
+
+T = TypeVar("T")
+
+
+def for_version(table: Mapping[int, T], version: int, family: str) -> T:
+    """``table[version]``; raises ``ValueError`` naming the generations ``family`` renders."""
+    if version not in table:
+        raise ValueError(f"{family}: no renderer for version {version} (renders {sorted(table)})")
+    return table[version]
 
 
 def the_list(objs: Sequence[str]) -> str:

@@ -91,6 +91,9 @@ def cmd_run(a: argparse.Namespace) -> int:
     bats = bt.resolve(a.batteries)
     root = bt.prompts_dir(a.prompts_dir)
     paths = {b.name: bt.path_for(b, root, check=not a.no_pin_check) for b in bats}   # fail before loading weights
+    if not a.no_pin_check:
+        for b in bats:
+            bt.check_render(b, paths[b.name])
     model = models.load(models.ModelSpec.parse(a.model), device=a.device)
     out = Path(a.out)
     for b in bats:

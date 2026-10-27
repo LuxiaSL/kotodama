@@ -117,7 +117,8 @@ import string
 from collections import defaultdict
 from typing import Any, Mapping, Optional, Sequence, TypedDict
 
-from kotodama.eval.bindprobes.base import Cell, Item, cell_key, name_list, rejection, the_list
+from kotodama.eval.bindprobes.base import (Cell, Item, cell_key, for_version, name_list, rejection, the_list,
+                                           version_of)
 from kotodama.eval.bindprobes.pools import PLURAL_FORM, Pools, singular
 
 FAMILY = "deixis"
@@ -350,6 +351,18 @@ GIVE_FORMS: dict[str, tuple[str, str]] = {
     "here": ("Here, {v}, take my {o}.", "Here, take my {o}."),
     "hand": ("{v}, my {o} is in your hand now.", "My {o} is in your hand now."),
 }
+# The first wording of the chat surfaces (deixis 2, answer 2, adjacency 1) also stated
+# ownership; it renders the item files of those generations exactly as they were scored.
+OWNING_DECLARE_FORMS = {"have": "I have the {o}.", "mine": "The {o} is mine."}
+OWNING_GIVE_FORMS: dict[str, tuple[str, str]] = {
+    "giving": GIVE_FORMS["giving"],
+    "here": GIVE_FORMS["here"],
+    "yours": ("{v}, my {o} is yours now.", "My {o} is yours now."),
+}
+Wording = tuple[dict[str, str], dict[str, tuple[str, str]]]
+WORDINGS: dict[str, Wording] = {"holding": (DECLARE_FORMS, GIVE_FORMS),
+                                "owning": (OWNING_DECLARE_FORMS, OWNING_GIVE_FORMS)}
+WORDING: dict[int, str] = {2: "owning", 3: "holding"}    # deixis version -> wording
 
 
 def gives_back(prev: Optional[Mapping[str, Any]], giver: str, recipient: str, obj: str) -> bool:
@@ -370,12 +383,16 @@ def check_no_give_back(explicit: Sequence[Mapping[str, Any]], what: str) -> None
             raise ValueError(f"{what}: event {k} hands the {ev['obj']} straight back")
 
 
-def _deictic_line(ev: Mapping[str, Any]) -> Segment:
+def _deictic_line(ev: Mapping[str, Any], wording: str = "holding") -> Segment:
+    """One chat line in ``wording`` (:data:`WORDINGS`); a form the wording lacks raises."""
     kind, s = ev["ev"], ev["speaker"]
+    declare, give = WORDINGS[wording]
+    if ev.get("form") not in (declare if kind == "declare" else give):
+        raise ValueError(f"{kind} form {ev.get('form')!r} is not in the {wording!r} wording")
     if kind == "declare":
-        return _fill("{_s}: " + DECLARE_FORMS[ev["form"]], _s=s, o=ev["obj"])
+        return _fill("{_s}: " + declare[ev["form"]], _s=s, o=ev["obj"])
     if kind == "give":
-        with_voc, bare = GIVE_FORMS[ev["form"]]
+        with_voc, bare = give[ev["form"]]
         if ev.get("voc"):
             return _fill("{_s}: " + with_voc, _s=s, v=ev["voc"], o=ev["obj"])
         return _fill("{_s}: " + bare, _s=s, o=ev["obj"])
@@ -430,7 +447,7 @@ def _lead(spec: Spec) -> Segment:
     return _fill("{s}: Right now you're holding the", s=q["speaker"])
 
 
-def _segments(spec: Spec) -> tuple[list[Segment], str]:
+def _segments(spec: Spec, wording: str) -> tuple[list[Segment], str]:
     """(scene + body + lead segments, the joiner): chat lines for deictic/twin, one
     prose paragraph for third."""
     people = spec["people"]
@@ -441,18 +458,18 @@ def _segments(spec: Spec) -> tuple[list[Segment], str]:
         segs += _third_sentences(spec["events"])
         return segs + [_lead(spec)], " "
     segs = [_fill("A chat between " + slots + ".", **names)]
-    segs += [_deictic_line(ev) for ev in spec["events"]]
+    segs += [_deictic_line(ev, wording) for ev in spec["events"]]
     return segs + [_lead(spec)], "\n"
 
 
-def _rendered(spec: Spec) -> tuple[str, list[str]]:
-    """(text without the answer, slot values in text order)."""
-    segs, joiner = _segments(spec)
+def _rendered(spec: Spec, version: int = VERSION) -> tuple[str, list[str]]:
+    """(text without the answer, slot values in text order), in generation ``version``'s wording."""
+    segs, joiner = _segments(spec, for_version(WORDING, version, FAMILY))
     return joiner.join(t for t, _ in segs), [s for _, ss in segs for s in ss]
 
 
 def render(item: Item, with_answer: bool) -> str:
-    text, _ = _rendered(item.spec)  # type: ignore[arg-type]
+    text, _ = _rendered(item.spec, version_of(item))  # type: ignore[arg-type]
     return f"{text} {item.gold}." if with_answer else text
 
 
@@ -528,7 +545,8 @@ def with_qform(item: Item, form: str) -> Item:
         return item
     def one(it: Item, suffix: str) -> Item:
         spec = dict(it.spec); spec["query"] = dict(spec["query"], form=form)
-        new = build(it.item_id + suffix, tuple(it.cell), spec, pair_id=(it.meta.get("pair_id") or it.item_id) + suffix)
+        new = build(it.item_id + suffix, tuple(it.cell), spec, pair_id=(it.meta.get("pair_id") or it.item_id) + suffix,
+                    version=version_of(it))
         if new.gold != it.gold:
             raise ValueError(f"{it.item_id}: gold changed under query form {form!r}")
         for k in ("audit", "slot"):
@@ -545,17 +563,18 @@ def with_qform(item: Item, form: str) -> Item:
     return out
 
 
-def build(item_id: str, cell: Cell, spec: Spec, pair_id: Optional[str] = None) -> Item:
-    """Item from a spec: gold from the simulator, audit controls in ``meta``."""
+def build(item_id: str, cell: Cell, spec: Spec, pair_id: Optional[str] = None, version: int = VERSION) -> Item:
+    """Item from a spec: gold from the simulator, audit controls in ``meta``; ``version`` is
+    the generation it renders as (``relabel`` and ``with_qform`` keep the source item's)."""
     if spec["variant"] not in VARIANTS:
         raise ValueError(f"{item_id}: unknown variant {spec['variant']!r}")
     kind = spec["query"]["kind"]
     cands = list(spec["people"]) if kind == "owner" else list(spec["objects"])
-    _, slots = _rendered(spec)
+    _, slots = _rendered(spec, version)
     mentions = [s for s in slots if s in cands]
     it = Item(item_id=item_id, family=FAMILY, cell=list(cell), spec=dict(spec), gold="",
               candidates=cands, mention_order=mentions,
-              meta={"deixis_version": VERSION, "variant": spec["variant"],
+              meta={"deixis_version": version, "variant": spec["variant"],
                     "pair_id": pair_id or item_id, "qkind": kind,
                     "n_objects": len(spec["objects"]),
                     "events": [ev["ev"] for ev in spec["events"] if ev["ev"] in TRANSFERS],
@@ -772,7 +791,7 @@ def relabel(item: Item, mapping: Mapping[str, str], target: Optional[Item] = Non
                  "query": _rename(spec["query"], mapping),
                  "sigma": [mapping[x] for x in spec["sigma"]] if spec["sigma"] else None}
     out = build(f"{item.item_id}_collide", tuple(item.cell), new,
-                pair_id=str(item.meta.get("pair_id", item.item_id)))
+                pair_id=str(item.meta.get("pair_id", item.item_id)), version=version_of(item))
     expect = mapping[item.gold] if spec["query"]["kind"] == "owner" else item.gold
     if out.gold != expect:
         raise ValueError(f"{item.item_id}: re-label changed the gold")

@@ -44,6 +44,7 @@ Thumbs.db
 
 # Profiler traces
 *.json.gz
+!tests/data/*.json.gz
 *.chrome_trace.json
 
 # Compiled HTML reports

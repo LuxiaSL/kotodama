@@ -25,13 +25,15 @@ Error types (priority order): ``wrong_binding`` (another entity's object; an
 from __future__ import annotations
 
 import random
-from typing import Any, Mapping, Optional, TypedDict
+from typing import Any, Callable, Mapping, Optional, TypedDict
 
-from kotodama.eval.bindprobes.base import Cell, Item, rejection
-from kotodama.eval.bindprobes.pools import Pools, countable, indefinite
+from kotodama.eval.bindprobes.base import Cell, Item, for_version, rejection, version_of
+from kotodama.eval.bindprobes.pools import Pools, countable, indefinite, letter_article
 
 FAMILY = "attr"
 VERSION = 2                       # meta.attr_version; items' id/seed tag "attr-v2"
+# the article of the unbound sentence, per generation (v1 items drew mass nouns too)
+ARTICLE: dict[int, Callable[[str], str]] = {1: letter_article, 2: indefinite}
 NS = (2, 4, 6, 8)
 QPOS = ("first", "middle", "last")
 CELLS: list[Cell] = [(n, q) for n in NS for q in QPOS if not (n == 2 and q == "middle")]
@@ -60,12 +62,12 @@ def simulate(item: Item) -> str:
     return table[spec["query"]]
 
 
-def _sentence(spec: Spec, kind: str, idx: int) -> str:
+def _sentence(spec: Spec, kind: str, idx: int, version: int = VERSION) -> str:
     if kind == "bind":
         name, obj = spec["entities"][idx]
         return f"{name} {spec['verb']} the {obj}."
     obj = spec["distractors"][idx]
-    return f"{indefinite(obj).capitalize()} {obj} lies on the shelf."
+    return f"{for_version(ARTICLE, version, FAMILY)(obj).capitalize()} {obj} lies on the shelf."
 
 
 def _mentions(spec: Spec) -> list[str]:
@@ -75,7 +77,8 @@ def _mentions(spec: Spec) -> list[str]:
 
 def render(item: Item, with_answer: bool) -> str:
     spec: Spec = item.spec  # type: ignore[assignment]
-    body = " ".join(_sentence(spec, k, i) for k, i in spec["order"])
+    v = version_of(item)
+    body = " ".join(_sentence(spec, k, i, v) for k, i in spec["order"])
     lead = f"{body} So {spec['query']} {spec['verb']} the"
     return f"{lead} {item.gold}." if with_answer else lead
 
@@ -84,8 +87,9 @@ def labels(item: Item) -> list[str]:
     return [name for name, _ in item.spec["entities"]]
 
 
-def build(item_id: str, cell: Cell, spec: Spec) -> Item:
-    """Item from a spec: gold from the simulator, candidates = mention order."""
+def build(item_id: str, cell: Cell, spec: Spec, version: int = VERSION) -> Item:
+    """Item from a spec: gold from the simulator, candidates = mention order; ``version``
+    is the generation it renders as (``relabel`` keeps the source item's)."""
     mentions = _mentions(spec)
     if sorted(i for k, i in spec["order"] if k == "bind") != list(range(len(spec["entities"]))):
         raise ValueError(f"{item_id}: every entity must be declared exactly once")
@@ -93,7 +97,7 @@ def build(item_id: str, cell: Cell, spec: Spec) -> Item:
     qidx = names.index(spec["query"])
     it = Item(item_id=item_id, family=FAMILY, cell=list(cell), spec=dict(spec), gold="",
               candidates=list(dict.fromkeys(mentions)), mention_order=mentions,
-              meta={"attr_version": VERSION, "qpos": cell[1], "query_index": qidx,
+              meta={"attr_version": version, "qpos": cell[1], "query_index": qidx,
                     "recency_control": False,
                     "n_distractors": len(spec["distractors"])})
     it.gold = simulate(it)
@@ -148,7 +152,7 @@ def relabel(item: Item, mapping: Mapping[str, str], target: Optional[Item] = Non
         raise ValueError(f"{item.item_id}: names {sorted(missing)} not in the map")
     new: Spec = {**spec, "entities": [[mapping[n], o] for n, o in spec["entities"]],
                  "query": mapping[spec["query"]]}
-    out = build(f"{item.item_id}_collide", tuple(item.cell), new)
+    out = build(f"{item.item_id}_collide", tuple(item.cell), new, version=version_of(item))
     if out.gold != item.gold:
         raise ValueError(f"{item.item_id}: re-label changed the gold")
     return out

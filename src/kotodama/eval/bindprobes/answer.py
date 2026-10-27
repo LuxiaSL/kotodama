@@ -50,11 +50,12 @@ from collections import defaultdict
 from typing import Any, Mapping, Optional, Sequence, TypedDict
 
 from kotodama.eval.bindprobes import deixis as dx
-from kotodama.eval.bindprobes.base import Cell, Item, name_list, rejection
+from kotodama.eval.bindprobes.base import Cell, Item, for_version, name_list, rejection, version_of
 from kotodama.eval.bindprobes.pools import PLURAL_FORM, singular
 
 FAMILY = "answer"
 VERSION = 3                       # null calibration variant; holding words; asker rule
+WORDING: dict[int, str] = {2: "owning", 3: "holding"}    # version -> deixis.WORDINGS key
 ES = (1, 2)
 CHANNELS = ("novoc", "voc")
 CELLS: list[Cell] = [(e, ch) for e in ES for ch in CHANNELS]
@@ -192,14 +193,16 @@ def _tail_lines(spec: Spec) -> list[str]:
     return [q, lead]
 
 
-def _rendered(spec: Spec) -> str:
+def _rendered(spec: Spec, version: int = VERSION) -> str:
+    """The prompt without the answer, in generation ``version``'s wording."""
+    wording = for_version(WORDING, version, FAMILY)
     people = spec["people"]
     if spec["variant"] == "third":
         prose = [f"{name_list(people)} are sitting at a table."]
         prose += [t for t, _ in dx._third_sentences(spec["events"])]
         return " ".join(prose) + "\n" + "\n".join(_tail_lines(spec))
     lines = [f"A chat between {name_list(people)}."]
-    lines += [dx._deictic_line(ev)[0] for ev in spec["events"]]
+    lines += [dx._deictic_line(ev, wording)[0] for ev in spec["events"]]
     if spec["variant"] == "null":
         return "\n".join([lines[0]] + _tail_lines(spec))
     if spec["variant"] == "narr":
@@ -210,7 +213,7 @@ def _rendered(spec: Spec) -> str:
 
 
 def render(item: Item, with_answer: bool) -> str:
-    text = _rendered(item.spec)  # type: ignore[arg-type]
+    text = _rendered(item.spec, version_of(item))  # type: ignore[arg-type]
     return f"{text} {item.gold}." if with_answer else text
 
 
@@ -227,7 +230,7 @@ def check_surface(item: Item) -> None:
     """deixis v2 law on the body (vocative on every you/imperative line at P = 4); the
     tail's question carries no "you"; third: the prose paragraph is pronoun-free."""
     spec: Spec = item.spec  # type: ignore[assignment]
-    text = _rendered(spec)
+    text = _rendered(spec, version_of(item))
     if "(" in text or ")" in text:
         raise ValueError(f"{item.item_id}: parentheses")
     if spec["variant"] == "third":
@@ -255,13 +258,15 @@ def check_surface(item: Item) -> None:
 
 # ── Items ──────────────────────────────────────────────────────────────────────
 
-def build(item_id: str, cell: Cell, spec: Spec, pair_id: Optional[str] = None) -> Item:
+def build(item_id: str, cell: Cell, spec: Spec, pair_id: Optional[str] = None, version: int = VERSION) -> Item:
+    """Item from a spec; ``version`` is the generation it renders as (``relabel`` keeps the
+    source item's)."""
     if spec["variant"] not in VARIANTS:
         raise ValueError(f"{item_id}: unknown variant {spec['variant']!r}")
     cands = candidates(spec)
     it = Item(item_id=item_id, family=FAMILY, cell=list(cell), spec=dict(spec), gold="",
-              candidates=cands, mention_order=_mentions(_rendered(spec), cands),
-              meta={"answer_version": VERSION, "variant": spec["variant"],
+              candidates=cands, mention_order=_mentions(_rendered(spec, version), cands),
+              meta={"answer_version": version, "variant": spec["variant"],
                     "pair_id": pair_id or item_id, "channel": spec["tail"]["channel"]})
     it.gold = simulate(it)
     h = holder(spec)
@@ -400,7 +405,7 @@ def relabel(item: Item, mapping: Mapping[str, str], target: Optional[Item] = Non
     if target is not None and sorted(new["people"]) == sorted(target.spec["people"]):
         new["people"] = list(target.spec["people"])
     out = build(f"{item.item_id}_collide", tuple(item.cell), new,
-                pair_id=str(item.meta.get("pair_id", item.item_id)))
+                pair_id=str(item.meta.get("pair_id", item.item_id)), version=version_of(item))
     expect = item.gold if item.gold in (ME, YOU) else m.get(item.gold, item.gold)
     if out.gold != expect:
         raise ValueError(f"{item.item_id}: re-label changed the gold")
