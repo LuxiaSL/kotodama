@@ -47,11 +47,11 @@ def main() -> int:
     res: dict = {"endpoint": url, "checks": {}}
     ok = True
 
-    def check(name: str, passed: bool, **info) -> None:
+    def check(label: str, passed: bool, **info) -> None:
         nonlocal ok
         ok &= bool(passed)
-        res["checks"][name] = {"pass": bool(passed), **info}
-        print(f"{'PASS' if passed else 'FAIL'} {name} {json.dumps(info)[:300]}", flush=True)
+        res["checks"][label] = {"pass": bool(passed), **info}
+        print(f"{'PASS' if passed else 'FAIL'} {label} {json.dumps(info)[:300]}", flush=True)
 
     with httpx.Client(timeout=600) as http:
         info = http.get(f"{url}/info").json()
