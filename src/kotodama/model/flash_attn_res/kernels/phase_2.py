@@ -92,7 +92,10 @@ def phase_2_online_softmax_merge_backward_kernel(
     grad_phase1_interblock_normalized_output_ptr,
     grad_phase1_interblock_logsumexp_ptr,
     eps,
-    BT: tl.constexpr,
+    # BT, the token count, is a runtime argument: as a constexpr every distinct batch shape compiles new kernels that stay
+    # loaded for the life of the process, so an eager caller whose lengths vary (serving, scoring) grows host memory
+    # without bound. Triton still specializes it on 1 and on divisibility by 16: three variants per configuration.
+    BT,
     HIDDEN_DIM: tl.constexpr,
     ACCUMULATE_GRAD_INTRABLOCK: tl.constexpr,
     PADDED_HIDDEN: tl.constexpr,
