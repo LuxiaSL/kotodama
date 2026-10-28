@@ -31,7 +31,7 @@ CFG = dict(hidden_size=64, num_layers=11, num_attention_heads=4, num_kv_heads=2,
            qk_norm=True, tie_word_embeddings=True, attn_impl="sdpa", use_liger=False,
            attn_res=True, attn_res_boundaries=[0, 1, 3, 6, 9], loop_start=3, loop_len=3, loop_times=2)
 ROWS = 8
-LYRA_KEYS = {"layer", "kind", "neuron", "ref_neuron", "prompt", "dose", "add", "rel_push", "text", "finish", "n_gen",
+RUN_FILE_KEYS = {"layer", "kind", "neuron", "ref_neuron", "prompt", "dose", "add", "rel_push", "text", "finish", "n_gen",
              "token_ids", "logprob", "capture_id"}
 
 
@@ -76,7 +76,7 @@ def test_batch_records_and_damage(model: KotodamaModel, mode: str) -> None:
     out = sweep.run_batch(_args(mode), eng, dec, units, batch, ids, ids.shape[1], cont,
                           SamplingParams(temperature=0.0, repetition_penalty=1.0), frozenset(), [7, 8], [8], cap)
     recs = out["records"]
-    assert len(recs) == len(batch) and all(LYRA_KEYS <= set(r) for r in recs)
+    assert len(recs) == len(batch) and all(RUN_FILE_KEYS <= set(r) for r in recs)
     base = recs[0]
     assert base["kind"] == "baseline" and base["damage"] == 0.0 and base["ref_neuron"] is None
     steered = [r for r in recs if r["kind"] != "baseline"]
