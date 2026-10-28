@@ -150,7 +150,8 @@ def test_variety_and_npz(tmp_path: Path) -> None:
                      "guards": {"rep4": 0.0, "loop8": False}})
     rep = sb.variety(rows, "tfidf", "energy", perms=50, verdicts={"s0": "keep", "s1": "reject"})
     c = rep["contrasts"]["frame:F0|F1"]
-    assert c["value"] > c["null_q95"] and c["p"] < 0.05
+    assert c["value"] > c["null_q95"] and c["p"] < 0.05 and c["auc"] > 0.9
+    assert rep["contrasts"]["pass:0|1"]["auc"] < 0.8 and rep["groups"]["frame=F0"]["mean_cos"] > 0
     assert rep["contrasts"]["pass:0|1"]["p"] > 0.05
     assert rep["groups"]["frame=F0"]["filter_keep"] == 0.5 and rep["groups"]["frame=F0"]["dispersion"] > 0
     assert sb.variety(rows, "tfidf", "mmd", perms=20)["contrasts"]["frame:F0|F1"]["value"] > 0

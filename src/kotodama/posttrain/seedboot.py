@@ -21,7 +21,9 @@ example text in front of the model:
                  carries the listing text above the cast list (``note``) or not (``bare``).
 ``boot-fan``     The frame-belief readout: ``n`` draws at each frame's boundary (where the first listing would start),
                  for an outside classifier to label by document type and genre.
-``boot-variety`` Distribution shift between frames and passes in a pluggable embedding space (``--embedder tfidf`` |
+``boot-variety`` Distribution shift between frames and passes, led by the held-out AUC of a length-residualized
+                 logistic probe per pair of groups (GroupKFold by theme root, the length-only AUC beside it), in a
+                 pluggable embedding space (``--embedder tfidf`` |
                  ``minilm`` | ``npz:PATH`` for vectors computed elsewhere, keyed by seed id) with a pluggable distance
                  (``energy`` | ``mmd``) and a document-level permutation null; within-group dispersion; the guards
                  beside every number (fluency: mean NLL under the unframed model, repeated 4-gram share, 8-gram loops;
@@ -513,6 +515,34 @@ def contrast(d: Any, a: list[int], b: list[int], metric: str, perms: int, rng: r
             "p": round(float((1 + (null_arr >= val).sum()) / (1 + perms)), 4)}
 
 
+def probe_auc(x: Any, a: list[int], b: list[int], groups: Sequence[str], lengths: Sequence[int],
+              folds: int = 5) -> dict[str, Optional[float]]:
+    """Held-out AUC of a logistic probe telling group ``a`` from ``b`` (GroupKFold by ``groups``, so one root never
+    sits on both sides of a split), on features residualized on log length within each training fold; beside it the
+    AUC of log length alone (the length rake). 0.5 = indistinguishable. None when there are too few groups."""
+    import numpy as np
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import GroupKFold
+
+    idx = np.array(a + b)
+    y = np.array([0] * len(a) + [1] * len(b))
+    g = np.array([groups[i] for i in idx])
+    if len(set(g)) < folds or min(len(a), len(b)) < folds:
+        return {"auc": None, "length_auc": None}
+    xs = x[idx]
+    ll = np.log1p(np.array([lengths[i] for i in idx], dtype=np.float64))[:, None]
+    scores, lscores = np.zeros(len(idx)), np.zeros(len(idx))
+    for tr, te in GroupKFold(n_splits=folds).split(xs, y, g):
+        design = np.hstack([np.ones((len(tr), 1)), ll[tr]])
+        coef, *_ = np.linalg.lstsq(design, xs[tr], rcond=None)
+        res = lambda rows: xs[rows] - np.hstack([np.ones((len(rows), 1)), ll[rows]]) @ coef  # noqa: E731
+        clf = LogisticRegression(max_iter=2000, C=1.0).fit(res(tr), y[tr])
+        scores[te] = clf.decision_function(res(te))
+        lscores[te] = LogisticRegression().fit(ll[tr], y[tr]).decision_function(ll[te])
+    return {"auc": round(float(roc_auc_score(y, scores)), 4), "length_auc": round(float(roc_auc_score(y, lscores)), 4)}
+
+
 def dispersion(d: Any, idx: list[int]) -> float:
     import numpy as np
 
@@ -530,6 +560,8 @@ def variety(rows: list[dict[str, Any]], embedder: str = "tfidf", metric: str = "
     rng = random.Random(seed)
     x = embed([r[field] for r in rows], embedder, [r["id"] for r in rows])
     d = _dist(x)
+    roots = [str(r.get("roots", {}).get("theme", r["id"])) for r in rows]
+    lengths = [len(r[field]) for r in rows]
     out: dict[str, Any] = {"embedder": embedder, "metric": metric, "field": field, "n": len(rows), "groups": {},
                            "contrasts": {}}
     for key in ("frame", "pass", "arm"):
@@ -542,6 +574,8 @@ def variety(rows: list[dict[str, Any]], embedder: str = "tfidf", metric: str = "
             kept = [verdicts.get(r["id"]) for r in sub] if verdicts else []
             out["groups"][f"{key}={g}"] = {
                 "n": len(idx), "dispersion": round(dispersion(d, idx), 4),
+                "mean_cos": round(float(1 - (d[np.ix_(idx, idx)] ** 2 / 2).sum() / max(1, len(idx) * (len(idx) - 1))),
+                                  4) if len(idx) > 1 else None,
                 "nll_mean": round(float(np.mean(nll)), 4) if nll else None,
                 "rep4_mean": round(float(np.mean([r["guards"].get("rep4", 0) for r in sub])), 4),
                 "loop8": sum(bool(r["guards"].get("loop8")) for r in sub),
@@ -552,8 +586,9 @@ def variety(rows: list[dict[str, Any]], embedder: str = "tfidf", metric: str = "
         for i, a in enumerate(names):
             for b in names[i + 1:]:
                 if len(groups[a]) >= 3 and len(groups[b]) >= 3:
-                    out["contrasts"][f"{key}:{a}|{b}"] = contrast(d, list(groups[a]), list(groups[b]), metric,
-                                                                 perms, rng)
+                    c = contrast(d, list(groups[a]), list(groups[b]), metric, perms, rng)
+                    c.update(probe_auc(x, list(groups[a]), list(groups[b]), roots, lengths))
+                    out["contrasts"][f"{key}:{a}|{b}"] = c
     return out
 
 
