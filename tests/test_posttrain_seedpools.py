@@ -262,6 +262,15 @@ def test_cli_dispatch(tmp_path: Path) -> None:
         seeds.main(["pools", "--endpoint", "http://x", "--out", str(tmp_path), "--axes", "nonsense"])
 
 
+def test_read_jsonl_skips_a_cut_last_line(tmp_path: Path) -> None:
+    p = tmp_path / "x.jsonl"
+    p.write_text('{"a": 1}\n{"a": 2}\n{"a": ')
+    assert sp.read_jsonl(p) == [{"a": 1}, {"a": 2}]
+    p.write_text('{"a": \n{"a": 2}\n')
+    with pytest.raises(json.JSONDecodeError):
+        sp.read_jsonl(p)
+
+
 def test_secret_held_by_another_and_need_pasted() -> None:
     c = _combo()
     moved = GOOD.replace("Teo's secret:", "Mara's secret:")

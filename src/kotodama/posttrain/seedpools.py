@@ -476,9 +476,20 @@ def write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Rows of a JSONL file ([] when absent). A final line cut mid-write (a client killed while appending) is
+    skipped with a warning, so a rerun resumes; a bad line anywhere else raises."""
     if not path.exists():
         return []
-    return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+    lines = [x for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+    rows = []
+    for i, x in enumerate(lines):
+        try:
+            rows.append(json.loads(x))
+        except json.JSONDecodeError:
+            if i != len(lines) - 1:
+                raise
+            logger.warning("%s: last line is incomplete; skipped", path)
+    return rows
 
 
 async def run_pools(complete: Complete, out: Path, axes: Sequence[str], per_pool: int, lists: dict[str, list[str]],
