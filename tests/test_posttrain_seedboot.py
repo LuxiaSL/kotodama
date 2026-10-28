@@ -82,12 +82,14 @@ def test_frames_and_pick(tmp_path: Path) -> None:
     v.write_text("".join(json.dumps({"id": r["id"], "verdict": verdict.get(r["id"], ("keep", "none"))[0],
                                      "category": verdict.get(r["id"], ("keep", "none"))[1], "reason": "r"}) + "\n"
                          for r in rows))
-    frames = sb.pick_frames(tmp_path, v, 6, control=1)
-    assert [f["frame"] for f in frames] == ["F0", "F1", "FC0"] and frames[2]["source"] == "index-0"
-    assert frames[2]["control"] and not frames[0]["control"]
+    frames = sb.pick_frames(tmp_path, v, 8, control=1)
+    assert [f["frame"] for f in frames] == ["F0", "F1", "F2", "F3", "FC0"] and frames[-1]["source"] == "index-0"
+    assert [f["title"] for f in frames[:4]] == ["Catalogue"] * 3 + ["Index"]
+    assert len(sb.pick_frames(tmp_path, v, 1)) == 2  # at most k per title
+    assert frames[-1]["control"] and not frames[0]["control"]
     rejected = sp.read_jsonl(tmp_path / "frames.rejected.jsonl")
     assert {r["id"]: r["category"] for r in rejected} == {"index-0": "not-a-collection", "index-1": "incoherent"}
-    frames = [f for f in frames if not f["control"]]
+    frames = [f for f in frames if not f["control"]]  # noqa: F841
     assert all(f["text"].startswith(f["title"] + "\n\n") for f in frames)
 
 
@@ -107,16 +109,16 @@ def _setup(tmp_path: Path) -> tuple[dict, list[dict]]:
                        for i, w in enumerate(_W[:10])],
              "names": [{"id": f"names:{i:04d}", "text": f"{c}{c.lower()}na Lund"} for i, c in
                        enumerate("ABCDEFGHIJKLMNOP")]}
-    frames = [{"frame": "F0", "text": "Catalogue\n\nThis volume collects plays."},
-              {"frame": "F1", "text": "Index\n\nEntries in order of performance."}]
+    frames = [{"frame": "F0", "title": "Catalogue", "text": "Catalogue\n\nThis volume collects plays."},
+              {"frame": "F1", "title": "Index", "text": "Index\n\nEntries in order of performance."}]
     return pools, frames
 
 
 def test_boot_passes(tmp_path: Path) -> None:
     pools, frames = _setup(tmp_path)
     starts = sb.draw_boot_starts(pools, LISTS, frames, 20, seed=0, pass_no=0)
-    assert collections.Counter((s["frame"], s["arm"]) for s in starts) == \
-        {("F0", "note"): 5, ("F1", "note"): 5, ("F0", "bare"): 5, ("F1", "bare"): 5}
+    assert collections.Counter(s["arm"] for s in starts) == {"note": 10, "bare": 10}
+    assert {s["frame"] for s in starts} == {"F0", "F1"} and all(s["frame_title"] for s in starts)
     assert collections.Counter(s["cast_arm"] for s in starts) == {"pair": 14, "cast": 6}
     p = sb.boot_prompt(frames[0]["text"], [], starts[0], "listing")
     assert p.startswith("Catalogue\n\nThis volume collects plays.\n\n1. ") and p.endswith("\n")
@@ -133,7 +135,7 @@ def test_boot_passes(tmp_path: Path) -> None:
         assert r["genre"].endswith("comedy")
         assert r["header"].startswith(r["listing"]) == (r["arm"] == "note")
     starts1 = sb.draw_boot_starts(pools, LISTS, frames, 10, seed=0, pass_no=1)
-    ex = sb.exemplar_pool(seeds0, "farthest", 5, 0)
+    ex = sb.exemplar_pool(seeds0, "kmedoids", 5, 0)
     assert len(ex) == 5 and len({e["id"] for e in ex}) == 5
     d1 = tmp_path / "pass1"
     d1.mkdir()

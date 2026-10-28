@@ -16,8 +16,8 @@ example text in front of the model:
                  of the frame, then of the roots line: the listing text, a cast line per name after "Characters:", and
                  the stage direction after "The play opens:". Pass 0 shows the frame and the roots line only; later
                  passes put 2-4 of the model's own kept listings from earlier passes between the frame and the new
-                 entry, different ones per seed (``--exemplar_select farthest`` draws them from a farthest-point pool
-                 in an embedding space). The genre is whatever the listing names, tagged afterwards. Arms: the header
+                 entry, different ones per seed (``--exemplar_select kmedoids`` draws them from a health-gated k-medoids pool
+                 in a text embedding). The genre is whatever the listing names, tagged afterwards. Arms: the header
                  carries the listing text above the cast list (``note``) or not (``bare``).
 ``boot-fan``     The frame-belief readout: ``n`` draws at each frame's boundary (where the first listing would start),
                  for an outside classifier to label by document type and genre.
@@ -144,7 +144,8 @@ async def write_frames(complete: sp.Complete, out: Path, titles: Sequence[str], 
 
 
 def pick_frames(out: Path, verdicts: Path, k: int, control: int = 0) -> list[dict[str, Any]]:
-    """Coherent (verdict keep) mechanically-sound intros, the lowest-NLL one per title, up to ``k``; frame ids
+    """Coherent (verdict keep) mechanically-sound intros, up to ``k`` per title (lowest NLL first): a large pool, since
+    each seed draws its frame at random and no single context's imprint should be shared corpus-wide; frame ids
     ``F0..``; writes ``<out>/frames.jsonl`` and every rejected candidate with the reader's reason to
     ``<out>/frames.rejected.jsonl``. The reader's choice is itself a selection imprint, so ``control`` adds that many
     reader-rejected frames as a control arm (``FC0..``, ``control: true``): the lowest-NLL mechanically-sound
@@ -156,15 +157,13 @@ def pick_frames(out: Path, verdicts: Path, k: int, control: int = 0) -> list[dic
                    [{**r, "verdict": vrows.get(r["id"], {}).get("verdict", "unjudged"),
                      "category": vrows.get(r["id"], {}).get("category"),
                      "reason": vrows.get(r["id"], {}).get("reason")} for r in cands if r["id"] not in keep])
-    best: dict[str, dict[str, Any]] = {}
-    for r in cands:
-        if r["mechanical_ok"] and r["id"] in keep:
-            cur = best.get(r["title"])
-            if cur is None or r.get("nll", 0.0) < cur.get("nll", 0.0):
-                best[r["title"]] = r
+    by_title: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for r in sorted(cands, key=lambda r: r.get("nll", 0.0)):
+        if r["mechanical_ok"] and r["id"] in keep and len(by_title[r["title"]]) < k:
+            by_title[r["title"]].append(r)
+    chosen = [r for t in sorted(by_title) for r in by_title[t]]
     frames = [{"frame": f"F{i}", "source": r["id"], "title": r["title"], "text": f"{r['title']}\n\n{r['intro']}",
-               "nll": r.get("nll"), "control": False}
-              for i, r in enumerate(sorted(best.values(), key=lambda r: r.get("nll", 0.0))[:k])]
+               "nll": r.get("nll"), "control": False} for i, r in enumerate(chosen)]
     borderline = sorted((r for r in cands if r["mechanical_ok"] and r["id"] in vrows and r["id"] not in keep
                          and vrows[r["id"]].get("category") != "incoherent"), key=lambda r: r.get("nll", 0.0))
     frames += [{"frame": f"FC{i}", "source": r["id"], "title": r["title"], "text": f"{r['title']}\n\n{r['intro']}",
@@ -332,7 +331,8 @@ async def grow_boot(complete: sp.Complete, score: Optional[sp.Score], st: dict[s
 def draw_boot_starts(pools: dict[str, list[dict[str, Any]]], lists: dict[str, list[str]], frames: list[dict],
                      n: int, seed: int, pass_no: int, cast_share: float = 0.3) -> list[dict[str, Any]]:
     """Roots and arms for ``n`` seeds: theme least-used from the pool, relationship = (antisyzygy, life moment)
-    atoms, names; cast arm by quota, note/bare arm and frame balanced by rotation."""
+    atoms, names; cast arm by quota, note/bare arm alternating; the frame drawn at random per seed from the whole
+    pool (rotation: no frame's imprint is shared by the corpus), its title recorded for grouping."""
     rng = random.Random(f"{seed}:{pass_no}")
     uses: collections.Counter = collections.Counter()
     sched = sp.arm_schedule(n, cast_share, rng)
@@ -344,7 +344,7 @@ def draw_boot_starts(pools: dict[str, list[dict[str, Any]]], lists: dict[str, li
         for e in (theme, *names):
             uses[e["id"]] += 1
         out.append({"id": f"p{pass_no}-{i:05d}", "pass": pass_no, "cast_arm": cast_arm,
-                    "arm": ("note", "bare")[(i // len(frames)) % 2], "frame": frames[i % len(frames)]["frame"],
+                    "arm": ("note", "bare")[i % 2], **_frame_fields(rng.choice(frames)),
                     "theme": theme["text"], "pair": rng.choice(lists["antisyzygies"]),
                     "moment": rng.choice(lists["moments"]),
                     "roots": {"theme": theme["id"], "names": [x["id"] for x in names]},
@@ -352,22 +352,43 @@ def draw_boot_starts(pools: dict[str, list[dict[str, Any]]], lists: dict[str, li
     return out
 
 
+def _frame_fields(f: dict[str, Any]) -> dict[str, Any]:
+    return {"frame": f["frame"], "frame_title": f.get("title", ""), "frame_control": bool(f.get("control"))}
+
+
 def exemplar_pool(kept: list[dict[str, Any]], select: str, size: int, seed: int,
-                  embedder: str = "tfidf") -> list[dict[str, Any]]:
-    """The listings later passes may show: all kept (``random``) or a farthest-point subset of ``size``."""
+                  embedder: str = "tfidf", rank: int = 32) -> list[dict[str, Any]]:
+    """The listings later passes may show (each seed then draws its own 2-4 from them): all kept (``random``), or
+    ``kmedoids``: a health gate (drop the worst NLL decile and any 8-gram loop), then ``size`` medoids in a whitened
+    rank-``rank`` projection of the text embedding. Selection never reads signatures, so signatures stay free to
+    audit it."""
     if select == "random" or len(kept) <= size:
         return list(kept)
-    x = embed([render_listing(1, r) for r in kept], embedder, [r["id"] for r in kept])
     import numpy as np
 
+    nll = sorted(r["nll"] for r in kept if r.get("nll") is not None)
+    cut = nll[int(0.9 * (len(nll) - 1))] if nll else None
+    healthy = [r for r in kept if not r.get("guards", {}).get("loop8")
+               and (cut is None or r.get("nll") is None or r["nll"] <= cut)]
+    if len(healthy) <= size:
+        return healthy
+    x = embed([render_listing(1, r) for r in healthy], embedder, [r["id"] for r in healthy])
+    x = x - x.mean(0)
+    u, sv, _ = np.linalg.svd(x, full_matrices=False)
+    z = u[:, :min(rank, u.shape[1])]  # whitened: unit variance along each kept direction
+    d = np.linalg.norm(z[:, None, :] - z[None, :, :], axis=-1)
     rng = random.Random(seed)
-    chosen = [rng.randrange(len(kept))]
-    d = 1 - x @ x[chosen[0]]
-    while len(chosen) < size:
-        j = int(np.argmax(d))
-        chosen.append(j)
-        d = np.minimum(d, 1 - x @ x[j])
-    return [kept[j] for j in chosen]
+    medoids = rng.sample(range(len(healthy)), size)
+    for _ in range(20):  # alternate assignment and medoid update (PAM-lite)
+        assign = np.argmin(d[:, medoids], axis=1)
+        new = []
+        for c in range(size):
+            members = np.where(assign == c)[0]
+            new.append(int(members[np.argmin(d[np.ix_(members, members)].sum(1))]) if len(members) else medoids[c])
+        if new == medoids:
+            break
+        medoids = new
+    return [healthy[j] for j in medoids]
 
 
 async def run_boot(complete: sp.Complete, score: Optional[sp.Score], starts: list[dict[str, Any]],
@@ -413,7 +434,8 @@ async def run_boot(complete: sp.Complete, score: Optional[sp.Score], starts: lis
 def boot_seed(st: dict[str, Any]) -> dict[str, Any]:
     """A loom seed (``kotodama.posttrain.selfplay.parse_seed`` reads it) with its provenance."""
     return {"id": st["id"], "cast": [x["label"] for x in st["names"]], "header": st["header"], "form": "boot",
-            "pass": st["pass"], "frame": st["frame"], "arm": st["arm"], "cast_arm": st["cast_arm"],
+            "pass": st["pass"], "frame": st["frame"], "frame_title": st.get("frame_title", ""),
+            "frame_control": st.get("frame_control", False), "arm": st["arm"], "cast_arm": st["cast_arm"],
             "exemplars": st.get("exemplars", []), "genre": st["genre"], "theme": st["theme"], "pair": st["pair"],
             "moment": st["moment"], "listing": st["listing"], "scene": st["scene"],
             "characters": [{"name": x["text"], "label": x["label"], "character": p}
@@ -578,10 +600,10 @@ def variety(rows: list[dict[str, Any]], embedder: str = "tfidf", metric: str = "
     lengths = [len(r[field]) for r in rows]
     out: dict[str, Any] = {"embedder": embedder, "metric": metric, "field": field, "n": len(rows), "groups": {},
                            "contrasts": {}}
-    for key in ("frame", "pass", "arm"):
+    for key in ("frame_title", "frame", "pass", "arm"):
         groups: dict[str, list[int]] = collections.defaultdict(list)
         for i, r in enumerate(rows):
-            groups[str(r[key])].append(i)
+            groups[str(r.get(key, ""))].append(i)
         for g, idx in sorted(groups.items()):
             sub = [rows[i] for i in idx]
             nll = [r["nll"] for r in sub if r.get("nll") is not None]
@@ -657,7 +679,7 @@ def main_frames_pick(argv: list[str]) -> int:
                                              "boot-frames-pick)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--verdicts", required=True)
-    ap.add_argument("--k", type=int, default=6)
+    ap.add_argument("--k", type=int, default=8, help="frames kept per title")
     ap.add_argument("--control", type=int, default=0, help="reader-rejected borderline frames kept as a control arm")
     a = ap.parse_args(argv)
     frames = pick_frames(Path(a.out), Path(a.verdicts), a.k, a.control)
@@ -720,7 +742,7 @@ def main_boot(argv: list[str]) -> int:
     ap.add_argument("--shots", default="2,4", help="few-shot listings per seed on passes >= 1: min,max")
     ap.add_argument("--verdicts", action="append", default=[],
                     help="filter verdicts of earlier passes ({id, verdict}); their kept seeds are the exemplars")
-    ap.add_argument("--exemplar_select", choices=["random", "farthest"], default="random")
+    ap.add_argument("--exemplar_select", choices=["random", "kmedoids"], default="random")
     ap.add_argument("--exemplar_pool", type=int, default=64)
     ap.add_argument("--concurrency", type=int, default=128)
     a = ap.parse_args(argv)
