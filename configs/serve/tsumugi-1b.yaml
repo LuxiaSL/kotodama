@@ -11,6 +11,7 @@
 # Neuron levers (an `injection` of kind mlp at effective layer L) are dosed in units of the median norm of the
 # state entering L's MLP, the unit of the neuron explorer (https://github.com/LuxiaSL/neuron-explorer).
 
+# The published release weights (every tensor bit-identical to the release training checkpoint).
 checkpoint: hf:LuxiaSL/kotodama-tsumugi-1b
 model_size: 1b-tsumugi
 rope_fp32: true
@@ -22,7 +23,9 @@ prefix_pool_tokens: 32768
 xbatch_rows: [16, 32, 64, 128]
 xbatch_refill: true
 cascade_attn: true
-levers: 16
+# Lever slots: one per steered request in flight (a request's whole steering, dose included, is one slot), so a
+# 128-row batch of steered n=2 requests needs 64.
+levers: 64
 # A request's `seed` reproduces its candidates whatever shares their batch.
 seeded_rows: true
 

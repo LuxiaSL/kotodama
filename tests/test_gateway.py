@@ -58,7 +58,7 @@ def test_a_pool_can_be_a_serve_profile() -> None:
     assert spec.profile == "tsumugi-1b"
     assert (spec.served_model_name, spec.model_size, spec.mode) == ("kotodama-tsumugi-1b", "1b-tsumugi", "base")
     assert spec.checkpoint == "hf:LuxiaSL/kotodama-tsumugi-1b"
-    assert cfg.warmup_grace_s >= 3600 and cfg.affinity_max_inflight > 0
+    assert cfg.warmup_grace_s >= 7200 and cfg.affinity_max_inflight > 0
 
 
 def test_one_pool_is_one_spec_and_a_spec_needs_its_fields(tmp_path) -> None:
@@ -135,3 +135,22 @@ def test_routes_pass_through_with_their_status(monkeypatch, tmp_path) -> None:
 def test_token_id_prompts_have_an_affinity_key() -> None:
     a = gateway._affinity_key({"prompt": list(range(100))})
     assert a == gateway._affinity_key({"prompt_ids": list(range(64)) + [7]}) and a.startswith("ids:")
+
+
+def test_a_pool_carries_its_own_server_flags(monkeypatch, tmp_path) -> None:
+    cfg = gateway.load_config(str(TSUMUGI), [0])
+    cfg.workdir = str(tmp_path)
+    cfg.models[0].args = ["--steer-npz", "/b/bank.npz,/b/norms.npz"]
+    fleet = gateway.Fleet(cfg)
+    seen = {}
+
+    class _Proc:
+        pid = 1
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", lambda cmd, **kw: seen.setdefault("cmd", cmd) and _Proc())
+    fleet.spawn(fleet.replicas[0])
+    cmd = seen["cmd"]
+    assert cmd[-2:] == ["--steer-npz", "/b/bank.npz,/b/norms.npz"]  # after the profile and fleet flags

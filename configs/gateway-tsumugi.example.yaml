@@ -5,6 +5,8 @@ name: tsumugi-fleet
 models:
   - key: base
     profile: tsumugi-1b
+    # checkpoint: /path/to/model.pt         # default: the profile's (the published weights)
+    # args: ["--steer-npz", "/path/to/bank.npz,/path/to/partial_norms.npz"]   # this pool's steering banks
 
 gpus: [0, 1, 2, 3]
 replica_base_port: 2380
@@ -27,6 +29,7 @@ request_timeout_s: 1800.0
 # One replica per pool compiles first and stores its artifacts (set KOTODAMA_COMPILE_STORE for the replicas); the
 # rest start once it is ready and load them.
 compile_first: true
-# A cold replica compiles every batch bucket before it serves: give it that long before health checks count.
-warmup_grace_s: 3600.0
+# A cold replica (a new code version, no compile store) compiles every batch bucket before it serves, which can take
+# well over an hour: health checks count only after this long.
+warmup_grace_s: 7200.0
 stuck_ceiling_s: 1800.0
