@@ -33,6 +33,7 @@ ENGINE_FLAGS: tuple[str, ...] = (
     "model_size", "rope_fp32", "attn_res", "attn_res_boundaries", "max_seq_len", "engine", "mode", "prefix_cache",
     "multi_rows", "xbatch_rows", "xbatch_refill", "prefix_pool_tokens", "prefix_pool_block", "cascade_attn",
     "cascade_groups", "cascade_tail_tokens", "levers", "seeded_rows", "steer_npz", "compile_mode", "warm_truncated",
+    "regional",
 )
 # Environment variables that change the kernels a compile emits.
 ENGINE_ENV: tuple[str, ...] = ("KOTODAMA_ATTNRES_EPS_FP64_COMPAT",)
@@ -69,6 +70,18 @@ def key_fields(flags: dict[str, Any]) -> dict[str, Any]:
 
 def cache_key(fields: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(fields, sort_keys=True, default=str).encode()).hexdigest()[:32]
+
+
+def cache_counters() -> str:
+    """How this process's compiles went so far: inductor FX-graph and AOT-autograd cache hits and misses (a start
+    whose graphs all hit compiled nothing)."""
+    try:
+        from torch._dynamo.utils import counters
+    except ImportError:
+        return "cache counters unavailable"
+    return ", ".join(f"{name} {counters[group].get(f'{key}_hit', 0)} hit / {counters[group].get(f'{key}_miss', 0)} miss"
+                     for name, group, key in (("fx graphs", "inductor", "fxgraph_cache"),
+                                              ("aot", "aot_autograd", "autograd_cache")))
 
 
 def load(store: str | os.PathLike[str], key: str) -> bool:

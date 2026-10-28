@@ -81,3 +81,33 @@ def test_compile_first_starts_the_rest_after_the_first_is_ready(monkeypatch, tmp
         lambda req: httpx.Response(503))), raising=False)  # nothing to adopt
     asyncio.run(gateway._adopt_or_spawn())
     assert events == [("spawn", 0), ("ready", 0), ("spawn", 1), ("spawn", 2)]
+
+
+def test_compile_first_without_a_store_is_reported(monkeypatch, tmp_path: Path) -> None:
+    from kotodama.serve import gateway
+
+    monkeypatch.delenv("KOTODAMA_COMPILE_STORE", raising=False)
+    example = Path(__file__).resolve().parents[1] / "configs" / "gateway-tsumugi.example.yaml"
+    cfg = gateway.load_config(str(example), [0, 1])
+    spec = cfg.models[0]
+    assert not gateway.compile_store_set(cfg, spec)
+    warned = []
+    monkeypatch.setattr(gateway.logger, "warning", lambda msg, *args: warned.append(msg % args))
+    gateway.load_config(str(example), [0, 1])
+    assert len(warned) == 1 and "sets no compile store" in warned[0]
+    monkeypatch.setenv("KOTODAMA_COMPILE_STORE", str(tmp_path))
+    assert gateway.compile_store_set(cfg, spec)
+    monkeypatch.delenv("KOTODAMA_COMPILE_STORE")
+    spec.args = ["--compile_store", str(tmp_path)]
+    assert gateway.compile_store_set(cfg, spec)
+    spec.args = []
+    cfg.env_extra = {"KOTODAMA_COMPILE_STORE": str(tmp_path)}
+    assert gateway.compile_store_set(cfg, spec)
+
+
+def test_the_key_moves_with_regional(monkeypatch, tmp_path: Path) -> None:
+    src = tmp_path / "model"
+    src.mkdir()
+    (src / "a.py").write_text("x = 1\n")
+    assert (compile_cache.cache_key(_fields(monkeypatch, src, regional=True))
+            != compile_cache.cache_key(_fields(monkeypatch, src, regional=False)))

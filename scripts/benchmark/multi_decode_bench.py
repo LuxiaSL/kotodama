@@ -281,6 +281,9 @@ def main() -> int:
                          "suffixed _n<n>)")
     ap.add_argument("--width_profile", action="store_true",
                     help="width: also log the top CUDA kernels over 20 steps of each measurement (torch.profiler)")
+    ap.add_argument("--levers", type=int, default=0, help="the server's --levers (lever table slots)")
+    ap.add_argument("--compile_mode", default="max-autotune", help="the server's --compile_mode")
+    ap.add_argument("--regional", action="store_true", help="the server's --regional")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -297,7 +300,8 @@ def main() -> int:
                                     prefix_cache=True, max_seq_len=4096, multi_rows=tuple(widths),
                                     steer_npz=a.steer_npz, prefix_pool_tokens=a.prefix_pool_tokens,
                                     prefix_pool_block=a.prefix_pool_block, cascade_attn=a.cascade == "on",
-                                    cascade_groups=a.cascade_groups, cascade_tail_tokens=a.cascade_tail_tokens)
+                                    cascade_groups=a.cascade_groups, cascade_tail_tokens=a.cascade_tail_tokens,
+                                    levers=a.levers, compile_mode=a.compile_mode, regional=a.regional)
     server._model, server._tokenizer = _model, tok
     eng = server._engine
     pool = server._prefix_pool

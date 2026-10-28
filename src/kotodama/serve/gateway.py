@@ -157,12 +157,34 @@ def load_config(path: Optional[str], gpus_override: Optional[list[int]]) -> Gate
             raise SystemExit(f"pool '{spec.key}' is configured twice: one pool is one model spec (one profile)")
         seen.add(spec.key)
         _resolve_profile(spec)
+    if cfg.compile_first:
+        for spec in cfg.models:
+            if not compile_store_set(cfg, spec):
+                logger.warning(
+                    "compile_first is on but pool '%s' sets no compile store (--compile_store in its args or "
+                    "serve_args, or KOTODAMA_COMPILE_STORE in env_extra, its profile's env or the gateway's "
+                    "environment): its later replicas start from whatever compile cache they share with the first, "
+                    "and compile cold if they share none", spec.key)
     # Validate routing targets exist
     keys = cfg.pool_keys()
     for target in (cfg.chat_pool, cfg.completion_pool):
         if target not in keys:
             raise SystemExit(f"routing target '{target}' is not a configured model key {sorted(keys)}")
     return cfg
+
+
+def compile_store_set(cfg: GatewayConfig, spec: ModelSpec) -> bool:
+    """Whether a pool's replicas get a compile store (kotodama.serve.compile_cache), from any place one can be set."""
+    if any(a == "--compile_store" or a.startswith("--compile_store=") for a in [*cfg.serve_args, *spec.args]):
+        return True
+    if cfg.env_extra.get("KOTODAMA_COMPILE_STORE") or os.environ.get("KOTODAMA_COMPILE_STORE"):
+        return True
+    if spec.profile is not None:
+        from kotodama.serve import profiles
+
+        flags, env = profiles.load(spec.profile)
+        return bool(flags.get("compile_store") or env.get("KOTODAMA_COMPILE_STORE"))
+    return False
 
 
 _SPEC_FROM_PROFILE = ("checkpoint", "mode", "served_model_name", "model_size")

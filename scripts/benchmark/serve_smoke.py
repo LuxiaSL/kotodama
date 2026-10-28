@@ -92,12 +92,25 @@ def main() -> int:
               prompt_tokens=len(prompt_ids))
 
         # a min-p that keeps only the top token decodes greedily on the batched path: its candidates agree with each
-        # other, and with the single-stream greedy decode (another kernel family) on the first token
+        # other, and with the single-stream greedy decode (another kernel family) on the first token. Where the top
+        # two logits tie exactly (bf16 logits do), both survive and each row's own noise picks one: candidates may
+        # part there, and only there, which the single-stream scores of the parting tokens show (equal to within
+        # kernel rounding).
         trunc = complete(temperature=1.5, min_p=0.999, n=4)
         if trunc["status"] == 200:
             cands = ids_of(trunc)
             mutual = all(x == cands[0] for x in cands)
-            check("min_p_batched", mutual and cands[0][:1] == ids_of(g_text)[0][:1], mutual_equal=mutual,
+            tie_gap = None
+            if not mutual:
+                d = min(first_divergence(c, cands[0]) for c in cands[1:])
+                parting = sorted({c[d] for c in cands if len(c) > d})
+                r = http.post(f"{url}/score_tokens", json={"items": [
+                    {"id": str(t), "prompt_ids": prompt_ids, "completion_ids": cands[0][:d] + [t]} for t in parting]})
+                if r.status_code == 200:
+                    nll = [x["sum_nll"] for x in r.json()["results"]]
+                    tie_gap = max(nll) - min(nll)
+            check("min_p_batched", (mutual or (tie_gap is not None and tie_gap < 0.1))
+                  and cands[0][:1] == ids_of(g_text)[0][:1], mutual_equal=mutual, parting_tokens_nll_gap=tie_gap,
                   first_divergence_vs_single_stream_greedy=first_divergence(cands[0], ids_of(g_text)[0]))
         else:
             check("min_p_batched", False, status=trunc["status"])
