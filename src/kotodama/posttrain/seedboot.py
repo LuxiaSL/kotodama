@@ -667,7 +667,8 @@ def dispersion(d: Any, idx: list[int]) -> float:
 
 
 def variety(rows: list[dict[str, Any]], embedder: str = "tfidf", metric: str = "energy", perms: int = 200,
-            verdicts: Optional[dict[str, str]] = None, field: str = "header", seed: int = 0) -> dict[str, Any]:
+            verdicts: Optional[dict[str, str]] = None, field: str = "header", seed: int = 0,
+            keys: Sequence[str] = ("frame_pool", "frame_title", "frame", "pass", "arm")) -> dict[str, Any]:
     """Per-group (frame, pass, arm) dispersion and guards, and pairwise contrasts with their nulls."""
     import numpy as np
 
@@ -678,7 +679,7 @@ def variety(rows: list[dict[str, Any]], embedder: str = "tfidf", metric: str = "
     lengths = [len(r[field]) for r in rows]
     out: dict[str, Any] = {"embedder": embedder, "metric": metric, "field": field, "n": len(rows), "groups": {},
                            "contrasts": {}}
-    for key in ("frame_pool", "frame_title", "frame", "pass", "arm"):
+    for key in keys:
         groups: dict[str, list[int]] = collections.defaultdict(list)
         for i, r in enumerate(rows):
             groups[str(r.get(key, ""))].append(i)
@@ -903,12 +904,17 @@ def main_variety(argv: list[str]) -> int:
     ap.add_argument("--field", default="header")
     ap.add_argument("--perms", type=int, default=200)
     ap.add_argument("--verdicts", action="append", default=[])
+    ap.add_argument("--keys", default="frame_pool,frame_title,frame,pass,arm", help="row fields to group by")
+    ap.add_argument("--kept_only", action="store_true", help="only rows the verdicts keep")
     a = ap.parse_args(argv)
     out = Path(a.out)
     rows = [r for p in a.passes.split(",") for r in sp.read_jsonl(out / f"pass{p}" / "seeds.all.jsonl")]
     verdicts = {v["id"]: v["verdict"] for vf in a.verdicts for v in sp.read_jsonl(Path(vf))} or None
-    rep = variety(rows, a.embedder, a.metric, a.perms, verdicts, a.field)
-    name = f"variety.{a.embedder.replace(':', '_').replace('/', '_')}.{a.metric}.{a.field}.json"
+    if a.kept_only and verdicts:
+        rows = [r for r in rows if verdicts.get(r["id"]) == "keep"]
+    rep = variety(rows, a.embedder, a.metric, a.perms, verdicts, a.field, keys=a.keys.split(","))
+    name = (f"variety.{a.embedder.replace(':', '_').replace('/', '_')}.{a.metric}.{a.field}"
+            f"{'.kept' if a.kept_only else ''}.json")
     (out / name).write_text(json.dumps(rep, indent=1))
     print(json.dumps(rep, indent=1))
     return 0
