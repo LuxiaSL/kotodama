@@ -3,10 +3,10 @@
 The ``python -m kotodama.posttrain.seeds`` subcommands ``pools``, ``combine``, ``headers`` and ``report`` live here:
 
 ``pools``     For each axis (characters, themes, needs, relationships, settings, inciting situations, stakes, register,
-              names) the base model continues a list document, one entry per line. A request on a crossed axis ends in
-              a fresh section headed by two items drawn at random from the ``--crossing`` lists (Gunkel's ideonomic
-              method: a pair of unrelated items, and the model writes the concrete thing they suggest;
-              https://ideonomy.mit.edu). Lines are normalised; malformed, mojibake, too short, too long and duplicate
+              names) the base model continues a list document, one entry per line. On a crossed axis every line opens
+              with a pair of items, ``(a / b) entry``, and a request's open line carries a pair drawn at random from
+              the ``--crossing_dir`` lists (Gunkel's ideonomic method: two unrelated items, and the model writes the
+              concrete thing they suggest; https://ideonomy.mit.edu). Lines are normalised; malformed, mojibake, too short, too long and duplicate
               lines are rejected; then a greedy within-pool dissimilarity filter (character n-gram TF-IDF cosine)
               drops near-paraphrases of entries already kept. Every rejection is banked with its reason.
 ``combine``   Samples combinations with spread: each slot prefers entries used least so far, and a combination that
@@ -65,11 +65,15 @@ DOC_START = "<|endoftext|>"  # a header opens a document, so its NLL is read aft
 @dataclass(frozen=True)
 class Axis:
     """One pool: the list document's opening line, default example entries, the crossing lists (names of files in
-    ``--crossing_dir``; two names = one item from each, one name = two distinct items from it), and length bounds."""
+    ``--crossing_dir``; two names = one item from each, one name = two distinct items from it), and length bounds.
+    A crossed entry is written ``(a / b) entry``: the pair opens every line, examples included, so each line is
+    anchored to its own pair. ``prefix``: one item instead (one side of it when it reads ``x and y``) opens the entry
+    itself and the model writes the rest ("thresholds" -> "thresholds and the things that live on them")."""
     name: str
     head: str
     examples: tuple[str, ...]
     crossing: tuple[str, ...] = ()
+    prefix: bool = False
     min_chars: int = 20
     max_chars: int = 160
     sim_threshold: float = 0.5
@@ -78,12 +82,12 @@ class Axis:
 AXES: dict[str, Axis] = {a.name: a for a in (
     Axis("character",
          "Characters for short plays: real people, each a role and one defining trait, written in a few words.",
-         ("a hospice volunteer who changes her mind about everything except showing up",
-          "a long-haul trucker who keeps a sketchbook of the birds he sees at rest stops",
-          "a junior architect who has promised the same weekend to three different people",
-          "a retired choir director who still rigs the parish raffle so the children win",
-          "a night-shift baggage handler who catalogues what travellers leave behind",
-          "a sous-chef who has quietly run the kitchen for years under someone else's name"),
+         ("(fickle / dutiful) a hospice volunteer who changes her mind about everything except showing up",
+          "(gruff / sentimental) a long-haul trucker who keeps a sketchbook of the birds he sees at rest stops",
+          "(ambitious / forgetful) a junior architect who has promised the same weekend to three different people",
+          "(pious / mischievous) a retired choir director who still rigs the parish raffle so the children win",
+          "(meticulous / lonely) a night-shift baggage handler who catalogues what travellers leave behind",
+          "(modest / resentful) a sous-chef who has quietly run the kitchen for years under someone else's name"),
          crossing=("traits", "traits")),
     Axis("theme",
          "Themes for short plays: an idea crossed with a longing or an illusion, written as a phrase.",
@@ -93,69 +97,69 @@ AXES: dict[str, Axis] = {a.name: a for a in (
           "waiting, and the dream of a day when there is finally enough time",
           "confession and the illusion of knowing why we do things",
           "maps and the longing for a place that stays where it is drawn"),
-         crossing=("antisyzygies", "illusion_examples"), min_chars=15, max_chars=120),
+         crossing=("antisyzygies",), prefix=True, min_chars=15, max_chars=120),
     Axis("need",
          "What people need underneath what they ask for: a dream, a fear or a lack, written as a phrase.",
-         ("to matter to someone without having to be useful to them",
-          "to be forgiven for a failure no one else remembers",
-          "to believe the body can still be trusted",
-          "to find one question that does not already have an owner",
-          "to be held without being handled",
-          "to stop waiting for permission from the dead"),
+         ("(devotion / aimlessness) to matter to someone without having to be useful to them",
+          "(pride / failure) to be forgiven for a failure no one else remembers",
+          "(fear / disease, illness, or infirmity) to believe the body can still be trusted",
+          "(curiosity / dogmatism) to find one question that does not already have an owner",
+          "(gentleness / brutality) to be held without being handled",
+          "(anguish / denial of rights) to stop waiting for permission from the dead"),
          crossing=("emotions", "bads"), min_chars=12, max_chars=110),
     Axis("relationship_pair",
          "How two people in a play are bound to each other, written as a phrase.",
-         ("a piano teacher and the former student who now out-earns her",
-          "two neighbours who share a driveway and have never agreed where it ends",
-          "best friends since school who have both asked out the same man",
-          "a retiring head chef and the sous-chef who has secretly run the kitchen for years",
-          "a widowed father and his daughter-in-law, a week after the baby came",
-          "two night-shift workers who have never had a full conversation"),
+         ("(teacher and pupil / reunion) a piano teacher and the former student who now out-earns her",
+          "(giving and receiving / purchase of house) two neighbours who share a driveway and have never agreed where it ends",
+          "(friend and enemy / first date) best friends since school who have both asked out the same man",
+          "(master and slave / retirement) a retiring head chef and the sous-chef who has secretly run the kitchen for years",
+          "(old and new / birth of a child) a widowed father and his daughter-in-law, a week after the baby came",
+          "(presence and absence / working the night shift) two night-shift workers who have never had a full conversation"),
          crossing=("antisyzygies", "moments")),
     Axis("relationship_cast",
          "How three or four people in a play are bound to each other, written as a phrase.",
-         ("three sisters and the eldest's fiancé, on the night before the wedding",
-          "a mother, her two grown sons, and the lawyer reading their father's will",
-          "a band's drummer, its singer, and the manager who has just dropped them",
-          "four housemates dividing up the furniture of a flat they are all leaving",
-          "a dairy farmer, her teenage son, and the inspector who went to school with her",
-          "a bride's father, the groom's mother, and the caterer they both owe money"),
+         ("(part and whole / getting married) three sisters and the eldest's fiancé, on the night before the wedding",
+          "(judge and judged / death of father) a mother, her two grown sons, and the lawyer reading their father's will",
+          "(success and failure / being fired) a band's drummer, its singer, and the manager who has just dropped them",
+          "(coming and going / moving) four housemates dividing up the furniture of a flat they are all leaving",
+          "(old and new / failing an inspection) a dairy farmer, her teenage son, and the inspector who went to school with her",
+          "(giving and receiving / wedding reception) a bride's father, the groom's mother, and the caterer they both owe money"),
          crossing=("antisyzygies", "moments"), max_chars=180),
     Axis("setting",
          "Settings for short plays: a place, a time, and one object in it that matters.",
-         ("a ferry's car deck at dawn, engines idling; a cooler with a broken lid",
-          "an emptied apartment in late afternoon; the one chair nobody took",
-          "a weather station on a ridge at midnight in February; a logbook missing three pages",
-          "a hotel night desk at three in the morning; a master key card that has gone missing",
-          "a school gym after the reunion dance; a framed photo face-down on the bleachers",
-          "a hospital car park in November rain; a car seat still in its box"),
+         ("(anticipation / vacationing) a ferry's car deck at dawn, engines idling; a cooler with a broken lid",
+          "(bitterness / moving) an emptied apartment in late afternoon; the one chair nobody took",
+          "(awe / aurora observed) a weather station on a ridge at midnight in February; a logbook missing three pages",
+          "(boredom / drunk on job) a hotel night desk at three in the morning; a master key card that has gone missing",
+          "(nostalgia / high school reunion) a school gym after the reunion dance; a framed photo face-down on the bleachers",
+          "(anxiety / birth of a child) a hospital car park in November rain; a car seat still in its box"),
          crossing=("emotions", "moments")),
     Axis("inciting",
          "Inciting moments for short plays: something that has just happened, or is about to.",
-         ("a letter has arrived for someone who died last spring",
-          "the buyer has just found out the seller still lives in the garden shed",
-          "the groom has walked out of the rehearsal and will not say why",
-          "the power has gone out and the freezer full of wedding food is warming",
-          "a stranger has knocked, holding a dog that belongs to one of them",
-          "the results of the paternity test are in an envelope on the table"),
+         ("(reunion / death of a friend) a letter has arrived for someone who died last spring",
+          "(purchase of house / being crass) the buyer has just found out the seller still lives in the garden shed",
+          "(getting married / cold feet) the groom has walked out of the rehearsal and will not say why",
+          "(wedding / power failure) the power has gone out and the freezer full of wedding food is warming",
+          "(finding a lost dog / meeting a neighbour) a stranger has knocked, holding a dog that belongs to one of them",
+          "(birth of a child / suspicion) the results of the paternity test are in an envelope on the table"),
          crossing=("moments", "moments")),
     Axis("stakes",
          "Stakes for short plays: what must happen before the scene ends, and the clock that runs out.",
-         ("the car must be packed and gone before the landlord arrives at noon",
-          "someone has to decide whether to call the ambulance before the snow closes the road",
-          "the stolen exam papers must be back in the office before the janitor's ten o'clock round",
-          "one of them must sign the form before the court office closes at five",
-          "they have until the tide turns to get the boat off the sandbar",
-          "the speech has to be finished before the car comes for them at seven"),
+         ("(failure / excessive haste) the car must be packed and gone before the landlord arrives at noon",
+          "(distrust / disaster) someone has to decide whether to call the ambulance before the snow closes the road",
+          "(cheating / fear of exposure) the stolen exam papers must be back in the office before the janitor's ten o'clock round",
+          "(family disintegration / denial of rights) one of them must sign the form before the court office closes at five",
+          "(complacency / disaster) they have until the tide turns to get the boat off the sandbar",
+          "(frustration / excessive haste) the speech has to be finished before the car comes for them at seven"),
          crossing=("bads", "bads")),
     Axis("register",
          "The register of a short play: its genre and the way its people talk, written as a phrase.",
-         ("a kitchen-sink comedy that turns, halfway, into a quarrel nobody can laugh off",
-          "a quiet two-hander, slow and plain, the way people talk in hospitals at night",
-          "a screwball farce, fast overlapping talk, everyone lying a little",
-          "a radio drama, terse, all sound and implication",
-          "a dry, deadpan comedy of manners",
-          "a ghost story told in daylight by people too tired to be scared"),
+         ("(amusement / anguish) a kitchen-sink comedy that turns, halfway, into a quarrel nobody can laugh off",
+          "(calm / caution) a quiet two-hander, slow and plain, the way people talk in hospitals at night",
+          "(defiance / gaiety) a screwball farce, fast overlapping talk, everyone lying a little",
+          "(dread / curiosity) a radio drama, terse, all sound and implication",
+          "(irony / dignity) a dry, deadpan comedy of manners",
+          "(fear / boredom) a ghost story told in daylight by people too tired to be scared"),
          crossing=("emotions", "emotions"), min_chars=12, max_chars=130),
     Axis("names",
          "Names from the guest list of an international conference, one full name per line.",
@@ -220,6 +224,8 @@ def check_entry(text: str, axis: Axis) -> Optional[str]:
     if len(text) > axis.max_chars:
         return "too_long"
     if axis.name == "names":
+        if re.search(r"\b(?:Doe|Bloggs|Smith Smith)\b", text):
+            return "placeholder"
         return None if name_label(text) else "malformed"
     if _META_LINE.search(text) or _LABEL_COLON.search(text) or text.count("(") != text.count(")"):
         return "malformed"
@@ -323,33 +329,55 @@ def load_list(path: Path) -> list[str]:
     return [x for x in out if x]
 
 
-def pool_prompt(axis: Axis, examples: Sequence[str], pair: Optional[tuple[str, str]]) -> str:
-    """The list document: the axis's opening line, the example entries as a bulleted list, then an open entry —
-    under a fresh section headed by the crossing pair when there is one."""
+_PAIR = re.compile(r"^\(([^()/\n]{1,80}?) / ([^()/\n]{1,80}?)\)\s*")
+
+
+def split_pair(line: str) -> tuple[Optional[tuple[str, str]], str]:
+    """``"(a / b) entry"`` -> ((a, b), entry); a line without a leading pair -> (None, line)."""
+    m = _PAIR.match(line)
+    if not m:
+        return None, line
+    return (m.group(1).strip(), m.group(2).strip()), line[m.end():]
+
+
+def pool_prompt(axis: Axis, examples: Sequence[str], crossing: Optional[tuple[str, ...]]) -> str:
+    """The list document: the axis's opening line, the example entries as a bulleted list, then an open entry. A
+    pair crossing opens the entry as ``(a / b)``; a prefix crossing opens it with the item itself."""
     body = "".join(f"- {e}\n" for e in examples)
-    if pair is None:
+    if not crossing:
         return f"{axis.head}\n\n{body}-"
-    return f"{axis.head}\n\n{body}\nSparked by \u201c{pair[0].lower()}\u201d and \u201c{pair[1].lower()}\u201d:\n-"
+    if axis.prefix:
+        return f"{axis.head}\n\n{body}- {crossing[0].lower()}"
+    return f"{axis.head}\n\n{body}- ({crossing[0].lower()} / {crossing[1].lower()})"
 
 
-def parse_list_completion(text: str, hit_cap: bool) -> list[str]:
-    """Entries of a completion that continues an open ``-`` bullet: the first line, then each following line that
-    starts with ``-``, up to the first line that does not. A final line cut by the token cap is dropped."""
-    lines = text.split("\n")
+def parse_list_completion(text: str, hit_cap: bool,
+                          lead: str = "") -> list[tuple[Optional[tuple[str, str]], str]]:
+    """Entries of a completion that continues an open ``-`` bullet: the first line (after ``lead``, the text the
+    prompt already opened it with), then each following line that starts with ``-``, up to the first line that does
+    not; each as (its own leading pair or None, entry). A final line cut by the token cap is dropped."""
+    lines = (lead + text).split("\n")
     if hit_cap and lines:
         lines = lines[:-1]
-    out: list[str] = []
+    out: list[tuple[Optional[tuple[str, str]], str]] = []
     for i, ln in enumerate(lines):
         if i > 0 and not ln.lstrip().startswith("-"):
             break
-        out.append(clean_entry(ln))
+        pair, rest = split_pair(_CLEAN_LEAD.sub("", ln).strip()) if i > 0 else (None, ln)
+        out.append((pair, clean_entry(rest)))
     return out
 
 
-def draw_pair(rng: random.Random, axis: Axis, lists: dict[str, list[str]]) -> Optional[tuple[str, str]]:
+def draw_crossing(rng: random.Random, axis: Axis, lists: dict[str, list[str]]) -> Optional[tuple[str, ...]]:
+    """A fresh crossing for one request: a pair (``Axis.crossing``) or, on a prefix axis, one item (one side of an
+    ``x and y`` item). None when a named list is missing."""
     names = [n for n in axis.crossing if lists.get(n)]
     if len(names) != len(axis.crossing) or not names:
         return None
+    if axis.prefix:
+        item = rng.choice(lists[names[0]])
+        sides = item.split(" and ")
+        return (rng.choice(sides).strip(),) if len(sides) == 2 else (item,)
     if len(names) == 1 or names[0] == names[1]:
         a, b = rng.sample(lists[names[0]], 2)
         return a, b
@@ -365,14 +393,16 @@ class PoolState:
 
 
 def filter_pool(state: PoolState, axis: Axis, threshold: float, names_extra: Sequence[str] = ()) -> dict[str, Any]:
-    """Run the filters over all lines drawn so far (arrival order). Returns {kept: [rows], rejects: [rows],
+    """Run the filters over all lines drawn so far (by line index within a completion, then arrival). Returns {kept: [rows], rejects: [rows],
     counts: {stage: n}}; a row is {text, crossing, reason?, nearest?, sim?}."""
     rejects: list[dict[str, Any]] = []
     seen: set[str] = set()
     labels: set[str] = set()
     candidates: list[dict[str, Any]] = []
     counts = {"drawn": len(state.lines)}
-    rows = [{"text": t, "crossing": None, "source": "list"} for t in names_extra] + state.lines
+    # first lines of completions come first: they sit right after their crossing, and later lines drift
+    ordered = sorted(state.lines, key=lambda r: r.get("line", 0))
+    rows = [{"text": t, "crossing": None, "source": "list"} for t in names_extra] + ordered
     for row in rows:
         reason = check_entry(row["text"], axis)
         if reason is None:
@@ -407,7 +437,7 @@ async def grow_pool(complete: Complete, axis: Axis, target: int, lists: dict[str
                     parallel: int = 16, max_rounds: int = 40, names_extra: Sequence[str] = ()) -> dict[str, Any]:
     """Draw lines for ``axis`` in rounds of ``parallel`` requests until the filtered pool reaches ``target`` (or
     ``max_rounds``). Each request shows a random subset of the examples (four, shuffled) and, on a crossed axis, a
-    fresh pair."""
+    fresh crossing. A line after the first carries the crossing the model wrote for it (``model-continued``)."""
     state = PoolState(axis.name)
     res = filter_pool(state, axis, threshold, names_extra)
     stops = ["\n\n"]
@@ -417,15 +447,17 @@ async def grow_pool(complete: Complete, axis: Axis, target: int, lists: dict[str
         prompts = []
         for _ in range(parallel):
             ex = rng.sample(list(examples), min(4, len(examples)))
-            pair = draw_pair(rng, axis, lists) if axis.crossing else None
-            prompts.append((pool_prompt(axis, ex, pair), pair))
+            crossing = draw_crossing(rng, axis, lists) if axis.crossing else None
+            prompts.append((pool_prompt(axis, ex, crossing), crossing))
         outs = await asyncio.gather(*(complete(p, n_per_request, stops) for p, _ in prompts))
-        for (_p, pair), raw in zip(prompts, outs):
+        for (_p, crossing), raw in zip(prompts, outs):
             state.requests += 1
             for text, _finish, hit in raw:
-                for k, entry in enumerate(parse_list_completion(text, hit)):
-                    state.lines.append({"text": entry, "crossing": list(pair) if pair else None,
-                                        "source": "model", "line": k})
+                lead = crossing[0].lower() if crossing and axis.prefix else ""
+                for k, (own, entry) in enumerate(parse_list_completion(text, hit, lead)):
+                    cross = list(crossing) if k == 0 and crossing else list(own) if own else None
+                    state.lines.append({"text": entry, "crossing": cross,
+                                        "source": "model" if k == 0 else "model-continued", "line": k})
         res = filter_pool(state, axis, threshold, names_extra)
         logger.info("pool %s round %d: %d requests, %d lines, %d kept", axis.name, rnd + 1, state.requests,
                     len(state.lines), len(res["kept"]))
@@ -451,7 +483,8 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 async def run_pools(complete: Complete, out: Path, axes: Sequence[str], per_pool: int, lists: dict[str, list[str]],
                     examples: dict[str, list[str]], seed: int, thresholds: dict[str, float],
-                    names_extra: Sequence[str] = (), parallel: int = 16, max_rounds: int = 40) -> dict[str, Any]:
+                    names_extra: Sequence[str] = (), parallel: int = 16, max_rounds: int = 40,
+                    per_request: int = 8) -> dict[str, Any]:
     """Grow every requested axis; writes ``<out>/pools/<axis>.jsonl`` (kept: {id, axis, text, crossing, source}),
     ``<out>/pools/<axis>.rejects.jsonl`` and ``<out>/pools/stats.json``. An axis whose pool file exists is skipped
     (resume)."""
@@ -466,7 +499,8 @@ async def run_pools(complete: Complete, out: Path, axes: Sequence[str], per_pool
             continue
         thr = thresholds.get(name, axis.sim_threshold)
         res = await grow_pool(complete, axis, per_pool, lists, examples.get(name) or list(axis.examples),
-                              random.Random(f"{seed}:{name}"), thr, parallel=parallel, max_rounds=max_rounds,
+                              random.Random(f"{seed}:{name}"), thr, n_per_request=per_request,
+                              parallel=parallel, max_rounds=max_rounds,
                               names_extra=names_extra if name == "names" else ())
         kept = [{"id": f"{name}:{i:04d}", "axis": name, "text": r["text"], "crossing": r["crossing"],
                  "source": r.get("source", "model")} for i, r in enumerate(res["kept"])]
@@ -763,7 +797,10 @@ def header_prompt(c: dict[str, Any], no: int, examples: Sequence[HeaderExample] 
 
 
 def parse_header_completion(text: str, labels: Sequence[str], holder: int) -> tuple[Optional[dict[str, Any]], str]:
-    """The completion after ``<first label> wants:`` -> ({wants: [..], secret, page}, "") or (None, reason)."""
+    """The completion after ``<first label> wants:`` -> ({wants: [..], secret, holder, page}, "") or (None, reason).
+    The secret is the ``<label>'s secret:`` line of the drawn holder, else of any cast member (the model often hands
+    the secret to someone else, and the page then follows its choice), else a plain notes line about the drawn
+    holder; ``holder`` is the index of whoever keeps it."""
     cut = text.find(END_MARK)
     nxt = text.find("\nNo. ")
     ends = [i for i in (cut, nxt) if i >= 0]
@@ -780,13 +817,21 @@ def parse_header_completion(text: str, labels: Sequence[str], holder: int) -> tu
         pre = f"{lb} wants:"
         hit = next((ln[len(pre):].strip() for ln in lines[1:] if ln.startswith(pre)), "")
         wants.append(hit)
-    pre = f"{labels[holder]}'s secret:"
-    secret = next((ln[len(pre):].strip() for ln in lines if ln.startswith(pre)), "")
+    secret = ""
+    for h in [holder] + [i for i in range(len(labels)) if i != holder]:
+        pre = f"{labels[h]}'s secret:"
+        secret = next((ln[len(pre):].strip() for ln in lines if ln.startswith(pre)), "")
+        if secret:
+            holder = h
+            break
+    if not secret:  # the secret written as a plain sentence about its holder ("Rosa has never told her ...")
+        secret = next((ln for ln in lines[1:] if ln.startswith(labels[holder] + " ")
+                       and not ln.startswith(f"{labels[holder]} wants:")), "")
     if len(wants) != len(labels) or not all(len(w) >= 8 for w in wants):
         return None, "want_missing"
     if len(secret) < 8:
         return None, "secret_missing"
-    return {"wants": wants, "secret": secret, "page": page.strip()}, ""
+    return {"wants": wants, "secret": secret, "holder": holder, "page": page.strip()}, ""
 
 
 _CONTENT = re.compile(r"[a-z][a-z'-]{2,}")
@@ -880,18 +925,40 @@ def gate_page(parsed: dict[str, Any], c: dict[str, Any]) -> Optional[str]:
             return "role_mixup"
     if len(_ngrams(page, 8) & _EXAMPLE_8GRAMS) >= 3:
         return "copied_example"
+    page6 = _ngrams(page, 6)
+    if any(_ngrams(ch["need"]["text"], 6) & page6 for ch in c["characters"]):
+        return "need_pasted"  # the need is the layer under the want; pasted onto the page it reads as a slogan
+    if c["secret_arm"] == "plain" and overlap(parsed["secret"], page) < 0.3:
+        return "secret_not_stated"  # the plain arm states the secret on the page; hinting is left to the model
     return None
 
 
 async def run_headers(complete: Complete, score: Optional[Score], combos: list[dict[str, Any]], out: Path,
-                      candidates: int = 2, nll_cut: float = 0.05, concurrency: int = 64) -> dict[str, Any]:
+                      candidates: int = 2, nll_cut: float = 0.05, concurrency: int = 64,
+                      rounds: int = 1) -> dict[str, Any]:
     """Write ``<out>/headers.raw.jsonl`` (every candidate with its verdict) and ``<out>/seeds.jsonl`` (one kept
-    header per combination that produced a passing candidate, after the NLL tail cut). Resumes: combinations already in
-    ``<out>/headers.raw.jsonl`` are not regenerated."""
+    header per combination that produced a passing candidate, after the NLL tail cut). A combination is drawn
+    ``candidates`` at a time, for up to ``rounds`` draws, until one candidate passes. Resumes: draws already in
+    ``<out>/headers.raw.jsonl`` count toward the rounds."""
     raw_path = out / "headers.raw.jsonl"
-    done = {r["combo_id"] for r in read_jsonl(raw_path)}
-    todo = [c for c in combos if c["id"] not in done]
-    logger.info("headers: %d combinations, %d already drawn, %d to draw", len(combos), len(done), len(todo))
+    for rnd in range(rounds):
+        raw = read_jsonl(raw_path)
+        passed = {r["combo_id"] for r in raw if not r["reason"]}
+        draws = collections.Counter(r["combo_id"] for r in raw if r["k"] % candidates == 0)
+        todo = [c for c in combos if c["id"] not in passed and draws[c["id"]] < rounds]
+        logger.info("headers round %d: %d combinations, %d passed, %d to draw", rnd + 1, len(combos), len(passed),
+                    len(todo))
+        if not todo:
+            break
+        await _draw_headers(complete, score, todo, raw_path, candidates, concurrency,
+                            {c["id"]: draws[c["id"]] for c in todo})
+    return finalize_headers(combos, read_jsonl(raw_path), out, nll_cut)
+
+
+async def _draw_headers(complete: Complete, score: Optional[Score], todo: list[dict[str, Any]], raw_path: Path,
+                        candidates: int, concurrency: int, draws: dict[str, int]) -> None:
+    """One draw of ``candidates`` headers for each combination in ``todo``, appended to ``raw_path``; candidate
+    index ``k`` continues across draws."""
     sem = asyncio.Semaphore(concurrency)
     stops = [END_MARK, "\nNo. "]
     t0 = time.time()
@@ -908,7 +975,7 @@ async def run_headers(complete: Complete, score: Optional[Score], combos: list[d
                 logger.error("combination %s failed: %s", c["id"], e)
                 return
             rows = []
-            for k, (text, finish, hit) in enumerate(outs):
+            for k, (text, finish, hit) in enumerate(outs, start=draws[c["id"]] * candidates):
                 if hit:
                     parsed, reason = None, "overlong"
                 else:
@@ -938,12 +1005,13 @@ async def run_headers(complete: Complete, score: Optional[Score], combos: list[d
         await asyncio.gather(*(one(c) for c in todo))
     finally:
         raw_f.close()
-    return finalize_headers(combos, read_jsonl(raw_path), out, nll_cut)
 
 
 def seed_row(c: dict[str, Any], r: dict[str, Any]) -> dict[str, Any]:
     """A loom seed from a combination and its chosen header candidate."""
     p = r["parsed"]
+    holder = p.get("holder", c["secret_holder"])
+    target = c["secret_target"] if c["secret_target"] != holder else c["secret_holder"]
     chars = [{"name": ch["name"], "label": ch["label"], "character": ch["character"]["text"],
               "need": ch["need"]["text"], "want": w} for ch, w in zip(c["characters"], p["wants"])]
     combo = {"relationship": c["relationship"]["id"], **{s: v["id"] for s, v in c["scene"].items()},
@@ -953,12 +1021,12 @@ def seed_row(c: dict[str, Any], r: dict[str, Any]) -> dict[str, Any]:
     return {"id": f"sp-{c['id']}", "cast": [ch["label"] for ch in c["characters"]], "header": p["page"],
             "combo": combo, "friction": c["friction"], "cast_arm": c["cast_arm"], "secret_arm": c["secret_arm"],
             "characters": chars,
-            "secret": {"holder": c["characters"][c["secret_holder"]]["label"],
-                       "target": c["characters"][c["secret_target"]]["label"], "text": p["secret"]},
+            "secret": {"holder": c["characters"][holder]["label"], "target": c["characters"][target]["label"],
+                       "text": p["secret"], "holder_drawn": c["characters"][c["secret_holder"]]["label"]},
             "theme": c["scene"]["theme"]["text"], "register": c["scene"]["register"]["text"],
             "relationship": c["relationship"]["text"], "setting": c["scene"]["setting"]["text"],
             "inciting": c["scene"]["inciting"]["text"], "stakes": c["scene"]["stakes"]["text"],
-            "nll": r.get("nll"), "candidate": r["k"]}
+            "secret_overlap": round(overlap(p["secret"], p["page"]), 3), "nll": r.get("nll"), "candidate": r["k"]}
 
 
 def finalize_headers(combos: list[dict[str, Any]], raw: list[dict[str, Any]], out: Path,
@@ -1028,6 +1096,9 @@ def report(out: Path, sample: int = 40, seed: int = 0) -> dict[str, Any]:
                if len(rows) > 1 and name != "names"}
     arms = {k: dict(collections.Counter(s[k] for s in seeds)) for k in ("friction", "secret_arm", "cast_arm")}
     arms["friction_x_secret"] = dict(collections.Counter(f"{s['friction']}/{s['secret_arm']}" for s in seeds))
+    arms["secret_overlap_by_arm"] = {a: quantiles([s["secret_overlap"] for s in seeds if s["secret_arm"] == a],
+                                                  (0.1, 0.5, 0.9)) for a in SECRET_ARMS}
+    arms["secret_moved_holder"] = sum(s["secret"]["holder"] != s["secret"]["holder_drawn"] for s in seeds)
     rep = {"pools": pool_stats, "combinations": combo_stats, "headers": head_stats, "seeds": len(seeds),
            "entry_reuse": reuse, "header_nn_similarity": quantiles(nn), "pool_nn_similarity": pool_nn,
            "arms": arms}
@@ -1089,10 +1160,12 @@ def main_pools(argv: list[str]) -> int:
                                                                      "defaults (one per line)")
     ap.add_argument("--names_file", default=None, help="names merged into the names pool ahead of model names")
     ap.add_argument("--threshold", action="append", default=[], help="AXIS=COS: dissimilarity threshold override")
-    ap.add_argument("--law", default="base")
-    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--law", default="tsumugi")
+    ap.add_argument("--temperature", type=float, default=0.85)
     ap.add_argument("--max_tokens", type=int, default=160)
-    ap.add_argument("--parallel", type=int, default=16, help="requests per round (8 completions each)")
+    ap.add_argument("--parallel", type=int, default=32, help="requests per round")
+    ap.add_argument("--per_request", type=int, default=2,
+                    help="completions per request (they share the request's crossing)")
     ap.add_argument("--max_rounds", type=int, default=40)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
@@ -1117,7 +1190,7 @@ def main_pools(argv: list[str]) -> int:
     async def go() -> dict[str, Any]:
         try:
             return await run_pools(complete, out, axes, a.per_pool, lists, examples, a.seed, thresholds,
-                                   names_extra, a.parallel, a.max_rounds)
+                                   names_extra, a.parallel, a.max_rounds, a.per_request)
         finally:
             await close()
 
@@ -1152,11 +1225,12 @@ def main_headers(argv: list[str]) -> int:
     ap.add_argument("--endpoint", action="append", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=0, help="first N combinations (0 = all)")
-    ap.add_argument("--candidates", type=int, default=2, help="headers drawn per combination")
+    ap.add_argument("--candidates", type=int, default=4, help="headers drawn per combination")
     ap.add_argument("--nll_cut", type=float, default=0.05, help="share of the chosen headers cut by NLL (worst)")
+    ap.add_argument("--rounds", type=int, default=3, help="draws per combination until one candidate passes")
     ap.add_argument("--no_score", action="store_true", help="skip the NLL read (rules only)")
-    ap.add_argument("--law", default="base")
-    ap.add_argument("--temperature", type=float, default=0.9)
+    ap.add_argument("--law", default="tsumugi")
+    ap.add_argument("--temperature", type=float, default=None, help="override the law's temperature")
     ap.add_argument("--max_tokens", type=int, default=480)
     ap.add_argument("--concurrency", type=int, default=64)
     a = ap.parse_args(argv)
@@ -1175,7 +1249,8 @@ def main_headers(argv: list[str]) -> int:
 
     async def go() -> dict[str, Any]:
         try:
-            return await run_headers(complete, score, combos, out, a.candidates, a.nll_cut, a.concurrency)
+            return await run_headers(complete, score, combos, out, a.candidates, a.nll_cut, a.concurrency,
+                                     a.rounds)
         finally:
             await close()
             if sclose is not None:

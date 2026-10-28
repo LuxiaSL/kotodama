@@ -63,12 +63,19 @@ def test_entry_hygiene() -> None:
 
 def test_pool_prompt_and_parse() -> None:
     ax = sp.AXES["character"]
-    p = sp.pool_prompt(ax, ["a baker who never sleeps"], ("Fickle", "Dutiful"))
-    assert p.startswith(ax.head) and p.endswith("\u201cfickle\u201d and \u201cdutiful\u201d:\n-")
+    p = sp.pool_prompt(ax, ["(shy / bold) a baker who never sleeps"], ("Fickle", "Dutiful"))
+    assert p.startswith(ax.head) and p.endswith("- (shy / bold) a baker who never sleeps\n- (fickle / dutiful)")
     assert sp.pool_prompt(ax, ["a baker who never sleeps"], None).endswith("- a baker who never sleeps\n-")
-    got = sp.parse_list_completion(" a pilot who hums\n- a tailor who lies.\nNot a bullet\n- after the break", False)
-    assert got == ["a pilot who hums", "a tailor who lies"]
-    assert sp.parse_list_completion(" a pilot who hums\n- a tailor wh", True) == ["a pilot who hums"]
+    theme = sp.AXES["theme"]
+    assert sp.pool_prompt(theme, ["maps and the longing for home"], ("Thresholds",)).endswith("\n- thresholds")
+    got = sp.parse_list_completion(" a pilot who hums\n- (vain / kind) a tailor who lies.\nNot a bullet\n- after",
+                                   False)
+    assert got == [(None, "a pilot who hums"), (("vain", "kind"), "a tailor who lies")]
+    assert sp.parse_list_completion(" a pilot who hums\n- a tailor wh", True) == [(None, "a pilot who hums")]
+    assert sp.parse_list_completion(" and the things that live on them", False, "thresholds") == \
+        [(None, "thresholds and the things that live on them")]
+    assert sp.draw_crossing(random.Random(0), theme, {"antisyzygies": ["order and chaos"]})[0] in ("order", "chaos")
+    assert sp.draw_crossing(random.Random(0), ax, {}) is None
 
 
 def test_dissimilarity_drops_paraphrase() -> None:
@@ -177,6 +184,8 @@ def test_header_prompt_and_parse() -> None:
     (lambda p: p.replace("five hundred pounds Mara keeps in the tin under the counter", "nothing at all"),
      "want_absent"),
     (lambda p: p.replace("Teo", "Theo"), "name_missing"),
+    (lambda p: p.replace(" The house sold last month; he signed for it.", "").replace(
+        "before their mother's house is sold", "before the ferry stops"), "secret_not_stated"),
 ])
 def test_gate_rules(edit, reason) -> None:
     c = _combo()
@@ -251,3 +260,34 @@ def test_cli_dispatch(tmp_path: Path) -> None:
     assert len(sp.read_jsonl(tmp_path / "combos.jsonl")) == 16
     with pytest.raises(SystemExit):
         seeds.main(["pools", "--endpoint", "http://x", "--out", str(tmp_path), "--axes", "nonsense"])
+
+
+def test_secret_held_by_another_and_need_pasted() -> None:
+    c = _combo()
+    moved = GOOD.replace("Teo's secret:", "Mara's secret:")
+    parsed, why = sp.parse_header_completion(moved, ["Mara", "Teo"], 1)
+    assert why == "" and parsed["holder"] == 0 and parsed["secret"].startswith("the house sold")
+    plain = GOOD.replace("Teo's secret: ", "Teo knows ")
+    parsed, why = sp.parse_header_completion(plain, ["Mara", "Teo"], 1)
+    assert why == "" and parsed["holder"] == 1 and parsed["secret"].startswith("Teo knows the house sold")
+    row = sp.seed_row(c, {"parsed": {**parsed, "holder": 0}, "k": 0})
+    assert row["secret"]["holder"] == "Mara" and row["secret"]["target"] == "Teo"
+    assert row["secret"]["holder_drawn"] == "Teo"
+    good, _ = sp.parse_header_completion(GOOD, ["Mara", "Teo"], 1)
+    pasted = {**good, "page": good["page"] + " She needs to stop being forgiven in advance."}
+    assert sp.gate_page(pasted, c) == "need_pasted"
+
+
+def test_headers_redraw_until_pass(tmp_path: Path) -> None:
+    c = _combo()
+    calls = {"n": 0}
+
+    async def complete(prompt: str, n: int, stops: list[str]):
+        calls["n"] += 1
+        bad = GOOD.replace("Teo wants:", "Teo hopes:")
+        return [(bad if calls["n"] < 2 else GOOD, "stop", False)] * n
+
+    stats = asyncio.run(sp.run_headers(complete, None, [c], tmp_path, candidates=2, rounds=3))
+    raw = sp.read_jsonl(tmp_path / "headers.raw.jsonl")
+    assert calls["n"] == 2 and [r["k"] for r in raw] == [0, 1, 2, 3]
+    assert stats["kept"] == 1 and sp.read_jsonl(tmp_path / "seeds.jsonl")[0]["candidate"] == 2
