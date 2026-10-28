@@ -22,6 +22,7 @@ def test_the_key_moves_with_the_code_and_the_engine_flags(monkeypatch, tmp_path:
     src = tmp_path / "model"
     src.mkdir()
     (src / "a.py").write_text("x = 1\n")
+    monkeypatch.delenv("KOTODAMA_ATTNRES_EPS_FP64_COMPAT", raising=False)
     base = compile_cache.cache_key(_fields(monkeypatch, src))
     assert base == compile_cache.cache_key(_fields(monkeypatch, src))  # stable
     assert base == compile_cache.cache_key(_fields(monkeypatch, src, checkpoint="/other.pt"))  # not an engine flag

@@ -1,0 +1,14 @@
+# kotodama-tsumugi 1B base, to start looking at it fast on any one GPU: the default way to serve the model.
+#   tools/run_serve.sh --profile tsumugi-1b-quick [--checkpoint <ckpt>] [--port <p>]
+# The same engine and request surface as tsumugi-1b (batched rows with refill, cascade attention, the prefix KV
+# pool, per-request steering levers, seeded candidates, top-p / min-p), sized to start in minutes and to fit a
+# 24 GB card: two row buckets, 512-token batched completions (longer ones are served one at a time), no kernel
+# benchmarking at compile time, and the top-p / min-p step compiled by the first request that uses it.
+# A fleet that serves sustained load runs tsumugi-1b instead (a longer one-time compile, more throughput).
+
+extends: tsumugi-1b.yaml
+xbatch_rows: [8, 32]
+cascade_tail_tokens: 512
+prefix_pool_tokens: 8192
+compile_mode: reduce-overhead
+warm_truncated: false

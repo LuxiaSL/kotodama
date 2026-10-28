@@ -27,7 +27,8 @@ def test_profile_is_a_complete_server_command_line(path: Path, monkeypatch) -> N
     flags, env = profiles.load(str(path))
     parser = build_arg_parser()
     for k in env:
-        monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv(k, "unset-marker")  # recorded, so the test restores the environment it changes
+        monkeypatch.delenv(k)
     profiles.apply(parser, str(path))
     args = parser.parse_args([])  # nothing else on the command line
     for k, v in flags.items():

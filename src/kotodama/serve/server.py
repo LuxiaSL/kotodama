@@ -222,6 +222,10 @@ _steer_partial_norms: dict[int, float] = {}
 _levers: int = 0
 # Seeded row decoders (--seeded_rows): a request's `seed` gives each candidate its own reproducible noise stream.
 _seeded_rows: bool = False
+# torch.compile mode of the engine and the row decoders (--compile_mode), and whether warmup compiles the truncated
+# (top-p / min-p) step variants or leaves them to their first request (--warm_truncated).
+_compile_mode: str = "max-autotune"
+_warm_truncated: bool = True
 # Server-wide default repetition penalty (CLI --default_repetition_penalty):
 # used by /generate when the field is absent and by the OpenAI routes when
 # frequency_penalty is absent.
@@ -336,9 +340,10 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None) -> tuple[KotodamaModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
-    global _row_token_cap, _cascade_info, _levers, _seeded_rows
+    global _row_token_cap, _cascade_info, _levers, _seeded_rows, _compile_mode, _warm_truncated
+    _compile_mode, _warm_truncated = compile_mode, bool(warm_truncated)
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
@@ -442,6 +447,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             "prefix_pool_tokens": prefix_pool_tokens, "prefix_pool_block": prefix_pool_block,
             "cascade_attn": cascade_attn, "cascade_groups": cascade_groups, "cascade_tail_tokens": cascade_tail_tokens,
             "levers": levers, "seeded_rows": seeded_rows, "steer_npz": steer_npz is not None,
+            "compile_mode": compile_mode, "warm_truncated": bool(warm_truncated),
         })
         store_key = compile_cache.cache_key(store_fields)
         store_hit = compile_cache.load(compile_store, store_key)
@@ -459,7 +465,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             # --levers: per-request lever tables replace the broadcast rows (banks resolve into levers).
             eng = DecodeEngine(model, max_seq_len=_max_seq_len, steer_enabled=steer_npz is not None and not levers,
                                levers=levers)
-            eng.compile_step(mode="max-autotune")
+            eng.compile_step(mode=_compile_mode)
             # Compile every block-forward bucket (incl. overlap plans) now:
             # an unwarmed bucket would pay its compile on a live request.
             eng.warm_blocks()
@@ -473,7 +479,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
                     tok = eng.sample_first(logits, warm_params)
                     for _ in range(4):
                         tok = eng.step(tok, warm_params)
-                    for _ in range(2):
+                    for _ in range(2 if _warm_truncated else 0):
                         # Warm the truncated (top-k/top-p) sampler graph too —
                         # a cold compile on the first truncated request would
                         # stall long enough to flap gateway health.
@@ -1470,6 +1476,8 @@ _cascade_tail_tokens_arg = 1024
 _levers_arg = 0
 _seeded_rows_arg = False
 _compile_store_arg: str | None = None
+_compile_mode_arg = "max-autotune"
+_warm_truncated_arg = True
 
 
 @asynccontextmanager
@@ -1492,6 +1500,8 @@ async def lifespan(app: FastAPI):
         levers=_levers_arg,
         seeded_rows=_seeded_rows_arg,
         compile_store=_compile_store_arg,
+        compile_mode=_compile_mode_arg,
+        warm_truncated=_warm_truncated_arg,
     )
     try:
         yield
@@ -1749,13 +1759,13 @@ def build_and_warm_row_decoder(eng: "DecodeEngine", rows: int, kv_from: "MultiSa
         dec = build_cascade_decoder(eng, rows, cascade[0], cascade[1], kv_from)
     else:
         dec = MultiSampleDecoder(eng, rows, kv_from=kv_from, seeded=_seeded_rows)
-    dec.compile_step(mode="max-autotune")
+    dec.compile_step(mode=_compile_mode)
     with torch.inference_mode():
         params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2)
         trunc = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2, top_p=0.9, min_p=0.05)
         for plen in sorted({min(plen, eng.max_seq_len - 8) for plen in [16, 256]}):
             logits = eng.prefill(torch.randint(4, eng.config.vocab_size, (1, plen), device=eng.device))
-            for law in (params, trunc):  # the plain and the truncated (top-p / min-p) step variants
+            for law in (params, trunc) if _warm_truncated else (params,):  # plain (and truncated) step variants
                 dec.start(logits, law)
                 for _ in range(4):
                     dec.step(law)
@@ -2158,6 +2168,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "(kotodama.serve.compile_cache): a stored key is loaded before compiling (the compiles "
                              "become cache hits), a missing one is saved after warmup. Default $KOTODAMA_COMPILE_STORE; "
                              "unset = off")
+    parser.add_argument("--compile_mode", default="max-autotune",
+                        choices=["max-autotune", "reduce-overhead", "max-autotune-no-cudagraphs", "default"],
+                        help="torch.compile mode of the engine and the row decoders: max-autotune benchmarks kernel "
+                             "choices for every graph (slowest to start, fastest steps); reduce-overhead keeps the "
+                             "CUDA graphs and skips the benchmarking")
+    parser.add_argument("--warm_truncated", action=argparse.BooleanOptionalAction, default=True,
+                        help="Warmup compiles the truncated (top-p / min-p) step variants; --no-warm_truncated leaves "
+                             "each to its first request, which then waits for that compile")
     parser.add_argument("--seeded_rows", action=argparse.BooleanOptionalAction, default=False,
                         help="Row decoders draw each candidate's noise from its own seed and step: a request's 'seed' "
                              "then reproduces its candidates whatever shares their batch (up to kernel rounding of "
@@ -2260,6 +2278,8 @@ if __name__ == "__main__":
     _levers_arg = args.levers
     _seeded_rows_arg = args.seeded_rows
     _compile_store_arg = args.compile_store
+    _compile_mode_arg = args.compile_mode
+    _warm_truncated_arg = args.warm_truncated
 
     import uvicorn
 
