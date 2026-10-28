@@ -756,6 +756,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--steer", default="")
     ap.add_argument("--steer_rule", choices=["K", "N", "S"], default="K")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--model", default="",
+                    help="the OpenAI model field of every request (a gateway routes it to the pool serving that name)")
     ap.add_argument("--pin", default="",
                     help="every request of tree i carries the OpenAI user field PIN/tree-<i> (gateway affinity: one "
                          "tree, one replica and its prefix cache)")
@@ -786,8 +788,8 @@ def main(argv: list[str] | None = None) -> int:
                      novelty_prior=a.novelty_prior, deep_children=a.deep_children, rerolls=a.rerolls)
     sp = SelfPlayConfig(candidates=a.candidates, max_tokens=a.max_tokens, min_turns=a.min_turns,
                         cycle_window=a.cycle_window, template_window=a.template_window, template_max=a.template_max)
-    complete, close = oai_completer(a.endpoint, sampling, a.max_tokens, steer=parse_steer(a.steer) or None,
-                                    steer_rule=a.steer_rule)
+    complete, close = oai_completer(a.endpoint, sampling, a.max_tokens, model=a.model,
+                                    steer=parse_steer(a.steer) or None, steer_rule=a.steer_rule)
 
     score, close_score = http_scorer(a.endpoint) if a.select == "engage" else (None, None)
 
@@ -802,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = asyncio.run(go())
     (out / "run.json").write_text(json.dumps({"config": asdict(cfg), "sp": asdict(sp), "law": a.law, "sampling": sampling,
-                                              "pin": a.pin, "steer": parse_steer(a.steer),
+                                              "pin": a.pin, "model": a.model, "steer": parse_steer(a.steer),
                                               "steer_rule": a.steer_rule, "seed": a.seed, "seeds": a.seeds,
                                               "endpoints": a.endpoint, **summary}, indent=1))
     logger.info("done: %s", summary)

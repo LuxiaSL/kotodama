@@ -468,3 +468,26 @@ def test_run_pin_sends_one_user_per_tree(tmp_path) -> None:
     asyncio.run(loom.run(seeds, complete, cfg, SelfPlayConfig(min_turns=2), tmp_path, concurrency=3, seed=0,
                          pin="probe0"))
     assert users == {f"header {i}": {f"probe0/tree-{i:05d}"} for i in range(3)}
+
+
+def test_main_sends_the_model_field_and_records_it(tmp_path, monkeypatch) -> None:
+    seen = {}
+
+    def fake_completer(endpoints, sampling, max_tokens, **kw):
+        seen.update(kw)
+
+        async def complete(*a, **k):
+            return []
+
+        async def close():
+            return None
+
+        return complete, close
+
+    monkeypatch.setattr(loom, "oai_completer", fake_completer)
+    seeds = tmp_path / "seeds.jsonl"
+    seeds.write_text("")
+    out = tmp_path / "run"
+    assert loom.main(["--seeds", str(seeds), "--endpoint", "http://x", "--out", str(out), "--model", "pool-b"]) == 0
+    assert seen["model"] == "pool-b"
+    assert json.loads((out / "run.json").read_text())["model"] == "pool-b"
