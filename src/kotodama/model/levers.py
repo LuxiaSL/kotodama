@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import math
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterable, Literal, Mapping, Optional, Sequence
 
@@ -252,3 +253,85 @@ def rule_n_norms(norms: Sequence[float] | Mapping[int, float], n_layers: int) ->
     if bad:
         raise LeverError(f"partial norms missing, non-finite or <= 0 at layers {bad[:5]}")
     return out
+
+
+CAPTURE_SITES: tuple[str, ...] = ("partial_post_attn", "mlp_in")
+
+
+class _Taps:
+    """What one module's eager forwards recorded at the tapped layers, in call order."""
+
+    def __init__(self, layers: Sequence[int], what: Sequence[str]) -> None:
+        self.layers = frozenset(int(x) for x in layers)
+        self.what = tuple(what)
+        self.records: dict[str, dict[int, list[torch.Tensor]]] = {w: {L: [] for L in self.layers} for w in self.what}
+
+    def record(self, layer: int, partial: torch.Tensor, x_mlp: torch.Tensor) -> None:
+        if layer not in self.layers:
+            return
+        for w, t in (("partial_post_attn", partial), ("mlp_in", x_mlp)):
+            if w in self.records:
+                self.records[w][layer].append(t.detach().float().clone())
+
+    def stacked(self) -> dict[str, dict[int, torch.Tensor]]:
+        """Per site and layer, every recorded call concatenated along the position axis: (B, positions, hidden)."""
+        return {w: {L: torch.cat(ts, dim=1) if ts else torch.empty(0) for L, ts in per.items()}
+                for w, per in self.records.items()}
+
+
+class Capture:
+    """The result of ``capture``: ``engine[what][layer]`` is (1, positions, hidden) over the engine's prefill and
+    steps, ``rows(dec)[what][layer]`` is (B, steps, hidden) over a decoder's steps, all float32, in position order."""
+
+    def __init__(self, engine_taps: _Taps, dec_taps: dict[int, _Taps]) -> None:
+        self._engine_taps = engine_taps
+        self._dec_taps = dec_taps
+
+    @property
+    def engine(self) -> dict[str, dict[int, torch.Tensor]]:
+        return self._engine_taps.stacked()
+
+    def rows(self, dec: torch.nn.Module) -> dict[str, dict[int, torch.Tensor]]:
+        try:
+            return self._dec_taps[id(dec)].stacked()
+        except KeyError:
+            raise LeverError("that decoder was not captured") from None
+
+    def sequence(self, what: str, layer: int, dec: Optional[torch.nn.Module] = None, row: int = 0) -> torch.Tensor:
+        """One row's whole sequence (positions, hidden): the engine's positions (its prefill, when the row was
+        admitted from it) followed by the row's decode steps in ``dec``."""
+        parts = [self.engine[what][layer][0]] if self._engine_taps.records[what][layer] else []
+        if dec is not None:
+            parts.append(self.rows(dec)[what][layer][row])
+        if not parts:
+            raise LeverError(f"nothing recorded for {what} at layer {layer}")
+        return torch.cat(parts, dim=0)
+
+
+@contextmanager
+def capture(engine: torch.nn.Module, *decoders: torch.nn.Module, layers: Sequence[int],
+            what: Sequence[str] = CAPTURE_SITES):
+    """Record the post-attention partial (after any lever or steering write; the partial the MLP routing reads)
+    and the MLP input (post-``ffn_norm``) at effective ``layers``, at every position the engine and ``decoders``
+    forward inside the block. Inside it every forward runs EAGER (compiled graphs carry no taps): an engine prefill
+    is one eager block forward over the prompt, a step the eager step. Capture one engine prefill per block, so
+    ``Capture.sequence`` can join it to the rows admitted from it."""
+    bad = [w for w in what if w not in CAPTURE_SITES]
+    if bad:
+        raise LeverError(f"unknown capture sites {bad}; choose from {CAPTURE_SITES}")
+    n = engine.n_layers
+    if any(not 0 <= int(x) < n for x in layers):
+        raise LeverError(f"capture layers {list(layers)} outside [0, {n})")
+    mods = [engine, *decoders]
+    if any(m._taps is not None for m in mods):
+        raise LeverError("a capture is already active on this engine or decoder")
+    eng_taps = _Taps(layers, what)
+    dec_taps = {id(d): _Taps(layers, what) for d in decoders}
+    engine._taps = eng_taps
+    for d in decoders:
+        d._taps = dec_taps[id(d)]
+    try:
+        yield Capture(eng_taps, dec_taps)
+    finally:
+        for m in mods:
+            m._taps = None

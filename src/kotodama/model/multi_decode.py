@@ -51,7 +51,8 @@ class MultiSampleDecoder(nn.Module):
     time; the server runs one at a time.
     """
 
-    def __init__(self, engine: DecodeEngine, rows: int, kv_from: Optional["MultiSampleDecoder"] = None) -> None:
+    def __init__(self, engine: DecodeEngine, rows: int, kv_from: Optional["MultiSampleDecoder"] = None,
+                 readout_k: int = 0, capture_layers: Sequence[int] = ()) -> None:
         super().__init__()
         if rows < 2:
             raise ValueError(f"rows must be >= 2 (one row is the engine's own path), got {rows}")
@@ -75,9 +76,33 @@ class MultiSampleDecoder(nn.Module):
         if engine.levers is not None:
             self.register_buffer("row_slots", torch.zeros((self.rows,), device=dev, dtype=torch.long),
                                  persistent=False)
+        # Per-step readouts (readout_k > 0, a trace-time constant): each row's chosen token's logprob and the top-k
+        # tokens with their logprobs, all under the model's own next-token distribution (log-softmax of the raw
+        # logits, before penalty and temperature), written in-graph at every step for the token that step chose.
+        self.readout_k = int(readout_k)
+        if self.readout_k > 0:
+            self.register_buffer("step_logprob", torch.zeros((self.rows,), device=dev, dtype=torch.float32),
+                                 persistent=False)
+            self.register_buffer("step_top_ids", torch.zeros((self.rows, self.readout_k), device=dev,
+                                                             dtype=torch.long), persistent=False)
+            self.register_buffer("step_top_lps", torch.zeros((self.rows, self.readout_k), device=dev,
+                                                             dtype=torch.float32), persistent=False)
+        # MLP-input capture (capture_layers, a trace-time constant): the post-ffn_norm vector each step feeds the
+        # MLP of these effective layers, kept for the step's input token (the last forced prompt token after
+        # ``force``). Every neuron's activation there is silu(W_gate x) * (W_up x).
+        self.capture_layers = tuple(int(x) for x in capture_layers)
+        if any(not 0 <= x < self.n_layers for x in self.capture_layers):
+            raise ValueError(f"capture_layers {self.capture_layers} outside [0, {self.n_layers})")
+        if self.capture_layers:
+            self.register_buffer("mlp_in", torch.zeros((self.rows, len(self.capture_layers), engine.hidden),
+                                                       device=dev, dtype=engine.dtype), persistent=False)
         self._cur_temp, self._cur_rp = 0.9, 1.2
         self._pos_host = [0] * self.rows  # host mirror of pos (no device syncs for capacity checks)
         self._compiled_step = None
+        self._compiled_greedy = None
+        self._greedy = False
+        # Eager taps (kotodama.model.levers.capture): None outside a capture; a compiled step never runs inside one.
+        self._taps = None
         logger.info("%s: %d rows, kv cache %.0f MB%s", type(self).__name__, self.rows, self.kv_bytes() / 1e6,
                     f" (shared with the {kv_from.rows}-row decoder)" if kv_from is not None else "")
 
@@ -176,7 +201,12 @@ class MultiSampleDecoder(nn.Module):
             if eng.steer_enabled:
                 partial = partial + eng.steer_buf[ls.layer_idx]
             h_mlp = eng._route(committed + [partial], layer.mlp_res_query, layer.mlp_res_norm.weight)
-            gu = F.linear(layer.ffn_norm(h_mlp), eng.w_gate_ups[ls.layer_idx])
+            x_mlp = layer.ffn_norm(h_mlp)
+            if ls.layer_idx in self.capture_layers:
+                self.mlp_in[:, self.capture_layers.index(ls.layer_idx)] = x_mlp[:, 0]
+            if self._taps is not None:
+                self._taps.record(ls.layer_idx, partial, x_mlp)
+            gu = F.linear(x_mlp, eng.w_gate_ups[ls.layer_idx])
             gate, up = gu.split(eng.config.intermediate_size, dim=-1)
             mlp_out = F.linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
             if eng.levers is not None:
@@ -188,16 +218,26 @@ class MultiSampleDecoder(nn.Module):
         self._advance_step()
         return logits[:, -1]
 
-    def _sample_rows(self, logits: torch.Tensor) -> torch.Tensor:
-        """Per-row repetition penalty over the row's own presence set, then Gumbel-max at 1/inv_temp."""
-        logits = logits.float()
+    def _sample_rows(self, logits: torch.Tensor, greedy: bool = False) -> torch.Tensor:
+        """Per-row repetition penalty over the row's own presence set, then Gumbel-max at 1/inv_temp (``greedy``:
+        the argmax of the penalized logits)."""
+        raw = logits.float()
         rp = self.rep_penalty
-        penalized = torch.where(logits > 0, logits / rp, logits * rp)
-        logits = torch.where(self.presence, penalized, logits)
-        scaled = logits * self.inv_temp
-        u = torch.rand_like(scaled)
-        gumbel = -torch.log((-torch.log(u.clamp_min(1e-20))).clamp_min(1e-20))
-        nxt = (scaled + gumbel).argmax(dim=-1, keepdim=True)  # (B, 1)
+        penalized = torch.where(raw > 0, raw / rp, raw * rp)
+        logits = torch.where(self.presence, penalized, raw)
+        if greedy:
+            nxt = logits.argmax(dim=-1, keepdim=True)  # (B, 1)
+        else:
+            scaled = logits * self.inv_temp
+            u = torch.rand_like(scaled)
+            gumbel = -torch.log((-torch.log(u.clamp_min(1e-20))).clamp_min(1e-20))
+            nxt = (scaled + gumbel).argmax(dim=-1, keepdim=True)  # (B, 1)
+        if self.readout_k > 0:
+            lp = torch.log_softmax(raw, dim=-1)
+            self.step_logprob.copy_(lp.gather(1, nxt).view(-1))
+            top_lp, top_id = lp.topk(self.readout_k, dim=-1)
+            self.step_top_ids.copy_(top_id)
+            self.step_top_lps.copy_(top_lp)
         self.presence.scatter_(1, nxt, True)
         self.cur_tokens.copy_(nxt)
         return self.cur_tokens
@@ -205,11 +245,20 @@ class MultiSampleDecoder(nn.Module):
     def _step_sampled(self, tokens: torch.Tensor) -> torch.Tensor:
         return self._sample_rows(self._forward_step(tokens))
 
+    def _step_greedy(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self._sample_rows(self._forward_step(tokens), greedy=True)
+
     # ── public API ──────────────────────────────────────────────────────────
 
     def _sync_sampling(self, params: SamplingParams) -> None:
-        if not self.supports(params):
-            raise ValueError("MultiSampleDecoder samples pure-temperature laws only (temperature > 0, no top-k/top-p)")
+        if params.truncated or params.temperature < 0.0:
+            raise ValueError("MultiSampleDecoder samples pure-temperature laws only (temperature >= 0, no top-k/top-p)")
+        self._greedy = params.temperature == 0.0
+        if self._greedy:  # the argmax variant, inv_temp unused
+            if params.repetition_penalty != self._cur_rp:
+                self.rep_penalty.fill_(params.repetition_penalty)
+                self._cur_rp = params.repetition_penalty
+            return
         if params.temperature != self._cur_temp:
             self.inv_temp.fill_(1.0 / params.temperature)
             self._cur_temp = params.temperature
@@ -312,10 +361,20 @@ class MultiSampleDecoder(nn.Module):
         n = len(rows)
         self.pos.index_fill_(0, idx, pos)
         # A fresh row's presence set is empty, so the penalty is the identity on its first token.
-        scaled = prefill_logits.reshape(1, -1).float().expand(n, -1) * self.inv_temp
-        u = torch.rand_like(scaled)
-        gumbel = -torch.log((-torch.log(u.clamp_min(1e-20))).clamp_min(1e-20))
-        first = (scaled + gumbel).argmax(dim=-1, keepdim=True)  # (n, 1)
+        raw = prefill_logits.reshape(1, -1).float().expand(n, -1)
+        if self._greedy:
+            first = raw.argmax(dim=-1, keepdim=True)  # (n, 1)
+        else:
+            scaled = raw * self.inv_temp
+            u = torch.rand_like(scaled)
+            gumbel = -torch.log((-torch.log(u.clamp_min(1e-20))).clamp_min(1e-20))
+            first = (scaled + gumbel).argmax(dim=-1, keepdim=True)  # (n, 1)
+        if self.readout_k > 0:
+            lp = torch.log_softmax(raw, dim=-1)
+            top_lp, top_id = lp.topk(self.readout_k, dim=-1)
+            self.step_logprob.index_copy_(0, idx, lp.gather(1, first).view(-1))
+            self.step_top_ids.index_copy_(0, idx, top_id)
+            self.step_top_lps.index_copy_(0, idx, top_lp)
         self.presence.index_fill_(0, idx, False)
         self.presence.index_put_((idx, first.view(-1)), torch.ones(n, dtype=torch.bool, device=idx.device))
         self.cur_tokens.index_copy_(0, idx, first)
@@ -331,16 +390,63 @@ class MultiSampleDecoder(nn.Module):
 
     @torch.inference_mode()
     def step(self, params: SamplingParams) -> torch.Tensor:
-        """Feed every row its last token, sample the next. Returns cur_tokens (B, 1)."""
+        """Feed every row its last token, sample the next (temperature 0: the argmax). Returns cur_tokens (B, 1)."""
         self._sync_sampling(params)
-        fn = self._compiled_step or self._step_sampled
+        greedy = params.temperature == 0.0
+        if self._taps is not None:
+            fn = self._step_greedy if greedy else self._step_sampled
+        elif greedy:
+            fn = self._compiled_greedy or self._step_greedy
+        else:
+            fn = self._compiled_step or self._step_sampled
         out = fn(self.cur_tokens)
         self._advance_host()
         return out
 
     @torch.inference_mode()
+    def admit_empty(self, slots: Optional[Sequence[int] | int] = None) -> None:
+        """Start EVERY row from an empty cache at position 0, each reading its lever slot from its first position:
+        the prompt is then fed through the decode step (``force``), so a uniform lever writes each row's prompt
+        under its own lever, as the eager reference writes every position. Rows hold no shared prompt."""
+        rows = list(range(self.rows))
+        self.set_slots(rows, slots)
+        self.release(rows)
+        idx = torch.arange(self.rows, device=self.pos.device)
+        self.pos.zero_()
+        self.presence.zero_()
+        self._pos_host = [0] * self.rows
+        self._admit_empty_storage(idx)
+
+    def _admit_empty_storage(self, idx: torch.Tensor) -> None:
+        """Per-decoder storage for rows starting from an empty cache: every position closed in the mask (each step
+        opens its own)."""
+        self.attn_bias.fill_(float("-inf"))
+
+    @torch.inference_mode()
+    def force(self, prompt: torch.Tensor, params: SamplingParams) -> list[int]:
+        """Feed every row the tokens of ``prompt`` ((B, S) or (1, S), one prompt for every row) through the decode
+        step, after ``admit_empty``. The step at the last prompt token samples each row's first generated token
+        under ``params`` (its readouts, when built with readout_k, are that token's); presence then holds only that
+        token. Returns the first tokens."""
+        if prompt.ndim != 2 or prompt.shape[0] not in (1, self.rows) or prompt.shape[1] < 1:
+            raise ValueError(f"prompt must be (1, S) or ({self.rows}, S), got {tuple(prompt.shape)}")
+        S = prompt.shape[1]
+        if any(p + S >= self.max_seq_len for p in self._pos_host) or not all(self._room_for(S)):
+            raise ValueError(f"a {S}-token prompt does not fit the rows' caches")
+        prompt = prompt.to(self.pos.device).expand(self.rows, S)
+        for t in range(S):
+            if t == S - 1:
+                self.presence.zero_()  # the tokens sampled at earlier prompt positions were never generated
+            self.cur_tokens.copy_(prompt[:, t:t + 1])
+            self.step(params)
+        return self.cur_tokens.view(-1).tolist()
+
+    def _room_for(self, n: int) -> list[bool]:
+        return [True] * self.rows
+
+    @torch.inference_mode()
     def step_logits(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Forward only (parity testing): tokens (B, 1) -> logits (B, V), eager."""
+        """Forward only (parity testing, captures): tokens (B, 1) -> logits (B, V), eager."""
         out = self._forward_step(tokens)
         self._advance_host()
         return out
@@ -356,6 +462,8 @@ class MultiSampleDecoder(nn.Module):
             torch._dynamo.mark_static_address(buf)
         self._compiled_step = torch.compile(self._step_sampled, mode=mode, fullgraph=True,
                                             dynamic=self._compile_dynamic)
+        self._compiled_greedy = torch.compile(self._step_greedy, mode=mode, fullgraph=True,
+                                              dynamic=self._compile_dynamic)
 
     # torch.compile's ``dynamic``: None lets a second bucket width recompile the shared step function with symbolic
     # row counts (automatic dynamic shapes).
@@ -406,7 +514,8 @@ class CascadeDecoder(MultiSampleDecoder):
     """
 
     def __init__(self, engine: DecodeEngine, rows: int, groups: int = 0, group_rows: int = 0,
-                 tail_tokens: int = 1024, kv_from: Optional["CascadeDecoder"] = None) -> None:
+                 tail_tokens: int = 1024, kv_from: Optional["CascadeDecoder"] = None, readout_k: int = 0,
+                 capture_layers: Sequence[int] = ()) -> None:
         groups = int(groups) or max(1, int(rows) // 4)
         group_rows = int(group_rows) or min(int(rows), 32)
         if not 1 <= groups <= rows or not 1 <= group_rows <= rows:
@@ -418,7 +527,7 @@ class CascadeDecoder(MultiSampleDecoder):
             raise ValueError("kv_from must be a CascadeDecoder with the same tail_tokens and >= as many groups")
         # read by _alloc_kv, which the base constructor calls
         self.__dict__["_cascade_shape"] = (groups, group_rows, int(tail_tokens))
-        super().__init__(engine, rows, kv_from=kv_from)
+        super().__init__(engine, rows, kv_from=kv_from, readout_k=readout_k, capture_layers=capture_layers)
         self.attend_backend, self._attend_fn = attend_for(engine.device, engine.dtype)
         self._row_group = [-1] * self.rows  # host: the group each row reads its prompt from (-1: none)
         self._group_members: list[set[int]] = [set() for _ in range(self.groups)]
@@ -492,6 +601,32 @@ class CascadeDecoder(MultiSampleDecoder):
 
     def row_full(self, row: int) -> bool:
         return super().row_full(row) or self._tail_host[row] >= self.tail_tokens
+
+    def _admit_empty_storage(self, idx: torch.Tensor) -> None:
+        """Every row joins a group whose prompt is empty (length 0: the shared pass gives it no weight), so the
+        whole sequence, prompt included, lives in the row's own tail."""
+        m = self.group_rows
+        rows = idx.tolist()
+        chunks = [rows[i:i + m] for i in range(0, len(rows), m)]
+        if len(chunks) > self.groups:
+            raise RuntimeError(f"{len(rows)} rows need {len(chunks)} groups, the decoder has {self.groups}")
+        dev = self.pos.device
+        slots = {}
+        for g, chunk in enumerate(chunks):
+            for i, r in enumerate(chunk):
+                slots[r] = g * m + i
+                self._row_group[r] = g
+            self._group_members[g] = set(chunk)
+            self._group_len[g] = 0
+        self.prompt_lens.zero_()
+        self.members.copy_(torch.tensor([c + [c[0]] * (m - len(c)) for c in chunks]
+                                        + [[0] * m] * (self.groups - len(chunks)), device=dev, dtype=torch.long))
+        self.row_slot.copy_(torch.tensor([slots[r] for r in rows], device=dev, dtype=torch.long))
+        self.tail_pos.zero_()
+        self._tail_host = [0] * self.rows
+
+    def _room_for(self, n: int) -> list[bool]:
+        return [t + n < self.tail_tokens for t in self._tail_host]
 
     def token_room(self, prompt_len: int) -> int:
         return min(super().token_room(prompt_len), self.tail_tokens)

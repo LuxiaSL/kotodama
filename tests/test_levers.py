@@ -338,3 +338,98 @@ def test_engine_without_tables_refuses_slots(model: KotodamaModel) -> None:
     dec = MultiSampleDecoder(eng, ROWS)
     with pytest.raises(RuntimeError):
         dec.set_slots([0], [1])
+
+
+# ── forced prompts, greedy rows, readouts, captures ─────────────────────────
+
+
+@pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])
+@torch.inference_mode()
+def test_forced_prompts_write_uniform_levers_per_row(model: KotodamaModel, cls) -> None:
+    """admit_empty + force: every row writes its own prompt under its own lever; the decode that follows matches
+    the eager hooks of that lever over prompt + continuation."""
+    plans = _plans()
+    eng = _engine(model, levers=3)
+    s1 = eng.levers.bind(plans["attn-K-uniform"])
+    s2 = eng.levers.bind(plans["mlp-pass1"])
+    slots = [s1, 0, s2, 0]
+    prompt = _ids(9, 12)
+    forced = torch.cat([_ids(6, 40 + r) for r in range(ROWS)])
+    dec = _dec(cls, eng)
+    dec.admit_empty(slots)
+    dec.force(prompt, SamplingParams(temperature=0.0, repetition_penalty=1.0))
+    got = torch.stack([dec.step_logits(forced[:, t:t + 1]).float() for t in range(forced.shape[1] - 1)], dim=1)
+    for r, s in enumerate(slots):
+        plan = eng.levers.plan(s) or LeverPlan(attn={0: np.zeros(H, np.float32)})
+        want = _oracle_logits(model, plan, prompt, forced[r:r + 1])[1:]
+        torch.testing.assert_close(got[r], want, **TOL)
+
+
+@pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])
+@torch.inference_mode()
+def test_greedy_rows_and_readouts(model: KotodamaModel, cls) -> None:
+    """Temperature 0 decodes the argmax; the readouts are the chosen token's logprob and the top-k under the
+    model's own distribution, for the first token (from the prefill) and every step after."""
+    eng = _engine(model, levers=2)
+    s = eng.levers.bind(_plans()["attn-K-decode"])
+    dec = cls(eng, ROWS, tail_tokens=32, readout_k=3) if cls is CascadeDecoder else cls(eng, ROWS, readout_k=3)
+    prompt = _ids(10, 13)
+    params = SamplingParams(temperature=0.0, repetition_penalty=1.0)
+    slots = [s, 0, s, 0]
+    dec.admit(list(range(ROWS)), eng.prefill(prompt), params, slots=slots)
+    toks = [dec.cur_tokens.view(-1).tolist()]
+    lps = [dec.step_logprob.clone()]
+    tops = [dec.step_top_ids.clone()]
+    for _ in range(5):
+        toks.append(dec.step(params).view(-1).tolist())
+        lps.append(dec.step_logprob.clone())
+        tops.append(dec.step_top_ids.clone())
+    for r in range(ROWS):
+        gen = torch.tensor([[t[r] for t in toks]])
+        plan = eng.levers.plan(slots[r]) or LeverPlan(attn={0: np.zeros(H, np.float32)}, span="decode")
+        want = _oracle_logits(model, plan, prompt, gen)  # logits for each generated token
+        want = torch.cat([want, want[-1:]])[: gen.shape[1]]
+        lp = torch.log_softmax(want, -1)
+        assert gen[0].tolist() == want.argmax(-1).tolist(), r
+        torch.testing.assert_close(torch.stack([x[r] for x in lps]), lp.gather(1, gen.view(-1, 1)).view(-1),
+                                   atol=1e-4, rtol=1e-4)
+        assert torch.stack([x[r] for x in tops]).tolist() == lp.topk(3, -1).indices.tolist()
+
+
+@torch.inference_mode()
+def test_capture_matches_the_instrumented_forward(model: KotodamaModel) -> None:
+    from kotodama.model.capture import instrumented_forward
+    from kotodama.model.levers import capture
+
+    eng = _engine(model, levers=1)
+    prompt, cont = _ids(10, 14), _ids(4, 15)
+    layers = [2, 4, 7]
+    with capture(eng, layers=layers) as cap:
+        eng.prefill(prompt)
+        for t in range(cont.shape[1]):
+            eng.step_logits(cont[:, t:t + 1])
+    ref = instrumented_forward(model, torch.cat([prompt, cont], dim=1), light=True)[1]["residual_partial"]
+    for L in layers:
+        got = cap.sequence("partial_post_attn", L)
+        torch.testing.assert_close(got, ref[2 * L][0].float(), **TOL)
+        assert cap.sequence("mlp_in", L).shape == got.shape
+    assert eng._taps is None
+
+
+@torch.inference_mode()
+def test_decoder_capture_buffer_holds_the_last_prompt_mlp_input(model: KotodamaModel) -> None:
+    from kotodama.model.levers import capture
+
+    eng = _engine(model, levers=2)
+    s = eng.levers.bind(_plans()["attn-K-uniform"])
+    dec = MultiSampleDecoder(eng, ROWS, capture_layers=(4, 7))
+    prompt = _ids(8, 16)
+    with capture(eng, dec, layers=[4, 7], what=("mlp_in",)) as cap:
+        dec.admit_empty([s, 0, s, 0])
+        dec.force(prompt, SamplingParams(temperature=0.0, repetition_penalty=1.0))
+    rows = cap.rows(dec)["mlp_in"]
+    for i, L in enumerate((4, 7)):
+        torch.testing.assert_close(dec.mlp_in[:, i].float(), rows[L][:, -1], atol=0, rtol=0)
+    assert not torch.allclose(dec.mlp_in[0], dec.mlp_in[1])  # the uniform lever changed the prompt's last state
+    # identity rows at different batch positions: equal up to how the batched GEMM rounds by row
+    torch.testing.assert_close(dec.mlp_in[1], dec.mlp_in[3], **TOL)

@@ -261,6 +261,8 @@ class DecodeEngine(nn.Module):
         # Digest of the uniform lever that wrote the prompt KV in the cache (None: unsteered). A cached prefix is
         # reused only by a request of the same lever.
         self._kv_lever: Optional[str] = None
+        # Eager taps (kotodama.model.levers.capture): None outside a capture; compiled graphs never run inside one.
+        self._taps = None
 
         # ── Fused projection weights (decode-only) ──────────────────────────
         # QKV and gate/up merges: fewer, larger GEMVs. Output rows are
@@ -522,7 +524,10 @@ class DecodeEngine(nn.Module):
             partial = partial + attn_out
 
             h_mlp = self._route(committed + [partial], layer.mlp_res_query, layer.mlp_res_norm.weight)
-            gu = self._linear(layer.ffn_norm(h_mlp), self.w_gate_ups[ls.layer_idx])
+            x_mlp = layer.ffn_norm(h_mlp)
+            if self._taps is not None:
+                self._taps.record(ls.layer_idx, partial, x_mlp)
+            gu = self._linear(x_mlp, self.w_gate_ups[ls.layer_idx])
             gate, up = gu.split(self.config.intermediate_size, dim=-1)
             mlp_out = self._linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
             if self.levers is not None:
@@ -586,7 +591,10 @@ class DecodeEngine(nn.Module):
 
             # Pre-MLP routing.
             h_mlp = self._route(committed + [partial], layer.mlp_res_query, layer.mlp_res_norm.weight)
-            gu = self._linear(layer.ffn_norm(h_mlp), self.w_gate_ups[ls.layer_idx])
+            x_mlp = layer.ffn_norm(h_mlp)
+            if self._taps is not None:
+                self._taps.record(ls.layer_idx, partial, x_mlp)
+            gu = self._linear(x_mlp, self.w_gate_ups[ls.layer_idx])
             gate, up = gu.split(self.config.intermediate_size, dim=-1)
             mlp_out = self._linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
             if self.levers is not None:
@@ -895,9 +903,17 @@ class DecodeEngine(nn.Module):
         pslot, digest = self._prompt_slot(slot)
         plan = (
             self._chunk_plan(0, prompt_len)
-            if self._compiled_block is not None and prompt_len <= self.block_span_max
+            if self._compiled_block is not None and prompt_len <= self.block_span_max and self._taps is None
             else None
         )
+        if self._taps is not None:  # one eager block over the whole prompt, so every position is tapped once
+            if self.levers is not None:
+                self.lever_slot.fill_(pslot)
+            logits = self._run_chunks(input_ids.to(self.device), [(0, prompt_len)], eager=True)
+            self.prompt_kv_len = 0 if pslot else prompt_len
+            self._kv_lever = digest
+            self._arm_decode_slot(slot)
+            return logits
         if pslot:
             self.lever_slot.fill_(pslot)
             if plan is None:
@@ -1186,7 +1202,7 @@ class DecodeEngine(nn.Module):
         # pure-temperature graph is byte-identical to before they existed.
         # (At temperature 0 server.py argmaxes BEFORE truncation, so truncation
         # is a no-op there — the greedy path below is correct for all laws.)
-        if params.temperature > 0.0:
+        if params.temperature > 0.0 and self._taps is None:
             fused = (
                 self._compiled_step_truncated if params.truncated else self._compiled_step_sampled
             )
@@ -1195,7 +1211,8 @@ class DecodeEngine(nn.Module):
                 out = fused(token)
                 self._pos_cpu += 1
                 return out
-        forward = self._compiled_forward or self._forward_step
+        forward = self._compiled_forward if self._compiled_forward is not None and self._taps is None \
+            else self._forward_step
         logits = forward(token)
         self._pos_cpu += 1
         next_token = self._sample(logits, params)
@@ -1211,7 +1228,8 @@ class DecodeEngine(nn.Module):
         before stepping again.
         """
         self._check_capacity()
-        forward = self._compiled_forward or self._forward_step
+        forward = self._compiled_forward if self._compiled_forward is not None and self._taps is None \
+            else self._forward_step
         out = forward(token)
         self._pos_cpu += 1
         return out
