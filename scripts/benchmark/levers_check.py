@@ -89,7 +89,7 @@ def section_identity(a: argparse.Namespace, tok, plain, plain_decs, lev, lev_dec
         same_prefill = bool(torch.equal(la, lb))
         same_fwd = True
         for t in range(forced.shape[1]):
-            x = forced[:, t:t + 1].contiguous()
+            x = forced[:, t:t + 1].clone()  # a fresh offset-0 tensor: a slice's offset would recompile per step
             fa = plain.step_logits(x).clone()
             fb = lev.step_logits(x).clone()
             same_fwd &= bool(torch.equal(fa, fb))
