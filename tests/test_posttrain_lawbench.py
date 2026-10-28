@@ -161,9 +161,11 @@ def test_generate_rows_requests_and_resume(tmp_path: Path) -> None:
     assert [p.kind for p in panels] == ["completion", "dialogue"]
     out = tmp_path / "run"
     cfg = lb.GenConfig(max_turns=4)
-    stats = asyncio.run(lb.generate(cells, panels, "http://gw:1", out, cfg, 8, transport=_mock_server(seen)))
+    stats = asyncio.run(lb.generate(cells, panels, "http://gw:1", out, cfg, 8, transport=_mock_server(seen),
+                                    stamp={"engine": "abc", "regional": "true"}))
     assert stats["done"] == 6 and stats["failed"] == 0
     rows = lb.read_jsonl(out / "gen" / "seed.jsonl")
+    assert all(r["prov"] == {"engine": "abc", "regional": "true"} for r in rows)
     assert {(r["cell"], r["item"]) for r in rows} == {(c, i) for c in ("base", "v") for i in ("p0", "p1")}
     assert all(len(r["draws"]) == 2 and r["draws"][0]["ended_by"] == "eos" for r in rows)
     first = [b for b in seen if b["prompt"] == "Once"]

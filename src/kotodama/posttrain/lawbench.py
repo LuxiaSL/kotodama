@@ -303,9 +303,11 @@ async def gen_dialogue(item: dict[str, Any], complete: Any, cfg: GenConfig, user
 
 
 async def generate(cells: list[Cell], panels: list[Panel], endpoint: str, out: Path, cfg: GenConfig,
-                   concurrency: int, limit: int = 0, transport: Any = None) -> dict[str, Any]:
+                   concurrency: int, limit: int = 0, transport: Any = None,
+                   stamp: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Every (cell, panel item) not yet in ``out/gen/<panel>.jsonl``; items of a panel are taken in file order
-    (``limit`` > 0: the first ``limit``). Jobs interleave cells, so a partial run covers every cell evenly."""
+    (``limit`` > 0: the first ``limit``). Jobs interleave cells, so a partial run covers every cell evenly. ``stamp``:
+    provenance (engine commit, engine flags) written into every row as ``prov``."""
     (out / "gen").mkdir(parents=True, exist_ok=True)
     have_cells = {c["id"]: c for c in read_jsonl(out / "cells.jsonl")}
     for c in cells:
@@ -352,7 +354,8 @@ async def generate(cells: list[Cell], panels: list[Panel], endpoint: str, out: P
                 stats["failed"] += 1
                 logger.error("%s / %s / %s failed: %r", p.name, c.id, it["id"], e)
                 return
-        files[p.name].write(json.dumps({"panel": p.name, "kind": p.kind, "cell": c.id, "item": it["id"], **body},
+        files[p.name].write(json.dumps({"panel": p.name, "kind": p.kind, "cell": c.id, "item": it["id"], **body,
+                                        **({"prov": stamp} if stamp else {})},
                                        ensure_ascii=False) + "\n")
         files[p.name].flush()
         stats["done"] += 1
@@ -708,6 +711,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--concurrency", type=int, default=256)
     g.add_argument("--max_turns", type=int, default=GenConfig.max_turns)
     g.add_argument("--expect_name", default="", help="refuse unless the endpoint's /info name is this")
+    g.add_argument("--stamp", action="append", default=[], help="key=value provenance written into every row")
     f = sub.add_parser("fluency")
     f.add_argument("run")
     f.add_argument("--panel", action="append", required=True)
@@ -741,7 +745,11 @@ def main(argv: list[str] | None = None) -> int:
             keep = set(a.only.split(","))
             cells = [c for c in cells if c.id in keep]
         cfg = GenConfig(max_turns=a.max_turns)
-        stats = asyncio.run(generate(cells, _panels(a.panel), a.endpoint, Path(a.out), cfg, a.concurrency, a.limit))
+        if not all("=" in kv for kv in a.stamp):
+            raise SystemExit("--stamp takes key=value")
+        stamp = dict(kv.split("=", 1) for kv in a.stamp) or None
+        stats = asyncio.run(generate(cells, _panels(a.panel), a.endpoint, Path(a.out), cfg, a.concurrency, a.limit,
+                                     stamp=stamp))
         logger.info("done: %s", stats)
         return 1 if stats["failed"] else 0
     panels = {p.name: p for p in _panels(a.panel)}
