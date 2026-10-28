@@ -270,6 +270,10 @@ class DecodeEngine(nn.Module):
         # Digest of the uniform lever that wrote the prompt KV in the cache (None: unsteered). A cached prefix is
         # reused only by a request of the same lever.
         self._kv_lever: Optional[str] = None
+        # Where the positions the last prefill wrote end, and whether the decode steps since then ran on a lever
+        # slot: those steps wrote steered KV past that point, which no later prompt may reuse.
+        self._prefill_end = 0
+        self._gen_steered = False
         # Eager taps (kotodama.model.levers.capture): None outside a capture; compiled graphs never run inside one.
         self._taps = None
 
@@ -735,6 +739,8 @@ class DecodeEngine(nn.Module):
             self.k_caches[li].zero_()
             self.v_caches[li].zero_()
         self._kv_lever = None
+        self._prefill_end = 0
+        self._gen_steered = False
         if self.levers is not None:
             self.lever_slot.zero_()
         # NOTE: steer_buf is deliberately NOT cleared here — it is per-request
@@ -884,9 +890,12 @@ class DecodeEngine(nn.Module):
         return slot, self.levers.plan(slot).digest()
 
     def _arm_decode_slot(self, slot: int) -> None:
-        """The slot the single-stream decode step reads from here on: the request's lever, whatever its span."""
+        """The slot the single-stream decode step reads from here on: the request's lever, whatever its span. Called
+        at the end of every prefill, so it also records where the prefill-written positions end."""
+        self._prefill_end = self._pos_cpu
         if self.levers is not None:
             self.lever_slot.fill_(int(slot))
+            self._gen_steered = bool(slot)
 
     @torch.inference_mode()
     def prefill(self, input_ids: torch.Tensor, slot: int = 0) -> torch.Tensor:
@@ -1021,8 +1030,11 @@ class DecodeEngine(nn.Module):
 
         ``slot``: the request's lever, as in prefill(). A cached prefix is
         reused only when the lever that wrote it (none, or the same uniform
-        lever by content digest) is the one this prompt is written with; a
-        uniform lever's extend runs the block forward, which reads its slot.
+        lever by content digest) is the one this prompt is written with, and
+        never past the previous prompt when that request decoded on a lever
+        (its generated positions hold steered KV); a uniform lever's extend
+        runs the block forward, which reads its slot. Inside a capture every
+        prompt is a full eager prefill.
 
         Returns (last-position logits (1, V) float32, info dict with
         prefix_hit / common_prefix / suffix_len for observability).
@@ -1042,6 +1054,10 @@ class DecodeEngine(nn.Module):
         common = min(self._common_prefix_len(input_ids), prompt_len - 1)
         if digest != self._kv_lever:
             common = 0  # the cached prompt KV was written under another lever
+        if self._gen_steered:
+            common = min(common, self._prefill_end)  # the decode steps after it wrote steered KV
+        if self._taps is not None:
+            common = 0  # a capture taps every position: one eager prefill of the whole prompt
         if common < self.min_cached_prefix or (pslot and self._compiled_block is None):
             logits = self.prefill(input_ids, slot=slot)
             return logits, {"prefix_hit": False, "common_prefix": 0, "suffix_len": prompt_len}

@@ -504,3 +504,39 @@ def test_penalty_scope_row_counts_the_prompt(model: KotodamaModel, cls) -> None:
     assert set(dec.presence[3].nonzero().view(-1).tolist()) == set(prompt[0].tolist()) | {want_row[0]}
     with pytest.raises(ValueError):
         SamplingParams(penalty_scope="prompt")
+
+
+@torch.inference_mode()
+def test_generated_kv_of_a_lever_is_never_reused(model: KotodamaModel) -> None:
+    """A request that decoded on a lever (either span) leaves steered KV at its generated positions: a later prompt
+    containing that reply reuses at most the earlier prompt. An unsteered decode leaves the whole reply reusable."""
+    eng = _engine(model, levers=2)
+    prompt = _ids(30, 21)
+    for name, plan in (("none", None), ("decode", _plans()["attn-K-decode"])):
+        slot = eng.levers.bind(plan) if plan is not None else 0
+        eng.prefill(prompt, slot=slot)
+        t = torch.tensor([[5]])
+        reply = []
+        for _ in range(10):
+            t = eng.step_logits(t)[0, -1].argmax().view(1, 1)
+            reply.append(int(t))
+        if slot:
+            eng.levers.release(slot)
+        follow = torch.cat([prompt, torch.tensor([[5] + reply[:-1]]), _ids(5, 22)], dim=1)
+        _, info = eng.prefill_cached(follow, slot=0)
+        want = 40 if name == "none" else 30
+        assert info["prefix_hit"] and info["common_prefix"] == want, (name, info)
+
+
+@torch.inference_mode()
+def test_cached_prefill_inside_a_capture_taps_every_position(model: KotodamaModel) -> None:
+    from kotodama.model.levers import capture
+
+    eng = _engine(model, levers=1)
+    base = _ids(24, 23)
+    longer = torch.cat([base, _ids(6, 24)], dim=1)
+    eng.prefill(base)
+    with capture(eng, layers=[4]) as cap:
+        _, info = eng.prefill_cached(longer)
+    assert not info["prefix_hit"]
+    assert cap.sequence("partial_post_attn", 4).shape[0] == longer.shape[1]

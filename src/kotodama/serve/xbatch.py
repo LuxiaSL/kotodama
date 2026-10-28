@@ -244,7 +244,14 @@ class XBatchRunner:
             timing["lever_slot"] = float(slot)
         lv = _Live(job, logits, len(job.prompt_ids), budget, window, timing, t0, out=[[] for _ in range(job.n)],
                    home=frozenset(rows), slot=slot)
-        self._start(lv, rows, first)
+        try:
+            self._start(lv, rows, first)
+        except Exception as exc:  # the job never joins the batch: its slot and its caller must not wait on it
+            logger.warning("xbatch: starting a %d-token prompt's candidates failed: %r", len(job.prompt_ids), exc)
+            self._release_lever(lv)
+            dec.release(rows)
+            self._deliver(job, exc)
+            return None
         self.stats["admitted"] += 1
         self.stats["prefill_s"] += time.perf_counter() - t0
         return lv

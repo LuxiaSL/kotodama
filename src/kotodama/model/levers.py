@@ -156,8 +156,6 @@ class LeverTables:
                              device=self.device)
             for kind in KINDS}
         self._plans: dict[int, LeverPlan] = {}
-        # bound slots per digest: binding an identical lever twice is refused, so a digest names one slot
-        self._by_digest: dict[str, int] = {}
         self._free: list[int] = list(range(1, 1 + self.max_levers))
         self._lock = threading.Lock()
 
