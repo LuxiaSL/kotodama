@@ -45,6 +45,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from kotodama.model.gemv_kernels import decode_gemv, use_custom_gemv
+from kotodama.model.levers import LeverTables
 from kotodama.model.llama import KotodamaModel, apply_rope
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,7 @@ class DecodeEngine(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         prefill_backends: Optional[list[SDPBackend]] = None,
         steer_enabled: bool = False,
+        levers: int = 0,
     ) -> None:
         super().__init__()
         if not model.config.attn_res:
@@ -244,6 +246,21 @@ class DecodeEngine(nn.Module):
             )
         else:
             self.steer_buf = None
+
+        # ── Per-request levers (kotodama.model.levers; enabled at construction with levers > 0) ──
+        # Lever tables per site kind, one slot per bound lever, slot 0 the -0.0 identity. lever_slot is the slot
+        # this engine's own forwards read (prefill and the single-stream step); the batched decoders keep one slot
+        # per row. levers == 0 (a trace-time constant) traces no lever op at all.
+        self.levers = None
+        if int(levers) > 0:
+            self.levers = LeverTables(self.n_layers, self.hidden, int(levers), dtype, self.device)
+            self.register_buffer("lever_attn", self.levers.tables["attn"], persistent=False)
+            self.register_buffer("lever_mlp", self.levers.tables["mlp"], persistent=False)
+            self.register_buffer("lever_slot", torch.zeros((1,), device=self.device, dtype=torch.long),
+                                 persistent=False)
+        # Digest of the uniform lever that wrote the prompt KV in the cache (None: unsteered). A cached prefix is
+        # reused only by a request of the same lever.
+        self._kv_lever: Optional[str] = None
 
         # ── Fused projection weights (decode-only) ──────────────────────────
         # QKV and gate/up merges: fewer, larger GEMVs. Output rows are
@@ -458,10 +475,11 @@ class DecodeEngine(nn.Module):
         Rows beyond pos+i (stale KV from longer past requests) stay masked.
         Returns last-position logits (1, 1, V); advances pos by S.
 
-        DELIBERATELY NO STEERING WRITE: blocks forward PROMPT positions
-        (prefill/extend), and the write is generated-positions-only. This is
-        also what keeps re-prefilled prior turns unsteered (by design) — see
-        the steering block in __init__.
+        No steer_buf write: blocks forward PROMPT positions (prefill/extend),
+        and that write is generated-positions-only, which also keeps
+        re-prefilled prior turns unsteered — see the steering block in
+        __init__. Lever tables (when built) are read at ``lever_slot``, which
+        prefill sets to a uniform lever's slot and to 0 otherwise.
         """
         model = self.model
         S = tokens.shape[1]
@@ -499,12 +517,17 @@ class DecodeEngine(nn.Module):
             attn_out = self._attn_block(
                 ls.layer_idx, layer.attn_norm(h_attn), cos, sin, positions, bias
             )
+            if self.levers is not None:
+                attn_out = attn_out + self.lever_attn[ls.layer_idx].index_select(0, self.lever_slot)
             partial = partial + attn_out
 
             h_mlp = self._route(committed + [partial], layer.mlp_res_query, layer.mlp_res_norm.weight)
             gu = self._linear(layer.ffn_norm(h_mlp), self.w_gate_ups[ls.layer_idx])
             gate, up = gu.split(self.config.intermediate_size, dim=-1)
-            partial = partial + self._linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
+            mlp_out = self._linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
+            if self.levers is not None:
+                mlp_out = mlp_out + self.lever_mlp[ls.layer_idx].index_select(0, self.lever_slot)
+            partial = partial + mlp_out
 
         # Routing is per-position independent — only the last position's
         # logits are consumed, so slice before the final route + lm_head.
@@ -548,6 +571,8 @@ class DecodeEngine(nn.Module):
                 partial = torch.zeros_like(embed)
 
             attn_out = self._attn(ls.layer_idx, layer.attn_norm(h_attn))
+            if self.levers is not None:
+                attn_out = attn_out + self.lever_attn[ls.layer_idx].index_select(0, self.lever_slot)
             partial = partial + attn_out
 
             # Block-persistent steering write (decode/generated tokens only).
@@ -563,7 +588,10 @@ class DecodeEngine(nn.Module):
             h_mlp = self._route(committed + [partial], layer.mlp_res_query, layer.mlp_res_norm.weight)
             gu = self._linear(layer.ffn_norm(h_mlp), self.w_gate_ups[ls.layer_idx])
             gate, up = gu.split(self.config.intermediate_size, dim=-1)
-            partial = partial + self._linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
+            mlp_out = self._linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
+            if self.levers is not None:
+                mlp_out = mlp_out + self.lever_mlp[ls.layer_idx].index_select(0, self.lever_slot)
+            partial = partial + mlp_out
 
         x = self._route(committed + [partial], model.final_res_query, model.final_res_norm.weight)
         x = model.norm(x)
@@ -689,6 +717,9 @@ class DecodeEngine(nn.Module):
         for li in range(self.n_layers):
             self.k_caches[li].zero_()
             self.v_caches[li].zero_()
+        self._kv_lever = None
+        if self.levers is not None:
+            self.lever_slot.zero_()
         # NOTE: steer_buf is deliberately NOT cleared here — it is per-request
         # state owned by the caller (server.py engages it before prefill and
         # clears it in a finally after every request).
@@ -799,19 +830,21 @@ class DecodeEngine(nn.Module):
         return plan
 
     @torch.inference_mode()
-    def _run_chunks(self, input_ids: torch.Tensor, plan: list[tuple[int, int]]) -> torch.Tensor:
-        """Execute a chunk plan via the compiled block forward.
+    def _run_chunks(self, input_ids: torch.Tensor, plan: list[tuple[int, int]], eager: bool = False) -> torch.Tensor:
+        """Execute a chunk plan via the compiled block forward (``eager``: the same block forward uncompiled, for
+        spans no bucket covers).
 
         Each chunk pins pos eagerly (overlap chunks rewind it), replays the
         bucket graph, and leaves pos at chunk end. Restores the persistent
         attn_bias/pos state the decode step expects afterwards.
         """
-        assert self._compiled_block is not None
+        block = self._forward_block if eager else self._compiled_block
+        assert block is not None
         end = input_ids.shape[1]
         logits = None
         for s, b in plan:
             self.pos.fill_(s)
-            logits = self._compiled_block(_graph_input(input_ids[:, s: s + b]))
+            logits = block(_graph_input(input_ids[:, s: s + b]))
         # Block graphs derive their bias in-graph; re-establish the decode
         # invariant on the persistent buffer: [0, end) open, rest closed.
         self.attn_bias.fill_(float("-inf"))
@@ -820,13 +853,38 @@ class DecodeEngine(nn.Module):
         self._pos_cpu = end
         return logits[0, -1:].float()
 
+    def _prompt_slot(self, slot: int) -> tuple[int, Optional[str]]:
+        """The slot a request's PROMPT positions read and the digest of the lever that writes them: a uniform
+        lever's own slot, else the identity (a decode-span lever writes generated positions only)."""
+        slot = int(slot)
+        if self.levers is None:
+            if slot != 0:
+                raise RuntimeError("Engine was built without lever tables (levers=0); a lever slot needs levers > 0")
+            return 0, None
+        self.levers.check_slots([slot])
+        if slot == 0 or self.levers.span(slot) != "uniform":
+            return 0, None
+        return slot, self.levers.plan(slot).digest()
+
+    def _arm_decode_slot(self, slot: int) -> None:
+        """The slot the single-stream decode step reads from here on: the request's lever, whatever its span."""
+        if self.levers is not None:
+            self.lever_slot.fill_(int(slot))
+
     @torch.inference_mode()
-    def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def prefill(self, input_ids: torch.Tensor, slot: int = 0) -> torch.Tensor:
         """Full prefill into the static cache; returns last logits (1, V) fp32.
 
         Routes through the compiled block forward when available (chunked,
         ~launch-free); the eager reference path (prefill_reference) covers
         un-compiled engines and prompts shorter than the smallest bucket.
+
+        ``slot`` (an engine built with levers): the request's lever. A uniform
+        lever's prefill writes the prompt through the block forward at that
+        slot (compiled when a bucket plan covers the prompt, else the same
+        block forward eager); its prompt KV is then steered, so it is not
+        pooled by tokens (``prompt_kv_len`` stays 0). The decode steps that
+        follow read the slot whatever its span.
         """
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError(f"Expected (1, S) input_ids, got {tuple(input_ids.shape)}")
@@ -834,15 +892,28 @@ class DecodeEngine(nn.Module):
         self.reset()
         if prompt_len >= self.max_seq_len:
             raise ValueError(f"Prompt too long: {prompt_len} >= {self.max_seq_len}")
+        pslot, digest = self._prompt_slot(slot)
         plan = (
             self._chunk_plan(0, prompt_len)
             if self._compiled_block is not None and prompt_len <= self.block_span_max
             else None
         )
+        if pslot:
+            self.lever_slot.fill_(pslot)
+            if plan is None:
+                logits = self._run_chunks(input_ids.to(self.device), [(0, prompt_len)], eager=True)
+            else:
+                logits = self._run_chunks(input_ids.to(self.device), plan)
+            self.prompt_kv_len = 0
+            self._kv_lever = digest
+            self._arm_decode_slot(slot)
+            return logits
         if plan is None:
-            return self._prefill_reference_inner(input_ids, prompt_len)
-        logits = self._run_chunks(input_ids.to(self.device), plan)
-        self.prompt_kv_len = prompt_len
+            logits = self._prefill_reference_inner(input_ids, prompt_len)
+        else:
+            logits = self._run_chunks(input_ids.to(self.device), plan)
+            self.prompt_kv_len = prompt_len
+        self._arm_decode_slot(slot)
         return logits
 
     @torch.inference_mode()
@@ -895,6 +966,7 @@ class DecodeEngine(nn.Module):
         self.pos.fill_(n)
         self._pos_cpu = n
         self.prompt_kv_len = n
+        self._kv_lever = None
 
     def _common_prefix_len(self, input_ids: torch.Tensor) -> int:
         """Longest common prefix between the cached sequence and a new prompt.
@@ -909,7 +981,7 @@ class DecodeEngine(nn.Module):
         return n if neq.numel() == 0 else int(neq[0, 0].item())
 
     @torch.inference_mode()
-    def prefill_cached(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    def prefill_cached(self, input_ids: torch.Tensor, slot: int = 0) -> tuple[torch.Tensor, dict]:
         """Prefill reusing any cached common prefix from the previous request.
 
         Token-exact match against token_history; on a hit, only the suffix is
@@ -921,6 +993,11 @@ class DecodeEngine(nn.Module):
         match prefill(). The stale-KV NaN insurance that reset() provides is
         replaced by an explicit finiteness gate on the appended suffix KV
         (non-finite -> warn + full re-prefill, which zeroes).
+
+        ``slot``: the request's lever, as in prefill(). A cached prefix is
+        reused only when the lever that wrote it (none, or the same uniform
+        lever by content digest) is the one this prompt is written with; a
+        uniform lever's extend runs the block forward, which reads its slot.
 
         Returns (last-position logits (1, V) float32, info dict with
         prefix_hit / common_prefix / suffix_len for observability).
@@ -934,12 +1011,17 @@ class DecodeEngine(nn.Module):
             self.reset()
             raise ValueError(f"Prompt too long: {prompt_len} >= {self.max_seq_len}")
 
+        pslot, digest = self._prompt_slot(slot)
         # Cap at plen-1: even a fully-cached prompt must re-forward its last
         # token to produce next-token logits (regenerate / undo-to-midpoint).
         common = min(self._common_prefix_len(input_ids), prompt_len - 1)
-        if common < self.min_cached_prefix:
-            logits = self.prefill(input_ids)
+        if digest != self._kv_lever:
+            common = 0  # the cached prompt KV was written under another lever
+        if common < self.min_cached_prefix or (pslot and self._compiled_block is None):
+            logits = self.prefill(input_ids, slot=slot)
             return logits, {"prefix_hit": False, "common_prefix": 0, "suffix_len": prompt_len}
+        if self.levers is not None:
+            self.lever_slot.fill_(pslot)
         # The suffix attends to the reused prefix, so its KV is prompt KV only when the whole prefix is.
         prompt_kv_after = prompt_len if common <= self.prompt_kv_len else self.prompt_kv_len
 
@@ -967,7 +1049,8 @@ class DecodeEngine(nn.Module):
             self.pos.fill_(common)
             self._pos_cpu = common
             logits = self.step_logits(_graph_input(suffix))
-            self.prompt_kv_len = prompt_kv_after
+            self.prompt_kv_len = 0 if pslot else prompt_kv_after
+            self._arm_decode_slot(slot)
             return logits[0, -1:].float(), {
                 "prefix_hit": True, "common_prefix": common, "suffix_len": 1,
             }
@@ -997,13 +1080,17 @@ class DecodeEngine(nn.Module):
                         "prefill_cached(block): non-finite KV at common=%d suffix=%d — "
                         "falling back to full re-prefill", common, suffix_len,
                     )
-                    logits = self.prefill(input_ids)
+                    logits = self.prefill(input_ids, slot=slot)
                     return logits, {"prefix_hit": False, "common_prefix": 0, "suffix_len": prompt_len}
-                self.prompt_kv_len = prompt_kv_after
+                self.prompt_kv_len = 0 if pslot else prompt_kv_after
+                self._arm_decode_slot(slot)
                 return logits, {
                     "prefix_hit": True, "common_prefix": common, "suffix_len": suffix_len,
                 }
 
+        if pslot:  # the eager extend runs model.forward, which reads no lever: prefill the whole prompt steered
+            logits = self.prefill(input_ids, slot=slot)
+            return logits, {"prefix_hit": False, "common_prefix": 0, "suffix_len": prompt_len}
         past = [
             (self.k_caches[li][:, :, :common], self.v_caches[li][:, :, :common])
             for li in range(self.n_layers)
@@ -1037,7 +1124,7 @@ class DecodeEngine(nn.Module):
                 "prefill_cached: non-finite suffix KV at common=%d suffix=%d — "
                 "falling back to full re-prefill", common, suffix_len,
             )
-            logits = self.prefill(input_ids)
+            logits = self.prefill(input_ids, slot=slot)
             return logits, {"prefix_hit": False, "common_prefix": 0, "suffix_len": prompt_len}
 
         self.attn_bias[..., :prompt_len] = 0.0
@@ -1045,6 +1132,7 @@ class DecodeEngine(nn.Module):
         self.pos.fill_(prompt_len)
         self._pos_cpu = prompt_len
         self.prompt_kv_len = prompt_kv_after
+        self._arm_decode_slot(slot)
         return out["logits"][0, -1:].float(), {
             "prefix_hit": True, "common_prefix": common, "suffix_len": suffix_len,
         }

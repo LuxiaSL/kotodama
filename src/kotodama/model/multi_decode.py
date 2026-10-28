@@ -7,9 +7,10 @@ and samples each row's first token from the prompt's last-position logits. Rows 
 candidates of one prompt; rows filled from several prefills decode different prompts of different lengths together.
 
 Every row owns its KV cache slot, its attention bias (which positions it attends), its position (RoPE angle and KV
-write slot), its presence set (repetition penalty over the row's own generated tokens) and its sampling noise; the
-weights, temperature, repetition penalty and steering rows are shared, so rows decoded together must share one
-sampling law and one steering config. A row nobody reads keeps stepping on whatever it holds; its position stops at
+write slot), its presence set (repetition penalty over the row's own generated tokens), its sampling noise and, on an
+engine built with lever tables (kotodama.model.levers), its lever slot; the weights, temperature, repetition penalty
+and the engine's broadcast steering rows (``steer_buf``) are shared, so rows decoded together must share one sampling
+law and one broadcast steering config, while their levers may differ row by row. A row nobody reads keeps stepping on whatever it holds; its position stops at
 the last cache slot, so an idle row can never write out of bounds. Pure-temperature sampling only (the tsumugi law);
 truncated laws and temperature 0 stay on the single-stream path.
 
@@ -70,6 +71,10 @@ class MultiSampleDecoder(nn.Module):
                              persistent=False)
         self.register_buffer("inv_temp", torch.tensor(1.0 / 0.9, device=dev, dtype=torch.float32), persistent=False)
         self.register_buffer("rep_penalty", torch.tensor(1.2, device=dev, dtype=torch.float32), persistent=False)
+        # Each row's lever slot (0: the identity), read at every lever add of the step.
+        if engine.levers is not None:
+            self.register_buffer("row_slots", torch.zeros((self.rows,), device=dev, dtype=torch.long),
+                                 persistent=False)
         self._cur_temp, self._cur_rp = 0.9, 1.2
         self._pos_host = [0] * self.rows  # host mirror of pos (no device syncs for capacity checks)
         self._compiled_step = None
@@ -164,13 +169,19 @@ class MultiSampleDecoder(nn.Module):
             if ls.is_boundary:
                 committed.append(partial)
                 partial = torch.zeros_like(embed)
-            partial = partial + self._attn(ls.layer_idx, layer.attn_norm(h_attn))
+            attn_out = self._attn(ls.layer_idx, layer.attn_norm(h_attn))
+            if eng.levers is not None:
+                attn_out = attn_out + eng.lever_attn[ls.layer_idx].index_select(0, self.row_slots).unsqueeze(1)
+            partial = partial + attn_out
             if eng.steer_enabled:
                 partial = partial + eng.steer_buf[ls.layer_idx]
             h_mlp = eng._route(committed + [partial], layer.mlp_res_query, layer.mlp_res_norm.weight)
             gu = F.linear(layer.ffn_norm(h_mlp), eng.w_gate_ups[ls.layer_idx])
             gate, up = gu.split(eng.config.intermediate_size, dim=-1)
-            partial = partial + F.linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
+            mlp_out = F.linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
+            if eng.levers is not None:
+                mlp_out = mlp_out + eng.lever_mlp[ls.layer_idx].index_select(0, self.row_slots).unsqueeze(1)
+            partial = partial + mlp_out
         x = eng._route(committed + [partial], model.final_res_query, model.final_res_norm.weight)
         x = model.norm(x)
         logits = F.linear(x, model.get_lm_head_weight())  # (B, 1, V)
@@ -207,14 +218,17 @@ class MultiSampleDecoder(nn.Module):
             self._cur_rp = params.repetition_penalty
 
     @torch.inference_mode()
-    def admit(self, rows: Sequence[int], prefill_logits: torch.Tensor, params: SamplingParams) -> list[int]:
+    def admit(self, rows: Sequence[int], prefill_logits: torch.Tensor, params: SamplingParams,
+              slots: Optional[Sequence[int] | int] = None) -> list[int]:
         """Fill ``rows`` from the engine's prefilled prompt and sample each row's first token from the prompt's
         last-position logits (1, V). The prompt's KV positions are copied and the mask is the engine's (open on the
         prompt only), so a row attends to nothing it decoded before: its later positions are closed until its own
         decode steps rewrite and open them. Writes the first tokens into ``cur_tokens[rows]`` (the next step feeds
-        them) and returns them."""
+        them) and returns them. ``slots``: each row's lever slot (one int for every row; None: the identity)."""
         eng = self.engine
         rows = self._check_rows(rows)
+        self._check_prompt_lever(len(rows), slots)
+        self.set_slots(rows, slots)
         if eng._pos_cpu <= 0 or eng._pos_cpu >= self.max_seq_len:
             raise RuntimeError(f"engine position {eng._pos_cpu} is not a prefilled prompt")
         self._sync_sampling(params)
@@ -237,7 +251,8 @@ class MultiSampleDecoder(nn.Module):
         """Start a fresh candidate in ``rows``, which already hold a ``prompt_len``-token prompt in their first
         cache slots (they were admitted from it and have only decoded since): the rows rewind to the prompt's end
         (positions past it are closed in the mask and rewritten as decoding proceeds) and sample a first token from
-        that prompt's last-position logits (1, V). Costs no KV copy. Returns the first tokens."""
+        that prompt's last-position logits (1, V). Costs no KV copy; the rows keep their lever slots. Returns the
+        first tokens."""
         rows = self._check_rows(rows)
         if not 0 < prompt_len < self.max_seq_len:
             raise ValueError(f"prompt_len {prompt_len} outside (0, {self.max_seq_len})")
@@ -245,6 +260,46 @@ class MultiSampleDecoder(nn.Module):
         idx = torch.tensor(rows, device=self.pos.device, dtype=torch.long)
         self.attn_bias[idx, :, :, prompt_len:] = float("-inf")
         return self._seed(rows, idx, prompt_len, prefill_logits)
+
+    @torch.inference_mode()
+    def set_slots(self, rows: Sequence[int], slots: Optional[Sequence[int] | int]) -> None:
+        """Point ``rows`` at lever ``slots`` (one per row, or one int for all; None: the identity). Takes effect at
+        the next step. On an engine without lever tables only None (or all zeros) is accepted."""
+        rows = [int(r) for r in rows]
+        if slots is None:
+            vals = [0] * len(rows)
+        elif isinstance(slots, int):
+            vals = [int(slots)] * len(rows)
+        else:
+            vals = [int(x) for x in slots]
+            if len(vals) != len(rows):
+                raise ValueError(f"{len(vals)} slots for {len(rows)} rows")
+        levers = self.engine.levers
+        if levers is None:
+            if any(vals):
+                raise RuntimeError("the engine was built without lever tables (levers=0); rows can only read slot 0")
+            return
+        levers.check_slots(vals)
+        idx = torch.tensor(rows, device=self.pos.device, dtype=torch.long)
+        self.row_slots.index_copy_(0, idx, torch.tensor(vals, device=self.pos.device, dtype=torch.long))
+
+    def _check_prompt_lever(self, n: int, slots: Optional[Sequence[int] | int]) -> None:
+        """Rows admitted from a prefill must write their prompt the way it was written: a uniform lever's rows need
+        the prompt prefilled under that lever (same content digest), every other row an unsteered prompt."""
+        levers = self.engine.levers
+        if levers is None or slots is None:
+            want = [0] * n
+        else:
+            want = [int(slots)] * n if isinstance(slots, int) else [int(x) for x in slots]
+        if levers is None:
+            return
+        kv = self.engine._kv_lever
+        for s in set(want):
+            plan = levers.plan(s) if s else None
+            need = plan.digest() if plan is not None and plan.span == "uniform" else None
+            if need != kv:
+                raise ValueError(f"slot {s} writes its prompt {'under lever ' + need if need else 'unsteered'}, "
+                                 f"the engine's prompt KV is {'under lever ' + kv if kv else 'unsteered'}")
 
     def _check_rows(self, rows: Sequence[int]) -> list[int]:
         rows = [int(r) for r in rows]
@@ -463,13 +518,16 @@ class CascadeDecoder(MultiSampleDecoder):
             self.prompt_lens.index_fill_(0, torch.tensor(emptied, device=self.pos.device), 0)
 
     @torch.inference_mode()
-    def admit(self, rows: Sequence[int], prefill_logits: torch.Tensor, params: SamplingParams) -> list[int]:
+    def admit(self, rows: Sequence[int], prefill_logits: torch.Tensor, params: SamplingParams,
+              slots: Optional[Sequence[int] | int] = None) -> list[int]:
         """Fill ``rows`` from the engine's prefilled prompt: the prompt's KV is copied once into a free group (one
         group per ``group_rows`` rows), each row's tail starts empty, and each row's first token is sampled from the
         prompt's last-position logits (1, V). Raises RuntimeError when too few groups are free (``admit_capacity``).
-        Returns the first tokens."""
+        ``slots`` as in ``MultiSampleDecoder.admit``. Returns the first tokens."""
         eng = self.engine
         rows = self._check_rows(rows)
+        self._check_prompt_lever(len(rows), slots)
+        self.set_slots(rows, slots)
         p = eng._pos_cpu
         if p <= 0 or p >= self.max_seq_len:
             raise RuntimeError(f"engine position {p} is not a prefilled prompt")
