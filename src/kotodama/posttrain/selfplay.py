@@ -274,7 +274,8 @@ def oai_completer(endpoints: list[str], sampling: dict[str, float], max_tokens: 
                   steer_rule: str = "K") -> tuple[Complete, Callable[[], Awaitable[None]]]:
     """A ``Complete`` over one or more ``/v1/completions`` endpoints, and its async closer. Requests rotate over the
     endpoints, or go to ``endpoints[route]`` when the caller passes ``route=`` (one conversation per server, so its
-    prompts share that server's prefix cache); a failed request retries on the next endpoint. Every request has an
+    prompts share that server's prefix cache); a failed request retries on the next endpoint. ``user=`` is sent as the
+    OpenAI ``user`` field, which ``kotodama.serve.gateway`` uses to keep one conversation on one replica. Every request has an
     overall deadline of ``timeout`` seconds, so a connection that stalls without closing still fails. A 4xx is
     not retried; a prompt the server finds longer than its context raises ``PromptTooLong``.
     ``steer``: a residual steering stack sent with every request (the server's ``vectors``; it needs
@@ -285,14 +286,16 @@ def oai_completer(endpoints: list[str], sampling: dict[str, float], max_tokens: 
     counter = {"i": 0}
     rep = float(sampling.get("repetition_penalty", 1.0))
 
-    async def complete(prompt: str, n: int, stops: list[str],
-                       route: Optional[int] = None) -> list[tuple[str, str, bool]]:
+    async def complete(prompt: str, n: int, stops: list[str], route: Optional[int] = None,
+                       user: Optional[str] = None) -> list[tuple[str, str, bool]]:
         out: list[tuple[str, str, bool]] = []
         while len(out) < n:  # the server caps n at 8
             k = min(8, n - len(out))
             body = {"prompt": prompt, "model": model, "n": k, "max_tokens": max_tokens,
                     "temperature": sampling["temperature"], "top_p": sampling.get("top_p", 0.0),
                     "frequency_penalty": max(0.0, rep - 1.0), "stop": stops, "return_token_ids": True}
+            if user:
+                body["user"] = user  # a gateway keeps one conversation on one replica by this key
             if steer:
                 body["vectors"] = steer
                 body["steer_rule"] = steer_rule

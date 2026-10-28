@@ -263,9 +263,11 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
 
 
 def http_scorer(endpoints: list[str], timeout: float = 600.0, transport: Any = None,
-                max_completion_tokens: int = 256) -> tuple[Score, Callable[[], Awaitable[None]]]:
+                max_completion_tokens: int = 256,
+                total: bool = False) -> tuple[Score, Callable[[], Awaitable[None]]]:
     """A ``Score`` over the servers' /score_tokens (round-robin), tokenizing locally; and its async closer. A prompt
-    keeps its last 3500 tokens and a completion its first ``max_completion_tokens``."""
+    keeps its last 3500 tokens and a completion its first ``max_completion_tokens``. ``total``: the summed log-prob
+    of each completion instead of its per-token mean."""
     import httpx
     from transformers import AutoTokenizer
 
@@ -293,7 +295,8 @@ def http_scorer(endpoints: list[str], timeout: float = 600.0, transport: Any = N
                         raise
                     logger.warning("score request failed (%s); retrying", e)
                     await asyncio.sleep(2 ** attempt)
-            out += [-x["mean_nll"] if x["n_tokens"] else 0.0 for x in r.json()["results"]]
+            out += [(-x["sum_nll"] if total else -x["mean_nll"]) if x["n_tokens"] else 0.0
+                    for x in r.json()["results"]]
         return out
 
     return score, client.aclose
