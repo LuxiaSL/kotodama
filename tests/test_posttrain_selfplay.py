@@ -320,6 +320,8 @@ def test_novelty_count_and_own_opening_repeat() -> None:
     prior = [Turn("A", "The harbour was cold that night.")]
     assert sp.novelty("The lighthouse keeper never came back.", prior, count=True) == 5.0  # lighthouse keeper never came back
     assert sp.novelty("Cold harbour.", prior, count=True) == 0.0
+    assert sp.novelty_counts("The cold lighthouse.", prior) == (1, 2)  # lighthouse new; cold seen; "the" a stopword
+    assert sp.novelty_counts("Oh, the.", prior) == (0, 0)
     turns = [Turn("A", "Well, I think the boat is late."), Turn("B", "It always is on Sundays."),
              Turn("A", "Maybe the tide turned early."), Turn("B", "Or the captain overslept again.")]
     assert sp.own_opening_repeat("Well, I suppose we wait here then.", "A", turns)  # A's own earlier opening
