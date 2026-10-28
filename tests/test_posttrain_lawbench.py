@@ -304,3 +304,35 @@ def test_damage_scoring_on_a_tiny_model() -> None:
     with pytest.raises(SystemExit):
         law_damage.cell_plan(lb.Cell("n", "V", 1.0, 1.0, steer=(("Vx_s8", 0.5),), steer_rule="N"), bank, meds, {},
                              eng)
+    # an act injection, uniform span: rows force the prompt under their own lever; the identity row stays plain and
+    # the act row moves every scored token, the first included (its prompt was rewritten too)
+    act = lb.Cell("act", "act", 1.0, 1.0, steer_span="uniform",
+                  injection={"kind": "act", "sites": [4, 7], "neurons": [3, 10], "mu": [5.0, -5.0], "alpha": 1.0})
+    eng2 = DecodeEngine(model, max_seq_len=96, dtype=torch.float32, prefill_backends=[SDPBackend.MATH], levers=1)
+    slot = eng2.levers.bind(law_damage.cell_plan(act, bank, meds, {}, eng2))
+    dec2 = MultiSampleDecoder(eng2, 2)
+    act_lp, plain2 = law_damage.score_set(eng2, dec2, [act], [slot], prompt, cont)
+    assert torch.allclose(plain2, want_plain, atol=1e-4)
+    assert (act_lp[0] - want_plain).abs().min() > 1e-5
+    with pytest.raises(ValueError):
+        law_damage.score_set(eng2, dec2, [act, cells[0]], [slot, 0], prompt, cont)
+
+
+def test_cell_injection_rows_and_requests(tmp_path: Path) -> None:
+    inj = {"kind": "act", "sites": [6], "neurons": [780], "mu": [-0.85], "alpha": 0.5}
+    c = lb.Cell("bb", "act", 0.75, 1.2, steer_span="uniform", injection=inj)
+    assert lb.Cell.from_row(json.loads(json.dumps(c.to_row()))) == c
+    with pytest.raises(ValueError):
+        lb.Cell("x", "act", 0.75, 1.2, steer=(("v", 0.1),), injection=inj)
+    seen: list[dict] = []
+    comp = tmp_path / "c.jsonl"
+    comp.write_text(json.dumps({"id": "p0", "prompt": "Once"}) + "\n")
+    asyncio.run(lb.generate([c], [lb.load_panel("seed", comp)], "http://gw:1", tmp_path / "run", lb.GenConfig(), 4,
+                            transport=_mock_server(seen)))
+    assert seen[0]["injection"] == inj and seen[0]["steer_span"] == "uniform" and "vectors" not in seen[0]
+
+
+def test_score_parallel_merges_chunks() -> None:
+    items = [{"id": str(i)} for i in range(25)]
+    out = lb.score_parallel(items, lambda part: {x["id"]: [1.0, 2] for x in part}, workers=3, chunk=4)
+    assert sorted(out, key=int) == [str(i) for i in range(25)]

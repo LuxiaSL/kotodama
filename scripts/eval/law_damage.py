@@ -2,9 +2,10 @@
 """Damage readout of the sampling-law bench (kotodama.posttrain.lawbench): for every cell, the mean NLL of a fixed
 continuation set under the cell's whole law, teacher-forced, minus the plain model's NLL of the same tokens.
 
-One decoder batch holds every cell as a row (each with its lever slot, decode span: the prompt is prefilled
-unsteered, as the server serves a decode-span request) plus an identity row. For each continuation the prompt is
-prefilled once, every row admitted from it, and the continuation's tokens fed through the decode step; at each
+One decoder batch per span holds its cells as rows (each with its lever slot: bank vectors with the server's dose
+math and write rule, or an ``act`` injection) plus an identity row. Decode span: the prompt is prefilled unsteered,
+as the server serves a decode-span request, and every row admitted from it; uniform span: every row feeds the
+prompt through the decode step under its own lever. The continuation's tokens are then fed through the decode step; at each
 position the row's logits pass through its law (``lawbench.law_logprobs``: repetition penalty over the tokens the
 law's ``penalty_scope`` counts, temperature, top-p / min-p) and the next continuation token is scored. A token the
 truncation removes is counted in ``trunc_share`` and left out of the mean. The plain reference is the identity
@@ -40,8 +41,15 @@ logger = logging.getLogger("law_damage")
 def cell_plan(cell: lawbench.Cell, bank: dict, meds: dict, norms: dict, eng: DecodeEngine) -> Optional[Any]:
     """A cell's steering as one lever plan, with the server's dose math (alpha x the site's median norm x the unit
     vector) and write rule; None for an unsteered cell."""
-    from kotodama.serve.steering import writes_to_plan
+    from kotodama.serve.steering import act_injection_to_plan, writes_to_plan
 
+    if cell.injection is not None:
+        inj = cell.injection
+        if inj.get("kind") != "act":
+            raise SystemExit(f"cell {cell.id}: the damage readout takes act injections only, got {inj.get('kind')!r}")
+        return act_injection_to_plan(list(inj["sites"]), list(inj["neurons"]), list(inj["mu"]),
+                                     float(inj.get("alpha", 1.0)), [], cell.steer_span, eng.n_layers,
+                                     eng.config.intermediate_size)
     if not cell.steer:
         return None
     writes = []
@@ -60,19 +68,29 @@ def cell_plan(cell: lawbench.Cell, bank: dict, meds: dict, norms: dict, eng: Dec
 def score_set(eng: DecodeEngine, dec: MultiSampleDecoder, cells: list[lawbench.Cell], slots: list[int],
               prompt_ids: list[int], cont_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
     """(law logprobs (C, T), plain logprobs (T,)) of ``cont_ids`` after ``prompt_ids``: row 0 is the identity, rows
-    1..C the cells. The first continuation token is scored on the (unsteered) prefill logits."""
+    1..C the cells. Decode-span cells: the prompt is prefilled unsteered and the first continuation token is scored
+    on those logits. Uniform-span cells (every cell of the batch): each row feeds the prompt through the decode step
+    under its own lever, as the server writes a uniform request's prompt."""
     device = eng.device
     R = dec.rows
     C = len(cells)
-    logits0 = eng.prefill(torch.tensor([prompt_ids], device=device))
     row_slots = [0] + slots + [0] * (R - 1 - C)
-    dec.admit(list(range(R)), logits0, SamplingParams(temperature=1.0, repetition_penalty=1.0), slots=row_slots)
+    spans = {c.steer_span for c in cells}
+    if len(spans) > 1:
+        raise ValueError("score one span per batch (decode-span and uniform-span cells admit differently)")
+    if spans == {"uniform"}:
+        dec.admit_empty(row_slots)
+        for tok in prompt_ids:
+            logits = dec.step_logits(torch.full((R, 1), tok, dtype=torch.long, device=device))
+    else:
+        logits0 = eng.prefill(torch.tensor([prompt_ids], device=device))
+        dec.admit(list(range(R)), logits0, SamplingParams(temperature=1.0, repetition_penalty=1.0), slots=row_slots)
+        logits = logits0.reshape(1, -1).expand(R, -1)
     temps = [c.temperature for c in cells]
     rps = [c.repetition_penalty for c in cells]
     tps = [c.top_p for c in cells]
     mps = [c.min_p for c in cells]
     law_lp, plain_lp = [], []
-    logits = logits0.reshape(1, -1).expand(R, -1)
     for t, tok in enumerate(cont_ids):
         hist = cont_ids[:t]
         pen = [(prompt_ids + hist) if c.penalty_scope == "row" else hist for c in cells]
@@ -110,13 +128,18 @@ def main() -> int:
     bank, meds, _ = load_steer_banks(paths, cfg.num_layers, cfg.hidden_size, torch.device(device))
     norms = load_partial_norms(paths, cfg.num_layers)
     cells = lawbench.load_cells(Path(a.cells))
-    rows = 1 + len(cells)
-    eng = DecodeEngine(model, max_seq_len=a.max_seq_len, levers=max(1, sum(bool(c.steer) for c in cells)))
-    dec = MultiSampleDecoder(eng, rows)
-    slots = []
-    for c in cells:
-        plan = cell_plan(c, bank, meds, norms, eng)
-        slots.append(0 if plan is None else eng.levers.bind(plan))
+    n_levers = sum(c.steer != () or c.injection is not None for c in cells)
+    eng = DecodeEngine(model, max_seq_len=a.max_seq_len, levers=max(1, n_levers))
+    # one decoder batch per span: decode-span rows admit from an unsteered prefill, uniform rows force the prompt
+    groups = []
+    for span in ("decode", "uniform"):
+        g = [c for c in cells if c.steer_span == span]
+        if g:
+            slots = []
+            for c in g:
+                plan = cell_plan(c, bank, meds, norms, eng)
+                slots.append(0 if plan is None else eng.levers.bind(plan))
+            groups.append((g, slots, MultiSampleDecoder(eng, 1 + len(g))))
     items = lawbench.read_jsonl(Path(a.set))
     acc: dict[str, dict[str, Any]] = {c.id: {"d": 0.0, "nll": 0.0, "n": 0, "trunc": 0, "panels": {}} for c in cells}
     plain_tot, plain_n = 0.0, 0
@@ -126,21 +149,23 @@ def main() -> int:
         c = tok.encode(it["continuation"], add_special_tokens=False)[:a.max_cont_tokens]
         if not p or len(c) < 2 or len(p) + len(c) + 2 >= a.max_seq_len:
             continue
-        law_lp, plain_lp = score_set(eng, dec, cells, slots, p, c)
+        scored = [(g, *score_set(eng, dec, g, slots, p, c)) for g, slots, dec in groups]
+        plain_lp = scored[0][2]
         plain_tot += float(-plain_lp.sum())
         plain_n += len(c)
-        for j, cell in enumerate(cells):
-            lp = law_lp[j]
-            ok = torch.isfinite(lp)
-            d = (plain_lp[ok] - lp[ok]).double()
-            s = acc[cell.id]
-            s["d"] += float(d.sum())
-            s["nll"] += float(-lp[ok].double().sum())
-            s["n"] += int(ok.sum())
-            s["trunc"] += int((~ok).sum())
-            pp = s["panels"].setdefault(it.get("panel", ""), [0.0, 0])
-            pp[0] += float(d.sum())
-            pp[1] += int(ok.sum())
+        for g, law_lp, _ in scored:
+            for j, cell in enumerate(g):
+                lp = law_lp[j]
+                ok = torch.isfinite(lp)
+                d = (plain_lp[ok] - lp[ok]).double()
+                s = acc[cell.id]
+                s["d"] += float(d.sum())
+                s["nll"] += float(-lp[ok].double().sum())
+                s["n"] += int(ok.sum())
+                s["trunc"] += int((~ok).sum())
+                pp = s["panels"].setdefault(it.get("panel", ""), [0.0, 0])
+                pp[0] += float(d.sum())
+                pp[1] += int(ok.sum())
         if (i + 1) % 20 == 0:
             logger.info("%d/%d continuations (%.0fs)", i + 1, len(items), time.time() - t0)
     out = {"cells": {}, "plain_nll": round(plain_tot / max(plain_n, 1), 5), "tokens": plain_n,

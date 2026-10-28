@@ -68,7 +68,9 @@ SCOPES = ("generated", "row")
 
 @dataclass(frozen=True)
 class Cell:
-    """One sampling law. ``steer``: ((bank key or alias, dose), ...); ``control``: a random-direction control."""
+    """One sampling law. ``steer``: ((bank key or alias, dose), ...); ``injection``: a raw lever instead, as the
+    server's ``injection`` field (e.g. ``{"kind": "act", "sites", "neurons", "mu", "alpha"}``); ``control``: a
+    random-direction control."""
 
     id: str
     ladder: str
@@ -81,6 +83,7 @@ class Cell:
     steer_rule: str = "K"
     steer_span: str = "decode"
     control: bool = False
+    injection: Optional[dict[str, Any]] = field(default=None, compare=True, hash=False)
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", self.id):
@@ -96,6 +99,9 @@ class Cell:
         for name, dose in self.steer:
             if not name or not math.isfinite(dose):
                 raise ValueError(f"cell {self.id}: bad steering member {(name, dose)!r}")
+        if self.injection is not None:
+            if self.steer or not isinstance(self.injection, dict) or "sites" not in self.injection:
+                raise ValueError(f"cell {self.id}: an injection is a dict with sites, and excludes bank vectors")
 
     @property
     def dose(self) -> float:
@@ -353,6 +359,8 @@ async def generate(cells: list[Cell], panels: list[Panel], endpoint: str, out: P
         async def call(prompt: str, n: int, stops: list[str], **kw: Any) -> Any:
             if c.steer_span != "decode":
                 kw["steer_span"] = c.steer_span
+            if c.injection is not None:
+                kw["injection"] = c.injection
             return await comp(prompt, n, stops, **kw)
 
         async with sem:
@@ -571,6 +579,20 @@ def fluency_items(rows: list[dict[str, Any]], items: dict[str, dict[str, Any]], 
     return out
 
 
+def score_parallel(items: list[dict[str, Any]], score: Any, workers: int,
+                   chunk: int = 512) -> dict[str, list[float]]:
+    """``score`` (a list of ``/score_tokens`` items -> ``{id: [sum_nll, n_tokens]}``) over chunks of ``items``,
+    ``workers`` chunks at a time; the merged per-item results."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    parts = [items[i:i + chunk] for i in range(0, len(items), chunk)]
+    out: dict[str, list[float]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        for res in ex.map(score, parts):
+            out.update(res)
+    return out
+
+
 def fluency_by_row(scored: dict[str, list[float]]) -> dict[str, float]:
     """``{cell|item[|turn]: [sum_nll, n_tokens]}`` -> token-weighted mean NLL per ``cell|item``."""
     acc: dict[str, list[float]] = {}
@@ -727,6 +749,7 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("run")
     f.add_argument("--panel", action="append", required=True)
     f.add_argument("--endpoint", required=True)
+    f.add_argument("--workers", type=int, default=8, help="scoring requests in flight (spread over the fleet)")
     d = sub.add_parser("damage-set")
     d.add_argument("run")
     d.add_argument("--panel", action="append", required=True)
@@ -776,10 +799,14 @@ def main(argv: list[str] | None = None) -> int:
         for name, p in panels.items():
             items = {it["id"]: it for it in p.items}
             fi = fluency_items(read_jsonl(run / "gen" / f"{name}.jsonl"), items, tok)
-            res = score_fluency(fi, a.endpoint, per_item=True)
-            rows = fluency_by_row(res.pop("items"))
-            (run / "fluency" / f"{name}.json").write_text(json.dumps({**res, "rows": rows}))
-            logger.info("%s: %d texts, mean NLL %s", name, len(fi), res["mean_nll"])
+            res = score_parallel(fi, lambda part: score_fluency(part, a.endpoint, per_item=True)["items"],
+                                 a.workers)
+            rows = fluency_by_row(res)
+            tot = [sum(v[0] for v in res.values()), sum(v[1] for v in res.values())]
+            out = {"texts": len(fi), "tokens": int(tot[1]), "mean_nll": round(tot[0] / max(tot[1], 1), 4),
+                   "rows": rows}
+            (run / "fluency" / f"{name}.json").write_text(json.dumps(out))
+            logger.info("%s: %d texts, mean NLL %s", name, len(fi), out["mean_nll"])
         return 0
     if a.cmd == "damage-set":
         rows = damage_set(run, panels)
