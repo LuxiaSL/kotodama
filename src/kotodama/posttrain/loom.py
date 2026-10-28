@@ -637,6 +637,11 @@ def assemble_main(argv: list[str]) -> int:
     g.add_argument("--min_scene_turns", type=int, default=1, help="drop a scene left with fewer turns")
     g.add_argument("--scenes_out", default="", help="also write each cleaned scene as its own transcript row")
     g.add_argument("--records_out", default="", help="per-scene cleaning records (JSONL)")
+    g.add_argument("--cut_unended", type=int, default=0,
+                   help="> 0: a scene without a model-written ending keeps at most this many turns")
+    g.add_argument("--holdout_frac", type=float, default=0.0,
+                   help="hold out this share of seeds (every scene of a held-out seed) for evaluation")
+    g.add_argument("--holdout_out", default="", help="the held-out scenes (JSONL); required with --holdout_frac")
     a = ap.parse_args(argv)
     paths = []
     for ri, r in enumerate(a.runs):  # tree ids restart in every run directory: namespace them by run
@@ -674,9 +679,19 @@ def _assemble_anthology(a: argparse.Namespace, paths: list[dict[str, Any]]) -> i
                          clean_tail=a.clean_tail, max_template=a.max_template, untrain_repeats=a.untrain_repeats,
                          untrain_format=a.untrain_format, drop_minor_explicit=a.drop_minor_explicit,
                          blocklist=compliance.load_blocklist(a.blocklist) if a.blocklist else frozenset(),
-                         redact_pii=a.redact_pii, min_scene_turns=a.min_scene_turns)
+                         redact_pii=a.redact_pii, min_scene_turns=a.min_scene_turns, cut_unended=a.cut_unended)
     docs, scenes, recs = an.assemble_scenes(paths, nodes, cfg, a.max_chars, a.seed)
-    outs = [(a.out, docs)] + [(x, rows) for x, rows in ((a.scenes_out, scenes), (a.records_out, recs)) if x]
+    outs = []
+    if a.holdout_frac > 0:
+        if not a.holdout_out:
+            raise SystemExit("--holdout_frac needs --holdout_out")
+        held = an.holdout_seeds([p.get("seed", "") for p in paths], a.holdout_frac)
+        out_rows = [s for s in scenes if an.seed_key(s["source"].get("seed", "")) in held]
+        scenes = [s for s in scenes if an.seed_key(s["source"].get("seed", "")) not in held]
+        docs = an.stack(scenes, a.max_chars, a.seed)
+        outs.append((a.holdout_out, out_rows))
+        logger.info("held out %d seeds: %d scenes", len(held), len(out_rows))
+    outs += [(a.out, docs)] + [(x, rows) for x, rows in ((a.scenes_out, scenes), (a.records_out, recs)) if x]
     for path, rows in outs:
         with open(path, "w", encoding="utf-8") as f:
             for row in rows:

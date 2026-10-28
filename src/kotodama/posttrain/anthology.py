@@ -105,6 +105,7 @@ class SceneConfig:
     redact_pii: bool = False
     min_scene_turns: int = 1
     min_removed: int = 4
+    cut_unended: int = 0  # > 0: a scene without a model-written ending keeps at most this many turns
 
 
 @dataclass
@@ -298,6 +299,9 @@ def clean_scene(p: dict[str, Any], nodes: Optional[NodeIndex], cfg: SceneConfig,
         if cfg.frame_gate and (out_of_frame(body[-1]["text"]) or self_described(body[-1]["text"], body[-1]["speaker"])):
             body, ids, ended = body[:-1], ids[:-1], False  # still out of frame after the tail cut
             rec["frame_cut"] = len(body)
+    if cfg.cut_unended and not ended and len(body) > cfg.cut_unended:
+        body, ids = body[:cfg.cut_unended], ids[:cfg.cut_unended]
+        rec["unended_cut"] = cfg.cut_unended
     rec["turns_out"] = len(body)
     rec["ended"] = ended
     if len(body) < cfg.min_scene_turns:
@@ -390,3 +394,13 @@ def assemble_scenes(paths: list[dict[str, Any]], nodes: Optional[NodeIndex], cfg
     drops = Counter(r.get("drop", "kept") for r in recs)
     logger.info("%d scenes -> %s", len(recs), dict(drops))
     return stack(scenes, max_chars, seed), scenes, recs
+
+
+def holdout_seeds(seeds: list[str], frac: float, salt: str = "holdout") -> set[str]:
+    """The seed keys (``seed_key``) held out for evaluation: those whose sha256(salt + key) falls in the lowest
+    ``frac`` of the hash range. Deterministic, independent of order, and a seed's every tree goes the same way."""
+    import hashlib
+
+    keys = {seed_key(s) for s in seeds}
+    cut = int(frac * 2 ** 32)
+    return {k for k in keys if int(hashlib.sha256(f"{salt}:{k}".encode()).hexdigest()[:8], 16) < cut}

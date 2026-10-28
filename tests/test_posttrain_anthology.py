@@ -139,6 +139,21 @@ def test_a_repeated_farewell_that_ends_the_scene_still_trains() -> None:
     assert s["turns"][-1]["train"] is False
 
 
+def test_unended_scenes_are_cut_and_ended_ones_kept_whole() -> None:
+    cfg = an.SceneConfig(cut_unended=12)
+    s, rec = an.clean_scene(_path(TALK), None, cfg, {})
+    assert len(s["turns"]) == 12 and rec["unended_cut"] == 12 and s["ended"] is False
+    s, rec = an.clean_scene(_path(TALK, state="eos"), None, cfg, {})
+    assert len(s["turns"]) == len(TALK) and "unended_cut" not in rec
+
+
+def test_holdout_is_by_seed_and_deterministic() -> None:
+    seeds = [f"p1-{i:05d}~t{k}" for i in range(400) for k in range(3)]
+    held = an.holdout_seeds(seeds, 0.1)
+    assert 20 < len(held) < 70 and held == an.holdout_seeds(list(reversed(seeds)), 0.1)
+    assert all("~" not in k for k in held)
+
+
 def test_natural_ending_trains_and_shared_opening_trains_once() -> None:
     a = _path(TALK[:10], state="eos")
     b = dict(_path(TALK[:3] + ["Different now.", "Yes.", "Then go.", "I will.", "Good.", "Fine.", "Done."]),
