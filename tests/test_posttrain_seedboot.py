@@ -187,3 +187,22 @@ def test_fan_and_cli(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         seeds.main(["boot", "--endpoint", "http://x", "--out", str(tmp_path), "--lists", str(tmp_path),
                     "--pass", "0"])
+
+
+def test_exemplars_from_native_rows_and_same_roots(tmp_path: Path) -> None:
+    native = {"id": "sc-ch00001", "form": "native", "theme": "peace and despair", "relationship": "two rival bakers",
+              "blurb": "Two bakers share a kitchen. A comedy.", "scene": "A kitchen at dawn. Ines waits.",
+              "characters": [{"name": "Ines Moreau", "label": "Ines", "character": "forty, a baker"},
+                             {"name": "Kwame Asante", "label": "Kwame", "character": "thirty, a baker"}]}
+    ex = sb.as_exemplar(native)
+    lst = sb.render_listing(2, ex)
+    assert lst.startswith("2. Ines Moreau and Kwame Asante — peace and despair; two rival bakers\n")
+    assert "Characters:\nInes Moreau, forty, a baker" in lst and lst.endswith("The play opens:\nA kitchen at dawn. Ines waits.")
+    pools, frames = _setup(tmp_path)
+    a = sb.draw_boot_starts(pools, LISTS, frames, 12, seed=0, pass_no=0, lineage="A")
+    b = sb.draw_boot_starts(pools, LISTS, frames[:1], 12, seed=0, pass_no=0, lineage="B")
+    roots = lambda ss: [(s["theme"], s["pair"], s["moment"], tuple(n["text"] for n in s["names"])) for s in ss]  # noqa: E731
+    assert roots(a) == roots(b) and {s["lineage"] for s in a} == {"A"}
+    asyncio.run(sb.frame_fan(fake(), frames, 3, tmp_path, exemplars=[ex] * 5, name="fanx.jsonl"))
+    fan = sp.read_jsonl(tmp_path / "fanx.jsonl")
+    assert len(fan) == 6 and all(2 <= len(r["exemplars"]) <= 4 for r in fan)

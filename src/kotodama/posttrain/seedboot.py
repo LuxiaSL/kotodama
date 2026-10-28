@@ -231,9 +231,24 @@ async def grow_organon(complete: sp.Complete, kind: str, lists: dict[str, list[s
 
 
 def roots_line(n: int, st: dict[str, Any]) -> str:
+    """"n. Names — theme; relationship; moment", empty parts left out."""
     names = [x["text"] for x in st["names"]]
     who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
-    return f"{n}. {who} — {st['theme']}; {st['pair']}; {st['moment'].lower()}"
+    parts = [p for p in (st.get("theme", ""), st.get("pair", ""), st.get("moment", "").lower()) if p]
+    return f"{n}. {who} — {'; '.join(parts)}"
+
+
+def as_exemplar(row: dict[str, Any]) -> dict[str, Any]:
+    """A kept seed row as a listing the boot prompt can show: boot rows as they are; a ``seedchain`` native row
+    (programme note ``blurb``, cast ``characters``, ``scene``) mapped onto the same fields, its relationship in the
+    relationship slot and no moment."""
+    if row.get("form") == "boot":
+        return row
+    chars = row.get("characters", [])
+    return {"id": row["id"], "names": [{"text": c["name"], "label": c["label"]} for c in chars],
+            "theme": row.get("theme", ""), "pair": row.get("relationship", ""), "moment": "",
+            "listing": row.get("blurb") or row.get("listing", ""), "people": [c["character"] for c in chars],
+            "scene": row.get("scene", ""), "nll": row.get("nll"), "guards": row.get("guards", {})}
 
 
 def render_listing(n: int, st: dict[str, Any]) -> str:
@@ -343,11 +358,13 @@ async def grow_boot(complete: sp.Complete, score: Optional[sp.Score], st: dict[s
 
 
 def draw_boot_starts(pools: dict[str, list[dict[str, Any]]], lists: dict[str, list[str]], frames: list[dict],
-                     n: int, seed: int, pass_no: int, cast_share: float = 0.3) -> list[dict[str, Any]]:
+                     n: int, seed: int, pass_no: int, cast_share: float = 0.3,
+                     lineage: str = "") -> list[dict[str, Any]]:
     """Roots and arms for ``n`` seeds: theme least-used from the pool, relationship = (antisyzygy, life moment)
     atoms, names; cast arm by quota, note/bare arm alternating; the frame drawn at random per seed from the whole
     pool (rotation: no frame's imprint is shared by the corpus), its title recorded for grouping."""
     rng = random.Random(f"{seed}:{pass_no}")
+    frame_rng = random.Random(f"{seed}:{pass_no}:frame")  # its own stream: the frame pool never shifts the roots
     uses: collections.Counter = collections.Counter()
     sched = sp.arm_schedule(n, cast_share, rng)
     out = []
@@ -358,7 +375,7 @@ def draw_boot_starts(pools: dict[str, list[dict[str, Any]]], lists: dict[str, li
         for e in (theme, *names):
             uses[e["id"]] += 1
         out.append({"id": f"p{pass_no}-{i:05d}", "pass": pass_no, "cast_arm": cast_arm,
-                    "arm": ("note", "bare")[i % 2], **_frame_fields(rng.choice(frames)),
+                    "arm": ("note", "bare")[i % 2], **_frame_fields(frame_rng.choice(frames)), "lineage": lineage,
                     "theme": theme["text"], "pair": rng.choice(lists["antisyzygies"]),
                     "moment": rng.choice(lists["moments"]),
                     "roots": {"theme": theme["id"], "names": [x["id"] for x in names]},
@@ -448,7 +465,8 @@ async def run_boot(complete: sp.Complete, score: Optional[sp.Score], starts: lis
 def boot_seed(st: dict[str, Any]) -> dict[str, Any]:
     """A loom seed (``kotodama.posttrain.selfplay.parse_seed`` reads it) with its provenance."""
     return {"id": st["id"], "cast": [x["label"] for x in st["names"]], "header": st["header"], "form": "boot",
-            "pass": st["pass"], "frame": st["frame"], "frame_title": st.get("frame_title", ""),
+            "pass": st["pass"], "lineage": st.get("lineage", ""), "frame": st["frame"],
+            "frame_title": st.get("frame_title", ""),
             "frame_control": st.get("frame_control", False), "arm": st["arm"], "cast_arm": st["cast_arm"],
             "exemplars": st.get("exemplars", []), "genre": st["genre"], "theme": st["theme"], "pair": st["pair"],
             "moment": st["moment"], "listing": st["listing"], "scene": st["scene"],
@@ -461,15 +479,32 @@ def boot_seed(st: dict[str, Any]) -> dict[str, Any]:
 # ── readouts ─────────────────────────────────────────────────────────────────
 
 
-async def frame_fan(complete: sp.Complete, frames: list[dict[str, Any]], n: int, out: Path) -> None:
-    """``n`` draws at each frame's boundary; writes ``<out>/fan.jsonl`` ({id, frame, text})."""
-    rows = []
-    outs = await asyncio.gather(*(complete(f"{fr['text']}\n\n", n, ["\n\n"], user=f"fan:{fr['frame']}")
-                                  for fr in frames))
-    for fr, raw in zip(frames, outs):
-        rows += [{"id": f"fan-{fr['frame']}-{k}", "frame": fr["frame"], "text": t.strip()}
-                 for k, (t, _f, _h) in enumerate(raw)]
-    sp.write_jsonl(out / "fan.jsonl", rows)
+async def frame_fan(complete: sp.Complete, frames: list[dict[str, Any]], n: int, out: Path,
+                    exemplars: Sequence[dict[str, Any]] = (), shots: tuple[int, int] = (2, 4), seed: int = 0,
+                    name: str = "fan.jsonl") -> None:
+    """``n`` draws at each frame's boundary (where the first listing would start), or, with ``exemplars``, after the
+    frame and a fresh 2-4 of them per draw (where the next listing would start); writes ``<out>/<name>``
+    ({id, frame, text, exemplars})."""
+    rng = random.Random(seed)
+    jobs = []
+    for fr in frames:
+        if not exemplars:
+            jobs.append((fr, [], f"{fr['text']}\n\n", n))
+            continue
+        for k in range(n):
+            ex = rng.sample(list(exemplars), min(rng.randint(*shots), len(exemplars)))
+            body = "".join(render_listing(j + 1, e) + "\n\n" for j, e in enumerate(ex))
+            jobs.append((fr, ex, f"{fr['text']}\n\n{body}{len(ex) + 1}.", 1))
+    outs = await asyncio.gather(*(complete(p, m, ["\n\n"], user=f"fan:{fr['frame']}:{i}")
+                                  for i, (fr, _e, p, m) in enumerate(jobs)))
+    rows, counts = [], collections.Counter()
+    for (fr, ex, _p, _m), raw in zip(jobs, outs):
+        for t, _f, _h in raw:
+            k = counts[fr["frame"]]
+            counts[fr["frame"]] += 1
+            rows.append({"id": f"fan-{fr['frame']}-{k}", "frame": fr["frame"], "text": t.strip(),
+                         "exemplars": [e["id"] for e in ex]})
+    sp.write_jsonl(out / name, rows)
 
 
 def _tfidf_dense(texts: Sequence[str]) -> Any:
@@ -758,6 +793,10 @@ def main_boot(argv: list[str]) -> int:
                     help="filter verdicts of earlier passes ({id, verdict}); their kept seeds are the exemplars")
     ap.add_argument("--exemplar_select", choices=["random", "kmedoids"], default="random")
     ap.add_argument("--exemplar_pool", type=int, default=64)
+    ap.add_argument("--exemplar_file", default=None,
+                    help="JSONL of kept seed rows (boot or seedchain native) to draw few-shot from on THIS pass, "
+                         "pass 0 included; each seed draws a fresh 2-4 from the whole file")
+    ap.add_argument("--lineage", default="", help="generation-lineage tag written on every row")
     ap.add_argument("--concurrency", type=int, default=128)
     a = ap.parse_args(argv)
     out = Path(a.out)
@@ -768,9 +807,11 @@ def main_boot(argv: list[str]) -> int:
     frames = sp.read_jsonl(out / "frames.jsonl")
     if not frames or not all(pools.values()):
         raise SystemExit(f"frames or pools missing under {out} (boot-frames-pick, boot-organon first)")
-    starts = draw_boot_starts(pools, lists, frames, a.n, a.seed, a.pass_no)
+    starts = draw_boot_starts(pools, lists, frames, a.n, a.seed, a.pass_no, lineage=a.lineage)
     exemplars: list[dict[str, Any]] = []
-    if a.pass_no > 0:
+    if a.exemplar_file:
+        exemplars = [as_exemplar(r) for r in sp.read_jsonl(Path(a.exemplar_file))]
+    elif a.pass_no > 0:
         keep = {v["id"] for vf in a.verdicts for v in sp.read_jsonl(Path(vf)) if v.get("verdict") == "keep"}
         earlier = [r for p in range(a.pass_no) for r in sp.read_jsonl(out / f"pass{p}" / "seeds.all.jsonl")]
         kept = [r for r in earlier if r["id"] in keep]
@@ -802,12 +843,17 @@ def main_fan(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="frame-boundary fan (python -m kotodama.posttrain.seeds boot-fan)")
     _common(ap)
     ap.add_argument("--n", type=int, default=64)
+    ap.add_argument("--frames", default=None, help="frames JSONL ({frame, text}); default <out>/frames.jsonl")
+    ap.add_argument("--exemplar_file", default=None, help="draw after the frame and a fresh 2-4 of these listings")
+    ap.add_argument("--name", default="fan.jsonl")
     a = ap.parse_args(argv)
     complete, close = _client(a, 120)
+    frames = sp.read_jsonl(Path(a.frames) if a.frames else Path(a.out) / "frames.jsonl")
+    ex = [as_exemplar(r) for r in sp.read_jsonl(Path(a.exemplar_file))] if a.exemplar_file else []
 
     async def go() -> None:
         try:
-            await frame_fan(complete, sp.read_jsonl(Path(a.out) / "frames.jsonl"), a.n, Path(a.out))
+            await frame_fan(complete, frames, a.n, Path(a.out), ex, seed=a.seed, name=a.name)
         finally:
             await close()
 
