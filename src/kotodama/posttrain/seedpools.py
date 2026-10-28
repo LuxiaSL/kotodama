@@ -1179,14 +1179,17 @@ def _per_axis(items: Sequence[str]) -> dict[str, str]:
     return out
 
 
-def _completer(endpoints: list[str], law_name: str, temperature: Optional[float],
-               max_tokens: int) -> tuple[Complete, Callable[[], Awaitable[None]], dict[str, float]]:
+def _completer(endpoints: list[str], law_name: str, temperature: Optional[float], max_tokens: int,
+               repetition_penalty: Optional[float] = None) -> tuple[Complete, Callable[[], Awaitable[None]],
+                                                                    dict[str, float]]:
     from kotodama.posttrain.selfplay import oai_completer
     from kotodama.serve.laws import law
 
     sampling = law(law_name)
     if temperature is not None:
         sampling["temperature"] = temperature
+    if repetition_penalty is not None:
+        sampling["repetition_penalty"] = repetition_penalty
     complete, close = oai_completer(endpoints, sampling, max_tokens=max_tokens)
     return complete, close, sampling
 

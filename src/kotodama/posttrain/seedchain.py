@@ -457,6 +457,8 @@ def main_chain(argv: list[str]) -> int:
     ap.add_argument("--law", default="tsumugi")
     ap.add_argument("--temperature", type=float, default=1.0, help="short steps")
     ap.add_argument("--page_temperature", type=float, default=0.8, help="the opening page (rendering, not invention)")
+    ap.add_argument("--page_repetition_penalty", type=float, default=None,
+                    help="override the law's repetition penalty for the page, which must repeat names and facts")
     ap.add_argument("--page_candidates", type=int, default=4)
     ap.add_argument("--page_draws", type=int, default=2, help="page draws until one candidate passes the gate")
     ap.add_argument("--no_score", action="store_true")
@@ -479,7 +481,8 @@ def main_chain(argv: list[str]) -> int:
     if a.limit:
         starts = starts[:a.limit]
     complete, close, sampling = sp._completer(a.endpoint, a.law, a.temperature, 96)
-    complete_page, close_page, page_sampling = sp._completer(a.endpoint, a.law, a.page_temperature, 480)
+    complete_page, close_page, page_sampling = sp._completer(a.endpoint, a.law, a.page_temperature, 480,
+                                                             a.page_repetition_penalty)
     score, sclose = (None, None)
     if not a.no_score:
         from kotodama.posttrain.loom import http_scorer
