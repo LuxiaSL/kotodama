@@ -270,8 +270,9 @@ class DecodeEngine(nn.Module):
         # Digest of the uniform lever that wrote the prompt KV in the cache (None: unsteered). A cached prefix is
         # reused only by a request of the same lever.
         self._kv_lever: Optional[str] = None
-        # Where the positions the last prefill wrote end, and whether the decode steps since then ran on a lever
-        # slot: those steps wrote steered KV past that point, which no later prompt may reuse.
+        # Where the positions the last prefill wrote end, and whether the decode steps since then ran steered (a
+        # lever slot, or broadcast rows engaged by set_steer): those steps wrote steered KV past that point, which no
+        # later prompt may reuse.
         self._prefill_end = 0
         self._gen_steered = False
         # Eager taps (kotodama.model.levers.capture): None outside a capture; compiled graphs never run inside one.
@@ -893,9 +894,11 @@ class DecodeEngine(nn.Module):
         """The slot the single-stream decode step reads from here on: the request's lever, whatever its span. Called
         at the end of every prefill, so it also records where the prefill-written positions end."""
         self._prefill_end = self._pos_cpu
+        steered = self._steer_active  # broadcast rows engaged for this request (set_steer before the prefill)
         if self.levers is not None:
             self.lever_slot.fill_(int(slot))
-            self._gen_steered = bool(slot)
+            steered = steered or bool(slot)
+        self._gen_steered = steered
 
     @torch.inference_mode()
     def prefill(self, input_ids: torch.Tensor, slot: int = 0) -> torch.Tensor:
@@ -1031,8 +1034,8 @@ class DecodeEngine(nn.Module):
         ``slot``: the request's lever, as in prefill(). A cached prefix is
         reused only when the lever that wrote it (none, or the same uniform
         lever by content digest) is the one this prompt is written with, and
-        never past the previous prompt when that request decoded on a lever
-        (its generated positions hold steered KV); a uniform lever's extend
+        never past the previous prompt when that request decoded steered (a
+        lever, or broadcast rows: its generated positions hold steered KV); a uniform lever's extend
         runs the block forward, which reads its slot. Inside a capture every
         prompt is a full eager prefill.
 

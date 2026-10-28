@@ -201,9 +201,10 @@ def test_only_prefill_written_kv_is_pooled(model: KotodamaModel) -> None:
     eng.set_steer(None)
     nxt = prompt + gen + _ids(10, 12)
     _, info = pool.prefill(torch.tensor([nxt]))
-    # the engine reused its own (steered) decode KV, as prefill_cached always has; the pool did not take it
-    assert info["common_prefix"] == 40 and eng.prompt_kv_len == 20
-    assert len(pool.index) == 1 and pool.stats["stored_blocks"] == 1
+    # the engine reuses only the prefill-written positions (the steered decode KV after them is re-prefilled
+    # unsteered), so the whole new prompt is prompt KV and the pool takes its full blocks
+    assert info["common_prefix"] == 20 and eng.prompt_kv_len == len(nxt)
+    assert len(pool.index) == len(nxt) // BLOCK
     # a fresh prefill of the same prompt is all prompt KV again, and its blocks are pooled
     eng.reset()
     pool.prefill(torch.tensor([nxt]))

@@ -540,3 +540,24 @@ def test_cached_prefill_inside_a_capture_taps_every_position(model: KotodamaMode
         _, info = eng.prefill_cached(longer)
     assert not info["prefix_hit"]
     assert cap.sequence("partial_post_attn", 4).shape[0] == longer.shape[1]
+
+
+@torch.inference_mode()
+def test_generated_kv_of_broadcast_steering_is_never_reused(model: KotodamaModel) -> None:
+    """The same rule on the broadcast set_steer path: a reply decoded under steer_buf rows is not reused by a later
+    prompt; an unsteered engine's reply is (unchanged behaviour)."""
+    for steer in (False, True):
+        eng = _engine(model, steer=True)
+        prompt = _ids(30, 25)
+        if steer:
+            eng.set_steer([(4, torch.from_numpy(_vec(26)), 0.7)])
+        eng.prefill(prompt)
+        t = torch.tensor([[5]])
+        reply = []
+        for _ in range(10):
+            t = eng.step_logits(t)[0, -1].argmax().view(1, 1)
+            reply.append(int(t))
+        eng.set_steer(None)
+        follow = torch.cat([prompt, torch.tensor([[5] + reply[:-1]]), _ids(5, 27)], dim=1)
+        _, info = eng.prefill_cached(follow)
+        assert info["common_prefix"] == (30 if steer else 40), (steer, info)
