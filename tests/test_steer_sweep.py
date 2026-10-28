@@ -145,3 +145,24 @@ def test_shards_merge_into_layer_runs(model: KotodamaModel, tmp_path: Path) -> N
     assert first.shape == (4, 1, CFG["hidden_size"])
     cmeta = json.loads((tmp_path / "captures/decode/tsumugi-decode-L7.mlp_in.json").read_text())
     assert cmeta["per_prompt"] is True and cmeta["first_token"]["layers"] == [8]
+
+
+@pytest.mark.parametrize("mode", ["decode", "uniform"])
+@torch.inference_mode()
+def test_batch_runs_in_bf16(model: KotodamaModel, mode: str) -> None:
+    """The serving dtype: bf16 captures and readouts reach the numpy arrays."""
+    import copy
+
+    sweep.TOKENIZER[0] = _Tok()
+    m = copy.deepcopy(model).bfloat16()
+    eng = DecodeEngine(m, max_seq_len=96, dtype=torch.bfloat16, prefill_backends=[SDPBackend.MATH], levers=ROWS)
+    cap = [7, 8] if mode == "uniform" else [8]
+    dec = CascadeDecoder(eng, ROWS, groups=2, group_rows=4, tail_tokens=40, readout_k=3, capture_layers=cap)
+    units = sweep.Units(m, 7, list(range(4)), random_frac=0.5, seed=0, p50=3.0)
+    ids = torch.randint(4, CFG["vocab_size"], (1, 9), generator=torch.Generator().manual_seed(5))
+    cont = torch.randint(4, CFG["vocab_size"], (1, 4), generator=torch.Generator().manual_seed(6))
+    batch = [{"kind": "neuron", "neuron": n, "prompt": "p", "dose": 2.0} for n in range(3)]
+    out = sweep.run_batch(_args(mode), eng, dec, units, batch, ids, ids.shape[1], cont,
+                          SamplingParams(temperature=0.0, repetition_penalty=1.0), frozenset(), [7, 8], [8], cap)
+    key = "mlp_in" if mode == "uniform" else "mlp_in_first"
+    assert out["arrays"][key].dtype == np.float16 and np.isfinite(out["arrays"][key]).all()

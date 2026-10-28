@@ -244,7 +244,7 @@ def main() -> int:
                 with torch.inference_mode(), capture(eng, layers=cap_layers[L], what=("mlp_in",)) as cap:
                     eng.prefill(torch.tensor([ids], device=device))
                 for j, cl in enumerate(cap_layers[L]):
-                    caps[i, j] = cap.engine["mlp_in"][cl][0, -1].cpu().numpy()
+                    caps[i, j] = cap.engine["mlp_in"][cl][0, -1].float().cpu().numpy()
             np.savez(out_dir / f"L{L}.prompt_caps.npz", mlp_in=caps, prompts=np.array(list(prompt_ids)),
                      layers=np.array(cap_layers[L]))
 
@@ -355,10 +355,10 @@ def run_batch(a, eng: DecodeEngine, dec: CascadeDecoder, units: Units, batch: li
         keep.append(r)
     arrays = {"top_ids": top_ids_t[keep], "top_lps": top_lps_t[keep]}
     if prompt_caps is not None:
-        arrays["mlp_in"] = prompt_caps[keep][:, [dec_caps.index(x) for x in cap_layers]].cpu().numpy() \
+        arrays["mlp_in"] = prompt_caps[keep][:, [dec_caps.index(x) for x in cap_layers]].float().cpu().numpy() \
             .astype(np.float16)
     if first_caps is not None and first_layers:
-        arrays["mlp_in_first"] = first_caps[keep][:, [dec_caps.index(x) for x in first_layers]].cpu().numpy() \
+        arrays["mlp_in_first"] = first_caps[keep][:, [dec_caps.index(x) for x in first_layers]].float().cpu().numpy() \
             .astype(np.float16)
     return {"records": records, "arrays": arrays}
 

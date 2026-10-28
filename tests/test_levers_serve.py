@@ -202,3 +202,25 @@ def test_uniform_span_needs_levers(monkeypatch, model: KotodamaModel) -> None:
     r = client.post("/v1/completions", json={"prompt": "hey", "max_tokens": 3, "temperature": 0, "top_p": 0,
                                              "vectors": [{"name": "v"}], "steer_span": "uniform"})
     assert r.status_code == 400 and "--levers" in r.text
+
+
+def test_server_carries_the_penalty_scope(monkeypatch, model: KotodamaModel) -> None:
+    client, eng, _, _ = _serve(monkeypatch, model, levers=2)
+    body = {"prompt": "abcabcabcabc", "max_tokens": 5, "temperature": 0, "top_p": 0, "frequency_penalty": 1.0,
+            "return_token_ids": True}
+    prompt = torch.tensor([_CharTok().encode(body["prompt"])])
+
+    def engine_law(scope: str) -> list[int]:
+        params = SamplingParams(temperature=0.0, repetition_penalty=2.0, penalty_scope=scope)
+        with torch.inference_mode():
+            t = eng.sample_first(eng.prefill(prompt), params).clone()
+            out = [int(t)]
+            for _ in range(4):
+                t = eng.step(t, params).clone()
+                out.append(int(t))
+        return out
+
+    for scope in ("generated", "row"):
+        r = client.post("/v1/completions", json={**body, "penalty_scope": scope})
+        assert r.status_code == 200, r.text
+        assert r.json()["choices"][0]["token_ids"]["completion"] == engine_law(scope), scope

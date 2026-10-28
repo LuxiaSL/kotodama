@@ -102,6 +102,9 @@ class MultiSampleDecoder(nn.Module):
         self._compiled_greedy = None
         self._compiled_score = None
         self._greedy = False
+        self._scope = "generated"  # the penalty scope of the last law synced
+        # each row's prompt ids (device), for penalty_scope "row": restart and rewind re-seed presence from them
+        self._row_prompt: list[Optional[torch.Tensor]] = [None] * self.rows
         # score(): the token each row is scored on at the current step, and its logprob
         self.register_buffer("score_target", torch.zeros((self.rows, 1), device=dev, dtype=torch.long),
                              persistent=False)
@@ -265,6 +268,7 @@ class MultiSampleDecoder(nn.Module):
         if params.truncated or params.temperature < 0.0:
             raise ValueError("MultiSampleDecoder samples pure-temperature laws only (temperature >= 0, no top-k/top-p)")
         self._greedy = params.temperature == 0.0
+        self._scope = params.penalty_scope
         if self._greedy:  # the argmax variant, inv_temp unused
             if params.repetition_penalty != self._cur_rp:
                 self.rep_penalty.fill_(params.repetition_penalty)
@@ -303,6 +307,7 @@ class MultiSampleDecoder(nn.Module):
                 else:  # one indexed write, the prompt broadcast over the rows (no materialized copies)
                     dst[:, :, :p].index_put_((idx,), src[:, :, :p].expand(n, -1, -1, -1))
         self.attn_bias.index_copy_(0, idx, eng.attn_bias.expand(n, -1, -1, -1).contiguous())
+        self._set_prompt(rows, eng.token_history[:p])
         return self._seed(rows, idx, eng._pos_cpu, prefill_logits)
 
     @torch.inference_mode()
@@ -367,16 +372,37 @@ class MultiSampleDecoder(nn.Module):
             raise ValueError(f"rows must be distinct indices in [0, {self.rows}), got {rows}")
         return rows
 
+    def _set_prompt(self, rows: list[int], prompt: torch.Tensor) -> None:
+        ids = prompt.reshape(-1).clone()
+        for r in rows:
+            self._row_prompt[r] = ids
+
+    def _seed_presence(self, rows: list[int], idx: torch.Tensor) -> None:
+        """Empty presence for ``rows``, or (penalty_scope "row") each row's prompt ids."""
+        self.presence.index_fill_(0, idx, False)
+        if self._scope != "row":
+            return
+        for r in rows:
+            ids = self._row_prompt[r]
+            if ids is not None and ids.numel():
+                self.presence[r].index_fill_(0, ids, True)
+
     def _seed(self, rows: list[int], idx: torch.Tensor, pos: int, prefill_logits: torch.Tensor) -> list[int]:
-        """Put ``rows`` at position ``pos`` with an empty presence set and their first token sampled."""
+        """Put ``rows`` at position ``pos`` with their presence seeded (empty, or the prompt under penalty_scope
+        "row") and their first token sampled under that presence."""
         n = len(rows)
         self.pos.index_fill_(0, idx, pos)
-        # A fresh row's presence set is empty, so the penalty is the identity on its first token.
+        self._seed_presence(rows, idx)
         raw = prefill_logits.reshape(1, -1).float().expand(n, -1)
+        logits = raw
+        if self._scope == "row":  # the penalty over the prompt applies to the first token too
+            rp = self.rep_penalty
+            pres = self.presence.index_select(0, idx)
+            logits = torch.where(pres, torch.where(raw > 0, raw / rp, raw * rp), raw)
         if self._greedy:
-            first = raw.argmax(dim=-1, keepdim=True)  # (n, 1)
+            first = logits.argmax(dim=-1, keepdim=True)  # (n, 1)
         else:
-            scaled = raw * self.inv_temp
+            scaled = logits * self.inv_temp
             u = torch.rand_like(scaled)
             gumbel = -torch.log((-torch.log(u.clamp_min(1e-20))).clamp_min(1e-20))
             first = (scaled + gumbel).argmax(dim=-1, keepdim=True)  # (n, 1)
@@ -386,7 +412,6 @@ class MultiSampleDecoder(nn.Module):
             self.step_logprob.index_copy_(0, idx, lp.gather(1, first).view(-1))
             self.step_top_ids.index_copy_(0, idx, top_id)
             self.step_top_lps.index_copy_(0, idx, top_lp)
-        self.presence.index_fill_(0, idx, False)
         self.presence.index_put_((idx, first.view(-1)), torch.ones(n, dtype=torch.bool, device=idx.device))
         self.cur_tokens.index_copy_(0, idx, first)
         for r in rows:
@@ -446,9 +471,13 @@ class MultiSampleDecoder(nn.Module):
         if any(p + S >= self.max_seq_len for p in self._pos_host) or not all(self._room_for(S)):
             raise ValueError(f"a {S}-token prompt does not fit the rows' caches")
         prompt = prompt.to(self.pos.device).expand(self.rows, S)
+        self._sync_sampling(params)
+        for r in range(self.rows):
+            self._row_prompt[r] = prompt[r].clone()
         for t in range(S):
             if t == S - 1:
-                self.presence.zero_()  # the tokens sampled at earlier prompt positions were never generated
+                # the tokens sampled at earlier prompt positions were never generated
+                self._seed_presence(list(range(self.rows)), self.row_ids)
             self.cur_tokens.copy_(prompt[:, t:t + 1])
             self.step(params)
         return self.cur_tokens.view(-1).tolist()
@@ -479,8 +508,8 @@ class MultiSampleDecoder(nn.Module):
     @torch.inference_mode()
     def rewind(self, length: int, first: Sequence[int]) -> None:
         """Take every row back to the first ``length`` tokens of its sequence (later positions are closed and
-        rewritten as decoding proceeds); ``first`` is the token each row feeds next, its presence set holds only
-        that token."""
+        rewritten as decoding proceeds); ``first`` is the token each row feeds next, its presence set holds that
+        token (and, under penalty_scope "row", the row's prompt ids)."""
         if not 0 < length < self.max_seq_len or len(first) != self.rows:
             raise ValueError(f"rewind needs 0 < length < {self.max_seq_len} and one first token per row")
         dev = self.pos.device
@@ -489,7 +518,7 @@ class MultiSampleDecoder(nn.Module):
         self._rewind_storage(length)
         first_t = torch.tensor(list(first), device=dev, dtype=torch.long).view(-1, 1)
         self.cur_tokens.copy_(first_t)
-        self.presence.zero_()
+        self._seed_presence(list(range(self.rows)), self.row_ids)
         self.presence.scatter_(1, first_t, True)
 
     def _rewind_storage(self, length: int) -> None:
@@ -758,6 +787,7 @@ class CascadeDecoder(MultiSampleDecoder):
         self.tail_pos.index_fill_(0, idx, 0)
         for r in rows:
             self._tail_host[r] = 0
+        self._set_prompt(rows, eng.token_history[:p])
         return self._seed(rows, idx, p, prefill_logits)
 
     @torch.inference_mode()

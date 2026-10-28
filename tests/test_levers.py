@@ -459,3 +459,48 @@ def test_score_and_rewind(model: KotodamaModel, cls) -> None:
     fresh = _dec(cls, eng)
     fresh.admit(list(range(ROWS)), eng.prefill(prompt), params, slots=slots)
     assert after == [fresh.step(params).view(-1).tolist() for _ in range(3)]
+
+
+# ── repetition-penalty scope ────────────────────────────────────────────────
+
+
+@torch.inference_mode()
+def _engine_greedy(eng: DecodeEngine, prompt: torch.Tensor, params: SamplingParams, n: int) -> list[int]:
+    t = eng.sample_first(eng.prefill(prompt), params).clone()
+    out = [int(t)]
+    for _ in range(n - 1):
+        t = eng.step(t, params).clone()
+        out.append(int(t))
+    return out
+
+
+@pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])
+@torch.inference_mode()
+def test_penalty_scope_row_counts_the_prompt(model: KotodamaModel, cls) -> None:
+    """penalty_scope "row": the prompt's ids are in the presence set from the first token on, on the single-stream
+    engine and in the decoders alike (admit, restart, force, rewind); "generated" is the default law."""
+    eng = _engine(model, levers=1)
+    prompt = torch.tensor([[7, 9, 11, 7, 9, 11, 7, 9, 11, 13]])
+    row = SamplingParams(temperature=0.0, repetition_penalty=3.0, penalty_scope="row")
+    gen = SamplingParams(temperature=0.0, repetition_penalty=3.0)
+    want_row, want_gen = _engine_greedy(eng, prompt, row, 6), _engine_greedy(eng, prompt, gen, 6)
+    plain = torch.argmax(eng.prefill(prompt), -1).item()
+    assert want_gen[0] == plain  # the generated-only law leaves the first token unpenalized
+    assert not set(want_row) & set(prompt[0].tolist()) or want_row != want_gen
+    dec = _dec(cls, eng)
+    logits = eng.prefill(prompt)
+    toks = [dec.admit(list(range(ROWS)), logits, row)]
+    toks += [dec.step(row).view(-1).tolist() for _ in range(5)]
+    assert all([t[r] for t in toks] == want_row for r in range(ROWS))
+    first = dec.restart([1, 2], prompt.shape[1], logits, row)
+    assert first == [want_row[0]] * 2
+    for presence_row in (1, 2):
+        assert set(prompt[0].tolist()) <= set(dec.presence[presence_row].nonzero().view(-1).tolist())
+    dec.admit_empty(0)
+    f = dec.force(prompt, row)
+    assert f == [want_row[0]] * ROWS
+    assert set(dec.presence[0].nonzero().view(-1).tolist()) == set(prompt[0].tolist()) | {want_row[0]}
+    dec.rewind(prompt.shape[1], f)
+    assert set(dec.presence[3].nonzero().view(-1).tolist()) == set(prompt[0].tolist()) | {want_row[0]}
+    with pytest.raises(ValueError):
+        SamplingParams(penalty_scope="prompt")

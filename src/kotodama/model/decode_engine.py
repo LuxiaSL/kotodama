@@ -83,6 +83,11 @@ class SamplingParams:
     top_k == 0 and top_p in {0.0, 1.0} mean "disabled" (server.py convention).
     Truncated sampling (top_k > 0 or 0 < top_p < 1) routes through a separate
     compiled sampler variant; the pure-temperature graph is untouched.
+
+    ``penalty_scope`` says which tokens the repetition penalty counts:
+    "generated" (the default) the row's generated tokens only, "row" every
+    token of the row, prompt included (the CTRL / HF convention). Either way
+    the penalty reads one presence set; "row" seeds it with the prompt ids.
     """
 
     def __init__(
@@ -91,7 +96,10 @@ class SamplingParams:
         repetition_penalty: float = 1.2,
         top_k: int = 0,
         top_p: float = 0.0,
+        penalty_scope: str = "generated",
     ) -> None:
+        if penalty_scope not in ("generated", "row"):
+            raise ValueError(f"penalty_scope must be 'generated' or 'row', got {penalty_scope!r}")
         if top_k < 0:
             raise ValueError(f"top_k must be >= 0, got {top_k}")
         if not 0.0 <= top_p <= 1.0:
@@ -100,6 +108,7 @@ class SamplingParams:
         self.repetition_penalty = float(repetition_penalty)
         self.top_k = int(top_k)
         self.top_p = float(top_p)
+        self.penalty_scope = penalty_scope
 
     @property
     def truncated(self) -> bool:
@@ -1155,7 +1164,10 @@ class DecodeEngine(nn.Module):
 
     @torch.inference_mode()
     def sample_first(self, prefill_logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
-        """Sample the first token from prefill logits. Returns (1, 1) CUDA tensor."""
+        """Sample the first token from prefill logits. Returns (1, 1) CUDA tensor. Under
+        ``penalty_scope="row"`` the presence set starts as the prompt's ids."""
+        if params.penalty_scope == "row" and self._pos_cpu > 0:
+            self.presence.index_fill_(0, self.token_history[: self._pos_cpu], True)
         token = self._sample(prefill_logits.view(1, 1, -1), params)
         self.cur_token.copy_(token)
         return self.cur_token
