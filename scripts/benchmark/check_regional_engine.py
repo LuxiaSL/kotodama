@@ -19,7 +19,14 @@ way the server compiles it today (``compile_step(mode)``). Reports:
   * ``rows`` (``--sections rows``): each row decoder class (per-row KV and cascade) compiled regionally and captured,
     through every path a client takes (admit, the sampled / greedy / truncated steps, ``force`` and ``score``),
     against the same decoder uneager: per-step KL and top-1 of the forced continuation, the largest score
-    difference, and whether the greedy rows agree.
+    difference, and whether the greedy rows agree;
+  * ``sign`` (``--sections sign``): decode signing (kotodama.model.signing) on a cascade decoder of ``--sign_rows``
+    rows, regional and captured: (1) signing on vs off, mixed laws and a decode-span lever on half the rows, tokens
+    and per-step readouts compared bit for bit, and the step time of each; (2) the signed surfaces of two rows
+    against the replay capture (kotodama.model.capture.cached_forward over the decoded sequence), relative L2 per
+    surface; (3) batchmate independence at a fixed width: target rows decoded beside their own prompt's rows and
+    beside another prompt's rows (another cascade grouping), differing coordinates per surface; (4) the cross-width
+    floor: the same rows decoded at narrower decoder widths, relative L2 per surface against the widest.
 
 Usage (node, GPU):
   tools/run_py.sh scripts/benchmark/check_regional_engine.py --checkpoint <model.pt> --model_size 1b-tsumugi \\
@@ -212,6 +219,147 @@ def rows_check(a, eng: DecodeEngine, ids: torch.Tensor, forced: torch.Tensor) ->
     return out
 
 
+def _rel(x: torch.Tensor, y: torch.Tensor) -> float:
+    x, y = x.double(), y.double()
+    return float((x - y).norm() / y.norm().clamp_min(1e-30))
+
+
+@torch.inference_mode()
+def sign_check(a, eng: DecodeEngine, tok, slot: int) -> dict:
+    """Decode signing on a regional cascade decoder; see the module docstring (``sign``)."""
+    from kotodama.model.capture import cached_forward, hidden_rows
+    from kotodama.model.signing import SignSpec
+
+    B, steps = a.sign_rows, a.sign_steps
+    spec = SignSpec(tuple(int(x) for x in a.sign_layers.split(",")), tail=steps, depth=True)
+    laws = [SamplingParams(temperature=a.temperature, repetition_penalty=a.repetition_penalty),
+            SamplingParams(temperature=a.temperature, repetition_penalty=a.repetition_penalty, top_p=0.9, min_p=0.05)]
+    prompts = [torch.tensor([tok.encode(PROMPT)], device="cuda"),
+               torch.tensor([tok.encode(FORCED.strip() + " " + PROMPT)], device="cuda")]
+    seeds = [1000 + r for r in range(B)]
+    slots = [slot if r % 2 else 0 for r in range(B)]
+
+    def make(rows: int, sign):
+        dec = CascadeDecoder(eng, rows, groups=rows // 32 + 1, group_rows=min(rows, 32),
+                             tail_tokens=steps + 8, readout_k=4, seeded=True, sign=sign)
+        dec.compile_step(mode=a.mode, regional=True)
+        return dec
+
+    def run(dec, law, layout: list[int]) -> tuple[list, list, float, dict]:
+        """Rows admitted from ``prompts[layout[r]]`` (each prompt's rows in one admit), ``steps`` steps; per step the
+        tokens and readouts; ms per step past the first 8; each row's first token (sampled at admission)."""
+        dec.release(range(dec.rows))
+        firsts = {}
+        for p in sorted(set(layout)):
+            rows = [r for r in range(dec.rows) if layout[r] == p]
+            firsts.update(zip(rows, dec.admit(rows, eng.prefill(prompts[p]), law, slots=[slots[r] for r in rows],
+                                              seeds=[seeds[r] for r in rows])))
+        toks, reads = [], []
+        t_steady = 0.0
+        for i in range(steps):
+            t0 = time.perf_counter()
+            toks.append(dec.step(law).view(-1).clone())
+            reads.append((dec.step_logprob.clone(), dec.step_top_lps.clone(), dec.step_top_ids.clone()))
+            if i >= 8:
+                torch.cuda.synchronize()
+                t_steady += time.perf_counter() - t0
+        return toks, reads, t_steady / max(1, steps - 8) * 1000, firsts
+
+    out: dict = {"rows": B, "steps": steps, "layers": list(spec.layers), "depth": spec.depth}
+    # (1) on vs off
+    base = [0] * B
+    ident = {}
+    records = {}
+    for name, sign in (("off", None), ("on", spec)):
+        dec = make(B, sign)
+        if sign is not None:
+            out["sign_mb"] = round(sum(getattr(dec, f"sign_{n}").numel() * getattr(dec, f"sign_{n}").element_size()
+                                       for n in dec.sign_names) / 1e6, 1)
+        per_law = []
+        for law in laws:
+            per_law.append(run(dec, law, base))
+        records[name] = per_law
+        if sign is not None:
+            signed_dec = dec
+        else:
+            del dec
+            torch.cuda.empty_cache()
+    for li, law in enumerate(("plain", "truncated")):
+        (t0, r0, ms0, _), (t1, r1, ms1, _) = records["off"][li], records["on"][li]
+        first_tok = next((i for i, (x, y) in enumerate(zip(t0, t1)) if not torch.equal(x, y)), None)
+        first_read = next((i for i, (x, y) in enumerate(zip(r0, r1)) if not all(torch.equal(p, q)
+                                                                              for p, q in zip(x, y))), None)
+        ident[law] = {"tokens_bitwise": first_tok is None, "first_token_diff_step": first_tok,
+                      "readouts_bitwise": first_read is None, "first_readout_diff_step": first_read,
+                      "ms_off": round(ms0, 3), "ms_on": round(ms1, 3), "overhead": round(ms1 / ms0 - 1, 4)}
+    out["on_off"] = ident
+    logger.info("sign on/off: %s", json.dumps(ident))
+    # (2) the last law's signed rows vs the replay capture (rows 0 and 1: no lever and the lever)
+    model = eng.model
+    toks = torch.stack(records["on"][-1][0], dim=1)  # (B, steps)
+    firsts = records["on"][-1][3]
+    P = prompts[0].shape[1]
+    replay = {}
+    for r in (0, 1):
+        row = signed_dec.signed(r, device=torch.device("cuda"))
+        if slots[r]:
+            replay[str(r)] = {"lever_slot": row.lever_slot, "skipped": "the replay forward runs no levers"}
+            continue
+        # the sequence: the prompt, the first token (sampled at admission), then every step's token but the last
+        # (sampled, never fed)
+        replay[str(r)] = {"positions": row.positions}
+        seq = torch.cat([prompts[0][0], torch.tensor([firsts[r]], device="cuda"), toks[r, :-1]]).view(1, -1)
+        _, cap, _ = cached_forward(model, seq, past=None, position_offset=0, light=False, capture_hidden=True)
+        hid = hidden_rows(cap, model.config.num_layers)
+        span = slice(P, P + row.positions)
+        want_depth = torch.stack([hid[li + 1][0, span] for li in range(model.config.num_layers)], dim=1)
+        rel = {"depth": _rel(row.surfaces["depth"], want_depth)}
+        for name, key in (("q", "queries"), ("k", "keys"), ("v", "values")):
+            want = torch.stack([cap[key][li][0, :, span].transpose(0, 1) for li in spec.layers], dim=1)
+            rel[name] = _rel(row.surfaces[name], want)
+        rel["gate"] = _rel(row.surfaces["gate"], torch.stack([cap["gate"][li][0, span] for li in spec.layers], 1))
+        replay[str(r)]["rel_l2"] = rel
+        del cap
+    out["vs_replay"] = replay
+    logger.info("sign vs replay: %s", json.dumps(replay))
+
+    def surfaces(dec, rows) -> dict:
+        return {r: dec.signed(r, device=torch.device("cuda")).surfaces for r in rows}
+
+    # (3) batchmate independence at the fixed width: targets beside their own prompt vs beside another prompt
+    targets = list(range(8))
+    run(signed_dec, laws[0], base)
+    ref = surfaces(signed_dec, targets)
+    mixed = [0 if r < 8 else 1 for r in range(B)]
+    run(signed_dec, laws[0], mixed)
+    got = surfaces(signed_dec, targets)
+    bm = {}
+    for name in ref[0]:
+        differ = sum(int((ref[r][name] != got[r][name]).sum()) for r in targets)
+        bm[name] = {"coords": sum(ref[r][name].numel() for r in targets), "differ": differ}
+    out["batchmates_fixed_width"] = bm
+    logger.info("sign batchmates: %s", json.dumps(bm))
+    del signed_dec
+    torch.cuda.empty_cache()
+    # (4) the cross-width floor: the same rows at narrower widths against the widest
+    floor = {}
+    for w in (16, 32, 64):
+        if w >= B:
+            continue
+        dec = make(w, spec)
+        run(dec, laws[0], [0] * w)
+        sub = surfaces(dec, targets)
+        floor[str(w)] = {name: {"differ_frac": round(sum(int((ref[r][name] != sub[r][name]).sum()) for r in targets)
+                                                    / sum(ref[r][name].numel() for r in targets), 4),
+                                "rel_l2_max": max(_rel(sub[r][name], ref[r][name]) for r in targets)}
+                         for name in ref[0]}
+        del dec
+        torch.cuda.empty_cache()
+    out["cross_width_floor"] = floor
+    logger.info("sign cross-width floor: %s", json.dumps(floor))
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
@@ -223,7 +371,11 @@ def main() -> int:
                                                            "form")
     ap.add_argument("--whole", action="store_true", help="also build and measure the whole-step engine")
     ap.add_argument("--sections", default="engine", help="comma list: engine (the engine checks), rows (the row "
-                                                         "decoders over a regional engine)")
+                                                         "decoders over a regional engine), sign (decode signing)")
+    ap.add_argument("--sign_rows", type=int, default=128)
+    ap.add_argument("--sign_steps", type=int, default=256)
+    ap.add_argument("--sign_layers", default="0,18,25,34,36,45,54,56,63,71",
+                    help="the sampled effective layers (default: the tsumugi lane's)")
     ap.add_argument("--max_seq_len", type=int, default=4096)
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--cold", action="store_true", help="inductor caches off: cold compile seconds")
@@ -260,6 +412,13 @@ def main() -> int:
         eng.compile_step(mode=a.mode, regional=True)
         res["rows"] = rows_check(a, eng, ids, forced)
         logger.info("rows: %s", json.dumps(res["rows"]))
+        del eng
+        torch.cuda.empty_cache()
+    if "sign" in sections:
+        eng = DecodeEngine(model, max_seq_len=a.max_seq_len, levers=a.levers)
+        sslot = eng.levers.bind(plan) if plan is not None else 0
+        eng.compile_step(mode=a.mode, regional=True)
+        res["sign"] = sign_check(a, eng, tok, sslot)
         del eng
         torch.cuda.empty_cache()
     for name, regional in ((("regional", True), ("whole", False)) if a.whole else (("regional", True),)) \

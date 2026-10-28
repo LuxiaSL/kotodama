@@ -4,7 +4,7 @@ depth.
 The whole-step compile traces every effective layer into one graph, so its compile time grows with depth and every
 bucket width (rows, or block tokens) compiles the whole depth again. A layer's code is the same at every depth; what
 differs between layers is only static structure: how many committed AttnRes sources its routing reads, whether it
-opens a block, and whether its MLP input is captured. The regional path compiles one graph per such signature, with
+opens a block, whether its MLP input is captured and whether it signs (kotodama.model.signing). The regional path compiles one graph per such signature, with
 every weight, norm gain, routing query, KV buffer and lever row passed in as a tensor (no module attribute is read
 inside a region, so nothing guards on which layer's module it is), and runs the depth loop in Python. Every caller's
 signatures get code objects of their own, so each code object holds one compiled graph and dynamo's per-code-object
@@ -45,14 +45,43 @@ def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return x * norm * weight
 
 
-def _route(sources: list[torch.Tensor], query: torch.Tensor, norm_weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """DecodeEngine._route's arithmetic, with eps passed in."""
+def route_weights(sources: list[torch.Tensor], query: torch.Tensor, norm_weight: torch.Tensor,
+                  eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """DecodeEngine._route's arithmetic, with eps passed in: (the routed mixture, the weights (n, B, S))."""
     qw = query * norm_weight
     stacked = torch.stack(sources, dim=0)
     rsqrt = torch.rsqrt(stacked.pow(2).mean(-1) + eps)
     logits = (stacked * qw).sum(-1) * rsqrt
     weights = F.softmax(logits, dim=0)
-    return (weights.unsqueeze(-1) * stacked).sum(0)
+    return (weights.unsqueeze(-1) * stacked).sum(0), weights
+
+
+def _route(sources: list[torch.Tensor], query: torch.Tensor, norm_weight: torch.Tensor, eps: float) -> torch.Tensor:
+    return route_weights(sources, query, norm_weight, eps)[0]
+
+
+def sign_write(sign: tuple[torch.Tensor, ...], q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor,
+               w_attn: Optional[torch.Tensor], w_mlp: torch.Tensor) -> None:
+    """A sampled layer's surfaces at its last position into the sign buffers (kotodama.model.signing):
+    sign = (q, k, v, gate, route buffers, row ids, each row's slot, the layer's column (0-d)). q / k / v are
+    (B, heads, S, head_dim) before RoPE, gate (B, S, intermediate), the routing weights (n, B, S) (``w_attn`` None: the
+    attention input reads no routing)."""
+    q_buf, k_buf, v_buf, gate_buf, route_buf, row_ids, slot, col = sign
+    B = q.shape[0]
+    idx = (row_ids, slot, col.expand(B))
+    q_buf.index_put_(idx, q[:, :, -1].reshape(B, -1))
+    k_buf.index_put_(idx, k[:, :, -1].reshape(B, -1))
+    v_buf.index_put_(idx, v[:, :, -1].reshape(B, -1))
+    gate_buf.index_put_(idx, gate[:, -1])
+    width = route_buf.shape[-1] // 2
+    halves = []
+    for w in (w_attn, w_mlp):
+        n = 0 if w is None else w.shape[0]
+        if n:
+            halves.append(w[:, :, -1].transpose(0, 1).to(route_buf.dtype))
+        if n < width:
+            halves.append(route_buf.new_zeros((B, width - n)))
+    route_buf.index_put_(idx, torch.cat(halves, dim=-1))
 
 
 def cache_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[torch.Tensor, ...],
@@ -71,7 +100,7 @@ def cache_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[to
 
 def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_heads: int, n_kv_heads: int,
                        head_dim: int, intermediate: int, qk_norm: bool, levers: bool, steer: bool,
-                       attend: Callable, linear: Callable = F.linear) -> Callable:
+                       attend: Callable, linear: Callable = F.linear, sign: bool = False) -> Callable:
     """One layer as a function of tensors, mirroring the loop body of MultiSampleDecoder._forward_step and of
     DecodeEngine's step and block forwards: pre-attention routing over ``committed + [partial]``, the attention
     sublayer (KV write and attend through ``attend(q, k, v, kv, state)``), the lever and broadcast-steering adds,
@@ -80,14 +109,20 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
     S tokens; ``cos`` / ``sin`` are the rope rows of its positions, as apply_rope takes them; ``linear(x, w)`` is the
     projection (the engine's GEMV dispatch).
 
-    Returns the layer's output partial, and with ``capture`` also the MLP input (B, S, D). The function gets a code
+    Returns the layer's output partial, and with ``capture`` also the MLP input (B, S, D). With ``sign`` the layer
+    writes its surfaces through ``sign_write`` (``sign_args``: its sign tuple); the arithmetic of everything it
+    returns is the same as without. The function gets a code
     object of its own named ``name``, so its compiled graphs are cached apart from every other signature's."""
     q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
 
     def decode_layer(partial, committed, attn_q, attn_g, mlp_q, mlp_g, attn_norm_w, ffn_norm_w, q_norm_w, k_norm_w,
                      w_qkv, w_o, w_gate_up, w_down, cos, sin, kv, state, lever_a, lever_m, act_keep, act_add,
-                     steer_row):
-        h_attn = _route(committed + [partial], attn_q, attn_g, eps) if committed else partial
+                     steer_row, sign_args=None):
+        w_attn = None
+        if committed:
+            h_attn, w_attn = route_weights(committed + [partial], attn_q, attn_g, eps)
+        else:
+            h_attn = partial
         if is_boundary:
             sources = committed + [partial]
             base = torch.zeros_like(partial)
@@ -104,6 +139,7 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
         if qk_norm:
             q = _rms(q, q_norm_w, eps)
             k = _rms(k, k_norm_w, eps)
+        q_pre, k_pre = q, k
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         attn_out = linear(attend(q, k, v, kv, state), w_o)
@@ -112,8 +148,11 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
         new = base + attn_out
         if steer:
             new = new + steer_row
-        x_mlp = _rms(_route(sources + [new], mlp_q, mlp_g, eps), ffn_norm_w, eps)
+        h_mlp, w_mlp = route_weights(sources + [new], mlp_q, mlp_g, eps)
+        x_mlp = _rms(h_mlp, ffn_norm_w, eps)
         gate, up = linear(x_mlp, w_gate_up).split(intermediate, dim=-1)
+        if sign:
+            sign_write(sign_args, q_pre, k_pre, v, gate, w_attn, w_mlp)
         act = F.silu(gate) * up
         if levers:
             act = act * act_keep.unsqueeze(1) + act_add.unsqueeze(1)
@@ -126,7 +165,8 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
         return out
 
     code = decode_layer.__code__.replace(co_name=name, co_qualname=name)
-    return types.FunctionType(code, decode_layer.__globals__, name, None, decode_layer.__closure__)
+    return types.FunctionType(code, decode_layer.__globals__, name, decode_layer.__defaults__,
+                              decode_layer.__closure__)
 
 
 # The region mode for each whole-step mode: the same autotuning, without CUDA graphs (the whole step is captured as
@@ -185,17 +225,19 @@ def check_norms(model, eps: float) -> None:
                          "(build it with use_liger=False)")
 
 
-Region = tuple[Callable, bool, int, tuple, tuple]
+Region = tuple[Callable, bool, int, tuple, tuple, Optional[tuple]]
 
 
-def build_regions(eng, signatures: Sequence[tuple[int, bool, bool]], kvs: Sequence[tuple[torch.Tensor, ...]],
+def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, bool]], kvs: Sequence[tuple[torch.Tensor, ...]],
                   prefix: str, *, attend: Callable, steer: bool, linear: Callable = F.linear,
-                  capture_col: Optional[Callable[[int], int]] = None, **opts) -> tuple[list[Region], int]:
-    """One compiled layer per distinct signature (committed sources, boundary, capture) over a DecodeEngine's weights,
-    and each effective layer's (compiled layer, boundary, capture column or -1, its tensors, its KV buffers). The
-    compiled functions are named ``{prefix}_c{committed}[_boundary][_capture]``. ``opts`` go to torch.compile.
-    ``capture_col(layer)``: a captured layer's column in the caller's capture buffer. Returns (regions, number of
-    distinct signatures)."""
+                  capture_col: Optional[Callable[[int], int]] = None,
+                  sign_args: Optional[Callable[[int], tuple]] = None, **opts) -> tuple[list[Region], int]:
+    """One compiled layer per distinct signature (committed sources, boundary, capture, sign) over a DecodeEngine's
+    weights, and each effective layer's (compiled layer, boundary, capture column or -1, its tensors, its KV buffers,
+    its sign tuple or None). The compiled functions are named ``{prefix}_c{committed}[_boundary][_capture][_sign]``.
+    ``opts`` go to torch.compile. ``capture_col(layer)``: a captured layer's column in the caller's capture buffer;
+    ``sign_args(layer)``: a signing layer's sign tuple (``sign_write``). Returns (regions, number of distinct
+    signatures)."""
     model = eng.model
     static = dict(eps=eng.eps, n_heads=eng.n_heads, n_kv_heads=eng.n_kv_heads, head_dim=eng.head_dim,
                   intermediate=eng.config.intermediate_size, qk_norm=bool(eng.config.qk_norm),
@@ -203,10 +245,12 @@ def build_regions(eng, signatures: Sequence[tuple[int, bool, bool]], kvs: Sequen
     fns: dict[tuple[int, bool, bool], Callable] = {}
     regions: list[Region] = []
     for li, sig in enumerate(signatures):
-        c, boundary, capture = sig
+        c, boundary, capture, sign = sig
         if sig not in fns:
-            name = f"{prefix}_c{c}{'_boundary' if boundary else ''}{'_capture' if capture else ''}"
-            fns[sig] = torch.compile(make_layer(name, is_boundary=boundary, capture=capture, **static), **opts)
+            name = (f"{prefix}_c{c}{'_boundary' if boundary else ''}{'_capture' if capture else ''}"
+                    f"{'_sign' if sign else ''}")
+            fns[sig] = torch.compile(make_layer(name, is_boundary=boundary, capture=capture, sign=sign, **static),
+                                     **opts)
         layer = model.layers[li]
         attn = layer.attn
         tensors = (layer.attn_res_query, layer.attn_res_norm.weight, layer.mlp_res_query, layer.mlp_res_norm.weight,
@@ -214,27 +258,35 @@ def build_regions(eng, signatures: Sequence[tuple[int, bool, bool]], kvs: Sequen
                    attn.q_norm.weight if attn.qk_norm else None, attn.k_norm.weight if attn.qk_norm else None,
                    eng.w_qkvs[li], attn.o_proj.weight, eng.w_gate_ups[li], layer.ffn.down_proj.weight)
         col = capture_col(li) if capture else -1
-        regions.append((fns[sig], boundary, col, tensors, kvs[li]))
+        regions.append((fns[sig], boundary, col, tensors, kvs[li], sign_args(li) if sign else None))
     return regions, len(fns)
 
 
 def run_regions(regions: Sequence[Region], embed: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                 state: tuple[torch.Tensor, ...], levers: Optional[tuple[torch.Tensor, ...]],
                 steer_buf: Optional[torch.Tensor],
-                capture_buf: Optional[torch.Tensor]) -> tuple[list[torch.Tensor], torch.Tensor]:
+                capture_buf: Optional[torch.Tensor],
+                sign_partials: Optional[tuple] = None) -> tuple[list[torch.Tensor], torch.Tensor]:
     """The depth loop over ``regions`` from the embedding: each layer's lever rows (``levers``: attn, mlp, act keep,
     act add, each indexed by layer), broadcast steering row (``steer_buf[li]``) and, for a captured layer, its MLP
-    input written to ``capture_buf[:, col]`` (the last position's). Returns (the committed block outputs, the last
-    partial) for the tail."""
+    input written to ``capture_buf[:, col]`` (the last position's). ``sign_partials`` = (buffer, each layer's column
+    in it or -1, row ids, each row's slot): a signed layer's output partial (last position) is written there after
+    its region returns. Returns (the committed block outputs, the last partial) for the tail."""
     committed: list[torch.Tensor] = []
     partial = embed
-    for li, (fn, boundary, col, tensors, kv) in enumerate(regions):
+    for li, (fn, boundary, col, tensors, kv, sign) in enumerate(regions):
         rows = (None,) * 4 if levers is None else tuple(t[li] for t in levers)
-        out = fn(partial, committed, *tensors, cos, sin, kv, state, *rows,
-                 steer_buf[li] if steer_buf is not None else None)
+        steer_row = steer_buf[li] if steer_buf is not None else None
+        if sign is None:
+            out = fn(partial, committed, *tensors, cos, sin, kv, state, *rows, steer_row)
+        else:
+            out = fn(partial, committed, *tensors, cos, sin, kv, state, *rows, steer_row, sign)
         if col >= 0:
             out, x_mlp = out
             capture_buf[:, col] = x_mlp[:, -1]
+        if sign_partials is not None and sign_partials[1][li] >= 0:
+            buf, cols, row_ids, slot = sign_partials
+            buf[row_ids, slot, cols[li]] = out[:, -1]
         if boundary:
             committed.append(partial)
         partial = out

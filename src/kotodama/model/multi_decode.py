@@ -30,9 +30,10 @@ import torch.nn.functional as F
 
 from kotodama.model.cascade_attn import attend_for, merge, pack_group_queries, unpack_group_outputs
 from kotodama.model.decode_engine import DecodeEngine, SamplingParams
+from kotodama.model import signing
 from kotodama.model.llama import apply_rope
 from kotodama.model.regional import (REGION_MODES, StepGraph, build_regions, check_norms, layer_signatures,
-                                     run_regions)
+                                     route_weights, run_regions, sign_write)
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,8 @@ class MultiSampleDecoder(nn.Module):
     """
 
     def __init__(self, engine: DecodeEngine, rows: int, kv_from: Optional["MultiSampleDecoder"] = None,
-                 readout_k: int = 0, capture_layers: Sequence[int] = (), seeded: bool = False) -> None:
+                 readout_k: int = 0, capture_layers: Sequence[int] = (), seeded: bool = False,
+                 sign: Optional[signing.SignSpec] = None) -> None:
         super().__init__()
         if rows < 2:
             raise ValueError(f"rows must be >= 2 (one row is the engine's own path), got {rows}")
@@ -176,6 +178,36 @@ class MultiSampleDecoder(nn.Module):
                                  persistent=False)
             self.register_buffer("row_step", torch.zeros((self.rows,), device=dev, dtype=torch.int64),
                                  persistent=False)
+        # Signing (sign, a trace-time constant; kotodama.model.signing): each row's span surfaces at the sampled
+        # layers, written by every step at slot pos - sign_start (the row's position at admission).
+        self.sign = sign
+        self._sign_start_host = [0] * self.rows
+        if sign is not None:
+            sign.check(self.n_layers)
+            sigs = layer_signatures(engine.model._attn_res_boundary_set, self.n_layers)
+            self._sign_route = signing.route_width(sigs)
+            bufs = signing.allocate(sign, self.rows, hidden=engine.hidden, n_heads=engine.n_heads,
+                                    n_kv_heads=engine.n_kv_heads, head_dim=engine.head_dim,
+                                    intermediate=engine.config.intermediate_size, n_layers=self.n_layers,
+                                    route=self._sign_route, device=dev, dtype=engine.dtype)
+            for name, b in bufs.items():
+                self.register_buffer(f"sign_{name}", b, persistent=False)
+            self.sign_names = tuple(bufs)
+            self.register_buffer("sign_start", torch.zeros((self.rows,), device=dev, dtype=torch.long),
+                                 persistent=False)
+            self.register_buffer("sign_slot", torch.zeros((self.rows,), device=dev, dtype=torch.long),
+                                 persistent=False)
+            self.register_buffer("sign_cols", torch.arange(len(sign.layers), device=dev, dtype=torch.long),
+                                 persistent=False)
+            # each layer's column in the partial buffer (depth: every layer; else the sampled ones), -1: none
+            if sign.depth:
+                self._sign_partial_cols = list(range(self.n_layers))
+            else:
+                self._sign_partial_cols = [sign.layers.index(li) if li in sign.layers else -1
+                                           for li in range(self.n_layers)]
+            logger.info("%s: signing %d layers%s over %d positions per row, %.0f MB", type(self).__name__,
+                        len(sign.layers), " + the depth path" if sign.depth else "", sign.tail,
+                        sum(b.numel() * b.element_size() for b in bufs.values()) / 1e6)
         self._row_truncated = [False] * self.rows  # host: which rows' laws truncate (picks the step variant)
         self._row_scope = ["generated"] * self.rows  # host: each row's penalty scope
         self._pos_host = [0] * self.rows  # host mirror of pos (no device syncs for capacity checks)
@@ -233,7 +265,8 @@ class MultiSampleDecoder(nn.Module):
 
     # ── the batched decode step ─────────────────────────────────────────────
 
-    def _attn(self, layer_idx: int, x: torch.Tensor) -> torch.Tensor:
+    def _attn(self, layer_idx: int, x: torch.Tensor, keep: Optional[list] = None) -> torch.Tensor:
+        """``keep``: a list the pre-RoPE q, k and v are appended to (signing)."""
         eng = self.engine
         attn = eng.model.layers[layer_idx].attn
         B = x.shape[0]
@@ -245,6 +278,8 @@ class MultiSampleDecoder(nn.Module):
         if attn.qk_norm:
             q = attn.q_norm(q)
             k = attn.k_norm(k)
+        if keep is not None:
+            keep.extend((q, k, v))
         cos = eng.rope_cos_t.index_select(0, self.pos).unsqueeze(1)  # (B, 1, head_dim): each row's own angle
         sin = eng.rope_sin_t.index_select(0, self.pos).unsqueeze(1)
         q = apply_rope(q, cos, sin)
@@ -276,6 +311,7 @@ class MultiSampleDecoder(nn.Module):
         eng = self.engine
         model = eng.model
         self._open_step()
+        self._sign_step()
         embed = model.embed_tokens(tokens)  # (B, 1, D)
         committed: list[torch.Tensor] = []
         if eng.levers is not None:
@@ -287,20 +323,32 @@ class MultiSampleDecoder(nn.Module):
         partial = embed
         for ls in eng.schedule:
             layer = model.layers[ls.layer_idx]
+            signs = self.sign is not None and ls.layer_idx in self.sign.layers
+            w_attn = keep = None
             if committed:
-                h_attn = eng._route(committed + [partial], layer.attn_res_query, layer.attn_res_norm.weight)
+                if signs:
+                    h_attn, w_attn = route_weights(committed + [partial], layer.attn_res_query,
+                                                   layer.attn_res_norm.weight, eng.eps)
+                else:
+                    h_attn = eng._route(committed + [partial], layer.attn_res_query, layer.attn_res_norm.weight)
             else:
                 h_attn = partial
             if ls.is_boundary:
                 committed.append(partial)
                 partial = torch.zeros_like(embed)
-            attn_out = self._attn(ls.layer_idx, layer.attn_norm(h_attn))
+            if signs:
+                keep = []
+            attn_out = self._attn(ls.layer_idx, layer.attn_norm(h_attn), keep)
             if eng.levers is not None:
                 attn_out = attn_out + lever_attn[ls.layer_idx].unsqueeze(1)
             partial = partial + attn_out
             if eng.steer_enabled:
                 partial = partial + eng.steer_buf[ls.layer_idx]
-            h_mlp = eng._route(committed + [partial], layer.mlp_res_query, layer.mlp_res_norm.weight)
+            if signs:
+                h_mlp, w_mlp = route_weights(committed + [partial], layer.mlp_res_query, layer.mlp_res_norm.weight,
+                                             eng.eps)
+            else:
+                h_mlp = eng._route(committed + [partial], layer.mlp_res_query, layer.mlp_res_norm.weight)
             x_mlp = layer.ffn_norm(h_mlp)
             if ls.layer_idx in self.capture_layers:
                 self.mlp_in[:, self.capture_layers.index(ls.layer_idx)] = x_mlp[:, 0]
@@ -308,6 +356,8 @@ class MultiSampleDecoder(nn.Module):
                 self._taps.record(ls.layer_idx, partial, x_mlp)
             gu = F.linear(x_mlp, eng.w_gate_ups[ls.layer_idx])
             gate, up = gu.split(eng.config.intermediate_size, dim=-1)
+            if signs:
+                sign_write(self._sign_args(ls.layer_idx), *keep, gate, w_attn, w_mlp)
             act = F.silu(gate) * up
             if eng.levers is not None:
                 act = act * act_keep[ls.layer_idx].unsqueeze(1) + act_add[ls.layer_idx].unsqueeze(1)
@@ -315,6 +365,9 @@ class MultiSampleDecoder(nn.Module):
             if eng.levers is not None:
                 mlp_out = mlp_out + lever_mlp[ls.layer_idx].unsqueeze(1)
             partial = partial + mlp_out
+            if self.sign is not None and self._sign_partial_cols[ls.layer_idx] >= 0:
+                buf, cols, row_ids, slot = self._sign_partials()
+                buf[row_ids, slot, cols[ls.layer_idx]] = partial[:, -1]
         x = eng._route(committed + [partial], model.final_res_query, model.final_res_norm.weight)
         x = model.norm(x)
         logits = F.linear(x, model.get_lm_head_weight())  # (B, 1, V)
@@ -404,10 +457,40 @@ class MultiSampleDecoder(nn.Module):
         """The attention a regional layer runs: (attend function, each layer's KV buffers, the per-step state)."""
         return _slot_attend, list(zip(self.k_caches, self.v_caches)), (self.attn_bias, self.pos, self.row_ids)
 
-    def regional_signatures(self) -> list[tuple[int, bool, bool]]:
-        """Each effective layer's regional signature: (committed sources, block boundary, MLP input captured)."""
+    def regional_signatures(self) -> list[tuple[int, bool, bool, bool]]:
+        """Each effective layer's regional signature: (committed sources, block boundary, MLP input captured,
+        signs)."""
         sigs = layer_signatures(self.engine.model._attn_res_boundary_set, self.n_layers)
-        return [(c, b, li in self.capture_layers) for li, (c, b) in enumerate(sigs)]
+        signed = self.sign.layers if self.sign is not None else ()
+        return [(c, b, li in self.capture_layers, li in signed) for li, (c, b) in enumerate(sigs)]
+
+    # ── signing (kotodama.model.signing) ────────────────────────────────────
+
+    def _sign_step(self) -> None:
+        """Each row's slot this step: its position since admission (the last slot once past the tail)."""
+        if self.sign is not None:
+            self.sign_slot.copy_(torch.clamp(self.pos - self.sign_start, 0, self.sign.tail - 1))
+
+    def _sign_args(self, layer_idx: int) -> tuple[torch.Tensor, ...]:
+        """A sampled layer's sign tuple (regional.sign_write)."""
+        bufs = tuple(getattr(self, f"sign_{n}") for n in signing.REGION_SURFACES)
+        return bufs + (self.row_ids, self.sign_slot, self.sign_cols[self.sign.layers.index(layer_idx)])
+
+    def _sign_partials(self) -> tuple:
+        buf = self.sign_depth if self.sign.depth else self.sign_hidden
+        return buf, self._sign_partial_cols, self.row_ids, self.sign_slot
+
+    def signed(self, row: int, device: Optional[torch.device] = None) -> signing.SignedRow:
+        """Row ``row``'s captured span since its admission (copies; default on the CPU)."""
+        if self.sign is None:
+            raise RuntimeError("this decoder was built without signing (sign=None)")
+        eng = self.engine
+        lever = int(self.row_slots[row]) if eng.levers is not None else 0
+        bufs = {n: getattr(self, f"sign_{n}") for n in self.sign_names}
+        return signing.export(self.sign, bufs, row, start=self._sign_start_host[row], pos=self._pos_host[row],
+                              lever_slot=lever, steered=bool(eng.steer_enabled),
+                              signatures=layer_signatures(eng.model._attn_res_boundary_set, self.n_layers),
+                              n_heads=eng.n_heads, n_kv_heads=eng.n_kv_heads, head_dim=eng.head_dim, device=device)
 
     def _build_regions(self, **opts) -> None:
         """One compiled decode layer per distinct signature, and each layer's tensors in the order the layer takes."""
@@ -415,7 +498,7 @@ class MultiSampleDecoder(nn.Module):
         attend, kvs, self._regional_state = self._regional_attend()
         self._regional_layers, self.regional_variants = build_regions(
             eng, self.regional_signatures(), kvs, "decode_layer", attend=attend, steer=bool(eng.steer_enabled),
-            capture_col=self.capture_layers.index, **opts)
+            capture_col=self.capture_layers.index, sign_args=self._sign_args, **opts)
 
     def _final_logits(self, committed: list[torch.Tensor], partial: torch.Tensor) -> torch.Tensor:
         """The step's tail after the last layer: final routing, norm and LM head, then every row's position advances.
@@ -432,6 +515,7 @@ class MultiSampleDecoder(nn.Module):
         """``_forward_step`` with each layer run as its signature's compiled region: tokens (B, 1) -> logits (B, V)."""
         eng = self.engine
         self._open_step()
+        self._sign_step()
         embed = eng.model.embed_tokens(tokens)
         levers = None
         if eng.levers is not None:
@@ -441,7 +525,8 @@ class MultiSampleDecoder(nn.Module):
         sin = eng.rope_sin_t.index_select(0, self.pos).unsqueeze(1)
         committed, partial = run_regions(self._regional_layers, embed, cos, sin, self._regional_state, levers,
                                          eng.steer_buf if eng.steer_enabled else None,
-                                         self.mlp_in if self.capture_layers else None)
+                                         self.mlp_in if self.capture_layers else None,
+                                         self._sign_partials() if self.sign is not None else None)
         return self._regional_final(committed, partial)
 
     def _sample_plain(self, logits: torch.Tensor) -> torch.Tensor:
@@ -637,6 +722,7 @@ class MultiSampleDecoder(nn.Module):
         a fresh random seed per row); the first token is the row's step 0."""
         n = len(rows)
         self.pos.index_fill_(0, idx, pos)
+        self._sign_from(rows, idx, pos)
         if self.seeded:
             self._set_row_seeds(idx, seeds, n, step=0)
         self._seed_presence(rows, idx)
@@ -711,9 +797,17 @@ class MultiSampleDecoder(nn.Module):
         self.pos.zero_()
         self.presence.zero_()
         self._pos_host = [0] * self.rows
+        self._sign_from(rows, idx, 0)
         if self.seeded:
             self._set_row_seeds(idx, seeds, self.rows, step=0)
         self._admit_empty_storage(idx)
+
+    def _sign_from(self, rows: list[int], idx: torch.Tensor, pos: int) -> None:
+        """``rows``' spans start at ``pos``."""
+        for r in rows:
+            self._sign_start_host[r] = pos
+        if self.sign is not None:
+            self.sign_start.index_fill_(0, idx, pos)
 
     def _admit_empty_storage(self, idx: torch.Tensor) -> None:
         """Per-decoder storage for rows starting from an empty cache: every position closed in the mask (each step
@@ -879,7 +973,8 @@ class CascadeDecoder(MultiSampleDecoder):
 
     def __init__(self, engine: DecodeEngine, rows: int, groups: int = 0, group_rows: int = 0,
                  tail_tokens: int = 1024, kv_from: Optional["CascadeDecoder"] = None, readout_k: int = 0,
-                 capture_layers: Sequence[int] = (), seeded: bool = False) -> None:
+                 capture_layers: Sequence[int] = (), seeded: bool = False,
+                 sign: Optional[signing.SignSpec] = None) -> None:
         groups = int(groups) or max(1, int(rows) // 4)
         group_rows = int(group_rows) or min(int(rows), 32)
         if not 1 <= groups <= rows or not 1 <= group_rows <= rows:
@@ -892,7 +987,7 @@ class CascadeDecoder(MultiSampleDecoder):
         # read by _alloc_kv, which the base constructor calls
         self.__dict__["_cascade_shape"] = (groups, group_rows, int(tail_tokens))
         super().__init__(engine, rows, kv_from=kv_from, readout_k=readout_k, capture_layers=capture_layers,
-                         seeded=seeded)
+                         seeded=seeded, sign=sign)
         self.attend_backend, self._attend_fn = attend_for(engine.device, engine.dtype)
         self._row_group = [-1] * self.rows  # host: the group each row reads its prompt from (-1: none)
         self._group_members: list[set[int]] = [set() for _ in range(self.groups)]
