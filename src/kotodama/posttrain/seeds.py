@@ -13,7 +13,9 @@ Each output row is a self-play seed: ``{"id", "cast": [names], "header": "Partic
 
 The subcommands ``pools``, ``combine``, ``headers`` and ``report`` build seeds from model-written pools instead
 (characters, themes, needs, relationships, settings, inciting moments, stakes, register, names), crossed into
-combinations and rendered as scene headers by the model: ``kotodama.posttrain.seedpools``.
+combinations and rendered as scene headers by the model: ``kotodama.posttrain.seedpools``. ``chain``, ``pick`` and
+``chain-report`` draw three roots per seed from those pools and let the model write every later piece conditioned on
+the ones before: ``kotodama.posttrain.seedchain``.
 """
 
 from __future__ import annotations
@@ -100,7 +102,7 @@ async def generate(complete: Any, n: int, examples: list[str], shuffle_seed: int
 
 
 def main(argv: list[str] | None = None) -> int:
-    from kotodama.posttrain import seedpools
+    from kotodama.posttrain import seedchain, seedpools
     from kotodama.posttrain.selfplay import oai_completer
     from kotodama.serve.laws import law
 
@@ -108,6 +110,8 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] and argv[0] in seedpools.COMMANDS:
         return seedpools.COMMANDS[argv[0]](argv[1:])
+    if argv[:1] and argv[0] in seedchain.COMMANDS:
+        return seedchain.COMMANDS[argv[0]](argv[1:])
     if argv[:1] == ["catalogue"]:
         argv = argv[1:]
     ap = argparse.ArgumentParser(description="self-generated self-play seeds")

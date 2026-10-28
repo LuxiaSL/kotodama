@@ -264,6 +264,23 @@ def test_cli_dispatch(tmp_path: Path) -> None:
         seeds.main(["pools", "--endpoint", "http://x", "--out", str(tmp_path), "--axes", "nonsense"])
 
 
+def test_cut_famous_and_wants_required() -> None:
+    res = {"kept": [{"text": t} for t in ("Stephen King", "Ines Moreau", "Kwame Asante", "Edie Sedgwick")],
+           "rejects": [], "counts": {}}
+
+    async def score(pairs):
+        return [-0.5 if c.strip() in ("Stephen King", "Edie Sedgwick") else -4.0 for _, c in pairs]
+
+    out = asyncio.run(sp.cut_famous(res, sp.AXES["names"], score, 0.5, 2))
+    assert [r["text"] for r in out["kept"]] == ["Ines Moreau", "Kwame Asante"]
+    assert {r["text"] for r in out["rejects"] if r["reason"] == "famous"} == {"Stephen King", "Edie Sedgwick"}
+    c = _combo()
+    parsed, _ = sp.parse_header_completion(GOOD, ["Mara", "Teo"], 1)
+    page = parsed["page"].replace("five hundred pounds Mara keeps in the tin under the counter", "nothing at all")
+    assert sp.gate_page({**parsed, "page": page}, c) == "want_absent"
+    assert sp.gate_page({**parsed, "page": page}, c, wants_required=1) is None
+
+
 def test_read_jsonl_skips_a_cut_last_line(tmp_path: Path) -> None:
     p = tmp_path / "x.jsonl"
     p.write_text('{"a": 1}\n{"a": 2}\n{"a": ')

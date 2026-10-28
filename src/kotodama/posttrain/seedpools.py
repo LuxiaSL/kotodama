@@ -76,7 +76,7 @@ class Axis:
     prefix: bool = False
     min_chars: int = 20
     max_chars: int = 160
-    sim_threshold: float = 0.5
+    sim_threshold: float = 0.4
 
 
 AXES: dict[str, Axis] = {a.name: a for a in (
@@ -153,14 +153,14 @@ AXES: dict[str, Axis] = {a.name: a for a in (
           "(frustration / excessive haste) the speech has to be finished before the car comes for them at seven"),
          crossing=("bads", "bads")),
     Axis("register",
-         "The register of a short play: its genre and the way its people talk, written as a phrase.",
+         "The register of a short play: its genre and the way its people talk, in a short phrase.",
          ("(amusement / anguish) a kitchen-sink comedy that turns, halfway, into a quarrel nobody can laugh off",
           "(calm / caution) a quiet two-hander, slow and plain, the way people talk in hospitals at night",
           "(defiance / gaiety) a screwball farce, fast overlapping talk, everyone lying a little",
           "(dread / curiosity) a radio drama, terse, all sound and implication",
           "(irony / dignity) a dry, deadpan comedy of manners",
           "(fear / boredom) a ghost story told in daylight by people too tired to be scared"),
-         crossing=("emotions", "emotions"), min_chars=12, max_chars=130),
+         crossing=("emotions", "emotions"), min_chars=12, max_chars=80),
     Axis("names",
          "Names from the guest list of an international conference, one full name per line.",
          ("Ines Moreau", "Kwame Asante", "Dolores Vega", "Bram Visser", "Ruth Callaghan", "Sunil Mehta",
@@ -473,6 +473,21 @@ async def grow_pool(complete: Complete, axis: Axis, target: int, lists: dict[str
     return res
 
 
+async def cut_famous(res: dict[str, Any], axis: Axis, score: Score, cut: float, keep: int) -> dict[str, Any]:
+    """Drop the ``cut`` share of ``res["kept"]`` the model finds most predictable as a list entry (lowest mean NLL
+    after the axis's opening line), then keep the first ``keep``. Dropped rows join the rejects as ``famous``."""
+    kept = res["kept"]
+    lps = await score([(f"{axis.head}\n\n-", f" {r['text']}") for r in kept])
+    nll = [-lp for lp in lps]
+    n_drop = int(round(len(kept) * cut))
+    drop = set(sorted(range(len(kept)), key=lambda i: nll[i])[:n_drop])
+    res["rejects"] += [{**kept[i], "reason": "famous", "nll": round(nll[i], 4)} for i in sorted(drop)]
+    res["kept"] = [r for i, r in enumerate(kept) if i not in drop][:keep]
+    res["counts"]["famous_cut"] = n_drop
+    res["counts"]["final"] = len(res["kept"])
+    return res
+
+
 def write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -500,10 +515,12 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 async def run_pools(complete: Complete, out: Path, axes: Sequence[str], per_pool: int, lists: dict[str, list[str]],
                     examples: dict[str, list[str]], seed: int, thresholds: dict[str, float],
                     names_extra: Sequence[str] = (), parallel: int = 16, max_rounds: int = 40,
-                    per_request: int = 8) -> dict[str, Any]:
+                    per_request: int = 8, score: Optional[Score] = None,
+                    famous_cut: float = 0.0) -> dict[str, Any]:
     """Grow every requested axis; writes ``<out>/pools/<axis>.jsonl`` (kept: {id, axis, text, crossing, source}),
     ``<out>/pools/<axis>.rejects.jsonl`` and ``<out>/pools/stats.json``. An axis whose pool file exists is skipped
-    (resume)."""
+    (resume). With ``score`` and ``famous_cut`` > 0 the names pool drops that share of its most predictable names
+    (lowest mean NLL in the list document): a celebrity's name is one the model completes with ease."""
     pdir = out / "pools"
     pdir.mkdir(parents=True, exist_ok=True)
     stats_path = pdir / "stats.json"
@@ -514,10 +531,14 @@ async def run_pools(complete: Complete, out: Path, axes: Sequence[str], per_pool
             logger.info("pool %s exists; skipped", name)
             continue
         thr = thresholds.get(name, axis.sim_threshold)
-        res = await grow_pool(complete, axis, per_pool, lists, examples.get(name) or list(axis.examples),
+        cut = famous_cut if name == "names" and score is not None else 0.0
+        target = math.ceil(per_pool / (1 - cut)) if cut else per_pool
+        res = await grow_pool(complete, axis, target, lists, examples.get(name) or list(axis.examples),
                               random.Random(f"{seed}:{name}"), thr, n_per_request=per_request,
                               parallel=parallel, max_rounds=max_rounds,
                               names_extra=names_extra if name == "names" else ())
+        if cut:
+            res = await cut_famous(res, axis, score, cut, per_pool)
         kept = [{"id": f"{name}:{i:04d}", "axis": name, "text": r["text"], "crossing": r["crossing"],
                  "source": r.get("source", "model")} for i, r in enumerate(res["kept"])]
         write_jsonl(pdir / f"{name}.rejects.jsonl", res["rejects"])
@@ -899,8 +920,9 @@ def _ngrams(text: str, n: int) -> set[tuple[str, ...]]:
 _EXAMPLE_8GRAMS = set().union(*(_ngrams(ex.page, 8) for ex in HEADER_EXAMPLES))
 
 
-def gate_page(parsed: dict[str, Any], c: dict[str, Any]) -> Optional[str]:
-    """Rule-based coherence gate on one parsed header; the rejection reason, or None."""
+def gate_page(parsed: dict[str, Any], c: dict[str, Any], wants_required: Optional[int] = None) -> Optional[str]:
+    """Rule-based coherence gate on one parsed header; the rejection reason, or None. ``wants_required``: how many
+    of the wants must show on the page (default all)."""
     page = parsed["page"]
     names = [ch["name"] for ch in c["characters"]]
     labels = [ch["label"] for ch in c["characters"]]
@@ -923,9 +945,9 @@ def gate_page(parsed: dict[str, Any], c: dict[str, Any]) -> Optional[str]:
         return "name_duplicated"
     if len({w.lower() for w in parsed["wants"]}) < len(parsed["wants"]):
         return "wants_identical"
-    for w in parsed["wants"]:
-        if overlap(w, page) < 0.25:
-            return "want_absent"
+    shown = sum(overlap(w, page) >= 0.25 for w in parsed["wants"])
+    if shown < (len(parsed["wants"]) if wants_required is None else wants_required):
+        return "want_absent"
     for i, s in enumerate(starts):
         if s < 0:
             continue
@@ -1183,6 +1205,8 @@ def main_pools(argv: list[str]) -> int:
     ap.add_argument("--per_request", type=int, default=2,
                     help="completions per request (they share the request's crossing)")
     ap.add_argument("--max_rounds", type=int, default=40)
+    ap.add_argument("--famous_cut", type=float, default=0.0,
+                    help="share of the names pool cut as most predictable (celebrities); scores via /score_tokens")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
     axes = [x for x in a.axes.split(",") if x]
@@ -1203,12 +1227,20 @@ def main_pools(argv: list[str]) -> int:
     complete, close, sampling = _completer(a.endpoint, a.law, a.temperature, a.max_tokens)
     out = Path(a.out)
 
+    score, sclose = (None, None)
+    if a.famous_cut > 0:
+        from kotodama.posttrain.loom import http_scorer
+
+        score, sclose = http_scorer(a.endpoint)
+
     async def go() -> dict[str, Any]:
         try:
             return await run_pools(complete, out, axes, a.per_pool, lists, examples, a.seed, thresholds,
-                                   names_extra, a.parallel, a.max_rounds, a.per_request)
+                                   names_extra, a.parallel, a.max_rounds, a.per_request, score, a.famous_cut)
         finally:
             await close()
+            if sclose is not None:
+                await sclose()
 
     stats = asyncio.run(go())
     (out / "pools" / "run.json").write_text(json.dumps({"args": vars(a), "sampling": sampling,
