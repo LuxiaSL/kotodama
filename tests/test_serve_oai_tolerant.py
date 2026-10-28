@@ -54,3 +54,33 @@ def test_token_id_prompts_are_accepted() -> None:
     assert OAICompletionRequest.model_validate({"prompt": [[5, 6, 7]]}).prompt == [5, 6, 7]
     with pytest.raises(ValidationError):
         OAICompletionRequest.model_validate({"prompt": ["a", "b"]})
+
+
+def test_fields_the_server_would_ignore_are_refused() -> None:
+    """A field the server would accept and ignore is a 400: a nonzero presence_penalty, best_of above 1, an unknown
+    field that is on (a sampling law must never silently differ from what the client sent), and a completions-only
+    field on chat. Off values (null, false, 0, empty) and the gateway's affinity key pass."""
+    from fastapi import HTTPException
+
+    from kotodama.serve.server import GenerateRequest, _refuse_unserved
+
+    def refused(model, body: dict) -> bool:
+        try:
+            _refuse_unserved(model.model_validate(body))
+        except HTTPException as exc:
+            assert exc.status_code == 400
+            return True
+        return False
+
+    chat = {"messages": [{"role": "user", "content": "hi"}]}
+    for body in ({"presence_penalty": 0.5}, {"best_of": 3}, {"logit_bias": {"5": 2.0}}, {"logprobs": 5},
+                 {"echo": True}, {"suffix": "end"}, {"repetition_penalty": 1.3}, {"top_k": 40}, {"stream": True}):
+        assert refused(OAICompletionRequest, {"prompt": "x", **body}), body
+    for body in ({"presence_penalty": 0.0}, {"best_of": 1}, {"logprobs": None}, {"logprobs": 0}, {"echo": False},
+                 {"logit_bias": {}}, {"user": "pin/tree-3"}, {"frequency_penalty": 0.2, "min_p": 0.02, "seed": 4}):
+        assert not refused(OAICompletionRequest, {"prompt": "x", **body}), body
+    assert refused(OAIChatRequest, {**chat, "presence_penalty": 0.3})
+    assert refused(OAIChatRequest, {**chat, "min_p": 0.05})  # served on /v1/completions, not on chat
+    assert not refused(OAIChatRequest, {**chat, "stream": True, "user": "u"})
+    assert refused(GenerateRequest, {"prompt": "x", "frequency_penalty": 0.2})  # /generate takes repetition_penalty
+    assert not refused(GenerateRequest, {"prompt": "x", "repetition_penalty": 1.2, "top_k": 40})

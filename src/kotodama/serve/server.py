@@ -66,7 +66,7 @@ torch.set_num_threads(_SERVE_THREADS)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from transformers import AutoTokenizer
 
 from kotodama import ckpt, presets
@@ -675,6 +675,7 @@ class InjectionSpec(BaseModel):
 
 
 class GenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")  # kept so _refuse_unserved can see them
     prompt: str | None = None
     messages: list[ChatMessage] | None = None
     # The prompt as token ids, used as sent (the client's own tokenization; no text round trip).
@@ -1679,6 +1680,7 @@ async def score_tokens_endpoint(request: TokenScoreRequest):
 async def generate_endpoint(request: GenerateRequest, http_request: Request):
     if _model is None or _tokenizer is None:
         raise HTTPException(503, "Model not loaded")
+    _refuse_unserved(request)
 
     if request.seed is not None:  # seeded draws come from the batched decoders only
         if request.stream:
@@ -1705,6 +1707,25 @@ async def generate_endpoint(request: GenerateRequest, http_request: Request):
 
 # ── OpenAI-compatible /v1/completions (for Loom/Loomsidian) ─────────────────────
 
+# Request fields that only route or label a request (the gateway's affinity key): accepted, and they change nothing
+# that is generated.
+_PASSTHROUGH_FIELDS = frozenset({"user"})
+
+
+def _refuse_unserved(request: BaseModel) -> None:
+    """400 on a field this server would otherwise accept and ignore: an unknown field that is on (any value but
+    null / false / 0 / empty), a nonzero presence_penalty (the repetition law is multiplicative: frequency_penalty
+    maps to repetition_penalty), best_of above 1. A client's law must never silently differ from what it sent."""
+    bad = sorted(k for k, v in (request.model_extra or {}).items()
+                 if k not in _PASSTHROUGH_FIELDS and v not in (False, 0, "", [], {}))
+    if getattr(request, "presence_penalty", 0.0):
+        bad.append("presence_penalty")
+    if (getattr(request, "best_of", None) or 1) > 1:
+        bad.append("best_of")
+    if bad:
+        raise HTTPException(400, f"not served on this endpoint (the server would otherwise ignore them): {bad}")
+
+
 def _drop_nulls(data: Any) -> Any:
     """OpenAI clients (e.g. Loom) send unset sampling fields as JSON null; treat null as "not sent" so the field's
     default applies instead of a 422."""
@@ -1714,6 +1735,7 @@ def _drop_nulls(data: Any) -> Any:
 
 
 class OAICompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")  # kept so _refuse_unserved can see them
     # Text, or the OpenAI token form: a list of token ids (sent as the prompt's ids, never re-encoded).
     prompt: str | list[int]
     model: str = ""
@@ -1953,6 +1975,7 @@ def oai_completion_to_generate(request: OAICompletionRequest) -> GenerateRequest
 async def oai_completions(request: OAICompletionRequest):
     if _model is None or _tokenizer is None:
         raise HTTPException(503, detail="Model not loaded")
+    _refuse_unserved(request)
 
     choices = []
     gen_req = oai_completion_to_generate(request)
@@ -2027,6 +2050,7 @@ async def oai_models():
 
 
 class OAIChatRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")  # kept so _refuse_unserved can see them
     messages: list[ChatMessage]
     model: str = ""
     max_tokens: int = Field(default=DEFAULT_MAX_NEW_TOKENS, ge=1, le=2048)
@@ -2051,6 +2075,7 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
         raise HTTPException(503, detail="Model not loaded")
     if _serve_mode != "chat":
         raise HTTPException(400, detail="/v1/chat/completions requires --mode chat")
+    _refuse_unserved(request)
 
     msgs = [{"role": m.role, "content": m.content} for m in request.messages]
     prompt_text = _tokenizer.apply_chat_template(
