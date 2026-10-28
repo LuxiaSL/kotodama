@@ -69,7 +69,7 @@ class ModelSpec(BaseModel):
     served_model_name: Optional[str] = None
     model_size: Optional[str] = None
     # Server flags for this pool's replicas only (after the profile and the fleet's serve_args), e.g. the steering
-    # banks a pool serves: ["--steer-npz", "/path/a.npz,/path/norms.npz"].
+    # banks a pool serves: ["--steer-npz", "<bank>.npz,<partial norms>.npz"].
     args: list[str] = Field(default_factory=list)
     # Optional per-model GPU placement. When set, this model's replicas spawn
     # only on the intersection of this list with the fleet's effective GPUs;
