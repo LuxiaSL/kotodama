@@ -1,0 +1,31 @@
+# kotodama-tsumugi 1B base, served for generation at scale: the one profile a tsumugi fleet runs.
+#   tools/run_serve.sh --profile tsumugi-1b [--checkpoint <ckpt>] [--steer-npz <banks>] [--port <p>]
+# Keys are server.py flags (kotodama.serve.profiles); a flag on the command line overrides its value here.
+#
+# Engine: cross-request batching with refill, cascade attention (rows of one prompt share its KV), a prefix KV
+# pool in front of every prefill, and per-request steering levers (steered and unsteered requests share batches;
+# steering arrives as request fields: vectors / injection / steer_span / penalty_scope). Acceptance for this
+# engine configuration: tests/test_levers.py, tests/test_levers_serve.py, tests/test_xbatch.py,
+# tests/test_cascade_decode.py, tests/test_prefix_cache.py on CPU, and scripts/benchmark/levers_check.py on a GPU.
+#
+# Neuron levers (an `injection` of kind mlp at effective layer L) are dosed in units of the median norm of the
+# state entering L's MLP, the unit of the neuron explorer (https://github.com/LuxiaSL/neuron-explorer).
+
+checkpoint: hf:LuxiaSL/kotodama-tsumugi-1b
+model_size: 1b-tsumugi
+rope_fp32: true
+mode: base
+served_model_name: kotodama-tsumugi-1b
+engine: fast
+prefix_cache: true
+prefix_pool_tokens: 32768
+multi_rows: [4, 8]
+xbatch_rows: [16, 32, 64, 128]
+xbatch_refill: true
+cascade_attn: true
+levers: 16
+
+env:
+  # The AttnRes kernels add their eps as the trunk trained it (fp64 under compile); see
+  # kotodama/model/flash_attn_res/kernels/configs.py.
+  KOTODAMA_ATTNRES_EPS_FP64_COMPAT: "1"

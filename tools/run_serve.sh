@@ -1,6 +1,7 @@
 #!/bin/bash
 # One model server replica (OpenAI-compatible + /generate + /logprobs).
-# Usage: tools/run_serve.sh --checkpoint <ckpt.pt[.zst]> [--mode chat] [--port 2224] [--prefix-cache]
+# Usage: tools/run_serve.sh --profile <name> [overrides]   (configs/serve/<name>.yaml, e.g. tsumugi-1b)
+#        tools/run_serve.sh --checkpoint <ckpt.pt[.zst]> [--mode chat] [--port 2224] [--prefix-cache]
 set -e
 source "$(dirname -- "${BASH_SOURCE[0]}")/_env.sh"
 # 2 threads is optimal for single-request GPU decode.

@@ -2005,7 +2005,8 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
 
 _device_arg = "cuda"
 
-if __name__ == "__main__":
+def build_arg_parser() -> argparse.ArgumentParser:
+    """The server's command line (every flag a serve profile may set)."""
     parser = argparse.ArgumentParser(description="kotodama inference server")
     parser.add_argument("--checkpoint", required=True,
                         help="Path to checkpoint .pt/.pt.zst file")
@@ -2089,6 +2090,21 @@ if __name__ == "__main__":
                         help="With --cascade_attn: tokens a row can generate (its own KV slot)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
+    parser.add_argument("--profile", default=None,
+                        help="Serve profile: a name in configs/serve/ (e.g. tsumugi-1b) or a YAML path whose keys are "
+                             "these flags; it supplies their defaults and the server's environment "
+                             "(kotodama.serve.profiles), and any flag given here overrides it")
+    return parser
+
+
+if __name__ == "__main__":
+    parser = build_arg_parser()
+    _profile_parser = argparse.ArgumentParser(add_help=False)
+    _profile_parser.add_argument("--profile", default=None)
+    _profile_arg = _profile_parser.parse_known_args()[0].profile
+    if _profile_arg:
+        from kotodama.serve import profiles as _profiles
+        _profiles.apply(parser, _profile_arg)
     args = parser.parse_args()
 
     _checkpoint_path = args.checkpoint

@@ -154,10 +154,10 @@ runner per eval, scored with the same math.
 |---|---|
 | one model | `tools/run_serve.sh --checkpoint <ckpt> [--mode chat] [--model_size <shape>]` |
 | the public 3B base | `tools/serve_3b_base.sh` (downloads the checkpoint once, then serves it) |
-| the released kotodama-tsumugi 1B base | `tools/run_serve.sh --checkpoint hf:LuxiaSL/kotodama-tsumugi-1b --model_size 1b-tsumugi --rope_fp32 --mode base` (published weights load from the Hub or a downloaded directory; requests set sampling: the `tsumugi` law in `kotodama.serve.laws` is temperature 0.75, top-p off, repetition 1.2, which is also the server's default repetition penalty) |
+| the released kotodama-tsumugi 1B base | `tools/run_serve.sh --profile tsumugi-1b` (`configs/serve/tsumugi-1b.yaml`: the published weights from the Hub, the model's serving flags, and the batched engine with cross-request batching, cascade attention, the prefix KV pool and per-request steering levers; any flag after it overrides the profile, e.g. `--checkpoint <dir>`, `--port`, `--steer-npz <banks>`; requests set sampling: the `tsumugi` law in `kotodama.serve.laws` is temperature 0.75, top-p off, repetition 1.2, which is also the server's default repetition penalty) |
 | a fleet behind one port | `tools/run_gateway.sh --config configs/gateway.example.yaml` |
 | chat / completion client | `python -m kotodama.serve.chat [complete]` (sampling laws: `kotodama.serve.laws`) |
-| per-request steering | add `--levers <slots> [--steer-npz <banks>]` to the server: every steered request carries its own lever (bank `vectors`, or a raw `injection` at an attention or MLP site), `steer_span` `decode` or `uniform` (the prompt too), and steered and unsteered requests batch together (`kotodama/model/levers.py`) |
+| per-request steering | on in the tsumugi profile (`--levers <slots>` elsewhere, with `--steer-npz <banks>` for named vectors): every steered request carries its own lever (bank `vectors`, or a raw `injection` at an attention or MLP site), `steer_span` `decode` or `uniform` (the prompt too), and steered and unsteered requests batch together (`kotodama/model/levers.py`) |
 | neuron steering sweep (one process per GPU) | `tools/run_py.sh scripts/sweep/steer_sweep.py --checkpoint <ckpt> --model_size 1b-tsumugi --rope_fp32 --dose_norms <p50.json> --mode decode\|uniform --layers <L> --shard <i> --n_shards <n> --out <dir>`, then `scripts/sweep/merge.py --sweep <dir> --mode <mode>` (per-layer run files a neuron explorer ranks) |
 
 The server exposes `/v1/chat/completions`, `/v1/completions`, `/generate` (full
