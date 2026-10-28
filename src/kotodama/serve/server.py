@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import functools
 import gc
 import html
@@ -91,8 +92,10 @@ DD3B_BOUNDARIES = list(presets.DD3B)
 
 from kotodama.serve.steering import (  # noqa: E402
     STEER_DEFAULT_ALPHA,
+    injection_to_plan,
     load_partial_norms,
     load_steer_banks,
+    writes_to_plan,
 )
 from kotodama.serve.chatml import (  # noqa: E402
     BASE_STOP_TOKEN_IDS,
@@ -209,6 +212,10 @@ _steer_aliases: dict[str, tuple[str | None, float, str]] = {}
 # Per-layer median post-attention partial norms (``partial_norm_l{L}`` keys in any --steer-npz file, e.g. the
 # scripts/steer/partial_norms.py sidecar): the scale table of the N write rule. Empty = rule N unavailable (400).
 _steer_partial_norms: dict[int, float] = {}
+# Per-request levers (--levers N, kotodama.model.levers): every steered request binds its own lever slot in the
+# engine's tables for its lifetime (N slots at once), so steered and unsteered requests decode in one batch and a
+# request may steer its prompt too (steer_span "uniform"). 0 = off: steering takes the engine's broadcast set_steer.
+_levers: int = 0
 # Server-wide default repetition penalty (CLI --default_repetition_penalty):
 # used by /generate when the field is absent and by the OpenAI routes when
 # frequency_penalty is absent.
@@ -233,17 +240,23 @@ def _engine_lock_contended() -> bool:
     return bool(getattr(_engine_lock, "_waiters", None))
 
 
-def _engine_prefill(input_ids: "torch.Tensor") -> tuple["torch.Tensor", dict | None]:
+def _engine_prefill(input_ids: "torch.Tensor", slot: int = 0) -> tuple["torch.Tensor", dict | None]:
     """Engine prefill, via the prefix cache when enabled.
+
+    ``slot``: the request's lever slot (--levers). A uniform lever's prompt KV is steered, so it bypasses the pool
+    (keyed by tokens alone); the engine's own cached prefix is reused only under the same lever.
 
     Returns (last-position logits, prefix-cache info dict or None).
     """
     assert _engine is not None
-    if _prefix_pool is not None:
-        return _prefix_pool.prefill(input_ids)
+    uniform = bool(slot) and _engine.levers is not None and _engine.levers.span(slot) == "uniform"
+    if _prefix_pool is not None and not uniform:
+        out = _prefix_pool.prefill(input_ids)
+        _engine._arm_decode_slot(slot)
+        return out
     if _prefix_cache:
-        return _engine.prefill_cached(input_ids)
-    return _engine.prefill(input_ids), None
+        return _engine.prefill_cached(input_ids, slot=slot)
+    return _engine.prefill(input_ids, slot=slot), None
 
 
 # Cap concurrent in-flight streams so total KV/activation memory stays within
@@ -317,9 +330,9 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024) -> tuple[KotodamaModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
-    global _row_token_cap, _cascade_info
+    global _row_token_cap, _cascade_info, _levers
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
@@ -406,6 +419,9 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         torch.backends.cuda.enable_cudnn_sdp(False)
         logger.info("cuDNN SDP disabled (using flash/math backend)")
 
+    _levers = int(levers) if use_engine else 0
+    if levers and not use_engine:
+        raise ValueError("--levers needs the fast engine (cuda + --engine fast + attn_res model)")
     if use_engine:
         logger.info("Building fast decode engine (compile may take minutes on cold inductor cache)...")
         t0 = time.time()
@@ -417,7 +433,9 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             # per-request writes never touch the graphs. Warmup below runs
             # with the zero buffer — the graphs it captures ARE the steered
             # graphs.
-            eng = DecodeEngine(model, max_seq_len=_max_seq_len, steer_enabled=steer_npz is not None)
+            # --levers: per-request lever tables replace the broadcast rows (banks resolve into levers).
+            eng = DecodeEngine(model, max_seq_len=_max_seq_len, steer_enabled=steer_npz is not None and not levers,
+                               levers=levers)
             eng.compile_step(mode="max-autotune")
             # Compile every block-forward bucket (incl. overlap plans) now:
             # an unwarmed bucket would pay its compile on a live request.
@@ -516,7 +534,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
                                   set_steer=_engine.set_steer,
                                   decode=lambda ids: _tokenizer.decode(ids, skip_special_tokens=True),
                                   stop_ids=_stop_token_ids, max_seq_len=_max_seq_len, device=_device,
-                                  refill=xbatch_refill, should_yield=_engine_lock_contended)
+                                  refill=xbatch_refill, should_yield=_engine_lock_contended,
+                                  levers=_engine.levers)
             _xbatch = XBatchScheduler(runner, _engine_lock, _run_generation)
             logger.info("Cross-request batched decode ENABLED: row buckets %s, refill %s", sorted(set(xbatch_rows)),
                         "on" if xbatch_refill else "off")
@@ -580,6 +599,18 @@ class SteerVectorSpec(BaseModel):
     alpha: float | None = None
 
 
+class InjectionSpec(BaseModel):
+    """A raw steering write (--levers): ``alpha * vectors[j]`` at effective layer ``sites[j]``, the vectors already
+    carrying their dose. ``kind`` "attn" writes the attention output (block-persistent by ``rule``), "mlp" the MLP
+    output at the site only (rule S)."""
+
+    sites: list[int]
+    vectors: list[list[float]]
+    alpha: float = 1.0
+    rule: Literal["K", "N", "S"] = "K"
+    kind: Literal["attn", "mlp"] = "attn"
+
+
 class GenerateRequest(BaseModel):
     prompt: str | None = None
     messages: list[ChatMessage] | None = None
@@ -601,6 +632,11 @@ class GenerateRequest(BaseModel):
     # What lands at the later block entries: K = the site row unchanged (default), N = scaled to the partial norm
     # it lands in (needs partial_norm_l* in a bank), S = a single write at the site.
     steer_rule: Literal["K", "N", "S"] = "K"
+    # Which positions the write reaches: "decode" = generated tokens only (default), "uniform" = the prompt too
+    # (needs --levers).
+    steer_span: Literal["decode", "uniform"] = "decode"
+    # A raw write instead of bank vectors (needs --levers).
+    injection: InjectionSpec | None = None
 
 
 class GenerateResponse(BaseModel):
@@ -709,7 +745,8 @@ def _resolve_prompt(request: GenerateRequest, tokenizer: AutoTokenizer) -> str:
 # ── Steering composition ────────────────────────────────────────────────────────
 
 def _request_wants_steering(request: GenerateRequest) -> bool:
-    return bool(request.vectors) or request.steer_model is not None or request.steer_alpha is not None
+    return (bool(request.vectors) or request.steer_model is not None or request.steer_alpha is not None
+            or request.injection is not None or request.steer_span != "decode")
 
 
 def _resolve_steer_member(name: str, alpha: float | None) -> tuple[str | None, float]:
@@ -737,6 +774,77 @@ def _steer_rule_kwargs(request: GenerateRequest) -> dict[str, Any]:
     if request.steer_rule == "N" and not _steer_partial_norms:
         raise HTTPException(400, "steer_rule N needs per-layer partial norms (partial_norm_l* keys) in --steer-npz")
     return {"rule": request.steer_rule, "norms": _steer_partial_norms or None}
+
+
+def _request_lever(request: GenerateRequest) -> "LeverPlan | None":
+    """A request's steering as one lever plan (--levers), or None when it is unsteered. Bank vectors resolve with
+    the same dose math as ``_compose_steer_writes``; an ``injection`` is taken as given. 400 on anything the plan
+    refuses."""
+    assert _engine is not None and _engine.levers is not None
+    from kotodama.model.levers import LeverError
+
+    cfg = _engine.config
+    boundaries = list(_engine._boundaries)
+    try:
+        if request.injection is not None:
+            if request.vectors or request.steer_model is not None or request.steer_alpha is not None:
+                raise HTTPException(400, "Pass either 'injection' or bank vectors, not both")
+            inj = request.injection
+            if inj.rule == "N" and not _steer_partial_norms:
+                raise HTTPException(400, "injection rule N needs per-layer partial norms (partial_norm_l* keys)")
+            return injection_to_plan(inj.sites, inj.vectors, inj.alpha, inj.rule, inj.kind, request.steer_span,
+                                     _steer_partial_norms or None, boundaries, cfg.num_layers, cfg.hidden_size)
+        writes = _compose_steer_writes(request) if _request_wants_steering(request) and (
+            request.vectors or request.steer_model is not None or request.steer_alpha is not None) else None
+        if writes is None:
+            return None
+        kw = _steer_rule_kwargs(request)
+        return writes_to_plan(writes, kw["rule"], kw["norms"], boundaries, cfg.num_layers, request.steer_span)
+    except LeverError as exc:
+        raise HTTPException(400, f"Steering request refused: {exc}") from None
+
+
+def _check_span(request: GenerateRequest) -> None:
+    if request.steer_span != "decode" and not _levers:
+        raise HTTPException(400, "steer_span 'uniform' needs a server started with --levers")
+    if request.injection is not None and not _levers:
+        raise HTTPException(400, "'injection' needs a server started with --levers")
+
+
+@contextlib.contextmanager
+def _steering(request: GenerateRequest, timing: dict[str, float]):
+    """Engage a request's steering for the block and yield its lever slot (0: none). Without --levers this is the
+    broadcast set_steer path (slot 0); with it, the request binds a lever slot, released on exit. Everything that
+    can 400 resolves before anything is engaged. Run on the generation thread."""
+    assert _engine is not None
+    _check_span(request)
+    if not _levers:
+        steer_writes = _compose_steer_writes(request)
+        kwargs = _steer_rule_kwargs(request) if steer_writes is not None else {}
+        try:
+            if steer_writes is not None:
+                _engine.set_steer(steer_writes, **kwargs)
+                timing["steered"] = 1.0
+                timing["steer_writes"] = float(len(steer_writes))
+            yield 0
+        finally:
+            # ALWAYS clear (no-op on a steering-disabled engine): steering state must never leak into the next
+            # request.
+            _engine.set_steer(None)
+        return
+    plan = _request_lever(request)
+    if plan is None:
+        yield 0
+        return
+    if not _engine.levers.free:
+        raise HTTPException(503, "every lever slot is in use; retry")
+    slot = _engine.levers.bind(plan)
+    timing["steered"] = 1.0
+    timing["lever_slot"] = float(slot)
+    try:
+        yield slot
+    finally:
+        _engine.levers.release(slot)
 
 
 def _compose_steer_writes(request: GenerateRequest) -> "list[tuple[int, torch.Tensor, float]] | None":
@@ -994,17 +1102,10 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
         temperature=request.temperature, repetition_penalty=request.repetition_penalty,
         top_k=request.top_k, top_p=request.top_p,
     )
-    # Compose BEFORE engaging anything (400s on bad stacks leave no state).
-    steer_writes = _compose_steer_writes(request)
-
     t0 = time.perf_counter()
-    try:
-        if steer_writes is not None:
-            _engine.set_steer(steer_writes, **_steer_rule_kwargs(request))
-            timing["steered"] = 1.0
-            timing["steer_writes"] = float(len(steer_writes))
+    with _steering(request, timing) as slot:
         t_prefill = time.perf_counter()
-        prefill_logits, pc_info = _engine_prefill(input_ids)
+        prefill_logits, pc_info = _engine_prefill(input_ids, slot)
         tok = _engine.sample_first(prefill_logits, params)
         token_id = int(tok.item())
         timing["prefill_ms"] = (time.perf_counter() - t_prefill) * 1000
@@ -1030,10 +1131,6 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
                     decoded_so_far = _tokenizer.decode(generated_ids, skip_special_tokens=True)
                     if any(s in decoded_so_far for s in request.stop_strings):
                         break
-    finally:
-        # ALWAYS clear (no-op on a steering-disabled engine): steering state
-        # must never leak into the next request.
-        _engine.set_steer(None)
 
     elapsed = time.perf_counter() - t0
     completion_text = _tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -1079,9 +1176,13 @@ async def engine_generate_stream(
     async with _engine_lock:
         loop = asyncio.get_running_loop()
         max_pos = _max_seq_len
+        steer_stack = contextlib.ExitStack()
         try:
+            # Steering engages on the engine's thread (eager buffer mutation, no cudagraph replay, but the same
+            # conservative discipline as every other engine call here); a 400 there is the stream's error.
             try:
-                steer_writes = _compose_steer_writes(request)
+                slot = await loop.run_in_executor(_generate_executor, steer_stack.enter_context,
+                                                  _steering(request, {}))
             except HTTPException as exc:
                 yield f"data: {json.dumps({'error': str(exc.detail)})}\n\n"
                 return
@@ -1096,15 +1197,9 @@ async def engine_generate_stream(
                 temperature=request.temperature, repetition_penalty=request.repetition_penalty,
                 top_k=request.top_k, top_p=request.top_p,
             )
-            if steer_writes is not None:
-                # set_steer is eager buffer mutation (no cudagraph replay),
-                # but route it through the engine's thread anyway — same
-                # conservative discipline as every other engine call here.
-                await loop.run_in_executor(_generate_executor, functools.partial(
-                    _engine.set_steer, steer_writes, **_steer_rule_kwargs(request)))
             t_prefill = time.perf_counter()
             prefill_logits, pc_info = await loop.run_in_executor(
-                _generate_executor, _engine_prefill, input_ids
+                _generate_executor, _engine_prefill, input_ids, slot
             )
             if pc_info is not None:
                 logger.debug(
@@ -1173,16 +1268,16 @@ async def engine_generate_stream(
                         yield f"data: {json.dumps({'token': tail})}\n\n"
                 yield f"data: {json.dumps({'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': generated_count})}\n\n"
         finally:
-            # ALWAYS clear steering (no-op on a steering-disabled engine) so
-            # state never leaks between requests — including the disconnect /
-            # GeneratorExit paths. Prefer the engine thread; fall back to a
-            # direct call if the loop is tearing down (set_steer is eager
-            # buffer mutation, safe off-thread while the engine is idle).
+            # ALWAYS release steering (the broadcast rows, or the request's lever slot) so state never leaks
+            # between requests — including the disconnect / GeneratorExit paths. Prefer the engine thread; fall
+            # back to a direct call if the loop is tearing down (both are eager buffer mutations, safe off-thread
+            # while the engine is idle).
             try:
-                await loop.run_in_executor(_generate_executor, _engine.set_steer, None)
+                await loop.run_in_executor(_generate_executor, steer_stack.close)
             except BaseException:
                 # Loop teardown / GeneratorExit / cancellation mid-await:
-                # clear synchronously, then let the exception propagate.
+                # release synchronously, then let the exception propagate.
+                steer_stack.close()
                 _engine.set_steer(None)
                 raise
 
@@ -1316,6 +1411,7 @@ _prefix_pool_block_arg = 16
 _cascade_attn_arg = False
 _cascade_groups_arg = 0
 _cascade_tail_tokens_arg = 1024
+_levers_arg = 0
 
 
 @asynccontextmanager
@@ -1335,6 +1431,7 @@ async def lifespan(app: FastAPI):
         cascade_attn=_cascade_attn_arg,
         cascade_groups=_cascade_groups_arg,
         cascade_tail_tokens=_cascade_tail_tokens_arg,
+        levers=_levers_arg,
     )
     try:
         yield
@@ -1392,6 +1489,11 @@ async def info():
             "note": "block-persistent injection (site row + later block entries), "
                     "decode/generated positions only; multi-site stacks compose row-wise",
         }
+    if _levers and _engine is not None and _engine.levers is not None:
+        steering = dict(steering or {})
+        steering["levers"] = {"slots": _levers, "free": _engine.levers.free, "spans": ["decode", "uniform"],
+                              "sites": ["attn", "mlp"], "keyed_on": "effective layer",
+                              "note": "per-request levers: each steered request binds its own slot"}
     return ModelInfo(
         name=_model_name(),
         mode=_serve_mode,
@@ -1495,6 +1597,8 @@ class OAICompletionRequest(BaseModel):
     steer_model: str | None = None
     steer_alpha: float | None = None
     steer_rule: Literal["K", "N", "S"] = "K"
+    steer_span: Literal["decode", "uniform"] = "decode"
+    injection: InjectionSpec | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -1522,26 +1626,21 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
         raise HTTPException(400, f"Prompt too long: {prompt_len} tokens (max {_max_seq_len})")
     params = EngineSamplingParams(temperature=request.temperature, repetition_penalty=request.repetition_penalty,
                                   top_k=request.top_k, top_p=request.top_p)
-    steer_writes = _compose_steer_writes(request)
     stops = request.stop_strings
 
     def stop_check(ids: list[int]) -> bool:
         return bool(stops) and any(s in _tokenizer.decode(ids, skip_special_tokens=True) for s in stops)
 
     t0 = time.perf_counter()
-    try:
-        if steer_writes is not None:
-            _engine.set_steer(steer_writes, **_steer_rule_kwargs(request))
-            timing["steered"] = 1.0
-        prefill_logits, pc_info = _engine_prefill(input_ids)
+    with _steering(request, timing) as slot:
+        prefill_logits, pc_info = _engine_prefill(input_ids, slot)
         timing["prefill_ms"] = (time.perf_counter() - t0) * 1000
         if pc_info is not None:
             timing["prefix_cache_hit"] = pc_info["prefix_hit"]
             timing["prefix_common_tokens"] = pc_info["common_prefix"]
         budget = min(request.max_new_tokens, _max_seq_len - prompt_len)
-        rows = decode_rows(dec, prefill_logits, params, n, budget, _stop_token_ids, stop_check)
-    finally:
-        _engine.set_steer(None)
+        rows = decode_rows(dec, prefill_logits, params, n, budget, _stop_token_ids, stop_check,
+                           slots=slot if _levers else None)
     elapsed = time.perf_counter() - t0
     timing["total_ms"] = round(elapsed * 1000, 2)
     timing["batched_rows"] = float(dec.rows)
@@ -1607,9 +1706,10 @@ def _xbatch_compatible(request: GenerateRequest, n: int) -> bool:
 
 
 def _xbatch_key(request: GenerateRequest, steered: bool) -> tuple:
-    """Requests with equal keys may share a batch: the same sampling law and the same steering config."""
+    """Requests with equal keys may share a batch: the same sampling law and the same steering config (with
+    --levers every request carries its own lever, so steering is not part of the key)."""
     steer = None
-    if steered:
+    if steered and not _levers:
         steer = (tuple((v.name, v.alpha) for v in request.vectors or ()), request.steer_model, request.steer_alpha,
                  request.steer_rule)
     return (request.temperature, request.repetition_penalty, steer)
@@ -1624,16 +1724,20 @@ async def engine_generate_xbatch(request: GenerateRequest, n: int) -> list[Gener
     prompt_ids = _tokenizer.encode(prompt_text)
     if len(prompt_ids) >= _max_seq_len:
         raise HTTPException(400, f"Prompt too long: {len(prompt_ids)} tokens (max {_max_seq_len})")
-    steer_writes = _compose_steer_writes(request)
+    _check_span(request)
+    lever = _request_lever(request) if _levers else None
+    steer_writes = _compose_steer_writes(request) if not _levers else None
     steer_kwargs = _steer_rule_kwargs(request) if steer_writes is not None else {}
     params = EngineSamplingParams(temperature=request.temperature, repetition_penalty=request.repetition_penalty)
-    job = XBatchJob(key=_xbatch_key(request, steer_writes is not None), prompt_ids=prompt_ids, n=n,
+    steered = steer_writes is not None or lever is not None
+    job = XBatchJob(key=_xbatch_key(request, steered), prompt_ids=prompt_ids, n=n,
                     max_new_tokens=request.max_new_tokens, params=params, done=lambda _outcome: None,
-                    stop_strings=tuple(request.stop_strings), steer_writes=steer_writes, steer_kwargs=steer_kwargs)
+                    stop_strings=tuple(request.stop_strings), steer_writes=steer_writes, steer_kwargs=steer_kwargs,
+                    lever=lever)
     result = await _xbatch.submit(job)
     elapsed = time.perf_counter() - t0
     timing = dict(result.timing)
-    if steer_writes is not None:
+    if steered:
         timing["steered"] = 1.0
     total = sum(len(r) for r in result.rows)
     tps = round(total / elapsed, 1) if elapsed > 0 else 0.0
@@ -1671,6 +1775,8 @@ def oai_completion_to_generate(request: OAICompletionRequest) -> GenerateRequest
         steer_model=request.steer_model,
         steer_alpha=request.steer_alpha,
         steer_rule=request.steer_rule,
+        steer_span=request.steer_span,
+        injection=request.injection,
     )
 
 
@@ -1951,6 +2057,11 @@ if __name__ == "__main__":
                              "least recently used evicted) so a prompt sharing a prefix with ANY recently prefilled "
                              "prompt prefills only its suffix (~0.22 MB per token on the 1B at bf16). Implies "
                              "--prefix-cache. 0 = off")
+    parser.add_argument("--levers", type=int, default=0,
+                        help="Per-request steering: lever tables with this many slots (kotodama.model.levers). Every "
+                             "steered request binds its own slot, so steered and unsteered requests batch together, "
+                             "a request may steer its prompt (steer_span uniform) or send a raw 'injection'; "
+                             "--steer-npz banks resolve into levers. 0 = off (the broadcast steering rows)")
     parser.add_argument("--prefix_pool_block", type=int, default=16,
                         help="Token block size of the prefix KV pool (>= 16): prefixes are shared in whole blocks")
     parser.add_argument("--cascade_attn", action="store_true",
@@ -2029,6 +2140,9 @@ if __name__ == "__main__":
     _cascade_attn_arg = args.cascade_attn
     _cascade_groups_arg = args.cascade_groups
     _cascade_tail_tokens_arg = args.cascade_tail_tokens
+    if args.levers < 0 or (args.levers and _engine_arg != "fast"):
+        parser.error("--levers needs the fast engine and a slot count >= 0")
+    _levers_arg = args.levers
 
     import uvicorn
 

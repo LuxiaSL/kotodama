@@ -197,3 +197,54 @@ def load_partial_norms(npz_paths: list[str], n_layers: int) -> dict[int, float]:
                        len(norms), n_layers)
     return norms
 
+
+
+def writes_to_plan(writes: list[tuple[int, torch.Tensor, float]], rule: str, norms: dict[int, float] | None,
+                   boundaries: list[int], n_layers: int, span: str) -> "LeverPlan":
+    """The engine's WRITES list ``[(site_layer, unit_vec, scale), ...]`` (``_compose`` output, the arguments of
+    ``DecodeEngine.set_steer``) as one per-request lever: members at one site sum to that site's float32 row
+    ``sum(scale * unit)``, then the write rule places the rows (kotodama.model.levers.write_plan)."""
+    import numpy as np
+
+    from kotodama.model.levers import LeverPlan, write_plan
+
+    rows: dict[int, np.ndarray] = {}
+    for site, vec, scale in writes:
+        v = float(scale) * vec.detach().float().reshape(-1).cpu().numpy()
+        rows[int(site)] = rows[int(site)] + v if int(site) in rows else v.astype(np.float32)
+    sites = sorted(rows)
+    plan = write_plan(sites, np.stack([rows[s] for s in sites]), boundaries, n_layers, rule,
+                      norms if rule == "N" else None)
+    return LeverPlan(attn=plan, span=span)
+
+
+def injection_to_plan(sites: list[int], vectors: list[list[float]], alpha: float, rule: str, kind: str, span: str,
+                      norms: dict[int, float] | None, boundaries: list[int], n_layers: int,
+                      hidden: int) -> "LeverPlan":
+    """A raw injection (``alpha * vectors[j]`` at ``sites[j]``, the vectors already carrying their dose, never
+    renormalised) as one lever. ``kind`` "attn" writes the attention output with the block-persistent rule;
+    "mlp" writes the MLP output at the site only (the rule must be S)."""
+    import numpy as np
+
+    from kotodama.model.levers import LeverError, LeverPlan, write_plan
+
+    rows = np.asarray(vectors, dtype=np.float32)
+    if rows.ndim != 2 or rows.shape != (len(sites), hidden):
+        raise LeverError(f"injection vectors must be [n_sites={len(sites)}, hidden={hidden}], got {rows.shape}")
+    if not math.isfinite(alpha):
+        raise LeverError("injection alpha must be finite")
+    rows = (np.float32(alpha) * rows).astype(np.float32)
+    if kind == "mlp":
+        if rule != "S":
+            raise LeverError("an mlp injection writes the site only: use rule S")
+        if len(set(sites)) != len(sites):
+            raise LeverError(f"duplicate sites {sites}")
+        if any(not 0 <= int(s) < n_layers for s in sites):
+            raise LeverError(f"sites {sites} outside [0, {n_layers})")
+        return LeverPlan(mlp={int(s): r for s, r in zip(sites, rows)}, span=span)
+    if kind != "attn":
+        raise LeverError(f"injection kind must be attn or mlp, got {kind!r}")
+    if any(not 0 <= int(s) < n_layers for s in sites):
+        raise LeverError(f"sites {sites} outside [0, {n_layers})")
+    return LeverPlan(attn=write_plan([int(s) for s in sites], rows, boundaries, n_layers, rule,
+                                     norms if rule == "N" else None), span=span)

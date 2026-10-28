@@ -53,7 +53,7 @@ def write_plan(sites: Sequence[int], rows: np.ndarray, boundaries: Iterable[int]
     ``rows[j]`` (float32, dose already baked in) is site ``sites[j]``'s row. Rule K re-asserts it unchanged at the
     first attention of every later AttnRes block (``compute_steer_points``); rule N re-asserts it scaled by
     ``norms[point] / norms[site]`` (the typical partial norm at each point, so the row keeps its size relative to the
-    partial it lands in); rule S writes at the site only. Rows of several sites sum where their points overlap, in
+    partial it lands in; norms are needed at those points only); rule S writes at the site only. Rows of several sites sum where their points overlap, in
     site order. The arithmetic is float32 throughout, row by row, so two implementations of this law agree bit for
     bit.
     """
@@ -68,15 +68,15 @@ def write_plan(sites: Sequence[int], rows: np.ndarray, boundaries: Iterable[int]
     if len(set(sites)) != len(sites):
         raise LeverError(f"duplicate sites {sites}: sum the rows of a double write before planning it")
     bset = sorted({int(b) for b in boundaries})
-    if rule == "N":
-        if norms is None:
-            raise LeverError("write rule N needs the per-layer partial norms")
-        bad = [p for p in range(n_layers) if not float(norms.get(p, 0.0)) > 0]
-        if bad:
-            raise LeverError(f"rule N norms must be positive at every layer; missing or <= 0 at {bad[:5]}")
+    if rule == "N" and norms is None:
+        raise LeverError("write rule N needs the per-layer partial norms")
     plan: dict[int, np.ndarray] = {}
     for row, site in zip(rows, sites):
         points = (site,) if rule == "S" else compute_steer_points(site, bset, n_layers)
+        if rule == "N":
+            bad = [p for p in points if not float(norms.get(p, 0.0)) > 0]
+            if bad:
+                raise LeverError(f"rule N needs a positive partial norm at layers {bad} (site {site})")
         for layer in points:
             add = row if rule != "N" else row * np.float32(float(norms[layer]) / float(norms[site]))
             plan[layer] = plan[layer] + add if layer in plan else add.copy()

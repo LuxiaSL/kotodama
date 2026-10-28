@@ -24,8 +24,14 @@ group of rows) bounds admission too: the runner admits only as many rows as ``ad
 that finds no room waits in the queue), hands rows back with ``release`` as soon as nobody will restart from them,
 and caps each candidate at ``token_room``.
 
+With lever tables (``levers``, kotodama.model.levers), steering is per request instead: a job carries its own lever
+plan, binds a slot of the tables when it is admitted (a job finds no room while every slot is bound, as with
+``admit_capacity``), prefills and decodes its rows on that slot, and releases it when its last row ends, so the batch
+key need not include steering at all.
+
 The runner knows nothing about HTTP: prompts arrive tokenized and validated, steering arrives as the engine's
-``set_steer`` arguments, and stop strings are checked through a ``decode`` callable (the tokenizer's).
+``set_steer`` arguments or as a lever plan, and stop strings are checked through a ``decode`` callable (the
+tokenizer's).
 """
 
 from __future__ import annotations
@@ -71,6 +77,7 @@ class XBatchJob:
     stop_strings: tuple[str, ...] = ()
     steer_writes: Optional[list[tuple[int, torch.Tensor, float]]] = None
     steer_kwargs: dict[str, Any] = field(default_factory=dict)
+    lever: Any = None  # a kotodama.model.levers.LeverPlan (runner built with levers), None: unsteered
     t_enqueue: float = field(default_factory=time.perf_counter)
 
 
@@ -141,6 +148,7 @@ class _Live:
     running: dict[int, int] = field(default_factory=dict)  # row -> candidate
     started: int = 0
     home: frozenset[int] = frozenset()  # the rows admitted from this job's prompt: only they can restart it
+    slot: int = 0  # the job's lever slot (0: none)
 
     @property
     def done(self) -> bool:
@@ -160,10 +168,10 @@ class XBatchRunner:
     no prefill and no KV copy). Freed rows go first to admitted requests' unstarted candidates, then (with
     ``refill``) to new requests from the queue."""
 
-    def __init__(self, decoders: dict[int, MultiSampleDecoder], prefill: Callable[[torch.Tensor], tuple],
+    def __init__(self, decoders: dict[int, MultiSampleDecoder], prefill: Callable[..., tuple],
                  set_steer: Callable[..., None], decode: Callable[[list[int]], str], stop_ids: frozenset[int],
                  max_seq_len: int, device: torch.device, refill: bool = False,
-                 should_yield: Optional[Callable[[], bool]] = None) -> None:
+                 should_yield: Optional[Callable[[], bool]] = None, levers: Any = None) -> None:
         if not decoders:
             raise ValueError("XBatchRunner needs at least one decoder bucket")
         self.decoders = dict(sorted(decoders.items()))
@@ -176,6 +184,8 @@ class XBatchRunner:
         self.device = device
         self.refill = refill
         self.should_yield = should_yield or (lambda: False)
+        # the engine's LeverTables: per-job levers, ``prefill(ids, slot)``; None: ``prefill(ids)``, set_steer
+        self.levers = levers
         self.queue = XBatchQueue()
         self.stats: dict[str, float] = {"batches": 0, "steps": 0, "row_steps": 0, "useful_row_steps": 0,
                                         "admitted": 0, "refilled": 0, "restarts": 0, "prefill_s": 0.0,
@@ -197,15 +207,25 @@ class XBatchRunner:
         Returns None (the job already failed) when the prefill raises."""
         t0 = time.perf_counter()
         timing: dict[str, float] = {"queue_ms": round((t0 - job.t_enqueue) * 1000, 2)}
+        slot = 0
         try:
             ids = torch.tensor([job.prompt_ids], dtype=torch.long, device=self.device)
-            logits, info = self.prefill(ids)
+            if self.levers is not None:
+                slot = self.levers.bind(job.lever) if job.lever is not None else 0
+                logits, info = self.prefill(ids, slot)
+            else:
+                logits, info = self.prefill(ids)
             m = min(job.n, len(free), dec.admit_capacity())
             rows = free[:m]
-            first = dec.admit(rows, logits, job.params)
+            if self.levers is not None:
+                first = dec.admit(rows, logits, job.params, slots=slot)
+            else:
+                first = dec.admit(rows, logits, job.params)
             del free[:m]
         except Exception as exc:
             logger.warning("xbatch: prefill/admit failed for a %d-token prompt: %r", len(job.prompt_ids), exc)
+            if slot:
+                self.levers.release(slot)
             self._deliver(job, exc)
             return None
         timing["prefill_ms"] = round((time.perf_counter() - t0) * 1000, 2)
@@ -220,8 +240,10 @@ class XBatchRunner:
         # longest stop several times over finds it without re-decoding the whole row every step.
         window = 4 * max((len(x) for x in job.stop_strings), default=0) + 16
         budget = min(job.max_new_tokens, self.max_seq_len - len(job.prompt_ids), dec.token_room(len(job.prompt_ids)))
+        if slot:
+            timing["lever_slot"] = float(slot)
         lv = _Live(job, logits, len(job.prompt_ids), budget, window, timing, t0, out=[[] for _ in range(job.n)],
-                   home=frozenset(rows))
+                   home=frozenset(rows), slot=slot)
         self._start(lv, rows, first)
         self.stats["admitted"] += 1
         self.stats["prefill_s"] += time.perf_counter() - t0
@@ -253,7 +275,17 @@ class XBatchRunner:
             if any(s in tail for s in stops):
                 del lv.running[row]
 
+    def _room_for(self, job: XBatchJob) -> bool:
+        """Whether ``job`` can bind its lever now (always, for an unsteered job or a runner without levers)."""
+        return self.levers is None or job.lever is None or self.levers.free > 0
+
+    def _release_lever(self, lv: _Live) -> None:
+        if lv.slot:
+            self.levers.release(lv.slot)
+            lv.slot = 0
+
     def _finish(self, lv: _Live) -> None:
+        self._release_lever(lv)
         lv.timing["decode_ms"] = round((time.perf_counter() - lv.t_admit) * 1000 - lv.timing["prefill_ms"], 2)
         lv.timing["total_ms"] = round((time.perf_counter() - lv.job.t_enqueue) * 1000, 2)
         self._deliver(lv.job, XBatchResult(rows=lv.out, timing=lv.timing))
@@ -289,6 +321,9 @@ class XBatchRunner:
             job = self.queue.take_next(head.key)
             if job is None:
                 return taken
+            if not self._room_for(job):  # every lever slot is bound: it waits at the head of the queue
+                self.queue.requeue([job])
+                return taken
             taken += 1
             self.stats["refilled"] += 1
             lv = self._admit(dec, job, free)
@@ -308,10 +343,11 @@ class XBatchRunner:
         active: list[_Live] = []
         served = 0
         try:
-            if head.steer_writes:
+            if head.steer_writes and self.levers is None:
                 self.set_steer(head.steer_writes, **head.steer_kwargs)
             for i, job in enumerate(jobs):
-                if not dec.admit_capacity():  # the decoder's shared storage is taken: the rest wait in the queue
+                # the decoder's shared storage, or every lever slot, is taken: the rest wait in the queue
+                if not dec.admit_capacity() or not self._room_for(job):
                     self.queue.requeue(jobs[i:])
                     break
                 lv = self._admit(dec, job, free)
@@ -362,8 +398,10 @@ class XBatchRunner:
             logger.exception("xbatch: batch failed with %d live requests", len(active))
             for lv in active:
                 self._deliver(lv.job, exc)
-            active.clear()
         finally:
+            for lv in active:  # lever slots never outlive the batch either
+                self._release_lever(lv)
+            active.clear()
             self.set_steer(None)  # steering state never outlives the batch
         return served
 

@@ -394,9 +394,10 @@ class MultiSampleDecoder(nn.Module):
         return first.view(-1).tolist()
 
     @torch.inference_mode()
-    def start(self, prefill_logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
+    def start(self, prefill_logits: torch.Tensor, params: SamplingParams,
+              slots: Optional[Sequence[int] | int] = None) -> torch.Tensor:
         """Admit every row from the engine's prefilled prompt (n candidates of one prompt). Returns cur_tokens."""
-        self.admit(range(self.rows), prefill_logits, params)
+        self.admit(range(self.rows), prefill_logits, params, slots=slots)
         return self.cur_tokens
 
     @torch.inference_mode()
@@ -780,14 +781,16 @@ class CascadeDecoder(MultiSampleDecoder):
 
 def decode_rows(dec: MultiSampleDecoder, prefill_logits: torch.Tensor, params: SamplingParams, n: int,
                 max_new_tokens: int, stop_ids: frozenset[int],
-                stop_check: Optional[Callable[[list[int]], bool]] = None) -> list[list[int]]:
-    """Generate up to ``max_new_tokens`` per row for the first ``n`` rows of one prompt; a row ends at a stop token
-    (not kept), when ``stop_check(row_ids)`` is true, or at capacity. Returns each row's generated ids."""
+                stop_check: Optional[Callable[[list[int]], bool]] = None,
+                slots: Optional[int] = None) -> list[list[int]]:
+    """Generate up to ``max_new_tokens`` per row for the first ``n`` rows of one prompt (every row on lever slot
+    ``slots``); a row ends at a stop token (not kept), when ``stop_check(row_ids)`` is true, or at capacity. Returns
+    each row's generated ids."""
     if not 1 <= n <= dec.rows:
         raise ValueError(f"n={n} outside [1, {dec.rows}]")
     out: list[list[int]] = [[] for _ in range(n)]
     live = [True] * n
-    dec.start(prefill_logits, params)
+    dec.start(prefill_logits, params, slots=slots)
     toks = dec.cur_tokens.view(-1).tolist()
     for _ in range(max_new_tokens):
         for r in range(n):
