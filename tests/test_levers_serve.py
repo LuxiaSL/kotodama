@@ -224,3 +224,30 @@ def test_server_carries_the_penalty_scope(monkeypatch, model: KotodamaModel) -> 
         r = client.post("/v1/completions", json={**body, "penalty_scope": scope})
         assert r.status_code == 200, r.text
         assert r.json()["choices"][0]["token_ids"]["completion"] == engine_law(scope), scope
+
+
+def test_token_id_prompts_are_used_as_sent(monkeypatch, model: KotodamaModel) -> None:
+    """A prompt sent as token ids (prompt_ids on /generate, a list of ids as the OpenAI prompt) decodes exactly as
+    the same ids would if the server had encoded them itself; malformed id prompts are a 400."""
+    client, eng, _, _ = _serve(monkeypatch, model, levers=2)
+    text = "two friends talk"
+    ids = _CharTok().encode(text)
+    base = {"max_tokens": 5, "temperature": 0, "top_p": 0, "frequency_penalty": 0, "return_token_ids": True}
+    by_text = client.post("/v1/completions", json={**base, "prompt": text}).json()["choices"][0]["token_ids"]
+    by_ids = client.post("/v1/completions", json={**base, "prompt": ids}).json()["choices"][0]["token_ids"]
+    nested = client.post("/v1/completions", json={**base, "prompt": [ids]}).json()["choices"][0]["token_ids"]
+    assert by_ids == by_text == nested and by_ids["prompt"] == ids
+    r = client.post("/generate", json={"prompt_ids": ids, "max_new_tokens": 5, "temperature": 0,
+                                       "repetition_penalty": 1.0})
+    assert r.status_code == 200 and r.json()["completion_ids"] == by_text["completion"]
+    for bad in ({"prompt_ids": [CFG["vocab_size"] + 3]}, {"prompt_ids": []}, {"prompt_ids": ids, "prompt": text}):
+        r = client.post("/generate", json={**bad, "max_new_tokens": 3, "temperature": 0})
+        assert r.status_code == 400, (bad, r.text)
+
+
+def test_n_above_eight_is_served(monkeypatch, model: KotodamaModel) -> None:
+    client, _, _, _ = _serve(monkeypatch, model, levers=2)
+    r = client.post("/v1/completions", json={"prompt": "hey there", "n": 12, "max_tokens": 3, "temperature": 0.8,
+                                             "top_p": 0})
+    assert r.status_code == 200, r.text
+    assert len(r.json()["choices"]) == 12

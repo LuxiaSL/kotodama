@@ -14,8 +14,11 @@ Two decode paths, deliberately only two:
   * fast (default)  — DecodeEngine: static KV cache, max-autotune compiled +
     CUDA-graphed step, all sampling laws in-graph (temperature, repetition
     penalty, top-k/top-p), compiled block prefill/extend, optional token-exact
-    prefix cache. ~400 tok/s decode on B200. Startup pays a one-time compile
-    (~1 min warm inductor cache, minutes cold) — see gateway warmup timeouts.
+    prefix cache. Single-stream decode is kernel-count bound (per-token cost
+    grows with effective depth), so throughput comes from the batched row
+    decoders (--multi_rows / --xbatch_rows; serve profiles turn them on).
+    Startup pays a one-time compile per decode graph (minutes warm, much longer
+    cold with many row buckets) — see gateway warmup timeouts.
   * reference       — plain eager llama.py loop. The parity oracle and debug
     path (~10x slower); NOT for production traffic.
 
@@ -614,6 +617,8 @@ class InjectionSpec(BaseModel):
 class GenerateRequest(BaseModel):
     prompt: str | None = None
     messages: list[ChatMessage] | None = None
+    # The prompt as token ids, used as sent (the client's own tokenization; no text round trip).
+    prompt_ids: list[int] | None = None
     max_new_tokens: int = Field(default=DEFAULT_MAX_NEW_TOKENS, ge=1, le=2048)
     temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=0.0, le=2.0)
     top_k: int = Field(default=DEFAULT_TOP_K, ge=0)
@@ -729,6 +734,20 @@ def _score_tokens(req: TokenScoreRequest) -> dict[str, Any]:
     except LogprobLimitError as e:
         raise HTTPException(400, str(e)) from e
     return {"results": results, "model": _model_name()}
+
+
+def _prompt_ids(request: GenerateRequest, tokenizer: AutoTokenizer) -> list[int]:
+    """The request's prompt as token ids: ``prompt_ids`` as sent (the client's own tokenization, never re-encoded:
+    a text round trip can split a boundary differently), else the prompt text or chat messages, encoded once."""
+    if request.prompt_ids is not None:
+        if request.prompt is not None or request.messages is not None:
+            raise HTTPException(400, "Pass one of 'prompt_ids', 'prompt' or 'messages'")
+        ids = list(request.prompt_ids)
+        vocab = int(_model.config.vocab_size) if _model is not None else None
+        if not ids or (vocab is not None and not all(0 <= t < vocab for t in ids)):
+            raise HTTPException(400, f"prompt_ids must be a non-empty list of ids in [0, {vocab})")
+        return ids
+    return tokenizer.encode(_resolve_prompt(request, tokenizer))
 
 
 def _resolve_prompt(request: GenerateRequest, tokenizer: AutoTokenizer) -> str:
@@ -964,8 +983,7 @@ def generate(
 
     # Tokenization
     t_tok = time.perf_counter()
-    prompt_text = _resolve_prompt(request, tokenizer)
-    input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
+    input_ids = torch.tensor([_prompt_ids(request, tokenizer)], device=_device)
     prompt_len = input_ids.shape[1]
     timing["tokenize_ms"] = (time.perf_counter() - t_tok) * 1000
 
@@ -1099,8 +1117,7 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
     max_pos = _max_seq_len
 
     t_tok = time.perf_counter()
-    prompt_text = _resolve_prompt(request, _tokenizer)
-    input_ids = _tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
+    input_ids = torch.tensor([_prompt_ids(request, _tokenizer)], device=_device)
     prompt_len = input_ids.shape[1]
     timing["tokenize_ms"] = (time.perf_counter() - t_tok) * 1000
     if prompt_len >= max_pos:
@@ -1194,8 +1211,7 @@ async def engine_generate_stream(
             except HTTPException as exc:
                 yield f"data: {json.dumps({'error': str(exc.detail)})}\n\n"
                 return
-            prompt_text = _resolve_prompt(request, _tokenizer)
-            input_ids = _tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
+            input_ids = torch.tensor([_prompt_ids(request, _tokenizer)], device=_device)
             prompt_len = input_ids.shape[1]
             if prompt_len >= max_pos:
                 yield f'data: {{"error": "Prompt too long: {prompt_len} tokens"}}\n\n'
@@ -1310,8 +1326,7 @@ async def generate_stream(
                 # Reference path: no injection hook (see generate()).
                 yield f"data: {json.dumps({'error': 'Steering requires the fast engine (--engine fast with --steer-npz)'})}\n\n"
                 return
-            prompt_text = _resolve_prompt(request, tokenizer)
-            input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
+            input_ids = torch.tensor([_prompt_ids(request, tokenizer)], device=_device)
             prompt_len = input_ids.shape[1]
 
             if prompt_len >= _max_seq_len:
@@ -1589,10 +1604,11 @@ def _drop_nulls(data: Any) -> Any:
 
 
 class OAICompletionRequest(BaseModel):
-    prompt: str
+    # Text, or the OpenAI token form: a list of token ids (sent as the prompt's ids, never re-encoded).
+    prompt: str | list[int]
     model: str = ""
     max_tokens: int = Field(default=DEFAULT_MAX_NEW_TOKENS, ge=1, le=2048)
-    n: int = Field(default=1, ge=1, le=8)
+    n: int = Field(default=1, ge=1, le=64)
     temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=0.0, le=2.0)
     top_p: float = Field(default=DEFAULT_TOP_P, ge=0.0, le=1.0)
     frequency_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
@@ -1615,8 +1631,13 @@ class OAICompletionRequest(BaseModel):
         data = _drop_nulls(data)
         if isinstance(data, dict) and isinstance(data.get("prompt"), list):
             p = data["prompt"]
+            if p and all(isinstance(t, int) and not isinstance(t, bool) for t in p):
+                return data  # token ids
+            if len(p) == 1 and isinstance(p[0], list) and p[0] and all(isinstance(t, int) for t in p[0]):
+                return {**data, "prompt": p[0]}  # one token-id prompt in a batch of one
             if len(p) != 1 or not isinstance(p[0], str):
-                raise ValueError("prompt: send one string (a list of several prompts is not supported; use n)")
+                raise ValueError("prompt: send one string or one list of token ids (several prompts are not "
+                                 "supported; use n)")
             data = {**data, "prompt": p[0]}
         return data
 
@@ -1628,8 +1649,7 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
     dec = _multi_bucket(n)
     assert _engine is not None and dec is not None and _tokenizer is not None
     timing: dict[str, float] = {}
-    prompt_text = _resolve_prompt(request, _tokenizer)
-    input_ids = _tokenizer.encode(prompt_text, return_tensors="pt").to(_device)
+    input_ids = torch.tensor([_prompt_ids(request, _tokenizer)], device=_device)
     prompt_len = input_ids.shape[1]
     if prompt_len >= _max_seq_len:
         raise HTTPException(400, f"Prompt too long: {prompt_len} tokens (max {_max_seq_len})")
@@ -1729,8 +1749,7 @@ async def engine_generate_xbatch(request: GenerateRequest, n: int) -> list[Gener
     rules as engine_generate per candidate. Bad prompts and steering stacks 400 before the request queues."""
     assert _xbatch is not None and _tokenizer is not None
     t0 = time.perf_counter()
-    prompt_text = _resolve_prompt(request, _tokenizer)
-    prompt_ids = _tokenizer.encode(prompt_text)
+    prompt_ids = _prompt_ids(request, _tokenizer)
     if len(prompt_ids) >= _max_seq_len:
         raise HTTPException(400, f"Prompt too long: {len(prompt_ids)} tokens (max {_max_seq_len})")
     _check_span(request)
@@ -1774,8 +1793,10 @@ def oai_completion_to_generate(request: OAICompletionRequest) -> GenerateRequest
         stop_strings = [request.stop]
     elif isinstance(request.stop, list):
         stop_strings = request.stop
+    ids = request.prompt if isinstance(request.prompt, list) else None
     return GenerateRequest(
-        prompt=request.prompt,
+        prompt=None if ids is not None else request.prompt,
+        prompt_ids=ids,
         max_new_tokens=request.max_tokens,
         temperature=request.temperature,
         top_p=request.top_p,
@@ -1818,7 +1839,8 @@ async def oai_completions(request: OAICompletionRequest):
                                    "completion": result.completion_ids}
         choices.append(choice)
 
-    prompt_tokens = _tokenizer.encode(request.prompt, return_tensors="pt").shape[1]
+    prompt_tokens = (len(request.prompt) if isinstance(request.prompt, list)
+                     else _tokenizer.encode(request.prompt, return_tensors="pt").shape[1])
     completion_tokens = sum(
         _tokenizer.encode(c["text"], return_tensors="pt").shape[1] for c in choices
     )
@@ -1877,7 +1899,7 @@ class OAIChatRequest(BaseModel):
     presence_penalty: float = Field(default=0.0, ge=0.0, le=2.0)
     stop: list[str] | str | None = None
     stream: bool = False
-    n: int = Field(default=1, ge=1, le=8)
+    n: int = Field(default=1, ge=1, le=64)
     return_token_ids: bool = False
 
     @model_validator(mode="before")

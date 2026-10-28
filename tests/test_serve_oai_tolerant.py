@@ -23,7 +23,7 @@ def test_prompt_list() -> None:
 
 def test_ranges_still_enforced() -> None:
     with pytest.raises(ValidationError):
-        OAICompletionRequest.model_validate({"prompt": "x", "n": 9})
+        OAICompletionRequest.model_validate({"prompt": "x", "n": 65})
     with pytest.raises(ValidationError):
         OAICompletionRequest.model_validate({"prompt": "x", "frequency_penalty": -0.5})
 
@@ -47,3 +47,10 @@ def test_completion_maps_to_generate_with_steering() -> None:
     single = oai_completion_to_generate(OAICompletionRequest.model_validate(
         {"prompt": "x", "steer_model": "vrep", "steer_alpha": None}))
     assert single.steer_model == "vrep" and single.steer_alpha is None and single.vectors is None
+
+
+def test_token_id_prompts_are_accepted() -> None:
+    assert OAICompletionRequest.model_validate({"prompt": [5, 6, 7]}).prompt == [5, 6, 7]
+    assert OAICompletionRequest.model_validate({"prompt": [[5, 6, 7]]}).prompt == [5, 6, 7]
+    with pytest.raises(ValidationError):
+        OAICompletionRequest.model_validate({"prompt": ["a", "b"]})
