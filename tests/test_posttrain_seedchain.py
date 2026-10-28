@@ -165,3 +165,36 @@ def test_pick_applies_verdicts_and_cli(tmp_path: Path) -> None:
     assert rep["filter"]["reject_categories"] == {"mashup": 1}
     assert rep["by_arm"]["cast_arm=pair"]["pass_rate"] == 1.0
     assert "filter: reject / mashup" in (tmp_path / "filter-rejects-sample.md").read_text()
+
+
+def test_native_chain(tmp_path: Path) -> None:
+    async def complete(prompt: str, n: int, stops: list[str]):
+        if prompt.endswith("\nThe play opens:\n"):
+            text = "A kitchen at dawn in May. Ines stands by the kettle; Kwame waits at the door. The bus is due at six."
+        elif prompt.endswith(","):
+            text = " forty, a baker who never sleeps"
+        else:
+            text = ("Two bakers have shared a kitchen and a grudge for twenty years. One of them is leaving at six "
+                    "with the recipe the other never wrote down. A comedy about flour and forgiveness.")
+        return [(text + "\n", "stop", False)] * n
+
+    starts = [_start(2, "pair", "plain", 0), _start(3, "cast", "plain", 1)]
+    sc.assign_genres(starts, 0)
+    assert all(s["genre"] in sc.GENRES for s in starts)
+    p = sc.native_prompt(starts[0], "blurb")
+    assert p.startswith(sc.NATIVE_HEAD) and p.endswith(": Ines Moreau and Kwame Asante.\n")
+    assert sc.native_prompt({**starts[0], "blurb": "x. y."}, "character", 0).endswith("x. y.\nCharacters:\nInes Moreau,")
+    assert sc.check_native("character", " forty, a couple who run a bakery", starts[0])[1] == "group_as_person"
+    assert sc.check_native("scene", " " + "A kitchen with nobody named in it at all, at dawn in May, quiet. " * 2,
+                           starts[0])[1] == "nobody_on_stage"
+    stats = asyncio.run(sc.run_chains(complete, complete, None, starts, tmp_path, form="native"))
+    assert stats["pass"] == 2
+    rows = sp.read_jsonl(tmp_path / "chains.jsonl")
+    seed = sc.chain_seed(next(r for r in rows if r["id"] == "ch00000"))
+    assert seed["form"] == "native" and seed["header"].startswith("Ines Moreau, forty, a baker who never sleeps\n")
+    assert seed["header"].endswith("The bus is due at six.") and seed["tags"]["clock_on_page"]
+    assert parse_seed(seed, 0).cast == seed["cast"]
+    stats = sc.pick(tmp_path)
+    assert stats["stratified"]["available"] == {"none/pair": 1, "none/cast": 1}
+    rep = sc.chain_report(tmp_path, sample=2)
+    assert set(rep["by_arm"]["cast_arm=pair"]["stage_pass_rate"]) == {"blurb", "character", "scene", "page"}

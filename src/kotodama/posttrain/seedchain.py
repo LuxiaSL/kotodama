@@ -19,6 +19,12 @@ nothing ends there and is kept with its failed step. The page draws ``page_candi
     python -m kotodama.posttrain.seeds pick  --out DIR [--verdicts VERDICTS.jsonl]
     python -m kotodama.posttrain.seeds chain-report --out DIR
 
+``--form native`` grows a different chain from the same roots (theme, relationship, and a plain genre label in
+place of the register): the model writes a season-brochure programme note for the play, then the printed cast list
+(name, age, one-line note; one line per drawn name), then the stage direction that opens the play, each a few-shot
+document form in which premises occur naturally. The header is that cast list and stage direction; wants, secret
+and clock are never asked for, only tagged afterwards when legible on the page.
+
 ``chain`` writes ``<out>/chains.jsonl`` (every chain, passed or not, with per-step attempts) and resumes by id.
 ``pick`` writes ``<out>/seeds.all.jsonl`` (every passing chain as a loom seed, minus the rejects of an optional
 verdicts file: rows ``{id, verdict: keep|reject, ...}``) and ``<out>/seeds.jsonl``, a pick stratified by arm: each
@@ -38,6 +44,7 @@ import math
 import random
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -62,6 +69,7 @@ _PAGE_LEAK = re.compile(r"(?m)^(?:People|Needs|Wants today)\s*:")
 LIMITS = {"person": (10, 160), "need": (8, 120), "want": (8, 200), "place": (10, 160), "happening": (10, 200),
           "clock": (10, 200), "secret": (8, 240)}
 CELL_SHARE = {("plain", "pair"): 0.35, ("hinted", "pair"): 0.35, ("plain", "cast"): 0.15, ("hinted", "cast"): 0.15}
+CELL_SHARE_NATIVE = {("none", "pair"): 0.7, ("none", "cast"): 0.3}  # the native form has no secret arm
 
 
 def is_group(person: str) -> bool:
@@ -272,7 +280,7 @@ def draw_roots(pools: dict[str, list[dict[str, Any]]], n: int, seed: int, cast_s
 
 async def run_chains(complete: sp.Complete, complete_page: sp.Complete, score: Optional[sp.Score],
                      starts: list[dict[str, Any]], out: Path, concurrency: int = 128,
-                     page_candidates: int = 4, page_draws: int = 2) -> dict[str, Any]:
+                     page_candidates: int = 4, page_draws: int = 2, form: str = "slots") -> dict[str, Any]:
     """Grow every start not already in ``<out>/chains.jsonl`` (appended as each finishes)."""
     path = out / "chains.jsonl"
     done = {r["id"] for r in sp.read_jsonl(path)}
@@ -286,7 +294,10 @@ async def run_chains(complete: sp.Complete, complete_page: sp.Complete, score: O
     async def one(s: dict[str, Any]) -> None:
         async with sem:
             try:
-                st = await grow_chain(complete, complete_page, score, dict(s), page_candidates, page_draws)
+                if form == "native":
+                    st = await grow_native(complete, score, dict(s))
+                else:
+                    st = await grow_chain(complete, complete_page, score, dict(s), page_candidates, page_draws)
             except Exception as e:  # one chain's failure must not stop the run
                 logger.error("chain %s failed: %s", s["id"], e)
                 return
@@ -308,6 +319,14 @@ async def run_chains(complete: sp.Complete, complete_page: sp.Complete, score: O
 
 def chain_seed(st: dict[str, Any]) -> dict[str, Any]:
     """A loom seed (``kotodama.posttrain.selfplay.parse_seed`` reads it) from a passing chain."""
+    if st.get("form") == "native":
+        return {"id": f"sc-{st['id']}", "cast": [n["label"] for n in st["names"]], "header": st["page"],
+                "form": "native", "friction": st["friction"], "cast_arm": st["cast_arm"], "secret_arm": "none",
+                "characters": [{"name": n["text"], "label": n["label"], "character": p}
+                               for n, p in zip(st["names"], st["people"])],
+                "genre": st["genre"], "theme": st["theme"], "relationship": st["relationship"],
+                "blurb": st["blurb"], "scene": st["scene"], "tags": st.get("tags", {}), "roots": st["roots"],
+                "nll": st.get("nll")}
     chars = [{"name": n["text"], "label": n["label"], "character": p, "need": nd, "want": w}
              for n, p, nd, w in zip(st["names"], st["people"], st["needs"], st["wants"])]
     return {"id": f"sc-{st['id']}", "cast": [n["label"] for n in st["names"]], "header": st["page"],
@@ -325,9 +344,10 @@ def stratified(rows: list[dict[str, Any]], seed: int = 0) -> tuple[list[dict[str
     cells: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
     for r in rows:
         cells[(r["secret_arm"], r["cast_arm"])].append(r)
-    total = min((len(cells.get(c, [])) / share for c, share in CELL_SHARE.items()), default=0)
+    shares = CELL_SHARE_NATIVE if rows and all(r["secret_arm"] == "none" for r in rows) else CELL_SHARE
+    total = min((len(cells.get(c, [])) / share for c, share in shares.items()), default=0)
     out: list[dict[str, Any]] = []
-    for cell, share in CELL_SHARE.items():
+    for cell, share in shares.items():
         by_f: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
         for r in cells.get(cell, []):
             by_f[r["friction"]].append(r)
@@ -336,7 +356,7 @@ def stratified(rows: list[dict[str, Any]], seed: int = 0) -> tuple[list[dict[str
         inter = [r for group in itertools.zip_longest(*(by_f[f] for f in sp.FRICTIONS)) for r in group
                  if r is not None]
         out += inter[:math.floor(total * share)]
-    stats = {"available": {f"{a}/{b}": len(cells.get((a, b), [])) for a, b in CELL_SHARE},
+    stats = {"available": {f"{a}/{b}": len(cells.get((a, b), [])) for a, b in shares},
              "picked": dict(collections.Counter(f"{r['secret_arm']}/{r['cast_arm']}" for r in out)),
              "picked_friction": dict(collections.Counter(r["friction"] for r in out)), "total": len(out)}
     return out, stats
@@ -370,9 +390,10 @@ def chain_report(out: Path, sample: int = 40, reject_sample: int = 20, verdicts:
     """``<out>/chain-report.json`` (pass rates by arm and stage, page gate reasons, filter verdicts), a reading sample
     of picked seeds (``<out>/reading-sample.md``) and of filter rejects (``<out>/filter-rejects-sample.md``)."""
     chains = sp.read_jsonl(out / "chains.jsonl")
-    order = ["person", "need", "want", "secret", *SHORT_STEPS, "page"]
+    native = any(c.get("form") == "native" for c in chains)
+    order = [*NATIVE_STEPS, "page"] if native else ["person", "need", "want", "secret", *SHORT_STEPS, "page"]
     by_arm: dict[str, Any] = {}
-    for arm_key in ("cast_arm", "secret_arm", "friction"):
+    for arm_key in ("cast_arm", "friction") if native else ("cast_arm", "secret_arm", "friction"):
         for arm in sorted({c[arm_key] for c in chains}):
             sub = [c for c in chains if c[arm_key] == arm]
             fails = collections.Counter(c["failed_step"] for c in sub if c["status"] != "pass")
@@ -433,6 +454,11 @@ def _sample_md(path: Path, rows: list[dict[str, Any]], title: str, verdicts: dic
         v = verdicts.get(s["id"])
         if v:
             md.append(f"**filter: {v['verdict']} / {v.get('category')}**: {v.get('reason', '')}\n")
+        if s.get("form") == "native":
+            md.append(f"*genre:* {s['genre']}  \n*theme:* {s['theme']}  \n*bound:* {s['relationship']}  \n"
+                      f"*blurb:* {s['blurb']}  \n*tags:* {s['tags']}\n")
+            md.append("```\n" + s["header"] + "\n```\n")
+            continue
         md.append(f"*theme:* {s['theme']}  \n*register:* {s['register']}  \n*bound:* {s['relationship']}  \n"
                   f"*place:* {s['place']}  \n*happening:* {s['happening']}  \n*clock:* {s['clock']}\n")
         for ch in s["characters"]:
@@ -440,6 +466,207 @@ def _sample_md(path: Path, rows: list[dict[str, Any]], title: str, verdicts: dic
         md.append(f"- secret ({s['secret']['holder']} → {s['secret']['target']}): {s['secret']['text']}\n")
         md.append("```\n" + s["header"] + "\n```\n")
     path.write_text("\n".join(md), encoding="utf-8")
+
+
+# ── native form: blurb -> cast list -> opening stage direction ──────────────
+
+GENRES = ("comedy", "drama", "thriller", "romance", "mystery", "farce", "tragedy", "family drama", "satire",
+          "ghost story", "workplace comedy", "crime drama", "coming-of-age story", "black comedy", "melodrama",
+          "western", "science fiction", "kitchen-sink drama", "romantic comedy", "political drama")
+NATIVE_HEAD = ("The Lantern Theatre: new writing, this season and next. Each listing gives the genre, what the play "
+               "is about and who it concerns, then the programme note, the characters as printed in the script, "
+               "and the stage direction that opens the play.\n\n")
+NATIVE_STEPS = ("blurb", "character", "scene")
+
+
+@dataclass(frozen=True)
+class NativeExample:
+    genre: str
+    theme: str
+    relationship: str
+    blurb: str
+    characters: tuple[tuple[str, str], ...]  # (full name, "age, one-line note")
+    scene: str
+
+
+NATIVE_EXAMPLES: tuple[NativeExample, ...] = (
+    NativeExample(
+        "comedy", "owing a debt and the illusion of standing alone",
+        "a piano teacher and the former student who now out-earns her",
+        "Ines Moreau has taught piano for forty years and never asked anyone for anything. On the eve of her move "
+        "into sheltered housing, her most famous former pupil turns up with a van, a bottle of wine and a plan for "
+        "her old upright. What he has not mentioned is that the piano is already sold, to pay the rent she never "
+        "told anyone she owed. A comedy about pride, debt and the people we refuse to need.",
+        (("Ines Moreau", "seventy-one, a retired piano teacher who corrects everyone's posture"),
+         ("Kwame Asante", "thirty-eight, her former pupil, now a session pianist with a van parked outside")),
+        "Ines's flat, late afternoon in March. Everything is boxed except one chair and the piano. Kwame stands in "
+        "the doorway holding a bottle of wine. The movers are due back at six."),
+    NativeExample(
+        "thriller", "small kindnesses and the belief that they end where they land",
+        "two night-shift workers who have never had a full conversation",
+        "At three in the morning a coach pulls out of a motorway services without one of its passengers, a "
+        "ten-year-old boy. The night cashier wants to drive him to the ferry herself; the security guard wants to "
+        "wait for the police, as the procedure says. Only one of them knows the boy hid on purpose. A taut "
+        "two-hander about rules, mercy and a promise made to a child.",
+        (("Dolores Vega", "fifty-five, the night cashier, who sings along to the till"),
+         ("Bram Visser", "twenty-six, a security guard who follows every rule to the letter")),
+        "A motorway service station, three in the morning, January. A child's rucksack with a name tag sits on the "
+        "counter. Dolores has her car keys in her hand; Bram is on hold to the police. The boy's coach sails from "
+        "the ferry port at half past five."),
+    NativeExample(
+        "ghost story", "inheritance and the hope that children teach their parents",
+        "a widowed father, his grown daughter, and the estate agent selling the family house",
+        "Every viewing of the old house on Mill Lane has ended the same way: the buyers leave before they reach the "
+        "kitchen, and nobody will say why. Anna Hale drives up overnight to sell her childhood home out from under "
+        "her stubborn father, and finds him laying three places at the table and the estate agent refusing to go "
+        "upstairs. A quiet ghost story about grief, property and what a house remembers.",
+        (("Peter Hale", "sixty-eight, a retired signalman who will not leave"),
+         ("Anna Hale", "thirty-nine, his daughter, a paramedic who has driven up overnight"),
+         ("Joseph Okoro", "forty-two, the estate agent, polite and very keen to sell")),
+        "The kitchen of a terraced house on Mill Lane, an hour before dawn in November. The kettle is coming to the "
+        "boil. Peter sets out three cups; Anna still has her coat on; Joseph waits in the hall with the keys. The "
+        "first viewing is at nine."),
+    NativeExample(
+        "farce", "the illusion of a fresh start",
+        "three sisters and the eldest's fiance, on the night before the wedding",
+        "The night before Ruth Callaghan's wedding, her two sisters arrive at the farmhouse with a hip flask, a "
+        "suitcase and a secret apiece. By midnight the cake has been eaten by a calf, the groom has lost both rings "
+        "in the yard, and the youngest has announced she is not going back to Sydney alone. A farce about family, "
+        "cattle and the impossibility of starting over in the house you grew up in.",
+        (("Ruth Callaghan", "forty-four, the eldest, a dairy farmer who never sits down"),
+         ("Maeve Callaghan", "thirty-six, the middle sister, a solicitor with a hip flask"),
+         ("Orla Callaghan", "twenty-nine, the youngest, back from Australia with news"),
+         ("Tom Brennan", "forty-seven, the fiance, a vet who has lost the rings")),
+        "The farmhouse kitchen, eleven at night, the eve of the wedding. A half-iced cake stands on the table under "
+        "a tea towel. Tom is on his hands and knees by the door with a torch; Maeve pours from her hip flask into "
+        "three teacups. The church expects them at ten."),
+)
+
+
+def native_entry(no: int, st: dict[str, Any]) -> str:
+    """A season listing as far as ``st`` is filled: the roots line, then blurb, characters and scene."""
+    names = [n["text"] for n in st["names"]]
+    who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    out = [f"No. {no}. {st['genre'].capitalize()}, about {st['theme']}; {st['relationship']}: {who}."]
+    if st.get("blurb"):
+        out.append(st["blurb"])
+    if st.get("people"):
+        out.append("Characters:")
+        out += [f"{n['text']}, {p}" for n, p in zip(st["names"], st["people"])]
+    if st.get("scene"):
+        out += ["The play opens:", st["scene"]]
+    return "\n".join(out)
+
+
+def _native_example_state(ex: NativeExample) -> dict[str, Any]:
+    return {"genre": ex.genre, "theme": ex.theme, "relationship": ex.relationship, "blurb": ex.blurb,
+            "names": [{"text": n, "label": sp.name_label(n)} for n, _ in ex.characters],
+            "people": [c for _, c in ex.characters], "scene": ex.scene}
+
+
+NATIVE_EXAMPLES_TEXT = "".join(native_entry(i + 1, _native_example_state(ex)) + "\n\n"
+                               for i, ex in enumerate(NATIVE_EXAMPLES))
+
+
+def native_prompt(st: dict[str, Any], step: str, i: int = 0) -> str:
+    no = len(NATIVE_EXAMPLES) + 1
+    body = native_entry(no, st)
+    if step == "blurb":
+        tail = "\n"
+    elif step == "character":
+        tail = ("\nCharacters:" if i == 0 else "") + f"\n{st['names'][i]['text']},"
+    elif step == "scene":
+        tail = "\nThe play opens:\n"
+    else:
+        raise ValueError(f"unknown native step {step!r}")
+    return NATIVE_HEAD + NATIVE_EXAMPLES_TEXT + body + tail
+
+
+NATIVE_LIMITS = {"blurb": (150, 900), "character": (8, 160), "scene": (60, 700)}
+_SENTENCE = re.compile(r"[.!?](?:\s|$)")
+_CLOCK = re.compile(r"\b(?:at|by|until|before)\s+(?:\d{1,2}(?:[:.]\d\d)?|one|two|three|four|five|six|seven|eight|"
+                    r"nine|ten|eleven|twelve|noon|midnight|dawn|dusk)\b|o'clock|\bdue\b|\bin (?:an|one|two|three|"
+                    r"ten|twenty|thirty) (?:hour|minute)s?\b", re.I)
+
+
+def check_native(step: str, text: str, st: dict[str, Any]) -> tuple[Optional[str], str]:
+    t = " ".join(text.strip().split())
+    lo, hi = NATIVE_LIMITS[step]
+    if len(t) < lo:
+        return None, "too_short"
+    if len(t) > hi:
+        return None, "too_long"
+    if sp.mojibake(t) or re.search(r"\S{40,}", t):
+        return None, "garbled"
+    if re.search(r"\b(?:Characters|The play opens|No\. \d)\b", t):
+        return None, "field_leak"
+    if step == "blurb" and len(_SENTENCE.findall(t)) < 2:
+        return None, "one_sentence"
+    if step == "character":
+        note = re.sub(r"^[\w-]+,\s*", "", t)  # the age, then the note
+        if is_group(note):
+            return None, "group_as_person"
+    if step == "scene" and not any(n["label"] in t for n in st["names"]):
+        return None, "nobody_on_stage"
+    return t, ""
+
+
+async def grow_native(complete: sp.Complete, score: Optional[sp.Score], st: dict[str, Any],
+                      draws: int = 3, n: int = 2) -> dict[str, Any]:
+    """Blurb, then one cast line per name, then the opening stage direction; each step the first of ``n``
+    candidates (up to ``draws`` draws) that passes ``check_native``. The header is the cast lines and the stage
+    direction; it then passes the mechanical part of ``seedpools.gate_page``."""
+    st["form"] = "native"
+    st["rejections"] = {}
+    plan = [("blurb", 0)] + [("character", i) for i in range(len(st["names"]))] + [("scene", 0)]
+    for step, i in plan:
+        value, reasons = None, []
+        for _ in range(draws):
+            for text, _f, hit in await complete(native_prompt(st, step, i), n, ["\n"]):
+                if hit:
+                    reasons.append("overlong")
+                    continue
+                value, why = check_native(step, text, st)
+                if value is not None:
+                    break
+                reasons.append(why)
+            if value is not None:
+                break
+        if reasons:
+            st["rejections"][f"{step}{i if step == 'character' else ''}"] = reasons
+        if value is None:
+            st.update(status="fail", failed_step=step)
+            return st
+        if step == "character":
+            st.setdefault("people", []).append(value)
+        else:
+            st[step] = value
+    page = "\n".join(f"{nm['text']}, {p}" for nm, p in zip(st["names"], st["people"])) + "\n\n" + st["scene"]
+    c = {"secret_arm": "hinted",
+         "characters": [{"name": nm["text"], "label": nm["label"], "character": {"text": p}, "need": {"text": ""}}
+                        for nm, p in zip(st["names"], st["people"])]}
+    why = sp.gate_page({"wants": [], "secret": "", "page": page}, c, wants_required=0)
+    st["rejections"]["page"] = [why] if why else []
+    if why:
+        st.update(status="fail", failed_step="page", page_rejected=[[why, page]])
+        return st
+    st["page"] = page
+    st["tags"] = {"clock_on_page": bool(_CLOCK.search(st["scene"])),
+                  "wants_on_page": sum(bool(re.search(r"\bwants?\b|\bhopes?\b|\bneeds?\b", p))
+                                       for p in st["people"])}
+    if score is not None:
+        try:
+            st["nll"] = -(await score([(sp.DOC_START, page)]))[0]
+        except Exception as e:  # the NLL is a measurement, never a reason to lose the chain
+            logger.error("scoring %s failed: %s", st["id"], e)
+    st.update(status="pass", failed_step=None)
+    return st
+
+
+def assign_genres(starts: list[dict[str, Any]], seed: int) -> None:
+    """A plain genre label per start, drawn from ``GENRES`` by the start's id (stable across reruns)."""
+    for s in starts:
+        s.setdefault("genre", random.Random(f"{seed}:{s['id']}:genre").choice(GENRES))
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -453,6 +680,9 @@ def main_chain(argv: list[str]) -> int:
                                                    "relationship_cast,register,names}.jsonl")
     ap.add_argument("--n", type=int, default=3000)
     ap.add_argument("--limit", type=int, default=0, help="grow only the first N starts (0 = all)")
+    ap.add_argument("--form", choices=["slots", "native"], default="slots",
+                    help="slots: people/needs/wants/secret/place/happening/clock/page; native: programme note, "
+                         "cast list, opening stage direction")
     ap.add_argument("--cast_share", type=float, default=0.3)
     ap.add_argument("--law", default="tsumugi")
     ap.add_argument("--temperature", type=float, default=1.0, help="short steps")
@@ -478,6 +708,8 @@ def main_chain(argv: list[str]) -> int:
             raise SystemExit(f"pools missing or empty under {pdir}: {missing}")
         starts = draw_roots(pools, a.n, a.seed, a.cast_share)
         sp.write_jsonl(starts_path, starts)
+    if a.form == "native":
+        assign_genres(starts, a.seed)
     if a.limit:
         starts = starts[:a.limit]
     complete, close, sampling = sp._completer(a.endpoint, a.law, a.temperature, 96)
@@ -492,7 +724,7 @@ def main_chain(argv: list[str]) -> int:
     async def go() -> dict[str, Any]:
         try:
             return await run_chains(complete, complete_page, score, starts, out, a.concurrency, a.page_candidates,
-                                    a.page_draws)
+                                    a.page_draws, a.form)
         finally:
             await close()
             await close_page()
