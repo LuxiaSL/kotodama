@@ -78,10 +78,16 @@ def test_frames_and_pick(tmp_path: Path) -> None:
     rows = asyncio.run(sb.write_frames(fake(), tmp_path, ["Catalogue", "Index"], 3, _score))
     assert len(rows) == 6 and all(r["mechanical_ok"] and "nll" in r for r in rows)
     v = tmp_path / "v.jsonl"
-    v.write_text("".join(json.dumps({"id": r["id"], "verdict": "keep" if r["id"] != "index-0" else "reject"}) + "\n"
+    verdict = {"index-0": ("reject", "not-a-collection"), "index-1": ("reject", "incoherent")}
+    v.write_text("".join(json.dumps({"id": r["id"], "verdict": verdict.get(r["id"], ("keep", "none"))[0],
+                                     "category": verdict.get(r["id"], ("keep", "none"))[1], "reason": "r"}) + "\n"
                          for r in rows))
-    frames = sb.pick_frames(tmp_path, v, 6)
-    assert [f["title"] for f in frames] and len(frames) == 2 and frames[0]["frame"] == "F0"
+    frames = sb.pick_frames(tmp_path, v, 6, control=1)
+    assert [f["frame"] for f in frames] == ["F0", "F1", "FC0"] and frames[2]["source"] == "index-0"
+    assert frames[2]["control"] and not frames[0]["control"]
+    rejected = sp.read_jsonl(tmp_path / "frames.rejected.jsonl")
+    assert {r["id"]: r["category"] for r in rejected} == {"index-0": "not-a-collection", "index-1": "incoherent"}
+    frames = [f for f in frames if not f["control"]]
     assert all(f["text"].startswith(f["title"] + "\n\n") for f in frames)
 
 

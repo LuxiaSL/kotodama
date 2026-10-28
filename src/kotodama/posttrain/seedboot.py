@@ -143,11 +143,19 @@ async def write_frames(complete: sp.Complete, out: Path, titles: Sequence[str], 
     return rows
 
 
-def pick_frames(out: Path, verdicts: Path, k: int) -> list[dict[str, Any]]:
+def pick_frames(out: Path, verdicts: Path, k: int, control: int = 0) -> list[dict[str, Any]]:
     """Coherent (verdict keep) mechanically-sound intros, the lowest-NLL one per title, up to ``k``; frame ids
-    ``F0..``; writes ``<out>/frames.jsonl``."""
+    ``F0..``; writes ``<out>/frames.jsonl`` and every rejected candidate with the reader's reason to
+    ``<out>/frames.rejected.jsonl``. The reader's choice is itself a selection imprint, so ``control`` adds that many
+    reader-rejected frames as a control arm (``FC0..``, ``control: true``): the lowest-NLL mechanically-sound
+    rejects not called incoherent (borderline ones)."""
     cands = sp.read_jsonl(out / "frames.candidates.jsonl")
-    keep = {v["id"] for v in sp.read_jsonl(verdicts) if v.get("verdict") == "keep"}
+    vrows = {v["id"]: v for v in sp.read_jsonl(verdicts)}
+    keep = {i for i, v in vrows.items() if v.get("verdict") == "keep"}
+    sp.write_jsonl(out / "frames.rejected.jsonl",
+                   [{**r, "verdict": vrows.get(r["id"], {}).get("verdict", "unjudged"),
+                     "category": vrows.get(r["id"], {}).get("category"),
+                     "reason": vrows.get(r["id"], {}).get("reason")} for r in cands if r["id"] not in keep])
     best: dict[str, dict[str, Any]] = {}
     for r in cands:
         if r["mechanical_ok"] and r["id"] in keep:
@@ -155,7 +163,13 @@ def pick_frames(out: Path, verdicts: Path, k: int) -> list[dict[str, Any]]:
             if cur is None or r.get("nll", 0.0) < cur.get("nll", 0.0):
                 best[r["title"]] = r
     frames = [{"frame": f"F{i}", "source": r["id"], "title": r["title"], "text": f"{r['title']}\n\n{r['intro']}",
-               "nll": r.get("nll")} for i, r in enumerate(sorted(best.values(), key=lambda r: r.get("nll", 0.0))[:k])]
+               "nll": r.get("nll"), "control": False}
+              for i, r in enumerate(sorted(best.values(), key=lambda r: r.get("nll", 0.0))[:k])]
+    borderline = sorted((r for r in cands if r["mechanical_ok"] and r["id"] in vrows and r["id"] not in keep
+                         and vrows[r["id"]].get("category") != "incoherent"), key=lambda r: r.get("nll", 0.0))
+    frames += [{"frame": f"FC{i}", "source": r["id"], "title": r["title"], "text": f"{r['title']}\n\n{r['intro']}",
+                "nll": r.get("nll"), "control": True, "reader_reason": vrows[r["id"]].get("reason")}
+               for i, r in enumerate(borderline[:control])]
     sp.write_jsonl(out / "frames.jsonl", frames)
     return frames
 
@@ -644,9 +658,10 @@ def main_frames_pick(argv: list[str]) -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--verdicts", required=True)
     ap.add_argument("--k", type=int, default=6)
+    ap.add_argument("--control", type=int, default=0, help="reader-rejected borderline frames kept as a control arm")
     a = ap.parse_args(argv)
-    frames = pick_frames(Path(a.out), Path(a.verdicts), a.k)
-    print(json.dumps([{k: f[k] for k in ("frame", "source", "title")} for f in frames], indent=1))
+    frames = pick_frames(Path(a.out), Path(a.verdicts), a.k, a.control)
+    print(json.dumps([{k: f[k] for k in ("frame", "source", "title", "control")} for f in frames], indent=1))
     return 0
 
 
