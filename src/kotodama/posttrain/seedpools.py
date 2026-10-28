@@ -332,12 +332,17 @@ def load_list(path: Path) -> list[str]:
 _PAIR = re.compile(r"^\(([^()/\n]{1,80}?) / ([^()/\n]{1,80}?)\)\s*")
 
 
+_LEAD_PAREN = re.compile(r"^\(([^()\n]{1,80})\)\s*")
+
+
 def split_pair(line: str) -> tuple[Optional[tuple[str, str]], str]:
-    """``"(a / b) entry"`` -> ((a, b), entry); a line without a leading pair -> (None, line)."""
+    """``"(a / b) entry"`` -> ((a, b), entry); a single-item lead ``"(a) entry"`` (the model writing its own
+    crossing with one item) -> (None, entry); a line without a leading parenthesis -> (None, line)."""
     m = _PAIR.match(line)
-    if not m:
-        return None, line
-    return (m.group(1).strip(), m.group(2).strip()), line[m.end():]
+    if m:
+        return (m.group(1).strip(), m.group(2).strip()), line[m.end():]
+    m = _LEAD_PAREN.match(line)
+    return (None, line[m.end():]) if m else (None, line)
 
 
 def pool_prompt(axis: Axis, examples: Sequence[str], crossing: Optional[tuple[str, ...]]) -> str:

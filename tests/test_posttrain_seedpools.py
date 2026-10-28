@@ -72,6 +72,8 @@ def test_pool_prompt_and_parse() -> None:
                                    False)
     assert got == [(None, "a pilot who hums"), (("vain", "kind"), "a tailor who lies")]
     assert sp.parse_list_completion(" a pilot who hums\n- a tailor wh", True) == [(None, "a pilot who hums")]
+    assert sp.parse_list_completion(" a pilot\n- (child and grown-up) a boy and his aunt", False)[1] == \
+        (None, "a boy and his aunt")
     assert sp.parse_list_completion(" and the things that live on them", False, "thresholds") == \
         [(None, "thresholds and the things that live on them")]
     assert sp.draw_crossing(random.Random(0), theme, {"antisyzygies": ["order and chaos"]})[0] in ("order", "chaos")
