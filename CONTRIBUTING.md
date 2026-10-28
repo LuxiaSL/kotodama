@@ -137,6 +137,10 @@ stranger who has never seen the research and may read only one page. They follow
   limitations block.
 - **Numbers are verbatim from the run that produced them, with n and the comparison inline**, every
   time they appear. Comparisons with other models are same-harness or say they are not.
+- **Legible on one read.** A subject sits near its verb; an object relative keeps its "that" ("the tokens
+  that its output favours"); at most two nouns stack before a head; the subject of a mind verb (decide,
+  see, want) is a person, not a thing. `tools/check_legibility.py` reports these features against a
+  Wikipedia reference and lists the sentences behind each count. It is a report, not a gate.
 - **Plain and declarative.** No marketing and no mystique. Terms of art (AttnRes, looped depth,
   binding) are defined or linked at first use on each page.
 - **Never on a public page:** local paths, machine or host names, account details, private
