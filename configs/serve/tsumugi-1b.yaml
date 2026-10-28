@@ -19,7 +19,6 @@ served_model_name: kotodama-tsumugi-1b
 engine: fast
 prefix_cache: true
 prefix_pool_tokens: 32768
-multi_rows: [4, 8]
 xbatch_rows: [16, 32, 64, 128]
 xbatch_refill: true
 cascade_attn: true

@@ -1811,6 +1811,11 @@ async def _batched_candidates(request: GenerateRequest, n: int) -> list[Generate
     if _multi_compatible(request, n):
         async with _engine_lock:
             return await _run_generation(engine_generate_multi, request, n)
+    if _xbatch is not None and MultiSampleDecoder.supports(_engine_params(request)):
+        # a law the batcher samples, refused anyway (a candidate longer than the row cap, more candidates than the
+        # widest bucket): served one candidate at a time on the single-stream engine
+        logger.info("xbatch: n=%d, max_new_tokens=%d served single-stream (row cap %s, widest bucket %d)",
+                    n, request.max_new_tokens, _row_token_cap or "none", _xbatch.runner.max_rows)
     return []
 
 
