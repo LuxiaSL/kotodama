@@ -43,7 +43,8 @@ def test_stage_a_plan() -> None:
         # every vector cell has its controls at the same dose and rule
         for c in (x for x in cells if x.ladder == lad):
             twins = [r for r in ctrls if r.dose == c.dose and r.steer_rule == c.steer_rule]
-            assert len(twins) == 2 and len({r.steer[0][0] for r in twins}) == 2
+            n = 3 if lad == "V7" else 2  # the V7 ladder carries a third control per dose
+            assert len(twins) == n and len({r.steer[0][0] for r in twins}) == n
     small = lb.stage_a({"temperature": [0.6], "repetition_penalty": [], "vector_ladders": [], "random_per_dose": 0})
     assert [c.id for c in small] == ["base", "T0.6"]
 
@@ -129,6 +130,11 @@ def test_dialogue_meters_and_uptake() -> None:
     assert m["turns"] == 6 and m["repeat_share"] == pytest.approx(2 / 6, abs=1e-3)
     assert m["eos_share"] == pytest.approx(7 / 12, abs=1e-3) and m["veto_share"] == pytest.approx(2 / 6, abs=1e-3)
     assert 0 < m["sibling_distinct"] < 1 and m["uptake"] is not None
+    assert m["in_frame"] == 1.0
+    review = {**row, "turns": row["turns"][:1] + [{**row["turns"][1], "text": (
+        "I was afraid of it. The most interesting character is a young woman in the same room. In a scene that "
+        "punctuates the novel's beginning, she laments a man in a white labcoat.")}]}
+    assert lb.dialogue_meters(review)["in_frame"] == 0.5
 
 
 def _mock_server(seen: list[dict]):

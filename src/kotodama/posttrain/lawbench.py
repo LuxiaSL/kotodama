@@ -48,6 +48,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
+from kotodama.posttrain.narration import out_of_frame
 from kotodama.posttrain.selfplay import (PromptTooLong, SelfPlayConfig, evaluate, is_template,
                                          next_speaker, oai_completer, parse_seed, speech_key, spoken_text,
                                          split_completion)
@@ -137,7 +138,8 @@ STAGE_A: dict[str, Any] = {
     "temperature": [0.6, 0.7, 0.8, 0.9, 1.0],
     "repetition_penalty": [1.0, 1.1, 1.35],
     "vector_ladders": [
-        {"name": "V7", "key": "V7_s58", "rule": "K", "doses": [-0.15, -0.10, -0.05, 0.05, 0.10, 0.15]},
+        {"name": "V7", "key": "V7_s58", "rule": "K", "doses": [-0.15, -0.10, -0.05, 0.05, 0.10, 0.15],
+         "random_per_dose": 3},
         {"name": "Vrep", "key": "Vrepperp_s58", "rule": "N", "doses": [-0.15, -0.30, -0.50, -0.80]},
         {"name": "Vrep", "key": "Vrepperp_s58", "rule": "S", "doses": [-0.30, -0.60, -1.0]},
         {"name": "Vrep", "key": "Vrepperp_s58", "rule": "K", "doses": [-0.05, -0.10]},
@@ -150,7 +152,8 @@ STAGE_A: dict[str, Any] = {
 def stage_a(plan: Optional[dict[str, Any]] = None, base: str = BASE_LAW) -> list[Cell]:
     """The stage-A cells: the base law, its temperature and repetition-penalty ladders, each vector ladder at the
     base law, and ``random_per_dose`` random-direction controls per vector dose (same rule, dose and sign; the
-    random keys rotate so every key serves every ladder)."""
+    random keys rotate so every key serves every ladder; a ladder's own ``random_per_dose`` adds controls on the
+    keys its dose has not used)."""
     p = {**STAGE_A, **(plan or {})}
     b = law(base)
     T0, rp0 = float(b["temperature"]), float(b["repetition_penalty"])
@@ -164,9 +167,14 @@ def stage_a(plan: Optional[dict[str, Any]] = None, base: str = BASE_LAW) -> list
         for d in lad["doses"]:
             cells.append(Cell(f"{lad['name']}{rule}{_fmt(d)}", lad["name"], T0, rp0, steer=((lad["key"], float(d)),),
                               steer_rule=rule))
-            for j in range(int(p["random_per_dose"])):
-                key = keys[k % len(keys)]
-                k += 1
+            used: list[str] = []
+            for j in range(int(lad.get("random_per_dose", p["random_per_dose"]))):
+                if j < int(p["random_per_dose"]):
+                    key = keys[k % len(keys)]
+                    k += 1
+                else:  # a ladder's extra controls take the keys this dose has not used yet (the rotation is kept)
+                    key = next((x for x in keys if x not in used), keys[j % len(keys)])
+                used.append(key)
                 cells.append(Cell(f"R{lad['name']}{rule}{_fmt(d)}_{j}", f"rand:{lad['name']}", T0, rp0,
                                   steer=((key, float(d)),), steer_rule=rule, control=True))
     ids = [c.id for c in cells]
@@ -500,6 +508,7 @@ def dialogue_meters(row: dict[str, Any], template_window: int = 12, template_max
             if i else False for i, t in enumerate(turns)]
     cast = row.get("cast", [])
     narr = [spoken_text(t["text"], cast).strip() != t["text"].strip() for t in turns]
+    off = [out_of_frame(t["text"]) for t in turns]
     all_draws = [t["ended_by"] for t in row["turns"]] + [s["ended_by"] for t in row["turns"] for s in t["siblings"]]
     sib = [distinctness(t["text"], t["siblings"][0]["text"]) for t in turns if t["siblings"]]
     ups = [uptake(turns, k, row.get("header", "")) for k in range(n)]
@@ -515,6 +524,8 @@ def dialogue_meters(row: dict[str, Any], template_window: int = 12, template_max
         "repeat_share": _mean(rep),
         "template_share": _mean(tmpl),
         "narration_share": _mean(narr),
+        # character speech or scene narration, not text about a work or a page (narration.out_of_frame)
+        "in_frame": _mean(not x for x in off),
         "eos_share": _mean(e == "eos" for e in all_draws),
         "cap_share": _mean(e == "length" for e in all_draws),
         "sibling_distinct": _mean(sib),
@@ -782,7 +793,7 @@ def main(argv: list[str] | None = None) -> int:
         (run / "summary.json").write_text(json.dumps(summ, indent=1))
         for name, table in summ.items():
             cols = ["damage", "nll", "bt", "loop", "repeat_share", "sibling_distinct", "eos_share"]
-            cols += (["template_share", "narration_share", "uptake", "echo_share", "turns"]
+            cols += (["template_share", "narration_share", "in_frame", "uptake", "echo_share", "turns"]
                      if panels[name].kind == "dialogue" else ["form_pass", "ref_overlap", "words"])
             print(f"\n## {name}\n" + frontier_table(table, cols))
         return 0

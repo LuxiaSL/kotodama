@@ -82,3 +82,31 @@ def classify_paragraph(paragraph: str, previous: str = "", cast: list[str] | Non
     if strong_s and not strong_n:
         return "speech", cues_s + cues_n
     return "unclear", cues_n + cues_s
+
+
+# Out-of-frame text inside a scene: the turn stops being the scene (a character's speech or the scene's narration)
+# and becomes text ABOUT a work or a page: a review, a plot summary, an essay, web or transcript furniture. Only
+# sentences without first or second person outside quotes are read (a character saying what they think of a book is
+# speech). Strong cues decide alone; weak cues (nouns a scene can also use in-world) need two distinct hits in a turn.
+_FRAME_STRONG = re.compile(
+    r"\b(?:the|this|that|his|her|their|its) (?:novel|novel's|author|author's|narrator|protagonist|plot|reader|"
+    r"readers|screenplay|sequel)\b|\bthe book's\b|\bchapter \d+\b|"
+    r"\bspoilers?\b|\bout of (?:five|ten|5|10) stars\b|\b\d(?:\.\d)?/(?:5|10)\b|\bin this (?:essay|article|post|"
+    r"review|chapter)\b|\bin conclusion\b|\bthis article\b|\bposted (?:by|on)\b|\ball rights reserved\b|"
+    r"\bcopyright\b|https?://|\bwww\.|\bclick here\b|\bsubscribe\b|\b(?:the|this) (?:transcript|conversation above)\b|"
+    r"\bend of (?:the )?(?:transcript|chapter|episode)\b", re.I)
+_FRAME_WEAK = re.compile(r"\b(?:the|this) (story|scene|characters?|play|show|dialogue|writing|genre|audience|series|"
+                         r"film|movie|episode|book)\b", re.I)
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def out_of_frame(text: str) -> bool:
+    """Whether a turn leaves the scene for text about a work or a page (review, summary, essay, page furniture)."""
+    weak: set[str] = set()
+    for sent in _SENTENCE_END.split(_QUOTED.sub(" ", text)):
+        if not sent.strip() or _FIRST_SECOND.search(sent):
+            continue
+        if _FRAME_STRONG.search(sent):
+            return True
+        weak |= {m.group(1).lower().rstrip("s") for m in _FRAME_WEAK.finditer(sent)}
+    return len(weak) >= 2
