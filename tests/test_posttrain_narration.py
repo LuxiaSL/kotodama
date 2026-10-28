@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from kotodama.posttrain.narration import classify_paragraph, split_turn
+from kotodama.posttrain.narration import classify_paragraph, out_of_frame, split_turn
 
 CAST = ["Mara", "Teo"]
 
@@ -38,3 +38,18 @@ def test_unclear_and_split() -> None:
     assert classify_paragraph("", "x")[0] == "unclear"
     assert classify_paragraph("(I think) you should go.", "", CAST)[0] in ("unclear", "speech")
     assert split_turn("one\n\n\n two \n \n three") == ["one", "two", "three"]
+
+
+@pytest.mark.parametrize("text,off", [
+    ("I need to change my shirt.", False),
+    ("She sets the cup down. The kettle is still warm.", False),
+    ("I loved the novel, honestly. You should read it.", False),  # a character talking about a book is speech
+    ("The movie starts at nine.", False),  # one weak cue
+    ("I was afraid of it. The most interesting character is a young woman. In a scene that punctuates the novel's "
+     "beginning, she laments a man in a white labcoat.", True),
+    ("The story drags in the middle, and the characters never change.", True),  # two weak cues
+    ("Posted by admin on March 3.", True),
+    ("Rating: 4/5. Spoilers below.", True),
+])
+def test_out_of_frame(text: str, off: bool) -> None:
+    assert out_of_frame(text) is off

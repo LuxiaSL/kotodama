@@ -279,23 +279,29 @@ def oai_completer(endpoints: list[str], sampling: dict[str, float], max_tokens: 
     overall deadline of ``timeout`` seconds, so a connection that stalls without closing still fails. A 4xx is
     not retried; a prompt the server finds longer than its context raises ``PromptTooLong``.
     ``steer``: a residual steering stack sent with every request (the server's ``vectors``; it needs
-    ``--steer-npz``). ``transport``: an httpx transport (tests pass a mock)."""
+    ``--steer-npz``). ``sampling`` may also carry ``min_p`` and ``penalty_scope``, sent when present. Keyword
+    ``fields`` of one call (e.g. ``seed``, ``user``, ``max_tokens``) are added to that call's request body; a seeded
+    call split into several requests offsets the seed per request, so its candidates stay distinct.
+    ``transport``: an httpx transport (tests pass a mock)."""
     import httpx
 
     client = httpx.AsyncClient(timeout=timeout, transport=transport)
     counter = {"i": 0}
     rep = float(sampling.get("repetition_penalty", 1.0))
+    law_extra = {k: sampling[k] for k in ("min_p", "penalty_scope") if k in sampling}
 
     async def complete(prompt: str, n: int, stops: list[str], route: Optional[int] = None,
-                       user: Optional[str] = None) -> list[tuple[str, str, bool]]:
+                       **fields: Any) -> list[tuple[str, str, bool]]:
         out: list[tuple[str, str, bool]] = []
-        while len(out) < n:  # the server caps n at 8
+        cap = int(fields.get("max_tokens", max_tokens))
+        while len(out) < n:  # one request carries at most 8 candidates
             k = min(8, n - len(out))
             body = {"prompt": prompt, "model": model, "n": k, "max_tokens": max_tokens,
                     "temperature": sampling["temperature"], "top_p": sampling.get("top_p", 0.0),
-                    "frequency_penalty": max(0.0, rep - 1.0), "stop": stops, "return_token_ids": True}
-            if user:
-                body["user"] = user  # a gateway keeps one conversation on one replica by this key
+                    "frequency_penalty": max(0.0, rep - 1.0), "stop": stops, "return_token_ids": True,
+                    **law_extra, **fields}
+            if fields.get("seed") is not None and out:
+                body["seed"] = int(fields["seed"]) + len(out)
             if steer:
                 body["vectors"] = steer
                 body["steer_rule"] = steer_rule
@@ -317,7 +323,7 @@ def oai_completer(endpoints: list[str], sampling: dict[str, float], max_tokens: 
                     await asyncio.sleep(2 ** attempt)
             for ch in r.json()["choices"]:
                 ids = (ch.get("token_ids") or {}).get("completion") or []
-                out.append((ch["text"], ch.get("finish_reason", "stop"), len(ids) >= max_tokens))
+                out.append((ch["text"], ch.get("finish_reason", "stop"), len(ids) >= cap))
         return out
 
     return complete, client.aclose
