@@ -145,6 +145,32 @@ def test_oai_completer_request_shape() -> None:
     assert b["temperature"] == law("tsumugi")["temperature"] and b["return_token_ids"] is True
 
 
+
+def test_oai_completer_sends_the_dialogue_law_min_p() -> None:
+    import httpx
+
+    seen = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        seen.append(body)
+        return httpx.Response(200, json={"choices": [{"text": " hi", "finish_reason": "stop"}
+                                                     for _ in range(body["n"])]})
+
+    from kotodama.serve.laws import law
+
+    complete, close = sp.oai_completer(["http://a:1"], law("tsumugi-dialogue"), max_tokens=4,
+                                       transport=httpx.MockTransport(handler))
+
+    async def go():
+        try:
+            return await complete("Mara:", 2, STOPS)
+        finally:
+            await close()
+
+    asyncio.run(go())
+    assert seen[0]["min_p"] == 0.02 and seen[0]["temperature"] == 1.0
+
 def test_parse_seed() -> None:
     s = sp.parse_seed({"cast": ["A", "B"], "header": " h ", "turns": [{"speaker": "A", "text": "hi"}]}, 7)
     assert s.id == "7" and s.header == "h" and s.turns == [Turn("A", "hi")]

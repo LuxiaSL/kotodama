@@ -13,6 +13,13 @@ LAWS: dict[str, dict[str, float]] = {
     # kotodama-tsumugi (1b-tsumugi): the sampling bench's best binding (.42 vs .34 at the 3B's 0.9/1.2) sits at
     # T 0.7-0.8 with top-p off; repetition 1.2 (1.35 if it loops).
     "tsumugi": {"temperature": 0.75, "top_k": 0, "top_p": 0.0, "repetition_penalty": 1.2},
+    # kotodama-tsumugi, long multi-speaker dialogue (kotodama.posttrain.lawbench, blind pairwise reads):
+    # min-p truncation at T 1.0 cuts loop-locked 40-turn scenes from about half to about one in sixteen and
+    # reads best; min-p at T 0.75-0.85 locks scenes into loops instead.
+    "tsumugi-dialogue": {"temperature": 1.0, "top_k": 0, "top_p": 0.0, "min_p": 0.02, "repetition_penalty": 1.2},
+    # kotodama-tsumugi, short completions (scene seeds, prose continuation): same bench, best at T 0.75 with
+    # light min-p.
+    "tsumugi-short": {"temperature": 0.75, "top_k": 0, "top_p": 0.0, "min_p": 0.05, "repetition_penalty": 1.2},
     # The base model: raw base loops without strong anti-repetition.
     "base": {"temperature": 0.9, "top_k": 0, "top_p": 0.0, "repetition_penalty": 1.35},
     # Checkpoint soups: temp 1.0 clears the "i-don't-know" depth collapse.
