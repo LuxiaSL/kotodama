@@ -18,6 +18,15 @@ kotodama.model.capture (the replay lane's capture):
 With ``depth``, the post-MLP partial at every effective layer (the depth path; ``hidden`` is then its sampled
 columns).
 
+With ``attn``, attention statistics of each position's query row (columns 0..pos, the prompt then the row's own
+tokens, self included; fp32 probabilities from the row's attention scores), written by every layer's region after its
+attention:
+  * ``head_entropy`` (every layer): per query head, -sum p ln p;
+  * ``mean_entropy`` (every layer): the entropy of the head-mean distribution m = mean over heads of p;
+  * ``head_scalars`` (sampled layers): per head, the mass on prompt columns (< the row's position at admission), the
+    recency mass (columns >= max(1, floor(0.8 len)), len = pos + 1) and the sink (column 0);
+  * ``mean_rows`` (sampled layers): m over absolute columns 0..width-1 (zero past pos).
+
 The decode step writes q / k / v / gate / route inside each sampled layer's compiled region (index writes into the
 decoder's buffers, as its KV writes are) and the partials after each region returns; every buffer lives at a fixed
 address, so a CUDA-graph replay writes them too. Rows past ``tail`` positions overwrite their last slot (the export
@@ -33,16 +42,22 @@ import torch
 
 # The surfaces a sampled layer's region writes, in the order its sign tuple carries their buffers.
 REGION_SURFACES = ("q", "k", "v", "gate", "route")
+# The attention statistics every layer's region writes (head_scalars and mean_rows at sampled layers only), in the
+# order its stats tuple carries them.
+STATS = ("head_entropy", "mean_entropy", "head_scalars", "mean_rows")
 
 
 @dataclass(frozen=True)
 class SignSpec:
     """What a decoder signs. ``layers``: the sampled effective layers (sorted, distinct); ``tail``: positions kept per
-    row; ``depth``: also the post-MLP partial at every effective layer."""
+    row; ``depth``: also the post-MLP partial at every effective layer; ``attn``: attention statistics at every layer,
+    with head-mean rows over ``width`` absolute columns at the sampled layers."""
 
     layers: tuple[int, ...]
     tail: int
     depth: bool = False
+    attn: bool = False
+    width: int = 0
 
     def __post_init__(self) -> None:
         layers = tuple(int(x) for x in self.layers)
@@ -50,8 +65,11 @@ class SignSpec:
             raise ValueError(f"sign layers must be a non-empty sorted list of distinct layers, got {self.layers}")
         if int(self.tail) < 1:
             raise ValueError(f"sign tail must be >= 1, got {self.tail}")
+        if self.attn and int(self.width) < 1:
+            raise ValueError("attention statistics need width >= 1 (the head-mean rows' columns)")
         object.__setattr__(self, "layers", layers)
         object.__setattr__(self, "tail", int(self.tail))
+        object.__setattr__(self, "width", int(self.width))
 
     def check(self, n_layers: int) -> None:
         if self.layers[0] < 0 or self.layers[-1] >= n_layers:
@@ -84,6 +102,12 @@ def allocate(spec: SignSpec, rows: int, *, hidden: int, n_heads: int, n_kv_heads
         out["depth"] = buf(n_layers, hidden)
     else:
         out["hidden"] = buf(n, hidden)
+    if spec.attn:
+        def f32(cols: int, width: int) -> torch.Tensor:
+            return torch.zeros((rows, T, cols, width), device=device, dtype=torch.float32)
+
+        out.update(head_entropy=f32(n_layers, n_heads), mean_entropy=f32(n_layers, 1),
+                   head_scalars=f32(n, 3 * n_heads), mean_rows=f32(n, spec.width))
     return out
 
 
@@ -93,7 +117,34 @@ def sign_bytes(spec: SignSpec, rows: int, *, hidden: int, n_heads: int, n_kv_hea
     n = len(spec.layers)
     per_pos = n * (n_heads * head_dim + 2 * n_kv_heads * head_dim + intermediate + 2 * route)
     per_pos += n_layers * hidden if spec.depth else n * hidden
-    return rows * spec.tail * per_pos * torch.empty((), dtype=dtype).element_size()
+    total = rows * spec.tail * per_pos * torch.empty((), dtype=dtype).element_size()
+    if spec.attn:
+        total += rows * spec.tail * 4 * (n_layers * (n_heads + 1) + n * (3 * n_heads + spec.width))
+    return total
+
+
+def stats_write(st: tuple, p: torch.Tensor, sampled: bool) -> None:
+    """One layer's attention statistics into the stats buffers, from its probabilities p (B, heads, columns) fp32 in
+    absolute column order: st = (head_entropy, mean_entropy, head_scalars, mean_rows buffers, row ids, each row's
+    slot, the layer's column, the sampled column (0-d) or None, each row's position at admission, each row's
+    position)."""
+    head_ent, mean_ent, head_sc, mean_rows, row_ids, slot, layer_col, sampled_col, start, pos = st
+    B, H, W = p.shape
+    idx = (row_ids, slot, layer_col.expand(B))
+    head_ent.index_put_(idx, -torch.special.xlogy(p, p).sum(-1))
+    m = p.mean(1)
+    mean_ent.index_put_(idx, -torch.special.xlogy(m, m).sum(-1, keepdim=True))
+    if not sampled:
+        return
+    cols = torch.arange(W, device=p.device).view(1, 1, W)
+    cut = torch.clamp(((pos + 1) * 0.8).long(), min=1).view(B, 1, 1)
+    prompt = (p * (cols < start.view(B, 1, 1))).sum(-1)
+    recency = (p * (cols >= cut)).sum(-1)
+    sidx = (row_ids, slot, sampled_col.expand(B))
+    head_sc.index_put_(sidx, torch.cat([prompt, recency, p[:, :, 0]], dim=-1))
+    width = mean_rows.shape[-1]
+    row = m[:, :width] if W >= width else torch.cat([m, m.new_zeros((B, width - W))], dim=-1)
+    mean_rows.index_put_(sidx, row)
 
 
 @dataclass
@@ -103,7 +154,9 @@ class SignedRow:
     ``start``: the row's position at admission (its prompt length); ``lever_slot``: the row's lever slot (0: none
     bound); ``steered``: broadcast steering was engaged. ``surfaces``: name -> tensor [kept, layers, ...] with
     q (heads, head_dim), k / v (kv heads, head_dim), gate, route (2, route width), hidden, depth (every layer).
-    ``route_sources``: per sampled layer, (attention-input sources, MLP-input sources)."""
+    ``route_sources``: per sampled layer, (attention-input sources, MLP-input sources). With attention statistics:
+    head_entropy [kept, every layer, heads], mean_entropy [kept, every layer], head_scalars [kept, layers, 3, heads]
+    (prompt mass, recency mass, sink), mean_rows [kept, layers, width]."""
 
     positions: int
     kept: int
@@ -136,6 +189,10 @@ def export(spec: SignSpec, bufs: dict[str, torch.Tensor], row: int, *, start: in
             x = x.view(kept, n, n_kv_heads, head_dim)
         elif name == "route":
             x = x.view(kept, n, 2, -1)
+        elif name == "mean_entropy":
+            x = x[..., 0]
+        elif name == "head_scalars":
+            x = x.view(kept, n, 3, n_heads)
         surf[name] = x
     if spec.depth:
         surf["hidden"] = surf["depth"][:, list(spec.layers)]

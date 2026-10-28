@@ -231,7 +231,8 @@ def sign_check(a, eng: DecodeEngine, tok, slot: int) -> dict:
     from kotodama.model.signing import SignSpec
 
     B, steps = a.sign_rows, a.sign_steps
-    spec = SignSpec(tuple(int(x) for x in a.sign_layers.split(",")), tail=steps, depth=True)
+    spec = SignSpec(tuple(int(x) for x in a.sign_layers.split(",")), tail=steps, depth=True, attn=a.sign_attn,
+                    width=a.sign_width if a.sign_attn else 0)
     laws = [SamplingParams(temperature=a.temperature, repetition_penalty=a.repetition_penalty),
             SamplingParams(temperature=a.temperature, repetition_penalty=a.repetition_penalty, top_p=0.9, min_p=0.05)]
     prompts = [torch.tensor([tok.encode(PROMPT)], device="cuda"),
@@ -318,6 +319,14 @@ def sign_check(a, eng: DecodeEngine, tok, slot: int) -> dict:
             want = torch.stack([cap[key][li][0, :, span].transpose(0, 1) for li in spec.layers], dim=1)
             rel[name] = _rel(row.surfaces[name], want)
         rel["gate"] = _rel(row.surfaces["gate"], torch.stack([cap["gate"][li][0, span] for li in spec.layers], 1))
+        if spec.attn:  # the replay's attention weights at the span rows, every layer: (n, layers, heads, S)
+            pw = torch.stack([cap["attn"][li][0, :, span].float() for li in range(model.config.num_layers)])
+            pw = pw.permute(2, 0, 1, 3)
+            ent = -torch.special.xlogy(pw, pw).sum(-1)
+            rel["head_entropy"] = _rel(row.surfaces["head_entropy"], ent)
+            mean = pw[:, list(spec.layers)].mean(2)
+            S = min(mean.shape[-1], spec.width)
+            rel["mean_rows"] = _rel(row.surfaces["mean_rows"][..., :S], mean[..., :S])
         replay[str(r)]["rel_l2"] = rel
         del cap
     out["vs_replay"] = replay
@@ -376,6 +385,8 @@ def main() -> int:
     ap.add_argument("--sign_steps", type=int, default=256)
     ap.add_argument("--sign_layers", default="0,18,25,34,36,45,54,56,63,71",
                     help="the sampled effective layers (default: the tsumugi lane's)")
+    ap.add_argument("--sign_attn", action="store_true", help="also the attention statistics at every layer")
+    ap.add_argument("--sign_width", type=int, default=1024, help="columns of the head-mean rows (--sign_attn)")
     ap.add_argument("--max_seq_len", type=int, default=4096)
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--cold", action="store_true", help="inductor caches off: cold compile seconds")

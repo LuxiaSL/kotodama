@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from kotodama.model.llama import RMSNorm, apply_rope
+from kotodama.model.signing import stats_write
 
 
 def layer_signatures(boundaries: Iterable[int], n_layers: int) -> list[tuple[int, bool]]:
@@ -100,7 +101,8 @@ def cache_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[to
 
 def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_heads: int, n_kv_heads: int,
                        head_dim: int, intermediate: int, qk_norm: bool, levers: bool, steer: bool,
-                       attend: Callable, linear: Callable = F.linear, sign: bool = False) -> Callable:
+                       attend: Callable, linear: Callable = F.linear, sign: bool = False, stats: int = 0,
+                       probs: Optional[Callable] = None) -> Callable:
     """One layer as a function of tensors, mirroring the loop body of MultiSampleDecoder._forward_step and of
     DecodeEngine's step and block forwards: pre-attention routing over ``committed + [partial]``, the attention
     sublayer (KV write and attend through ``attend(q, k, v, kv, state)``), the lever and broadcast-steering adds,
@@ -111,13 +113,15 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
 
     Returns the layer's output partial, and with ``capture`` also the MLP input (B, S, D). With ``sign`` the layer
     writes its surfaces through ``sign_write`` (``sign_args``: its sign tuple); the arithmetic of everything it
-    returns is the same as without. The function gets a code
+    returns is the same as without. With ``stats`` (1: every layer's statistics, 2: a sampled layer's too) the layer
+    writes its attention statistics through kotodama.model.signing.stats_write from ``probs(q, kv, state)`` (the
+    attention's probabilities in absolute column order; ``stats_args``: its stats tuple). The function gets a code
     object of its own named ``name``, so its compiled graphs are cached apart from every other signature's."""
     q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
 
     def decode_layer(partial, committed, attn_q, attn_g, mlp_q, mlp_g, attn_norm_w, ffn_norm_w, q_norm_w, k_norm_w,
                      w_qkv, w_o, w_gate_up, w_down, cos, sin, kv, state, lever_a, lever_m, act_keep, act_add,
-                     steer_row, sign_args=None):
+                     steer_row, sign_args=None, stats_args=None):
         w_attn = None
         if committed:
             h_attn, w_attn = route_weights(committed + [partial], attn_q, attn_g, eps)
@@ -142,7 +146,10 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
         q_pre, k_pre = q, k
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        attn_out = linear(attend(q, k, v, kv, state), w_o)
+        attended = attend(q, k, v, kv, state)
+        if stats:
+            stats_write(stats_args, probs(q, kv, state), stats == 2)
+        attn_out = linear(attended, w_o)
         if levers:
             attn_out = attn_out + lever_a.unsqueeze(1)
         new = base + attn_out
@@ -225,19 +232,21 @@ def check_norms(model, eps: float) -> None:
                          "(build it with use_liger=False)")
 
 
-Region = tuple[Callable, bool, int, tuple, tuple, Optional[tuple]]
+Region = tuple[Callable, bool, int, tuple, tuple, Optional[tuple], Optional[tuple]]
 
 
-def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, bool]], kvs: Sequence[tuple[torch.Tensor, ...]],
-                  prefix: str, *, attend: Callable, steer: bool, linear: Callable = F.linear,
-                  capture_col: Optional[Callable[[int], int]] = None,
-                  sign_args: Optional[Callable[[int], tuple]] = None, **opts) -> tuple[list[Region], int]:
-    """One compiled layer per distinct signature (committed sources, boundary, capture, sign) over a DecodeEngine's
-    weights, and each effective layer's (compiled layer, boundary, capture column or -1, its tensors, its KV buffers,
-    its sign tuple or None). The compiled functions are named ``{prefix}_c{committed}[_boundary][_capture][_sign]``.
-    ``opts`` go to torch.compile. ``capture_col(layer)``: a captured layer's column in the caller's capture buffer;
-    ``sign_args(layer)``: a signing layer's sign tuple (``sign_write``). Returns (regions, number of distinct
-    signatures)."""
+def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, bool, int]],
+                  kvs: Sequence[tuple[torch.Tensor, ...]], prefix: str, *, attend: Callable, steer: bool,
+                  linear: Callable = F.linear, capture_col: Optional[Callable[[int], int]] = None,
+                  sign_args: Optional[Callable[[int], tuple]] = None, probs: Optional[Callable] = None,
+                  stats_args: Optional[Callable[[int], tuple]] = None, **opts) -> tuple[list[Region], int]:
+    """One compiled layer per distinct signature (committed sources, boundary, capture, sign, stats) over a
+    DecodeEngine's weights, and each effective layer's (compiled layer, boundary, capture column or -1, its tensors,
+    its KV buffers, its sign tuple or None, its stats tuple or None). The compiled functions are named
+    ``{prefix}_c{committed}[_boundary][_capture][_sign][_stats{level}]``. ``opts`` go to torch.compile.
+    ``capture_col(layer)``: a captured layer's column in the caller's capture buffer; ``sign_args(layer)``: a signing
+    layer's sign tuple (``sign_write``); ``probs`` / ``stats_args(layer)``: the attention probabilities and a layer's
+    stats tuple (``make_layer``). Returns (regions, number of distinct signatures)."""
     model = eng.model
     static = dict(eps=eng.eps, n_heads=eng.n_heads, n_kv_heads=eng.n_kv_heads, head_dim=eng.head_dim,
                   intermediate=eng.config.intermediate_size, qk_norm=bool(eng.config.qk_norm),
@@ -245,12 +254,12 @@ def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, bool]], kvs: 
     fns: dict[tuple[int, bool, bool], Callable] = {}
     regions: list[Region] = []
     for li, sig in enumerate(signatures):
-        c, boundary, capture, sign = sig
+        c, boundary, capture, sign, stats = sig
         if sig not in fns:
             name = (f"{prefix}_c{c}{'_boundary' if boundary else ''}{'_capture' if capture else ''}"
-                    f"{'_sign' if sign else ''}")
-            fns[sig] = torch.compile(make_layer(name, is_boundary=boundary, capture=capture, sign=sign, **static),
-                                     **opts)
+                    f"{'_sign' if sign else ''}{f'_stats{stats}' if stats else ''}")
+            fns[sig] = torch.compile(make_layer(name, is_boundary=boundary, capture=capture, sign=sign, stats=stats,
+                                                probs=probs, **static), **opts)
         layer = model.layers[li]
         attn = layer.attn
         tensors = (layer.attn_res_query, layer.attn_res_norm.weight, layer.mlp_res_query, layer.mlp_res_norm.weight,
@@ -258,7 +267,8 @@ def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, bool]], kvs: 
                    attn.q_norm.weight if attn.qk_norm else None, attn.k_norm.weight if attn.qk_norm else None,
                    eng.w_qkvs[li], attn.o_proj.weight, eng.w_gate_ups[li], layer.ffn.down_proj.weight)
         col = capture_col(li) if capture else -1
-        regions.append((fns[sig], boundary, col, tensors, kvs[li], sign_args(li) if sign else None))
+        regions.append((fns[sig], boundary, col, tensors, kvs[li], sign_args(li) if sign else None,
+                        stats_args(li) if stats else None))
     return regions, len(fns)
 
 
@@ -274,13 +284,13 @@ def run_regions(regions: Sequence[Region], embed: torch.Tensor, cos: torch.Tenso
     its region returns. Returns (the committed block outputs, the last partial) for the tail."""
     committed: list[torch.Tensor] = []
     partial = embed
-    for li, (fn, boundary, col, tensors, kv, sign) in enumerate(regions):
+    for li, (fn, boundary, col, tensors, kv, sign, stats) in enumerate(regions):
         rows = (None,) * 4 if levers is None else tuple(t[li] for t in levers)
         steer_row = steer_buf[li] if steer_buf is not None else None
-        if sign is None:
+        if sign is None and stats is None:
             out = fn(partial, committed, *tensors, cos, sin, kv, state, *rows, steer_row)
         else:
-            out = fn(partial, committed, *tensors, cos, sin, kv, state, *rows, steer_row, sign)
+            out = fn(partial, committed, *tensors, cos, sin, kv, state, *rows, steer_row, sign, stats)
         if col >= 0:
             out, x_mlp = out
             capture_buf[:, col] = x_mlp[:, -1]

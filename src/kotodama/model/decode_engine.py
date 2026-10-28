@@ -1409,7 +1409,7 @@ class DecodeEngine(nn.Module):
             opts["mode"] = REGION_MODES.get(mode, mode)
             block_opts["mode"] = REGION_MODES.get(block_mode, block_mode)
         kvs = list(zip(self.k_caches, self.v_caches))
-        sigs = [(c, b, False, False) for c, b in layer_signatures(self._boundaries, self.n_layers)]
+        sigs = [(c, b, False, False, 0) for c, b in layer_signatures(self._boundaries, self.n_layers)]
         build = dict(attend=cache_attend, linear=decode_linear, **opts)
         self._step_regions, self.regional_variants = build_regions(
             self, sigs, kvs, "engine_step_layer", steer=self.steer_enabled, **build)

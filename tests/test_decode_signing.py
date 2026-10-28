@@ -4,6 +4,8 @@ What is pinned here:
   * every surface a signed row decoder captures over a row's generated span (hidden, pre-RoPE q / k, v, pre-SiLU
     gate, both routings, and the depth path) equals the replay capture's (kotodama.model.capture.cached_forward over
     the decoded sequence) at the same positions, for the eager step and the regional step, for both row decoders;
+  * so do the attention statistics (per-head and head-mean entropy at every layer; per-head prompt, recency and sink
+    mass and the head-mean rows at the sampled layers), computed from the replay's attention weights;
   * signing does not change generation: a signed and an unsigned regional decoder give the same tokens and readouts,
     bit for bit;
   * the span bookkeeping: a row's span starts at its admission, a re-admitted row starts over, a row past the tail
@@ -137,6 +139,42 @@ def test_signed_surfaces_match_the_replay_capture(model: KotodamaModel, cls, reg
         _check_row(model, dec.signed(r), seqs[r], P, depth)
 
 
+def _xlogx(p: torch.Tensor) -> torch.Tensor:
+    return -torch.special.xlogy(p, p).sum(-1)
+
+
+@pytest.mark.parametrize("regional", [False, True])
+@pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])
+@torch.inference_mode()
+def test_attention_statistics_match_the_replay_weights(model: KotodamaModel, cls, regional: bool) -> None:
+    eng = _engine(model)
+    width = 40
+    dec = _dec(cls, eng, SignSpec(LAYERS, tail=16, attn=True, width=width))
+    if regional:
+        dec.compile_step(regional=True, backend="aot_eager")
+    P = 11
+    seqs = _decode(eng, dec, _ids(P, 7))
+    L = CFG["num_layers"]
+    for r in range(ROWS):
+        row = dec.signed(r)
+        _, cap, _ = cached_forward(model, torch.tensor([seqs[r]]), past=None, position_offset=0, light=False,
+                                   capture_hidden=True)
+        aw = [cap["attn"][li][0].float() for li in range(L)]  # (heads, S, S)
+        p = torch.stack([w[:, P:P + STEPS] for w in aw], dim=0).permute(2, 0, 1, 3)  # (n, L, heads, S)
+        torch.testing.assert_close(row.surfaces["head_entropy"], _xlogx(p), **TOL)
+        torch.testing.assert_close(row.surfaces["mean_entropy"], _xlogx(p.mean(2)), **TOL)
+        ps = p[:, list(LAYERS)]  # (n, layers, heads, S)
+        S = ps.shape[-1]
+        cols = torch.arange(S)
+        lens = torch.arange(P, P + STEPS) + 1
+        cut = torch.clamp((lens * 0.8).long(), min=1).view(-1, 1, 1, 1)
+        want = torch.stack([(ps * (cols < P)).sum(-1), (ps * (cols >= cut)).sum(-1), ps[..., 0]], dim=2)
+        torch.testing.assert_close(row.surfaces["head_scalars"], want, **TOL)
+        rows = torch.zeros(STEPS, len(LAYERS), width)
+        rows[..., :S] = ps.mean(2)
+        torch.testing.assert_close(row.surfaces["mean_rows"], rows, **TOL)
+
+
 @pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])
 @torch.inference_mode()
 def test_signing_does_not_change_generation(model: KotodamaModel, cls) -> None:
@@ -144,7 +182,7 @@ def test_signing_does_not_change_generation(model: KotodamaModel, cls) -> None:
     s1 = eng.levers.bind(LeverPlan(attn={4: np.full(CFG["hidden_size"], 0.3, np.float32)}, span="decode"))
     eng.set_steer([(2, torch.full((CFG["hidden_size"],), 0.2), 0.5)])
     off = _dec(cls, eng, None, readout_k=3)
-    on = _dec(cls, eng, SignSpec(LAYERS, tail=16, depth=True), readout_k=3)
+    on = _dec(cls, eng, SignSpec(LAYERS, tail=16, depth=True, attn=True, width=48), readout_k=3)
     for dec in (off, on):
         dec.compile_step(regional=True, backend="aot_eager")
     prompt = _ids(9, 2)
@@ -197,11 +235,13 @@ def test_span_bookkeeping(model: KotodamaModel) -> None:
         _dec(MultiSampleDecoder, eng, SignSpec((3, 11), tail=4))
     with pytest.raises(ValueError, match="sorted"):
         SignSpec((5, 3), tail=4)
-    spec = SignSpec(LAYERS, tail=4, depth=True)
+    spec = SignSpec(LAYERS, tail=4, depth=True, attn=True, width=24)
     sized = sign_bytes(spec, ROWS, hidden=64, n_heads=4, n_kv_heads=2, head_dim=16, intermediate=128,
                        n_layers=11, route=dec._sign_route, dtype=torch.float32)
     built = _dec(MultiSampleDecoder, eng, spec)
     assert sized == sum(getattr(built, f"sign_{n}").numel() * 4 for n in built.sign_names)
+    with pytest.raises(ValueError, match="width"):
+        SignSpec(LAYERS, tail=4, attn=True)
 
 
 @torch.inference_mode()

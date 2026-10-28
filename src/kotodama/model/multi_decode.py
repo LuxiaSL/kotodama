@@ -75,6 +75,42 @@ def _slot_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[to
     return out.transpose(1, 2).contiguous().view(B, 1, -1)
 
 
+def _slot_probs(q: torch.Tensor, kv: tuple[torch.Tensor, ...], state: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """The attention probabilities of ``_slot_attend`` (after its KV write), fp32: q (B, heads, 1, head_dim) ->
+    (B, heads, max_seq_len), absolute columns."""
+    k_cache = kv[0]
+    attn_bias = state[0]
+    r = q.shape[1] // k_cache.shape[1]
+    scores = torch.einsum("bhd,bhsd->bhs", q[:, :, 0].float(), k_cache.float().repeat_interleave(r, dim=1))
+    scores = scores / math.sqrt(q.shape[-1]) + attn_bias[:, 0].float()
+    return torch.softmax(scores, dim=-1)
+
+
+def _cascade_probs(q: torch.Tensor, kv: tuple[torch.Tensor, ...], state: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """The attention probabilities of the cascade attention (after its tail write), fp32: q (B, heads, 1, head_dim)
+    -> (B, heads, prompt slot width) in absolute columns (the group's prompt, then the row's tail from its prompt's
+    end). The prompt part is scored per group over the group-major queries, as the attention reads it."""
+    tail_k, _, prompt_k, _ = kv
+    tail_pos, members, row_slot, prompt_lens, _ = state
+    B, H, _, D = q.shape
+    n_kv, T, W = tail_k.shape[2], tail_k.shape[1], prompt_k.shape[1]
+    r = H // n_kv
+    g, m = members.shape
+    q_rows = q[:, :, 0].float()
+    qg = pack_group_queries(q_rows, members, n_kv)  # (G, m * r, Hk, D)
+    s1 = torch.einsum("gqkd,gskd->gkqs", qg, prompt_k.float()) / math.sqrt(D)  # (G, Hk, m * r, W)
+    s1 = s1.masked_fill(torch.arange(W, device=q.device).view(1, 1, 1, W) >= prompt_lens.view(g, 1, 1, 1),
+                        float("-inf"))
+    s1 = s1.view(g, n_kv, m, r, W).permute(0, 2, 1, 3, 4).reshape(g * m, H, W)[row_slot]  # (B, H, W)
+    s2 = torch.einsum("bhd,bthd->bht", q_rows, tail_k.float().repeat_interleave(r, dim=2)) / math.sqrt(D)
+    s2 = s2.masked_fill(torch.arange(T, device=q.device).view(1, 1, T) > tail_pos.view(B, 1, 1), float("-inf"))
+    lse = torch.logsumexp(torch.cat([s1, s2], dim=-1), dim=-1, keepdim=True)
+    p = torch.exp(s1 - lse)
+    start = prompt_lens[torch.div(row_slot, m, rounding_mode="floor")].long().view(B, 1, 1)
+    cols = torch.clamp(start + torch.arange(T, device=q.device).view(1, 1, T), max=W - 1).expand(B, H, T)
+    return p.scatter_add(-1, cols, torch.exp(s2 - lse))
+
+
 def _cascade_attend_with(attend_fn: Callable) -> Callable:
     """CascadeDecoder._attend on passed tensors, over the part kernel ``attend_fn``: kv = (tail_k, tail_v, prompt_k,
     prompt_v), state = (tail_pos, members, row_slot, prompt_lens, row_ids)."""
@@ -199,6 +235,8 @@ class MultiSampleDecoder(nn.Module):
                                  persistent=False)
             self.register_buffer("sign_cols", torch.arange(len(sign.layers), device=dev, dtype=torch.long),
                                  persistent=False)
+            self.register_buffer("sign_layer_ids", torch.arange(self.n_layers, device=dev, dtype=torch.long),
+                                 persistent=False)
             # each layer's column in the partial buffer (depth: every layer; else the sampled ones), -1: none
             if sign.depth:
                 self._sign_partial_cols = list(range(self.n_layers))
@@ -265,8 +303,9 @@ class MultiSampleDecoder(nn.Module):
 
     # ── the batched decode step ─────────────────────────────────────────────
 
-    def _attn(self, layer_idx: int, x: torch.Tensor, keep: Optional[list] = None) -> torch.Tensor:
-        """``keep``: a list the pre-RoPE q, k and v are appended to (signing)."""
+    def _attn(self, layer_idx: int, x: torch.Tensor, keep: Optional[list] = None, stats: int = 0) -> torch.Tensor:
+        """``keep``: a list the pre-RoPE q, k and v are appended to (signing); ``stats``: write the layer's attention
+        statistics (1: every layer's, 2: a sampled layer's too)."""
         eng = self.engine
         attn = eng.model.layers[layer_idx].attn
         B = x.shape[0]
@@ -285,6 +324,9 @@ class MultiSampleDecoder(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         out = self._attend(layer_idx, q, k, v)  # (B, 1, n_heads * head_dim)
+        if stats:
+            _, kvs, state = self._regional_attend()
+            signing.stats_write(self._stats_args(layer_idx), self._probs(q, kvs[layer_idx], state), stats == 2)
         return F.linear(out, attn.o_proj.weight)
 
     def _attend(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -338,7 +380,10 @@ class MultiSampleDecoder(nn.Module):
                 partial = torch.zeros_like(embed)
             if signs:
                 keep = []
-            attn_out = self._attn(ls.layer_idx, layer.attn_norm(h_attn), keep)
+            stats = 0
+            if self.sign is not None and self.sign.attn:
+                stats = 2 if signs else 1
+            attn_out = self._attn(ls.layer_idx, layer.attn_norm(h_attn), keep, stats)
             if eng.levers is not None:
                 attn_out = attn_out + lever_attn[ls.layer_idx].unsqueeze(1)
             partial = partial + attn_out
@@ -462,7 +507,12 @@ class MultiSampleDecoder(nn.Module):
         signs)."""
         sigs = layer_signatures(self.engine.model._attn_res_boundary_set, self.n_layers)
         signed = self.sign.layers if self.sign is not None else ()
-        return [(c, b, li in self.capture_layers, li in signed) for li, (c, b) in enumerate(sigs)]
+        attn = self.sign is not None and self.sign.attn
+        return [(c, b, li in self.capture_layers, li in signed, (2 if li in signed else 1) if attn else 0)
+                for li, (c, b) in enumerate(sigs)]
+
+    # The attention probabilities of this decoder's attention (signing statistics), on the regional attend's tensors.
+    _probs = staticmethod(_slot_probs)
 
     # ── signing (kotodama.model.signing) ────────────────────────────────────
 
@@ -475,6 +525,13 @@ class MultiSampleDecoder(nn.Module):
         """A sampled layer's sign tuple (regional.sign_write)."""
         bufs = tuple(getattr(self, f"sign_{n}") for n in signing.REGION_SURFACES)
         return bufs + (self.row_ids, self.sign_slot, self.sign_cols[self.sign.layers.index(layer_idx)])
+
+    def _stats_args(self, layer_idx: int) -> tuple:
+        """A layer's stats tuple (kotodama.model.signing.stats_write)."""
+        sampled = self.sign.layers.index(layer_idx) if layer_idx in self.sign.layers else None
+        return tuple(getattr(self, f"sign_{n}") for n in signing.STATS) + (
+            self.row_ids, self.sign_slot, self.sign_layer_ids[layer_idx],
+            None if sampled is None else self.sign_cols[sampled], self.sign_start, self.pos)
 
     def _sign_partials(self) -> tuple:
         buf = self.sign_depth if self.sign.depth else self.sign_hidden
@@ -498,7 +555,8 @@ class MultiSampleDecoder(nn.Module):
         attend, kvs, self._regional_state = self._regional_attend()
         self._regional_layers, self.regional_variants = build_regions(
             eng, self.regional_signatures(), kvs, "decode_layer", attend=attend, steer=bool(eng.steer_enabled),
-            capture_col=self.capture_layers.index, sign_args=self._sign_args, **opts)
+            capture_col=self.capture_layers.index, sign_args=self._sign_args, probs=self._probs,
+            stats_args=self._stats_args, **opts)
 
     def _final_logits(self, committed: list[torch.Tensor], partial: torch.Tensor) -> torch.Tensor:
         """The step's tail after the last layer: final routing, norm and LM head, then every row's position advances.
@@ -1051,6 +1109,8 @@ class CascadeDecoder(MultiSampleDecoder):
         o1, l1 = o1[self.row_slot], l1[self.row_slot]  # (B, H, D), (B, H)
         o2, l2 = self._attend_fn(q_rows.unsqueeze(1), tail_k, tail_v, (self.tail_pos + 1).to(torch.int32))
         return merge(o1, l1, o2[:, 0], l2[:, :, 0]).reshape(B, 1, H * D)
+
+    _probs = staticmethod(_cascade_probs)
 
     def _open_step(self) -> None:
         """Nothing to open: the tail's length (tail_pos + 1) bounds what each row attends."""
