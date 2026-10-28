@@ -93,6 +93,7 @@ TOKENIZER_NAME = presets.TOKENIZER_NAME
 DDV1_BOUNDARIES = list(presets.DDV1)
 DD3B_BOUNDARIES = list(presets.DD3B)
 
+from kotodama.serve import compile_cache  # noqa: E402
 from kotodama.serve.steering import (  # noqa: E402
     STEER_DEFAULT_ALPHA,
     injection_to_plan,
@@ -335,7 +336,7 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False) -> tuple[KotodamaModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
     global _row_token_cap, _cascade_info, _levers, _seeded_rows
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
@@ -428,6 +429,22 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     _seeded_rows = bool(seeded_rows) and use_engine
     if levers and not use_engine:
         raise ValueError("--levers needs the fast engine (cuda + --engine fast + attn_res model)")
+    store_key = store_fields = None
+    store_hit = False
+    if use_engine and compile_store:
+        # The compiled decode graphs depend on the model code, the runtime and these flags, not on the weights:
+        # a stored blob for the same key turns the compiles below into cache hits.
+        store_fields = compile_cache.key_fields({
+            "model_size": model_size, "rope_fp32": _rope_fp32_override, "attn_res": _attn_res_override,
+            "attn_res_boundaries": _attn_res_boundaries_override, "max_seq_len": _max_seq_len, "engine": engine,
+            "mode": mode, "prefix_cache": prefix_cache, "multi_rows": list(multi_rows),
+            "xbatch_rows": list(xbatch_rows), "xbatch_refill": xbatch_refill,
+            "prefix_pool_tokens": prefix_pool_tokens, "prefix_pool_block": prefix_pool_block,
+            "cascade_attn": cascade_attn, "cascade_groups": cascade_groups, "cascade_tail_tokens": cascade_tail_tokens,
+            "levers": levers, "seeded_rows": seeded_rows, "steer_npz": steer_npz is not None,
+        })
+        store_key = compile_cache.cache_key(store_fields)
+        store_hit = compile_cache.load(compile_store, store_key)
     if use_engine:
         logger.info("Building fast decode engine (compile may take minutes on cold inductor cache)...")
         t0 = time.time()
@@ -557,7 +574,10 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             _prefix_pool = _generate_executor.submit(_build_and_warm_pool, _engine, prefix_pool_tokens,
                                                      prefix_pool_block).result()
             logger.info("Prefix KV pool ENABLED: %d blocks of %d tokens", _prefix_pool.n_blocks, prefix_pool_block)
-        logger.info("Fast decode engine ready in %.1fs", time.time() - t0)
+        logger.info("Fast decode engine ready in %.1fs (compile store: %s)", time.time() - t0,
+                    "hit" if store_hit else ("miss" if store_key else "off"))
+        if store_key and not store_hit:
+            compile_cache.save(compile_store, store_key, store_fields)
     elif _device.type == "cuda" and warmup_sdpa:
         # Reference path only: prime cuDNN plan cache so per-shape ~300ms
         # stalls don't land on live requests. ~100s; opt-in for debug use.
@@ -1449,6 +1469,7 @@ _cascade_groups_arg = 0
 _cascade_tail_tokens_arg = 1024
 _levers_arg = 0
 _seeded_rows_arg = False
+_compile_store_arg: str | None = None
 
 
 @asynccontextmanager
@@ -1470,6 +1491,7 @@ async def lifespan(app: FastAPI):
         cascade_tail_tokens=_cascade_tail_tokens_arg,
         levers=_levers_arg,
         seeded_rows=_seeded_rows_arg,
+        compile_store=_compile_store_arg,
     )
     try:
         yield
@@ -2131,6 +2153,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "steered request binds its own slot, so steered and unsteered requests batch together, "
                              "a request may steer its prompt (steer_span uniform) or send a raw 'injection'; "
                              "--steer-npz banks resolve into levers. 0 = off (the broadcast steering rows)")
+    parser.add_argument("--compile_store", default=os.environ.get("KOTODAMA_COMPILE_STORE") or None,
+                        help="Directory of compiled engine artifacts keyed by model code, runtime, GPU and engine flags "
+                             "(kotodama.serve.compile_cache): a stored key is loaded before compiling (the compiles "
+                             "become cache hits), a missing one is saved after warmup. Default $KOTODAMA_COMPILE_STORE; "
+                             "unset = off")
     parser.add_argument("--seeded_rows", action=argparse.BooleanOptionalAction, default=False,
                         help="Row decoders draw each candidate's noise from its own seed and step: a request's 'seed' "
                              "then reproduces its candidates whatever shares their batch (up to kernel rounding of "
@@ -2232,6 +2259,7 @@ if __name__ == "__main__":
         parser.error("--levers needs the fast engine and a slot count >= 0")
     _levers_arg = args.levers
     _seeded_rows_arg = args.seeded_rows
+    _compile_store_arg = args.compile_store
 
     import uvicorn
 

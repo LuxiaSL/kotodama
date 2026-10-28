@@ -118,6 +118,10 @@ class GatewayConfig(BaseModel):
     max_inflight_global: int = 64          # gateway-wide cap -> 503 over this
     request_timeout_s: float = 900.0       # upstream read timeout (long for streams)
     spawn_stagger_s: float = 0.5           # delay between replica spawns at startup
+    # Start one replica per pool first and the rest only once it is ready: with a compile store
+    # (server --compile_store / $KOTODAMA_COMPILE_STORE) the first replica compiles and stores the engine's
+    # artifacts, the others load them instead of compiling the same graphs at the same time.
+    compile_first: bool = False
 
     # Health / supervision
     health_interval_s: float = 5.0
@@ -504,9 +508,30 @@ async def health_loop() -> None:
         await asyncio.sleep(_cfg.health_interval_s)
 
 
+async def _wait_ready(r: Replica) -> bool:
+    """Poll one replica until it reports its model loaded, its process exits, or the warmup grace runs out."""
+    deadline = time.time() + _cfg.warmup_grace_s
+    while time.time() < deadline:
+        if r.proc is not None and r.proc.poll() is not None:
+            logger.warning("%s exited during startup (code %s)", r.tag, r.proc.returncode)
+            return False
+        try:
+            resp = await _http.get(f"{r.url}/health", timeout=2.0)
+            if resp.status_code == 200 and resp.json().get("model_loaded"):
+                r.healthy = True
+                r.last_activity = time.time()
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(_cfg.health_interval_s)
+    return False
+
+
 async def _adopt_or_spawn() -> None:
     """Reuse an already-healthy replica on the expected port (daemon restart),
-    otherwise spawn a fresh one. Staggered to avoid a thundering herd."""
+    otherwise spawn a fresh one. Staggered to avoid a thundering herd; with
+    ``compile_first``, each pool's first replica is ready before the rest start."""
+    first_of_pool: set[str] = set()
     for r in _fleet.replicas:
         adopted = False
         try:
@@ -523,7 +548,13 @@ async def _adopt_or_spawn() -> None:
             adopted = False
         if not adopted:
             _fleet.spawn(r)
+            if _cfg.compile_first and r.spec.key not in first_of_pool and len(_fleet.by_pool[r.spec.key]) > 1:
+                logger.info("compile_first: waiting for %s before starting the rest of pool '%s'", r.tag, r.spec.key)
+                t0 = time.time()
+                ok = await _wait_ready(r)
+                logger.info("compile_first: %s %s after %.0fs", r.tag, "ready" if ok else "NOT ready", time.time() - t0)
             await asyncio.sleep(_cfg.spawn_stagger_s)
+        first_of_pool.add(r.spec.key)
 
 
 # ── App ───────────────────────────────────────────────────────────────────────

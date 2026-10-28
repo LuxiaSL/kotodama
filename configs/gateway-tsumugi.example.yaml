@@ -24,6 +24,9 @@ completion_pool: base
 affinity_max_inflight: 32
 max_inflight_global: 256
 request_timeout_s: 1800.0
+# One replica per pool compiles first and stores its artifacts (set KOTODAMA_COMPILE_STORE for the replicas); the
+# rest start once it is ready and load them.
+compile_first: true
 # A cold replica compiles every batch bucket before it serves: give it that long before health checks count.
 warmup_grace_s: 3600.0
 stuck_ceiling_s: 1800.0
