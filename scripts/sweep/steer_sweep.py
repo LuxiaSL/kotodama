@@ -144,6 +144,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max_seq_len", type=int, default=512)
     ap.add_argument("--no_compile", action="store_true", help="eager decoders (CPU smoke tests)")
+    ap.add_argument("--compile_mode", default="max-autotune",
+                    help="torch.compile mode of the engine and decoder (reduce-overhead starts in minutes)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -184,9 +186,9 @@ def main() -> int:
     dec = CascadeDecoder(eng, a.rows, groups=groups, group_rows=a.group_rows, tail_tokens=tail,
                          readout_k=a.top_k, capture_layers=dec_caps)
     if not a.no_compile:
-        eng.compile_step(mode="max-autotune")
+        eng.compile_step(mode=a.compile_mode)
         eng.warm_blocks()
-        dec.compile_step(mode="max-autotune")
+        dec.compile_step(mode=a.compile_mode)
     greedy = SamplingParams(temperature=0.0, repetition_penalty=1.0)
     stop_ids = BASE_STOP_TOKEN_IDS
     logger.info("engine + %d-row decoder (%d groups, %d-token tails) ready in %.0fs; lever tables %.0f MB",
