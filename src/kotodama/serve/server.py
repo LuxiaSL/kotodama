@@ -2065,7 +2065,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seq-len", type=int, default=None,
                         help="Serving context limit (16-4096 for the 3B model). Lower values "
                              "reduce the fast engine's static KV-cache memory; default is 4096")
-    parser.add_argument("--prefix-cache", action="store_true",
+    parser.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=False,
                         help="Reuse the engine KV cache across requests sharing a token-exact "
                              "prompt prefix (multi-turn TTFT win; requires --engine fast and "
                              "per-conversation replica pinning)")
@@ -2074,7 +2074,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--served_model_name", default=None,
                         help="Override the model id reported by /info and /v1/models "
                              "(default: kotodama-<size>-<base|instruct>)")
-    parser.add_argument("--warmup-sdpa", action="store_true",
+    parser.add_argument("--warmup-sdpa", action=argparse.BooleanOptionalAction, default=False,
                         help="Reference engine only: pre-pay the ~100s cuDNN SDPA plan-cache "
                              "sweep at startup instead of ~300ms per novel shape at runtime")
     parser.add_argument("--steer-npz", default=None,
@@ -2089,7 +2089,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "baseline/NCA-only checkpoints have no AttnRes params)")
     parser.add_argument("--attn_res_boundaries", default=None,
                         help="Override boundaries, comma ints (proxy DD-v1: 0,3,7,12,21,25)")
-    parser.add_argument("--rope_fp32", action="store_true",
+    parser.add_argument("--rope_fp32", action=argparse.BooleanOptionalAction, default=False,
                         help="Model config rope_fp32=True (the 1B ladder arms trained with it)")
     parser.add_argument("--default_repetition_penalty", type=float,
                         default=DEFAULT_REPETITION_PENALTY,
@@ -2106,7 +2106,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "config decode together, each filled from its own prefill, on the narrowest bucket that "
                              "holds their rows. All buckets (and --multi_rows) share the widest one's KV memory. "
                              "Empty = off")
-    parser.add_argument("--xbatch_refill", action="store_true",
+    parser.add_argument("--xbatch_refill", action=argparse.BooleanOptionalAction, default=False,
                         help="With --xbatch_rows: refill rows freed by finished requests from the queue between "
                              "decode steps (continuous batching) instead of waiting for the batch's longest row")
     parser.add_argument("--prefix_pool_tokens", type=int, default=0,
@@ -2119,13 +2119,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "steered request binds its own slot, so steered and unsteered requests batch together, "
                              "a request may steer its prompt (steer_span uniform) or send a raw 'injection'; "
                              "--steer-npz banks resolve into levers. 0 = off (the broadcast steering rows)")
-    parser.add_argument("--seeded_rows", action="store_true",
+    parser.add_argument("--seeded_rows", action=argparse.BooleanOptionalAction, default=False,
                         help="Row decoders draw each candidate's noise from its own seed and step: a request's 'seed' "
                              "then reproduces its candidates whatever shares their batch (up to kernel rounding of "
                              "the logits, which can flip a near-tie). Without it a 'seed' is a 400")
     parser.add_argument("--prefix_pool_block", type=int, default=16,
                         help="Token block size of the prefix KV pool (>= 16): prefixes are shared in whole blocks")
-    parser.add_argument("--cascade_attn", action="store_true",
+    parser.add_argument("--cascade_attn", action=argparse.BooleanOptionalAction, default=False,
                         help="Row decoders (--multi_rows, --xbatch_rows) share each prompt's KV among its rows and "
                              "attend to it once per group (cascade attention, merged by log-sum-exp): less attention "
                              "time per step and KV memory per row. A row then generates at most "

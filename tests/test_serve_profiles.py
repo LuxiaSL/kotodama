@@ -63,3 +63,11 @@ def test_profiles_extend_like_training_configs(tmp_path: Path) -> None:
     (tmp_path / "child.yaml").write_text("extends: base.yaml\nlevers: 8\n")
     flags, env = profiles.load(str(tmp_path / "child.yaml"))
     assert flags == {"model_size": "1b-tsumugi", "levers": 8} and env == {"A_VAR": "one"}
+
+
+def test_a_profile_switch_can_be_turned_off_on_the_command_line() -> None:
+    parser = build_arg_parser()
+    profiles.apply(parser, "tsumugi-1b")
+    args = parser.parse_args(["--no-seeded_rows", "--no-cascade_attn", "--levers", "0"])
+    assert args.seeded_rows is False and args.cascade_attn is False and args.levers == 0
+    assert build_arg_parser().parse_args(["--checkpoint", "c", "--prefix-cache"]).prefix_cache is True
