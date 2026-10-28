@@ -21,6 +21,9 @@ engine: fast
 prefix_cache: true
 prefix_pool_tokens: 32768
 xbatch_rows: [16, 32, 64, 128]
+# Kernel benchmarking (max-autotune) where it pays: the single-stream step and the 64- and 128-row buckets (~7%);
+# the 16- and 32-row buckets and the prefill blocks compile without it.
+autotune_min_rows: 64
 xbatch_refill: true
 cascade_attn: true
 # Lever slots: one per steered request in flight (a request's whole steering, dose included, is one slot), so a

@@ -39,7 +39,7 @@ ENGINE_FLAGS: tuple[str, ...] = (
     "model_size", "rope_fp32", "attn_res", "attn_res_boundaries", "max_seq_len", "engine", "mode", "prefix_cache",
     "multi_rows", "xbatch_rows", "xbatch_refill", "prefix_pool_tokens", "prefix_pool_block", "cascade_attn",
     "cascade_groups", "cascade_tail_tokens", "levers", "seeded_rows", "steer_npz", "compile_mode", "warm_truncated",
-    "regional",
+    "regional", "autotune_min_rows",
 )
 # Environment variables that change the kernels a compile emits.
 ENGINE_ENV: tuple[str, ...] = ("KOTODAMA_ATTNRES_EPS_FP64_COMPAT",)

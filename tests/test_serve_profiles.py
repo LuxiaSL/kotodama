@@ -72,3 +72,18 @@ def test_a_profile_switch_can_be_turned_off_on_the_command_line() -> None:
     args = parser.parse_args(["--no-seeded_rows", "--no-cascade_attn", "--levers", "0"])
     assert args.seeded_rows is False and args.cascade_attn is False and args.levers == 0
     assert build_arg_parser().parse_args(["--checkpoint", "c", "--prefix-cache"]).prefix_cache is True
+
+
+def test_narrow_row_buckets_skip_kernel_benchmarking(monkeypatch) -> None:
+    from kotodama.serve import server
+
+    monkeypatch.setattr(server, "_compile_mode", "max-autotune")
+    monkeypatch.setattr(server, "_autotune_min_rows", 64)
+    assert [server._row_compile_mode(r) for r in (16, 32, 64, 128)] == ["reduce-overhead"] * 2 + ["max-autotune"] * 2
+    monkeypatch.setattr(server, "_compile_mode", "max-autotune-no-cudagraphs")
+    assert server._row_compile_mode(16) == "default"
+    monkeypatch.setattr(server, "_compile_mode", "reduce-overhead")
+    assert server._row_compile_mode(16) == "reduce-overhead"
+    monkeypatch.setattr(server, "_autotune_min_rows", 0)
+    monkeypatch.setattr(server, "_compile_mode", "max-autotune")
+    assert server._row_compile_mode(16) == "max-autotune"

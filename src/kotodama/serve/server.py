@@ -229,6 +229,8 @@ _seeded_rows: bool = False
 _compile_mode: str = "max-autotune"
 _warm_truncated: bool = True
 _regional: bool = False
+# Row buckets narrower than this compile without kernel benchmarking (--autotune_min_rows): it buys them nothing.
+_autotune_min_rows: int = 0
 # Startup: when this process started, how long it took to be ready (and against what budget), for /info.
 _PROCESS_T0 = time.time()
 _startup_info: dict | None = None
@@ -347,11 +349,12 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True, regional: bool = False) -> tuple[KotodamaModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True, regional: bool = False, autotune_min_rows: int = 0) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
     global _row_token_cap, _cascade_info, _levers, _seeded_rows, _compile_mode, _warm_truncated, _regional
-    global _compile_store_state
+    global _compile_store_state, _autotune_min_rows
     _compile_mode, _warm_truncated, _regional = compile_mode, bool(warm_truncated), bool(regional)
+    _autotune_min_rows = int(autotune_min_rows)
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
@@ -457,6 +460,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             "cascade_attn": cascade_attn, "cascade_groups": cascade_groups, "cascade_tail_tokens": cascade_tail_tokens,
             "levers": levers, "seeded_rows": seeded_rows, "steer_npz": steer_npz is not None,
             "compile_mode": compile_mode, "warm_truncated": bool(warm_truncated), "regional": bool(regional),
+            "autotune_min_rows": int(autotune_min_rows),
         })
         store_key = compile_cache.cache_key(store_fields)
         store_hit, store_claim = compile_cache.acquire(compile_store, store_key)
@@ -482,7 +486,9 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
                 except ValueError as exc:  # the decoders follow the engine's choice
                     logger.warning("--regional: %s; compiling the whole-step graphs instead", exc)
                     _regional = False
-            eng.compile_step(mode=_compile_mode, regional=_regional)
+            # prefill blocks compile without kernel benchmarking: it buys their replays little (measured within a
+            # few % on the 1B) and costs minutes per bucket
+            eng.compile_step(mode=_compile_mode, regional=_regional, block_mode=_without_autotune(_compile_mode))
             # Compile every block-forward bucket (incl. overlap plans) now:
             # an unwarmed bucket would pay its compile on a live request.
             eng.warm_blocks()
@@ -1500,6 +1506,7 @@ _compile_mode_arg = "max-autotune"
 _warm_truncated_arg = True
 _regional_arg = True
 _startup_budget_s_arg = 1800.0
+_autotune_min_rows_arg = 0
 
 
 def _record_startup() -> None:
@@ -1507,7 +1514,8 @@ def _record_startup() -> None:
     global _startup_info
     seconds = time.time() - _PROCESS_T0
     _startup_info = {"seconds": round(seconds, 1), "budget_s": _startup_budget_s_arg, "regional": _regional,
-                     "compile_mode": _compile_mode, "compile_store": _compile_store_state}
+                     "compile_mode": _compile_mode, "autotune_min_rows": _autotune_min_rows,
+                     "compile_store": _compile_store_state}
     if _startup_budget_s_arg and seconds > _startup_budget_s_arg:
         logger.warning("STARTUP OVER BUDGET: ready after %.0fs, budget %.0fs (%s). A start this slow usually means "
                        "the compiled graphs multiplied: see the compile log above, or start with --regional",
@@ -1539,6 +1547,7 @@ async def lifespan(app: FastAPI):
         compile_mode=_compile_mode_arg,
         warm_truncated=_warm_truncated_arg,
         regional=_regional_arg,
+        autotune_min_rows=_autotune_min_rows_arg,
     )
     _record_startup()
     try:
@@ -1790,6 +1799,19 @@ def build_cascade_decoder(eng: "DecodeEngine", rows: int, groups: int, tail_toke
     return CascadeDecoder(eng, rows, groups=groups, tail_tokens=tail_tokens, kv_from=kv_from, seeded=_seeded_rows)
 
 
+def _without_autotune(mode: str) -> str:
+    """``mode`` without its kernel benchmarking (its CUDA-graph choice kept)."""
+    if mode.startswith("max-autotune"):
+        return "reduce-overhead" if mode == "max-autotune" else "default"
+    return mode
+
+
+def _row_compile_mode(rows: int) -> str:
+    """The compile mode of a ``rows``-row decoder: the server's, without kernel benchmarking below
+    --autotune_min_rows."""
+    return _without_autotune(_compile_mode) if rows < _autotune_min_rows else _compile_mode
+
+
 def build_and_warm_row_decoder(eng: "DecodeEngine", rows: int, kv_from: "MultiSampleDecoder | None" = None,
                                cascade: tuple[int, int] | None = None) -> "MultiSampleDecoder":
     """A compiled, warmed row decoder over ``eng`` (call on the generation thread: its CUDA graphs are thread-local).
@@ -1798,7 +1820,7 @@ def build_and_warm_row_decoder(eng: "DecodeEngine", rows: int, kv_from: "MultiSa
         dec = build_cascade_decoder(eng, rows, cascade[0], cascade[1], kv_from)
     else:
         dec = MultiSampleDecoder(eng, rows, kv_from=kv_from, seeded=_seeded_rows)
-    dec.compile_step(mode=_compile_mode, regional=_regional)
+    dec.compile_step(mode=_row_compile_mode(rows), regional=_regional)
     with torch.inference_mode():
         params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2)
         trunc = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2, top_p=0.9, min_p=0.05)
@@ -2221,6 +2243,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "width, and capture each step whole as one CUDA graph; a fraction of the compile time at "
                              "the same or better step time. --no-regional compiles the whole-step graphs (a model "
                              "whose norms the regions cannot run falls back to them, logged)")
+    parser.add_argument("--autotune_min_rows", type=int, default=0,
+                        help="Row buckets narrower than this compile without kernel benchmarking (max-autotune's "
+                             "choices buy nothing at narrow widths on the regional step, and cost minutes each); "
+                             "0 = every bucket compiles under --compile_mode")
     parser.add_argument("--startup_budget_s", type=float, default=1800.0,
                         help="Seconds from process start to ready this server should take; a start over it is logged "
                              "as a warning and reported in /info (startup). 0 = no budget")
@@ -2330,6 +2356,7 @@ if __name__ == "__main__":
     _warm_truncated_arg = args.warm_truncated
     _regional_arg = args.regional
     _startup_budget_s_arg = args.startup_budget_s
+    _autotune_min_rows_arg = args.autotune_min_rows
 
     import uvicorn
 

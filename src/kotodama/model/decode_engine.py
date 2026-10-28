@@ -1321,7 +1321,7 @@ class DecodeEngine(nn.Module):
         return out
 
     def compile_step(self, mode: str = "reduce-overhead", regional: bool = False, backend="inductor",
-                     cuda_graph: Optional[bool] = None) -> None:
+                     cuda_graph: Optional[bool] = None, block_mode: Optional[str] = None) -> None:
         """torch.compile the decode-step variants and the block forward.
 
         Default: each is one graph of the whole depth under ``mode`` (CUDA graphs come from the mode).
@@ -1330,9 +1330,11 @@ class DecodeEngine(nn.Module):
         tails and samplers are graphs of their own, all without CUDA graphs (``mode`` maps to its no-cudagraphs
         form). With ``cuda_graph`` (default: on a CUDA engine) each step variant and each block bucket is captured
         whole as one CUDA graph on its third call and replayed after. ``backend`` (regional only): the torch.compile
-        backend of the regions."""
+        backend of the regions. ``block_mode``: the block forward's mode (default ``mode``); prefill blocks gain little
+        from kernel benchmarking and their buckets multiply its cost."""
+        block_mode = block_mode or mode
         if regional:
-            self._compile_regional(mode, backend, cuda_graph)
+            self._compile_regional(mode, backend, cuda_graph, block_mode)
             return
         if backend != "inductor" or cuda_graph is not None:
             raise ValueError("backend and cuda_graph apply to the regional step only (regional=True)")
@@ -1345,7 +1347,7 @@ class DecodeEngine(nn.Module):
         self._compiled_forward = torch.compile(self._forward_step, mode=mode, fullgraph=True)
         self._compiled_step_sampled = torch.compile(self._step_sampled, mode=mode, fullgraph=True)
         self._compiled_step_truncated = torch.compile(self._step_sampled_truncated, mode=mode, fullgraph=True)
-        self._compiled_block = torch.compile(self._forward_block, mode=mode, fullgraph=True)
+        self._compiled_block = torch.compile(self._forward_block, mode=block_mode, fullgraph=True)
 
     # ── The regional step and block forward (compile_step(regional=True)) ──
 
@@ -1382,22 +1384,24 @@ class DecodeEngine(nn.Module):
             raise ValueError(f"no regional block forward for {S} tokens (buckets {self.block_buckets})")
         return self._block_runs[S](tokens)
 
-    def _compile_regional(self, mode: str, backend, cuda_graph: Optional[bool]) -> None:
+    def _compile_regional(self, mode: str, backend, cuda_graph: Optional[bool], block_mode: str) -> None:
         check_norms(self.model, self.eps)
         on_cuda = self.device.type == "cuda"
         cuda_graph = on_cuda if cuda_graph is None else bool(cuda_graph)
         if cuda_graph and not on_cuda:
             raise ValueError("whole-step CUDA graph capture needs a CUDA engine")
         opts = dict(fullgraph=True, dynamic=False, backend=backend)
+        block_opts = dict(opts)
         if backend == "inductor":
             opts["mode"] = REGION_MODES.get(mode, mode)
+            block_opts["mode"] = REGION_MODES.get(block_mode, block_mode)
         kvs = list(zip(self.k_caches, self.v_caches))
         sigs = [(c, b, False) for c, b in layer_signatures(self._boundaries, self.n_layers)]
         build = dict(attend=cache_attend, linear=decode_linear, **opts)
         self._step_regions, self.regional_variants = build_regions(
             self, sigs, kvs, "engine_step_layer", steer=self.steer_enabled, **build)
         self._regional_step_tail = torch.compile(self._step_tail, **opts)
-        self._regional_block_tail = torch.compile(self._block_tail, **opts)
+        self._regional_block_tail = torch.compile(self._block_tail, **block_opts)
         pool = torch.cuda.graph_pool_handle() if cuda_graph else None
 
         def step_with(head: Optional[Callable[[torch.Tensor], torch.Tensor]]) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -1415,7 +1419,8 @@ class DecodeEngine(nn.Module):
         # Each block bucket: its own regions (a static S), and on CUDA its own captured graph reading its own input.
         self._block_regions, self._block_runs = {}, {}
         for b in self.block_buckets:
-            self._block_regions[b], _ = build_regions(self, sigs, kvs, f"engine_block{b}_layer", steer=False, **build)
+            self._block_regions[b], _ = build_regions(self, sigs, kvs, f"engine_block{b}_layer", steer=False,
+                                                      attend=cache_attend, linear=decode_linear, **block_opts)
             if cuda_graph:
                 buf = torch.zeros((1, b), device=self.device, dtype=torch.long)
                 self._block_runs[b] = StepGraph(self._regional_block_forward, buf, pool)
