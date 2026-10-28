@@ -561,3 +561,71 @@ def test_generated_kv_of_broadcast_steering_is_never_reused(model: KotodamaModel
         follow = torch.cat([prompt, torch.tensor([[5] + reply[:-1]]), _ids(5, 27)], dim=1)
         _, info = eng.prefill_cached(follow)
         assert info["common_prefix"] == (30 if steer else 40), (steer, info)
+
+
+# ── seeded rows ──────────────────────────────────────────────────────────────
+
+
+def test_seeded_uniform_depends_only_on_seed_and_step() -> None:
+    from kotodama.model.multi_decode import candidate_seed, seeded_uniform
+
+    seeds = torch.tensor([7, 7, 8]); steps = torch.tensor([3, 3, 3])
+    u = seeded_uniform(seeds, steps, 1000)
+    assert u.shape == (3, 1000) and float(u.min()) > 0 and float(u.max()) < 1
+    assert torch.equal(u[0], u[1]) and not torch.equal(u[0], u[2])
+    assert not torch.equal(u[0], seeded_uniform(torch.tensor([7]), torch.tensor([4]), 1000)[0])
+    assert abs(float(u.mean()) - 0.5) < 0.03
+    assert len({candidate_seed(5, i) for i in range(64)}) == 64 and candidate_seed(5, 0) != candidate_seed(6, 0)
+
+
+@pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])
+@torch.inference_mode()
+def test_a_seeded_candidate_draws_the_same_in_any_batch(model: KotodamaModel, cls) -> None:
+    """The same row seed at another row index, beside other rows, or after a restart, samples the same tokens."""
+    eng = _engine(model, levers=1)
+    mk = (lambda: cls(eng, ROWS, tail_tokens=32, seeded=True)) if cls is CascadeDecoder \
+        else (lambda: cls(eng, ROWS, seeded=True))
+    params = SamplingParams(temperature=1.0, repetition_penalty=1.1)
+    prompt = _ids(10, 31)
+
+    def run(dec, seeds):
+        dec.admit(list(range(ROWS)), eng.prefill(prompt), params, seeds=seeds)
+        toks = [dec.cur_tokens.view(-1).tolist()]
+        for _ in range(8):
+            toks.append(dec.step(params).view(-1).tolist())
+        return [[t[r] for t in toks] for r in range(ROWS)]
+
+    a = run(mk(), [11, 22, 33, 44])
+    b = run(mk(), [44, 33, 22, 11])  # the same seeds at other rows
+    c = run(mk(), [11, 99, 98, 97])  # seed 11 at row 0 beside different neighbours
+    assert a[0] == b[3] == c[0] and a[1] == b[2] and a[2] == b[1]
+    assert len({tuple(r) for r in a}) == ROWS  # different seeds, different draws
+    dec = mk()
+    run(dec, [11, 22, 33, 44])
+    first = dec.restart([2], prompt.shape[1], eng.prefill(prompt), params, seeds=[11])
+    redo = [first[0]] + [dec.step(params).view(-1).tolist()[2] for _ in range(8)]
+    assert redo == a[0]
+
+
+@torch.inference_mode()
+def test_seeded_forced_prompts_and_rewind(model: KotodamaModel) -> None:
+    eng = _engine(model, levers=1)
+    params = SamplingParams(temperature=1.0, repetition_penalty=1.0)
+    prompt = _ids(9, 32)
+    out = []
+    for seeds in ([5, 6, 7, 8], [8, 7, 6, 5]):
+        dec = MultiSampleDecoder(eng, ROWS, seeded=True)
+        dec.admit_empty(0, seeds=seeds)
+        first = dec.force(prompt, params)
+        out.append([first] + [dec.step(params).view(-1).tolist() for _ in range(5)])
+    a, b = out
+    assert [s[0] for s in a] == [s[3] for s in b]  # seed 5's row, forced at row 0 then row 3
+    dec = MultiSampleDecoder(eng, ROWS, seeded=True)
+    dec.admit(list(range(ROWS)), eng.prefill(prompt), params, seeds=[5, 6, 7, 8])
+    first = dec.cur_tokens.view(-1).tolist()
+    dec.score(_ids(4, 33))
+    dec.rewind(prompt.shape[1], first)
+    after = dec.step(params).view(-1).tolist()
+    fresh = MultiSampleDecoder(eng, ROWS, seeded=True)
+    fresh.admit(list(range(ROWS)), eng.prefill(prompt), params, seeds=[5, 6, 7, 8])
+    assert after == fresh.step(params).view(-1).tolist()

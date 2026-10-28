@@ -76,8 +76,8 @@ def _solo_greedy(eng: DecodeEngine, prompt: list[int], plan: LeverPlan | None, n
             eng.levers.release(slot)
 
 
-def _runner(eng: DecodeEngine, width: int = 6) -> XBatchRunner:
-    dec = MultiSampleDecoder(eng, width)
+def _runner(eng: DecodeEngine, width: int = 6, seeded: bool = False) -> XBatchRunner:
+    dec = MultiSampleDecoder(eng, width, seeded=seeded)
 
     def prefill(ids, slot=0):
         return eng.prefill(ids, slot=slot), None
@@ -134,13 +134,13 @@ class _CharTok:
         return "".join(chr(97 + (i - 4) % 26) for i in ids)
 
 
-def _serve(monkeypatch, model: KotodamaModel, levers: int):
+def _serve(monkeypatch, model: KotodamaModel, levers: int, seeded: bool = False):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
     from kotodama.serve import server
 
     eng = _engine(model, levers=levers)
-    runner = _runner(eng, width=4)
+    runner = _runner(eng, width=4, seeded=seeded)
     runner.decode = lambda ids: _CharTok().decode(ids)
     used: list[str] = []
 
@@ -155,7 +155,8 @@ def _serve(monkeypatch, model: KotodamaModel, levers: int):
                  "_device": torch.device("cpu"), "_max_seq_len": MAX_SEQ, "_prefix_cache": False,
                  "_prefix_pool": None, "_stop_token_ids": frozenset({0}), "_run_generation": run_inline,
                  "_levers": levers, "_steer_loaded": True, "_steer_bank": {"v": (4, unit)},
-                 "_steer_meds": {4: 3.0}, "_steer_aliases": {}, "_steer_partial_norms": {}}.items():
+                 "_steer_meds": {4: 3.0}, "_steer_aliases": {}, "_steer_partial_norms": {},
+                 "_seeded_rows": seeded}.items():
         monkeypatch.setattr(server, k, v)
     return TestClient(server.app), eng, unit, used
 
@@ -251,3 +252,31 @@ def test_n_above_eight_is_served(monkeypatch, model: KotodamaModel) -> None:
                                              "top_p": 0})
     assert r.status_code == 200, r.text
     assert len(r.json()["choices"]) == 12
+
+
+def test_seeded_requests_reproduce_whatever_shares_their_batch(monkeypatch, model: KotodamaModel) -> None:
+    client, _, _, _ = _serve(monkeypatch, model, levers=2, seeded=True)
+    base = {"prompt": "two friends talk", "max_tokens": 6, "temperature": 1.0, "top_p": 0, "frequency_penalty": 0,
+            "return_token_ids": True}
+
+    def draws(**kw) -> list[list[int]]:
+        r = client.post("/v1/completions", json={**base, **kw})
+        assert r.status_code == 200, r.text
+        return [c["token_ids"]["completion"] for c in r.json()["choices"]]
+
+    a = draws(n=2, seed=5)
+    assert a == draws(n=2, seed=5) and a != draws(n=2, seed=6)
+    assert draws(n=1, seed=5)[0] == a[0]  # candidate 0 of seed 5, alone in its batch
+    assert a[0] != a[1]  # the candidates of one request differ
+    r = client.post("/generate", json={"prompt": "two friends talk", "max_new_tokens": 6, "temperature": 1.0,
+                                       "repetition_penalty": 1.0, "seed": 5})
+    assert r.status_code == 200 and r.json()["completion_ids"] == a[0]
+    r = client.post("/v1/completions", json={**base, "seed": 5, "top_p": 0.9})
+    assert r.status_code == 400  # a truncated law has no seeded path
+
+
+def test_a_seed_without_seeded_rows_is_refused(monkeypatch, model: KotodamaModel) -> None:
+    client, _, _, _ = _serve(monkeypatch, model, levers=2)
+    r = client.post("/v1/completions", json={"prompt": "hey", "max_tokens": 3, "temperature": 1.0, "top_p": 0,
+                                             "seed": 3})
+    assert r.status_code == 400 and "--seeded_rows" in r.text

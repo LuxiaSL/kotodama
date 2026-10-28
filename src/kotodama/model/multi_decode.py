@@ -33,6 +33,31 @@ from kotodama.model.llama import apply_rope
 
 logger = logging.getLogger(__name__)
 
+_U31 = (1 << 31) - 1
+
+
+def seeded_uniform(seeds: torch.Tensor, steps: torch.Tensor, n: int) -> torch.Tensor:
+    """Counter-based uniforms in (0, 1): row r's value for token j is a hash of (seeds[r], steps[r], j), so a row's
+    noise depends on nothing but its own seed and step (not on its batch, its row index or the RNG state). Integer
+    mixing on 31-bit values (every product stays below 2**62). Returns float32 (rows, n)."""
+    j = torch.arange(n, device=seeds.device, dtype=torch.int64).view(1, -1)
+    h = (seeds.view(-1, 1) * 0x5BD1E995 + steps.view(-1, 1) * 0x2C1B3C6D + j * 0x297A2D39) & _U31
+    h = h ^ (h >> 15)
+    h = (h * 0x7FEB352D) & _U31
+    h = h ^ (h >> 13)
+    h = (h * 0x46B6E8E5) & _U31
+    h = h ^ (h >> 16)
+    return (h.float() + 0.5) / float(1 << 31)
+
+
+def candidate_seed(seed: int, candidate: int) -> int:
+    """The row seed of candidate ``candidate`` of a request seeded ``seed`` (31-bit; distinct per candidate)."""
+    x = (int(seed) * 0x9E3779B1 + int(candidate) * 0x85EBCA77 + 0x27D4EB2F) & 0xFFFFFFFF
+    x ^= x >> 15
+    x = (x * 0x2C1B3C6D) & 0xFFFFFFFF
+    x ^= x >> 12
+    return x & _U31
+
 
 class MultiSampleDecoder(nn.Module):
     """B-row lockstep decoder over a DecodeEngine's weights, with per-row positions.
@@ -52,7 +77,7 @@ class MultiSampleDecoder(nn.Module):
     """
 
     def __init__(self, engine: DecodeEngine, rows: int, kv_from: Optional["MultiSampleDecoder"] = None,
-                 readout_k: int = 0, capture_layers: Sequence[int] = ()) -> None:
+                 readout_k: int = 0, capture_layers: Sequence[int] = (), seeded: bool = False) -> None:
         super().__init__()
         if rows < 2:
             raise ValueError(f"rows must be >= 2 (one row is the engine's own path), got {rows}")
@@ -96,6 +121,15 @@ class MultiSampleDecoder(nn.Module):
         if self.capture_layers:
             self.register_buffer("mlp_in", torch.zeros((self.rows, len(self.capture_layers), engine.hidden),
                                                        device=dev, dtype=engine.dtype), persistent=False)
+        # Seeded rows (seeded, a trace-time constant): each row's sampling noise is seeded_uniform(row_seed, row_step),
+        # its own seed and its own step count, so a seeded candidate draws the same noise in any batch, at any row.
+        # A row admitted without a seed gets a fresh random one. Off: the noise is the process RNG (torch.rand_like).
+        self.seeded = bool(seeded)
+        if self.seeded:
+            self.register_buffer("row_seed", torch.zeros((self.rows,), device=dev, dtype=torch.int64),
+                                 persistent=False)
+            self.register_buffer("row_step", torch.zeros((self.rows,), device=dev, dtype=torch.int64),
+                                 persistent=False)
         self._cur_temp, self._cur_rp = 0.9, 1.2
         self._pos_host = [0] * self.rows  # host mirror of pos (no device syncs for capacity checks)
         self._compiled_step = None
@@ -238,9 +272,14 @@ class MultiSampleDecoder(nn.Module):
             nxt = logits.argmax(dim=-1, keepdim=True)  # (B, 1)
         else:
             scaled = logits * self.inv_temp
-            u = torch.rand_like(scaled)
+            if self.seeded:
+                u = seeded_uniform(self.row_seed, self.row_step, scaled.shape[-1])
+            else:
+                u = torch.rand_like(scaled)
             gumbel = -torch.log((-torch.log(u.clamp_min(1e-20))).clamp_min(1e-20))
             nxt = (scaled + gumbel).argmax(dim=-1, keepdim=True)  # (B, 1)
+        if self.seeded:
+            self.row_step.add_(1)
         if self.readout_k > 0:
             lp = torch.log_softmax(raw, dim=-1)
             self.step_logprob.copy_(lp.gather(1, nxt).view(-1))
@@ -283,7 +322,7 @@ class MultiSampleDecoder(nn.Module):
 
     @torch.inference_mode()
     def admit(self, rows: Sequence[int], prefill_logits: torch.Tensor, params: SamplingParams,
-              slots: Optional[Sequence[int] | int] = None) -> list[int]:
+              slots: Optional[Sequence[int] | int] = None, seeds: Optional[Sequence[int]] = None) -> list[int]:
         """Fill ``rows`` from the engine's prefilled prompt and sample each row's first token from the prompt's
         last-position logits (1, V). The prompt's KV positions are copied and the mask is the engine's (open on the
         prompt only), so a row attends to nothing it decoded before: its later positions are closed until its own
@@ -308,11 +347,11 @@ class MultiSampleDecoder(nn.Module):
                     dst[:, :, :p].index_put_((idx,), src[:, :, :p].expand(n, -1, -1, -1))
         self.attn_bias.index_copy_(0, idx, eng.attn_bias.expand(n, -1, -1, -1).contiguous())
         self._set_prompt(rows, eng.token_history[:p])
-        return self._seed(rows, idx, eng._pos_cpu, prefill_logits)
+        return self._seed(rows, idx, eng._pos_cpu, prefill_logits, seeds)
 
     @torch.inference_mode()
     def restart(self, rows: Sequence[int], prompt_len: int, prefill_logits: torch.Tensor,
-                params: SamplingParams) -> list[int]:
+                params: SamplingParams, seeds: Optional[Sequence[int]] = None) -> list[int]:
         """Start a fresh candidate in ``rows``, which already hold a ``prompt_len``-token prompt in their first
         cache slots (they were admitted from it and have only decoded since): the rows rewind to the prompt's end
         (positions past it are closed in the mask and rewritten as decoding proceeds) and sample a first token from
@@ -324,7 +363,7 @@ class MultiSampleDecoder(nn.Module):
         self._sync_sampling(params)
         idx = torch.tensor(rows, device=self.pos.device, dtype=torch.long)
         self.attn_bias[idx, :, :, prompt_len:] = float("-inf")
-        return self._seed(rows, idx, prompt_len, prefill_logits)
+        return self._seed(rows, idx, prompt_len, prefill_logits, seeds)
 
     @torch.inference_mode()
     def set_slots(self, rows: Sequence[int], slots: Optional[Sequence[int] | int]) -> None:
@@ -372,6 +411,16 @@ class MultiSampleDecoder(nn.Module):
             raise ValueError(f"rows must be distinct indices in [0, {self.rows}), got {rows}")
         return rows
 
+    def _set_row_seeds(self, idx: torch.Tensor, seeds: Optional[Sequence[int]], n: int, step: int) -> None:
+        if seeds is None:
+            vals = torch.randint(0, 1 << 31, (n,), device=idx.device, dtype=torch.int64)
+        else:
+            if len(seeds) != n:
+                raise ValueError(f"{len(seeds)} seeds for {n} rows")
+            vals = torch.tensor([int(x) & _U31 for x in seeds], device=idx.device, dtype=torch.int64)
+        self.row_seed.index_copy_(0, idx, vals)
+        self.row_step.index_fill_(0, idx, step)
+
     def _set_prompt(self, rows: list[int], prompt: torch.Tensor) -> None:
         ids = prompt.reshape(-1).clone()
         for r in rows:
@@ -387,11 +436,15 @@ class MultiSampleDecoder(nn.Module):
             if ids is not None and ids.numel():
                 self.presence[r].index_fill_(0, ids, True)
 
-    def _seed(self, rows: list[int], idx: torch.Tensor, pos: int, prefill_logits: torch.Tensor) -> list[int]:
+    def _seed(self, rows: list[int], idx: torch.Tensor, pos: int, prefill_logits: torch.Tensor,
+              seeds: Optional[Sequence[int]] = None) -> list[int]:
         """Put ``rows`` at position ``pos`` with their presence seeded (empty, or the prompt under penalty_scope
-        "row") and their first token sampled under that presence."""
+        "row") and their first token sampled under that presence. ``seeds`` (seeded decoders): each row's seed (None:
+        a fresh random seed per row); the first token is the row's step 0."""
         n = len(rows)
         self.pos.index_fill_(0, idx, pos)
+        if self.seeded:
+            self._set_row_seeds(idx, seeds, n, step=0)
         self._seed_presence(rows, idx)
         raw = prefill_logits.reshape(1, -1).float().expand(n, -1)
         logits = raw
@@ -403,9 +456,15 @@ class MultiSampleDecoder(nn.Module):
             first = logits.argmax(dim=-1, keepdim=True)  # (n, 1)
         else:
             scaled = logits * self.inv_temp
-            u = torch.rand_like(scaled)
+            if self.seeded:
+                u = seeded_uniform(self.row_seed.index_select(0, idx), self.row_step.index_select(0, idx),
+                                   scaled.shape[-1])
+            else:
+                u = torch.rand_like(scaled)
             gumbel = -torch.log((-torch.log(u.clamp_min(1e-20))).clamp_min(1e-20))
             first = (scaled + gumbel).argmax(dim=-1, keepdim=True)  # (n, 1)
+        if self.seeded:
+            self.row_step.index_fill_(0, idx, 1)
         if self.readout_k > 0:
             lp = torch.log_softmax(raw, dim=-1)
             top_lp, top_id = lp.topk(self.readout_k, dim=-1)
@@ -420,9 +479,9 @@ class MultiSampleDecoder(nn.Module):
 
     @torch.inference_mode()
     def start(self, prefill_logits: torch.Tensor, params: SamplingParams,
-              slots: Optional[Sequence[int] | int] = None) -> torch.Tensor:
+              slots: Optional[Sequence[int] | int] = None, seeds: Optional[Sequence[int]] = None) -> torch.Tensor:
         """Admit every row from the engine's prefilled prompt (n candidates of one prompt). Returns cur_tokens."""
-        self.admit(range(self.rows), prefill_logits, params, slots=slots)
+        self.admit(range(self.rows), prefill_logits, params, slots=slots, seeds=seeds)
         return self.cur_tokens
 
     @torch.inference_mode()
@@ -441,7 +500,7 @@ class MultiSampleDecoder(nn.Module):
         return out
 
     @torch.inference_mode()
-    def admit_empty(self, slots: Optional[Sequence[int] | int] = None) -> None:
+    def admit_empty(self, slots: Optional[Sequence[int] | int] = None, seeds: Optional[Sequence[int]] = None) -> None:
         """Start EVERY row from an empty cache at position 0, each reading its lever slot from its first position:
         the prompt is then fed through the decode step (``force``), so a uniform lever writes each row's prompt
         under its own lever, as the eager reference writes every position. Rows hold no shared prompt."""
@@ -452,6 +511,8 @@ class MultiSampleDecoder(nn.Module):
         self.pos.zero_()
         self.presence.zero_()
         self._pos_host = [0] * self.rows
+        if self.seeded:
+            self._set_row_seeds(idx, seeds, self.rows, step=0)
         self._admit_empty_storage(idx)
 
     def _admit_empty_storage(self, idx: torch.Tensor) -> None:
@@ -478,6 +539,8 @@ class MultiSampleDecoder(nn.Module):
             if t == S - 1:
                 # the tokens sampled at earlier prompt positions were never generated
                 self._seed_presence(list(range(self.rows)), self.row_ids)
+                if self.seeded:
+                    self.row_step.zero_()  # the first generated token is each row's step 0
             self.cur_tokens.copy_(prompt[:, t:t + 1])
             self.step(params)
         return self.cur_tokens.view(-1).tolist()
@@ -520,6 +583,8 @@ class MultiSampleDecoder(nn.Module):
         self.cur_tokens.copy_(first_t)
         self._seed_presence(list(range(self.rows)), self.row_ids)
         self.presence.scatter_(1, first_t, True)
+        if self.seeded:
+            self.row_step.fill_(1)  # the first token was each row's step 0
 
     def _rewind_storage(self, length: int) -> None:
         self.attn_bias[:, :, :, length:] = float("-inf")
@@ -597,7 +662,7 @@ class CascadeDecoder(MultiSampleDecoder):
 
     def __init__(self, engine: DecodeEngine, rows: int, groups: int = 0, group_rows: int = 0,
                  tail_tokens: int = 1024, kv_from: Optional["CascadeDecoder"] = None, readout_k: int = 0,
-                 capture_layers: Sequence[int] = ()) -> None:
+                 capture_layers: Sequence[int] = (), seeded: bool = False) -> None:
         groups = int(groups) or max(1, int(rows) // 4)
         group_rows = int(group_rows) or min(int(rows), 32)
         if not 1 <= groups <= rows or not 1 <= group_rows <= rows:
@@ -609,7 +674,8 @@ class CascadeDecoder(MultiSampleDecoder):
             raise ValueError("kv_from must be a CascadeDecoder with the same tail_tokens and >= as many groups")
         # read by _alloc_kv, which the base constructor calls
         self.__dict__["_cascade_shape"] = (groups, group_rows, int(tail_tokens))
-        super().__init__(engine, rows, kv_from=kv_from, readout_k=readout_k, capture_layers=capture_layers)
+        super().__init__(engine, rows, kv_from=kv_from, readout_k=readout_k, capture_layers=capture_layers,
+                         seeded=seeded)
         self.attend_backend, self._attend_fn = attend_for(engine.device, engine.dtype)
         self._row_group = [-1] * self.rows  # host: the group each row reads its prompt from (-1: none)
         self._group_members: list[set[int]] = [set() for _ in range(self.groups)]
@@ -747,7 +813,7 @@ class CascadeDecoder(MultiSampleDecoder):
 
     @torch.inference_mode()
     def admit(self, rows: Sequence[int], prefill_logits: torch.Tensor, params: SamplingParams,
-              slots: Optional[Sequence[int] | int] = None) -> list[int]:
+              slots: Optional[Sequence[int] | int] = None, seeds: Optional[Sequence[int]] = None) -> list[int]:
         """Fill ``rows`` from the engine's prefilled prompt: the prompt's KV is copied once into a free group (one
         group per ``group_rows`` rows), each row's tail starts empty, and each row's first token is sampled from the
         prompt's last-position logits (1, V). Raises RuntimeError when too few groups are free (``admit_capacity``).
@@ -788,11 +854,11 @@ class CascadeDecoder(MultiSampleDecoder):
         for r in rows:
             self._tail_host[r] = 0
         self._set_prompt(rows, eng.token_history[:p])
-        return self._seed(rows, idx, p, prefill_logits)
+        return self._seed(rows, idx, p, prefill_logits, seeds)
 
     @torch.inference_mode()
     def restart(self, rows: Sequence[int], prompt_len: int, prefill_logits: torch.Tensor,
-                params: SamplingParams) -> list[int]:
+                params: SamplingParams, seeds: Optional[Sequence[int]] = None) -> list[int]:
         """Start a fresh candidate in ``rows``, which still belong to a group holding a ``prompt_len``-token prompt
         (they were admitted from it and not released): the tails empty and each row samples a first token from that
         prompt's last-position logits (1, V). Costs no KV copy. Returns the first tokens."""
@@ -806,21 +872,26 @@ class CascadeDecoder(MultiSampleDecoder):
         self.tail_pos.index_fill_(0, idx, 0)
         for r in rows:
             self._tail_host[r] = 0
-        return self._seed(rows, idx, prompt_len, prefill_logits)
+        return self._seed(rows, idx, prompt_len, prefill_logits, seeds)
 
 
 def decode_rows(dec: MultiSampleDecoder, prefill_logits: torch.Tensor, params: SamplingParams, n: int,
                 max_new_tokens: int, stop_ids: frozenset[int],
                 stop_check: Optional[Callable[[list[int]], bool]] = None,
-                slots: Optional[int] = None) -> list[list[int]]:
+                slots: Optional[int] = None, seed: Optional[int] = None) -> list[list[int]]:
     """Generate up to ``max_new_tokens`` per row for the first ``n`` rows of one prompt (every row on lever slot
-    ``slots``); a row ends at a stop token (not kept), when ``stop_check(row_ids)`` is true, or at capacity. Returns
-    each row's generated ids."""
+    ``slots``); a row ends at a stop token (not kept), when ``stop_check(row_ids)`` is true, or at capacity. ``seed``
+    (a seeded decoder): candidate i draws with ``candidate_seed(seed, i)``. Returns each row's generated ids."""
     if not 1 <= n <= dec.rows:
         raise ValueError(f"n={n} outside [1, {dec.rows}]")
     out: list[list[int]] = [[] for _ in range(n)]
     live = [True] * n
-    dec.start(prefill_logits, params, slots=slots)
+    seeds = None
+    if seed is not None:
+        if not dec.seeded:
+            raise ValueError("a seed needs a seeded decoder (seeded=True)")
+        seeds = [candidate_seed(seed, i) for i in range(dec.rows)]  # rows past n draw candidates nobody reads
+    dec.start(prefill_logits, params, slots=slots, seeds=seeds)
     toks = dec.cur_tokens.view(-1).tolist()
     for _ in range(max_new_tokens):
         for r in range(n):

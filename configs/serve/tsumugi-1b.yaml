@@ -24,6 +24,8 @@ xbatch_rows: [16, 32, 64, 128]
 xbatch_refill: true
 cascade_attn: true
 levers: 16
+# A request's `seed` reproduces its candidates whatever shares their batch.
+seeded_rows: true
 
 env:
   # The AttnRes kernels add their eps as the trunk trained it (fp64 under compile); see

@@ -219,6 +219,8 @@ _steer_partial_norms: dict[int, float] = {}
 # engine's tables for its lifetime (N slots at once), so steered and unsteered requests decode in one batch and a
 # request may steer its prompt too (steer_span "uniform"). 0 = off: steering takes the engine's broadcast set_steer.
 _levers: int = 0
+# Seeded row decoders (--seeded_rows): a request's `seed` gives each candidate its own reproducible noise stream.
+_seeded_rows: bool = False
 # Server-wide default repetition penalty (CLI --default_repetition_penalty):
 # used by /generate when the field is absent and by the OpenAI routes when
 # frequency_penalty is absent.
@@ -333,9 +335,9 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0) -> tuple[KotodamaModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
-    global _row_token_cap, _cascade_info, _levers
+    global _row_token_cap, _cascade_info, _levers, _seeded_rows
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
@@ -423,6 +425,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         logger.info("cuDNN SDP disabled (using flash/math backend)")
 
     _levers = int(levers) if use_engine else 0
+    _seeded_rows = bool(seeded_rows) and use_engine
     if levers and not use_engine:
         raise ValueError("--levers needs the fast engine (cuda + --engine fast + attn_res model)")
     if use_engine:
@@ -619,6 +622,9 @@ class GenerateRequest(BaseModel):
     messages: list[ChatMessage] | None = None
     # The prompt as token ids, used as sent (the client's own tokenization; no text round trip).
     prompt_ids: list[int] | None = None
+    # Seeded candidates (--seeded_rows): candidate i of a request draws from its own noise stream (this seed and i),
+    # whatever else shares its batch. Pure-temperature laws on the batched decoders.
+    seed: int | None = Field(default=None, ge=0)
     max_new_tokens: int = Field(default=DEFAULT_MAX_NEW_TOKENS, ge=1, le=2048)
     temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=0.0, le=2.0)
     top_k: int = Field(default=DEFAULT_TOP_K, ge=0)
@@ -1435,6 +1441,7 @@ _cascade_attn_arg = False
 _cascade_groups_arg = 0
 _cascade_tail_tokens_arg = 1024
 _levers_arg = 0
+_seeded_rows_arg = False
 
 
 @asynccontextmanager
@@ -1455,6 +1462,7 @@ async def lifespan(app: FastAPI):
         cascade_groups=_cascade_groups_arg,
         cascade_tail_tokens=_cascade_tail_tokens_arg,
         levers=_levers_arg,
+        seeded_rows=_seeded_rows_arg,
     )
     try:
         yield
@@ -1576,6 +1584,12 @@ async def generate_endpoint(request: GenerateRequest, http_request: Request):
     if _model is None or _tokenizer is None:
         raise HTTPException(503, "Model not loaded")
 
+    if request.seed is not None:  # seeded draws come from the batched decoders only
+        if request.stream:
+            raise HTTPException(400, "a seeded request cannot stream")
+        out = await _batched_candidates(request, 1)
+        return out[0]
+
     if request.stream:
         if _engine_compatible(request):
             return StreamingResponse(
@@ -1624,6 +1638,7 @@ class OAICompletionRequest(BaseModel):
     steer_span: Literal["decode", "uniform"] = "decode"
     injection: InjectionSpec | None = None
     penalty_scope: Literal["generated", "row"] = "generated"
+    seed: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -1669,7 +1684,7 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
             timing["prefix_common_tokens"] = pc_info["common_prefix"]
         budget = min(request.max_new_tokens, _max_seq_len - prompt_len)
         rows = decode_rows(dec, prefill_logits, params, n, budget, _stop_token_ids, stop_check,
-                           slots=slot if _levers else None)
+                           slots=slot if _levers else None, seed=request.seed)
     elapsed = time.perf_counter() - t0
     timing["total_ms"] = round(elapsed * 1000, 2)
     timing["batched_rows"] = float(dec.rows)
@@ -1694,7 +1709,7 @@ def build_cascade_decoder(eng: "DecodeEngine", rows: int, groups: int, tail_toke
     if kv_from is not None:
         assert isinstance(kv_from, CascadeDecoder)
         groups = min(kv_from.groups, max(1, kv_from.groups * rows // kv_from.rows))
-    return CascadeDecoder(eng, rows, groups=groups, tail_tokens=tail_tokens, kv_from=kv_from)
+    return CascadeDecoder(eng, rows, groups=groups, tail_tokens=tail_tokens, kv_from=kv_from, seeded=_seeded_rows)
 
 
 def build_and_warm_row_decoder(eng: "DecodeEngine", rows: int, kv_from: "MultiSampleDecoder | None" = None,
@@ -1704,7 +1719,7 @@ def build_and_warm_row_decoder(eng: "DecodeEngine", rows: int, kv_from: "MultiSa
     if cascade is not None:
         dec = build_cascade_decoder(eng, rows, cascade[0], cascade[1], kv_from)
     else:
-        dec = MultiSampleDecoder(eng, rows, kv_from=kv_from)
+        dec = MultiSampleDecoder(eng, rows, kv_from=kv_from, seeded=_seeded_rows)
     dec.compile_step(mode="max-autotune")
     with torch.inference_mode():
         params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2)
@@ -1723,7 +1738,7 @@ def _within_row_cap(request: GenerateRequest) -> bool:
 
 
 def _multi_compatible(request: GenerateRequest, n: int) -> bool:
-    return (n > 1 and _multi_bucket(n) is not None and _within_row_cap(request)
+    return ((n > 1 or request.seed is not None) and _multi_bucket(n) is not None and _within_row_cap(request)
             and MultiSampleDecoder.supports(EngineSamplingParams(temperature=request.temperature,
                                                                  top_k=request.top_k, top_p=request.top_p)))
 
@@ -1762,7 +1777,7 @@ async def engine_generate_xbatch(request: GenerateRequest, n: int) -> list[Gener
     job = XBatchJob(key=_xbatch_key(request, steered), prompt_ids=prompt_ids, n=n,
                     max_new_tokens=request.max_new_tokens, params=params, done=lambda _outcome: None,
                     stop_strings=tuple(request.stop_strings), steer_writes=steer_writes, steer_kwargs=steer_kwargs,
-                    lever=lever)
+                    lever=lever, seed=request.seed)
     result = await _xbatch.submit(job)
     elapsed = time.perf_counter() - t0
     timing = dict(result.timing)
@@ -1777,7 +1792,14 @@ async def engine_generate_xbatch(request: GenerateRequest, n: int) -> list[Gener
 
 async def _batched_candidates(request: GenerateRequest, n: int) -> list[GenerateResponse]:
     """All n candidates from one batched path (cross-request batcher, else the n-row decoder), or [] when neither
-    takes the request and the caller generates candidates one at a time."""
+    takes the request and the caller generates candidates one at a time. A seeded request that no batched path
+    takes is a 400: only the seeded row decoders draw from per-candidate seeds."""
+    if request.seed is not None:
+        if not _seeded_rows:
+            raise HTTPException(400, "'seed' needs a server started with --seeded_rows")
+        if not (_xbatch_compatible(request, n) or _multi_compatible(request, n)):
+            raise HTTPException(400, "'seed' needs a pure-temperature law (temperature > 0, no top-k/top-p) and "
+                                     "the batched decoders (--xbatch_rows or --multi_rows)")
     if _xbatch_compatible(request, n):
         return await engine_generate_xbatch(request, n)
     if _multi_compatible(request, n):
@@ -1809,6 +1831,7 @@ def oai_completion_to_generate(request: OAICompletionRequest) -> GenerateRequest
         steer_span=request.steer_span,
         injection=request.injection,
         penalty_scope=request.penalty_scope,
+        seed=request.seed,
     )
 
 
@@ -2096,6 +2119,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "steered request binds its own slot, so steered and unsteered requests batch together, "
                              "a request may steer its prompt (steer_span uniform) or send a raw 'injection'; "
                              "--steer-npz banks resolve into levers. 0 = off (the broadcast steering rows)")
+    parser.add_argument("--seeded_rows", action="store_true",
+                        help="Row decoders draw each candidate's noise from its own seed and step: a request's 'seed' "
+                             "then reproduces its candidates whatever shares their batch (up to kernel rounding of "
+                             "the logits, which can flip a near-tie). Without it a 'seed' is a 400")
     parser.add_argument("--prefix_pool_block", type=int, default=16,
                         help="Token block size of the prefix KV pool (>= 16): prefixes are shared in whole blocks")
     parser.add_argument("--cascade_attn", action="store_true",
@@ -2192,6 +2219,7 @@ if __name__ == "__main__":
     if args.levers < 0 or (args.levers and _engine_arg != "fast"):
         parser.error("--levers needs the fast engine and a slot count >= 0")
     _levers_arg = args.levers
+    _seeded_rows_arg = args.seeded_rows
 
     import uvicorn
 

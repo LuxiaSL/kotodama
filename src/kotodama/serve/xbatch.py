@@ -46,7 +46,7 @@ from typing import Any, Awaitable, Callable, Hashable, Optional
 import torch
 
 from kotodama.model.decode_engine import SamplingParams
-from kotodama.model.multi_decode import MultiSampleDecoder
+from kotodama.model.multi_decode import MultiSampleDecoder, candidate_seed
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,7 @@ class XBatchJob:
     steer_writes: Optional[list[tuple[int, torch.Tensor, float]]] = None
     steer_kwargs: dict[str, Any] = field(default_factory=dict)
     lever: Any = None  # a kotodama.model.levers.LeverPlan (runner built with levers), None: unsteered
+    seed: Optional[int] = None  # seeded decoders: candidate i draws with candidate_seed(seed, i), in any batch
     t_enqueue: float = field(default_factory=time.perf_counter)
 
 
@@ -217,10 +218,12 @@ class XBatchRunner:
                 logits, info = self.prefill(ids)
             m = min(job.n, len(free), dec.admit_capacity())
             rows = free[:m]
+            kw: dict[str, Any] = {}
             if self.levers is not None:
-                first = dec.admit(rows, logits, job.params, slots=slot)
-            else:
-                first = dec.admit(rows, logits, job.params)
+                kw["slots"] = slot
+            if job.seed is not None:
+                kw["seeds"] = [candidate_seed(job.seed, c) for c in range(m)]
+            first = dec.admit(rows, logits, job.params, **kw)
             del free[:m]
         except Exception as exc:
             logger.warning("xbatch: prefill/admit failed for a %d-token prompt: %r", len(job.prompt_ids), exc)
@@ -313,7 +316,9 @@ class XBatchRunner:
                     rows = [r for r in sorted(lv.home) if r not in busy][:want]
                     if rows:
                         busy.update(rows)
-                        self._start(lv, rows, dec.restart(rows, lv.prompt_len, lv.logits, lv.job.params))
+                        kw = {} if lv.job.seed is None else {
+                            "seeds": [candidate_seed(lv.job.seed, lv.started + i) for i in range(len(rows))]}
+                        self._start(lv, rows, dec.restart(rows, lv.prompt_len, lv.logits, lv.job.params, **kw))
                         self.stats["restarts"] += len(rows)
                         progress = True
             for lv in [lv for lv in active if lv.done]:
