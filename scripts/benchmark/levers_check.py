@@ -54,9 +54,9 @@ PROMPTS = [
 ]
 
 
-def build(model, levers: int, max_seq_len: int, widths: list[int], cascade: bool, tail: int):
+def build(model, levers: int, max_seq_len: int, widths: list[int], cascade: bool, tail: int, regional: bool = True):
     eng = DecodeEngine(model, max_seq_len=max_seq_len, levers=levers)
-    eng.compile_step(mode="max-autotune")
+    eng.compile_step(mode="max-autotune", regional=regional)
     eng.warm_blocks()
     decs: dict[int, MultiSampleDecoder] = {}
     for w in sorted(widths, reverse=True):
@@ -65,7 +65,7 @@ def build(model, levers: int, max_seq_len: int, widths: list[int], cascade: bool
             dec = CascadeDecoder(eng, w, groups=max(1, w // 8), group_rows=8, tail_tokens=tail, kv_from=widest)
         else:
             dec = MultiSampleDecoder(eng, w, kv_from=widest)
-        dec.compile_step(mode="max-autotune")
+        dec.compile_step(mode="max-autotune", regional=regional)
         decs[w] = dec
     return eng, decs
 
@@ -264,6 +264,8 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=0.75)
     ap.add_argument("--repetition_penalty", type=float, default=1.2)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--regional", action=argparse.BooleanOptionalAction, default=True,
+                    help="compile regionally, as the server does (--no-regional: the whole-step graphs)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -278,8 +280,9 @@ def main() -> int:
     cfg = model.config
     params = SamplingParams(temperature=a.temperature, repetition_penalty=a.repetition_penalty)
     t0 = time.time()
-    plain, plain_decs = build(model, 0, a.max_seq_len, widths, a.cascade == "on", a.cascade_tail_tokens)
-    lev, lev_decs = build(model, a.levers, a.max_seq_len, widths, a.cascade == "on", a.cascade_tail_tokens)
+    plain, plain_decs = build(model, 0, a.max_seq_len, widths, a.cascade == "on", a.cascade_tail_tokens, a.regional)
+    lev, lev_decs = build(model, a.levers, a.max_seq_len, widths, a.cascade == "on", a.cascade_tail_tokens,
+                          a.regional)
     plans = bound_plans(model, cfg.num_layers, list(cfg.attn_res_boundaries), cfg.hidden_size, a.seed)
     slots = [lev.levers.bind(p) for p in plans]
     res: dict = {"checkpoint": a.checkpoint, "rows": widths, "cascade": a.cascade, "levers": a.levers,
