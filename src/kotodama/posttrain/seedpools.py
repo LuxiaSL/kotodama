@@ -474,10 +474,16 @@ async def grow_pool(complete: Complete, axis: Axis, target: int, lists: dict[str
 
 
 async def cut_famous(res: dict[str, Any], axis: Axis, score: Score, cut: float, keep: int) -> dict[str, Any]:
-    """Drop the ``cut`` share of ``res["kept"]`` the model finds most predictable as a list entry (lowest mean NLL
-    after the axis's opening line), then keep the first ``keep``. Dropped rows join the rejects as ``famous``."""
+    """Drop the ``cut`` share of ``res["kept"]`` whose rest of the name the model finds most predictable after the
+    first token (lowest mean NLL of " Taylor" after "- Liz"), then keep the first ``keep``. A famous person is a
+    pairing the model completes with ease; a common first name alone is not. Dropped rows join the rejects as
+    ``famous``."""
     kept = res["kept"]
-    lps = await score([(f"{axis.head}\n\n-", f" {r['text']}") for r in kept])
+    pairs = []
+    for r in kept:
+        first, _, rest = r["text"].partition(" ")
+        pairs.append((f"{axis.head}\n\n- {first}", f" {rest}"))
+    lps = await score(pairs)
     nll = [-lp for lp in lps]
     n_drop = int(round(len(kept) * cut))
     drop = set(sorted(range(len(kept)), key=lambda i: nll[i])[:n_drop])

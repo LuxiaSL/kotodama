@@ -269,7 +269,8 @@ def test_cut_famous_and_wants_required() -> None:
            "rejects": [], "counts": {}}
 
     async def score(pairs):
-        return [-0.5 if c.strip() in ("Stephen King", "Edie Sedgwick") else -4.0 for _, c in pairs]
+        assert all(p.endswith(("- Stephen", "- Ines", "- Kwame", "- Edie")) for p, _ in pairs)
+        return [-0.5 if c.strip() in ("King", "Sedgwick") else -4.0 for _, c in pairs]
 
     out = asyncio.run(sp.cut_famous(res, sp.AXES["names"], score, 0.5, 2))
     assert [r["text"] for r in out["kept"]] == ["Ines Moreau", "Kwame Asante"]

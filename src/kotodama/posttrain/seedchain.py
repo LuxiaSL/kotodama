@@ -192,8 +192,9 @@ def gate_chain_page(page: str, st: dict[str, Any]) -> Optional[str]:
 
 
 async def grow_chain(complete: sp.Complete, complete_page: sp.Complete, score: Optional[sp.Score],
-                     st: dict[str, Any], page_candidates: int = 4) -> dict[str, Any]:
-    """Fill ``st`` step by step; returns it with ``status`` (pass | fail), ``failed_step``, ``rejections``."""
+                     st: dict[str, Any], page_candidates: int = 4, page_draws: int = 2) -> dict[str, Any]:
+    """Fill ``st`` step by step; returns it with ``status`` (pass | fail), ``failed_step``, ``rejections`` and up to
+    two rejected pages (``page_rejected``: [reason, text]) for reading what the gate refused."""
     st["rejections"] = {}
     k = len(st["names"])
     plan = ([("person", i) for i in range(k)] + [("need", i) for i in range(k)] + [("want", i) for i in range(k)]
@@ -210,19 +211,25 @@ async def grow_chain(complete: sp.Complete, complete_page: sp.Complete, score: O
             st.setdefault(key, []).append(value)
         else:
             st[step] = value
-    outs = await complete_page(step_prompt(st, "page"), page_candidates, [sp.END_MARK, "\nNo. "])
-    page_reasons = []
-    for text, _finish, hit in outs:
-        if hit:
-            page_reasons.append("overlong")
-            continue
-        page = text.split(sp.END_MARK)[0].split("\nNo. ")[0].strip()
-        why = gate_chain_page(page, st)
-        if why:
-            page_reasons.append(why)
-            continue
-        st["page"] = page
-        break
+    page_reasons: list[str] = []
+    st["page_rejected"] = []
+    for _ in range(page_draws):
+        outs = await complete_page(step_prompt(st, "page"), page_candidates, [sp.END_MARK, "\nNo. "])
+        for text, _finish, hit in outs:
+            if hit:
+                page_reasons.append("overlong")
+                continue
+            page = text.split(sp.END_MARK)[0].split("\nNo. ")[0].strip()
+            why = gate_chain_page(page, st)
+            if why:
+                page_reasons.append(why)
+                if len(st["page_rejected"]) < 2:
+                    st["page_rejected"].append([why, page])
+                continue
+            st["page"] = page
+            break
+        if st.get("page"):
+            break
     st["rejections"]["page"] = page_reasons
     if not st.get("page"):
         st.update(status="fail", failed_step="page")
@@ -265,7 +272,7 @@ def draw_roots(pools: dict[str, list[dict[str, Any]]], n: int, seed: int, cast_s
 
 async def run_chains(complete: sp.Complete, complete_page: sp.Complete, score: Optional[sp.Score],
                      starts: list[dict[str, Any]], out: Path, concurrency: int = 128,
-                     page_candidates: int = 4) -> dict[str, Any]:
+                     page_candidates: int = 4, page_draws: int = 2) -> dict[str, Any]:
     """Grow every start not already in ``<out>/chains.jsonl`` (appended as each finishes)."""
     path = out / "chains.jsonl"
     done = {r["id"] for r in sp.read_jsonl(path)}
@@ -279,7 +286,7 @@ async def run_chains(complete: sp.Complete, complete_page: sp.Complete, score: O
     async def one(s: dict[str, Any]) -> None:
         async with sem:
             try:
-                st = await grow_chain(complete, complete_page, score, dict(s), page_candidates)
+                st = await grow_chain(complete, complete_page, score, dict(s), page_candidates, page_draws)
             except Exception as e:  # one chain's failure must not stop the run
                 logger.error("chain %s failed: %s", s["id"], e)
                 return
@@ -451,6 +458,7 @@ def main_chain(argv: list[str]) -> int:
     ap.add_argument("--temperature", type=float, default=1.0, help="short steps")
     ap.add_argument("--page_temperature", type=float, default=0.8, help="the opening page (rendering, not invention)")
     ap.add_argument("--page_candidates", type=int, default=4)
+    ap.add_argument("--page_draws", type=int, default=2, help="page draws until one candidate passes the gate")
     ap.add_argument("--no_score", action="store_true")
     ap.add_argument("--concurrency", type=int, default=128)
     ap.add_argument("--seed", type=int, default=0)
@@ -480,7 +488,8 @@ def main_chain(argv: list[str]) -> int:
 
     async def go() -> dict[str, Any]:
         try:
-            return await run_chains(complete, complete_page, score, starts, out, a.concurrency, a.page_candidates)
+            return await run_chains(complete, complete_page, score, starts, out, a.concurrency, a.page_candidates,
+                                    a.page_draws)
         finally:
             await close()
             await close_page()
