@@ -22,7 +22,11 @@ model sees at inference:
   tag (that tag is how the turn learns to stop); the last turn trains through the end-of-text token. Other turns are
   context. A turn with ``"train": false`` is context whoever speaks it.
 
-The header never trains: it is the frame a run supplies.
+The header never trains: it is the frame a run supplies. A row with ``"ended": false`` keeps its end-of-text as
+context: the conversation was cut there, so the model must not learn to stop there.
+
+An anthology row ``{"scenes": [transcript row, ...]}`` is one document holding several transcripts, each followed
+by its own end-of-text token (``kotodama.posttrain.anthology`` builds them from loom runs).
 
 CLI:  python -m kotodama.posttrain.transcript convert-markdown --in raw.jsonl --out turns.jsonl [--rename "A=B"]
       (rows ``{"text": "**User:** ... **Night Owl:** ..."}`` -> rows ``{"turns": [{"speaker", "text"}, ...]}``)
@@ -66,10 +70,19 @@ class Turn:
 class Transcript:
     turns: tuple[Turn, ...]
     header: str = ""
+    ended: bool = True  # False: the end-of-text after the last turn is context (the conversation was cut, not ended)
+
+
+@dataclass(frozen=True)
+class Anthology:
+    """Several transcripts in one document, one after another, each followed by its end-of-text token, in one
+    attention segment (a later scene sees the earlier ones)."""
+
+    scenes: tuple[Transcript, ...]
 
 
 def parse_row(row: dict[str, Any]) -> Optional[Transcript]:
-    """A transcript from ``{"turns": [{"speaker", "text"[, "train"]}], "header"?}``; None if malformed."""
+    """A transcript from ``{"turns": [{"speaker", "text"[, "train"]}], "header"?, "ended"?}``; None if malformed."""
     turns = row.get("turns") if isinstance(row, dict) else None
     if not isinstance(turns, list) or not turns:
         return None
@@ -82,18 +95,30 @@ def parse_row(row: dict[str, Any]) -> Optional[Transcript]:
             return None
         out.append(Turn(sp, t["text"].strip(), bool(t.get("train", True))))
     header = row.get("header", "")
-    return Transcript(tuple(out), header.strip() if isinstance(header, str) else "")
+    return Transcript(tuple(out), header.strip() if isinstance(header, str) else "", bool(row.get("ended", True)))
 
 
-def load_jsonl(path: str | Path) -> list[Transcript]:
-    res: list[Transcript] = []
+def parse_document(row: dict[str, Any]) -> Optional[Transcript | Anthology]:
+    """A transcript row, or an anthology row ``{"scenes": [transcript row, ...]}``; None if malformed (an anthology
+    with any malformed scene is malformed)."""
+    if isinstance(row, dict) and "scenes" in row:
+        scenes = row["scenes"]
+        if not isinstance(scenes, list) or not scenes:
+            return None
+        parsed = [parse_row(s) for s in scenes]
+        return None if any(s is None for s in parsed) else Anthology(tuple(parsed))  # type: ignore[arg-type]
+    return parse_row(row)
+
+
+def load_jsonl(path: str | Path) -> list[Transcript | Anthology]:
+    res: list[Transcript | Anthology] = []
     bad = 0
     with open(path, encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
             try:
-                tr = parse_row(json.loads(line))
+                tr = parse_document(json.loads(line))
             except json.JSONDecodeError:
                 tr = None
             if tr is None:
@@ -149,14 +174,16 @@ def _train_ranges(tr: Transcript, spans: list[tuple[int, int, int]], n_text: int
             lo = txt0
         else:
             continue
-        hi = spans[i + 1][1] if i + 1 < n else n_text + 1  # through the next tag, or through end-of-text
+        # through the next tag; the last turn through end-of-text when the conversation ended there
+        hi = spans[i + 1][1] if i + 1 < n else (n_text + 1 if tr.ended else n_text)
         ranges.append((lo, hi))
     return ranges
 
 
 def _example(ids: list[int], starts: list[int], ranges: list[tuple[int, int]], n_text: int, max_len: int,
-             eos_id: int) -> Optional[Example]:
-    """Labels for one tokenized document: a token trains when its start offset falls in a training range."""
+             eos_id: int, keep_empty: bool = False) -> Optional[Example]:
+    """Labels for one tokenized document: a token trains when its start offset falls in a training range. None when
+    nothing trains, unless ``keep_empty`` (an anthology scene may be all context)."""
     ids = ids + [eos_id]
     a = np.asarray(list(starts) + [n_text], dtype=np.int64)
     if ranges:
@@ -170,7 +197,7 @@ def _example(ids: list[int], starts: list[int], ranges: list[tuple[int, int]], n
     if len(ids) > max_len:
         ids, labels = ids[:max_len], labels[:max_len]
     ex = Example(ids, labels)
-    return ex if ex.n_trainable else None
+    return ex if ex.n_trainable or keep_empty else None
 
 
 def tokenize(tr: Transcript, tokenizer: Any, max_len: int, eos_id: int,
@@ -182,27 +209,39 @@ def tokenize(tr: Transcript, tokenizer: Any, max_len: int, eos_id: int,
                     _train_ranges(tr, spans, len(text), train_speakers), len(text), max_len, eos_id)
 
 
-def encode(transcripts: Iterable[Transcript], tokenizer: Any, max_len: int, eos_id: int,
+def encode(transcripts: Iterable[Transcript | Anthology], tokenizer: Any, max_len: int, eos_id: int,
            train_speakers: Optional[set[str]] = None, drop_overlong: bool = False,
            chunk: int = 1024) -> list[Example]:
     """Tokenized examples (the tokenizer is called on ``chunk`` documents at a time — a fast tokenizer encodes a batch
     in parallel). ``drop_overlong`` drops a transcript longer than ``max_len`` instead of truncating it (instruction
-    data: a truncated answer teaches answers that stop mid-thought)."""
+    data: a truncated answer teaches answers that stop mid-thought). An ``Anthology`` is one example: each scene is
+    tokenized and labelled on its own (so token boundaries match a scene generated from its header) and the scenes'
+    tokens, each ending in end-of-text, are concatenated before truncation."""
     out: list[Example] = []
     n = dropped = 0
     cap = max_len + (1 if drop_overlong else 0)
+    unbounded = 1 << 62
     it = iter(transcripts)
     while True:
         batch = [tr for _, tr in zip(range(chunk), it)]
         if not batch:
             break
-        rendered = [render(tr) for tr in batch]
+        units = [s for tr in batch for s in (tr.scenes if isinstance(tr, Anthology) else (tr,))]
+        rendered = [render(tr) for tr in units]
         enc = tokenizer([t for t, _ in rendered], return_offsets_mapping=True, add_special_tokens=False)
-        for tr, (text, spans), ids, offs in zip(batch, rendered, enc["input_ids"], enc["offset_mapping"]):
+        parts = iter(zip(units, rendered, enc["input_ids"], enc["offset_mapping"]))
+        for doc in batch:
             n += 1
-            ex = _example(list(ids), [o[0] for o in offs], _train_ranges(tr, spans, len(text), train_speakers),
-                          len(text), cap, eos_id)
-            if ex is not None and drop_overlong and len(ex.input_ids) > max_len:
+            pieces = []
+            for _ in (doc.scenes if isinstance(doc, Anthology) else (doc,)):
+                tr, (text, spans), ids, offs = next(parts)
+                pieces.append(_example(list(ids), [o[0] for o in offs],
+                                       _train_ranges(tr, spans, len(text), train_speakers), len(text), unbounded,
+                                       eos_id, keep_empty=True))
+            all_ids = [t for p in pieces if p is not None for t in p.input_ids]
+            all_labels = [t for p in pieces if p is not None for t in p.labels]
+            ex: Optional[Example] = Example(all_ids[:cap], all_labels[:cap])
+            if not ex.n_trainable or (drop_overlong and len(ex.input_ids) > max_len):
                 ex = None
             if ex is None:
                 dropped += 1
