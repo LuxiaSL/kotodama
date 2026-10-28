@@ -262,8 +262,10 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
     return stats
 
 
-def http_scorer(endpoints: list[str], timeout: float = 600.0, transport: Any = None) -> tuple[Score, Callable[[], Awaitable[None]]]:
-    """A ``Score`` over the servers' /score_tokens (round-robin), tokenizing locally; and its async closer."""
+def http_scorer(endpoints: list[str], timeout: float = 600.0, transport: Any = None,
+                max_completion_tokens: int = 256) -> tuple[Score, Callable[[], Awaitable[None]]]:
+    """A ``Score`` over the servers' /score_tokens (round-robin), tokenizing locally; and its async closer. A prompt
+    keeps its last 3500 tokens and a completion its first ``max_completion_tokens``."""
     import httpx
     from transformers import AutoTokenizer
 
@@ -277,7 +279,7 @@ def http_scorer(endpoints: list[str], timeout: float = 600.0, transport: Any = N
         out: list[float] = []
         for k in range(0, len(pairs), 32):
             items = [{"id": str(j), "prompt_ids": tok.encode(p, add_special_tokens=False)[-3500:],
-                      "completion_ids": tok.encode(c, add_special_tokens=False)[:256]}
+                      "completion_ids": tok.encode(c, add_special_tokens=False)[:max_completion_tokens]}
                      for j, (p, c) in enumerate(pairs[k:k + 32])]
             for attempt in range(4):  # idle keep-alive sockets get closed server-side between engagement rounds
                 url = endpoints[counter["i"] % len(endpoints)].rstrip("/") + "/score_tokens"

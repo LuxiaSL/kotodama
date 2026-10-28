@@ -6,9 +6,14 @@ rather than from a hand-written topic list. The catalogue's opening entries are 
 context, never training data (a seed becomes a transcript header, and headers never carry loss), and ``--examples``
 can replace them with entries an earlier round generated.
 
-    python -m kotodama.posttrain.seeds --endpoint http://HOST:PORT --n 2000 --out seeds.jsonl [--temperature 1.0]
+    python -m kotodama.posttrain.seeds [catalogue] --endpoint http://HOST:PORT --n 2000 --out seeds.jsonl \\
+        [--temperature 1.0]
 
 Each output row is a self-play seed: ``{"id", "cast": [names], "header": "Participants: ...\\nSetting: ..."}``.
+
+The subcommands ``pools``, ``combine``, ``headers`` and ``report`` build seeds from model-written pools instead
+(characters, themes, needs, relationships, settings, inciting moments, stakes, register, names), crossed into
+combinations and rendered as scene headers by the model: ``kotodama.posttrain.seedpools``.
 """
 
 from __future__ import annotations
@@ -95,10 +100,16 @@ async def generate(complete: Any, n: int, examples: list[str], shuffle_seed: int
 
 
 def main(argv: list[str] | None = None) -> int:
+    from kotodama.posttrain import seedpools
     from kotodama.posttrain.selfplay import oai_completer
     from kotodama.serve.laws import law
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [seeds] %(message)s", datefmt="%H:%M:%S")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] and argv[0] in seedpools.COMMANDS:
+        return seedpools.COMMANDS[argv[0]](argv[1:])
+    if argv[:1] == ["catalogue"]:
+        argv = argv[1:]
     ap = argparse.ArgumentParser(description="self-generated self-play seeds")
     ap.add_argument("--endpoint", action="append", required=True)
     ap.add_argument("--n", type=int, required=True)
