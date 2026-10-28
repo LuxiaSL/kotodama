@@ -379,3 +379,17 @@ def test_untrain_repeats_and_format() -> None:
     cast_ok = _path(["Hello there, friend.", "Fine.\nB: and you?", "Tell me."], tree="t2")
     d3 = loom.assemble([cast_ok], 100_000, 50_000, 1, 1, 0, loom.Clean(untrain_format=True))
     assert all(t["train"] for t in d3[0]["turns"])  # a cast name's label is cut_stray_label's job, not this rule's
+
+
+def test_run_pin_sends_one_user_per_tree(tmp_path) -> None:
+    users: dict[str, set] = {}
+
+    async def complete(prompt: str, n: int, stops: list[str], user=None):
+        users.setdefault(prompt.split("\n")[0], set()).add(user)
+        return [(f"line {prompt.count(chr(10))}-{i}" + stops[0], "stop", False) for i in range(n)]
+
+    seeds = [(i, SeedSpec(f"s{i}", ["Mara", "Teo"], f"header {i}", [])) for i in range(3)]
+    cfg = loom.LoomConfig(candidates=2, children=1, width=1, max_depth=3, min_turns=2)
+    asyncio.run(loom.run(seeds, complete, cfg, SelfPlayConfig(min_turns=2), tmp_path, concurrency=3, seed=0,
+                         pin="probe0"))
+    assert users == {f"header {i}": {f"probe0/tree-{i:05d}"} for i in range(3)}

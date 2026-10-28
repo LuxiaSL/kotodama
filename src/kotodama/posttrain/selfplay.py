@@ -220,16 +220,28 @@ def spoken_text(text: str, cast: Optional[list[str]] = None) -> str:
 
 
 def novelty(text: str, prior: list[Turn], window: int = 30, speech_only: bool = False,
-            cast: Optional[list[str]] = None) -> float:
+            cast: Optional[list[str]] = None, count: bool = False) -> float:
     """Share of the candidate's content words (3+ letters, not stopwords) that none of the last ``window`` turns
     used; 0 for a turn without content words. ``speech_only``: narration paragraphs earn nothing (prose is word-rich,
-    so counting it rewards narration over speech)."""
+    so counting it rewards narration over speech). ``count``: the number of such new words instead of their share
+    (new state per turn, which a share hides: a one-word turn with one new word scores 1.0 as a share)."""
     words = {w for w in speech_key(spoken_text(text, cast) if speech_only else text).split()
              if len(w) >= 3 and w not in _STOP}
     if not words:
         return 0.0
     seen = {w for t in prior[-window:] for w in speech_key(t.text).split()}
-    return len(words - seen) / len(words)
+    return float(len(words - seen)) if count else len(words - seen) / len(words)
+
+
+def own_opening_repeat(text: str, speaker: str, prior: list[Turn], back: int = 3) -> bool:
+    """The turn's opening (first two spoken words) equals one of ``speaker``'s own last ``back`` openings: a
+    per-speaker template ("Well, I ..." turn after turn) that the cross-speaker pair check (``is_template``) does not
+    see. Turns under 4 spoken words are left to the repeat and cycle checks (False)."""
+    key = speech_key(text)
+    if len(key.split()) < 4:
+        return False
+    own = [_opening(speech_key(t.text)) for t in prior if t.speaker == speaker][-back:]
+    return _opening(key) in own
 
 
 def next_speaker(cast: list[str], turns: list[Turn]) -> str:

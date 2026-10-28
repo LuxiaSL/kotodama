@@ -286,3 +286,17 @@ def test_novelty_speech_only_ignores_narration() -> None:
     assert sp.novelty(prose, prior) > 0.5  # the narration paragraph brings many new words
     assert sp.novelty(prose, prior, speech_only=True, cast=["A", "B"]) == 0.0  # the spoken part brings none
     assert sp.spoken_text("Hello.\n\nAnd another thing, you never asked me.", ["A", "B"]).count("\n\n") == 1
+
+
+def test_novelty_count_and_own_opening_repeat() -> None:
+    from kotodama.posttrain.transcript import Turn
+
+    prior = [Turn("A", "The harbour was cold that night.")]
+    assert sp.novelty("The lighthouse keeper never came back.", prior, count=True) == 5.0  # lighthouse keeper never came back
+    assert sp.novelty("Cold harbour.", prior, count=True) == 0.0
+    turns = [Turn("A", "Well, I think the boat is late."), Turn("B", "It always is on Sundays."),
+             Turn("A", "Maybe the tide turned early."), Turn("B", "Or the captain overslept again.")]
+    assert sp.own_opening_repeat("Well, I suppose we wait here then.", "A", turns)  # A's own earlier opening
+    assert not sp.own_opening_repeat("Well, I suppose we wait here then.", "B", turns)  # B never opened so
+    assert not sp.own_opening_repeat("Well, I suppose we wait here then.", "A", turns, back=1)  # only "maybe the"
+    assert not sp.own_opening_repeat("Well, I.", "A", turns)  # under 4 spoken words

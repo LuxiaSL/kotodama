@@ -331,9 +331,10 @@ def prune_unfinished(run_dir: Path) -> int:
 
 async def run(seeds: list[tuple[int, SeedSpec]], complete: Complete, cfg: LoomConfig, sp: SelfPlayConfig,
               out_dir: Path, concurrency: int, seed: int, score: Optional[Score] = None,
-              routes: int = 0) -> dict[str, Any]:
+              routes: int = 0, pin: str = "") -> dict[str, Any]:
     """Grow one tree per (index, seed) pair, named by the zero-padded index. ``routes`` > 0: ``complete`` takes ``route=`` and each tree
-    is pinned to the least-loaded of that many endpoints."""
+    is pinned to the least-loaded of that many endpoints. ``pin``: every request of tree i carries the OpenAI ``user``
+    field ``<pin>/tree-<i>`` (``complete`` takes ``user=``), so a gateway keeps the tree on one replica."""
     out_dir.mkdir(parents=True, exist_ok=True)
     files = {k: (out_dir / f"{k}s.jsonl").open("a", encoding="utf-8") for k in ("node", "path", "tree")}
     states = (out_dir / "states.jsonl").open("a", encoding="utf-8")
@@ -348,6 +349,8 @@ async def run(seeds: list[tuple[int, SeedSpec]], complete: Complete, cfg: LoomCo
         async with sem:
             route = min(range(routes), key=load.__getitem__) if routes else None
             tree_complete = complete if route is None else functools.partial(complete, route=route)
+            if pin:
+                tree_complete = functools.partial(tree_complete, user=f"{pin}/tree-{i:05d}")
             if route is not None:
                 load[route] += 1
             try:
@@ -635,6 +638,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--steer", default="")
     ap.add_argument("--steer_rule", choices=["K", "N", "S"], default="K")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--pin", default="",
+                    help="every request of tree i carries the OpenAI user field PIN/tree-<i> (gateway affinity: one "
+                         "tree, one replica and its prefix cache)")
     ap.add_argument("--skip_done", action="append", default=[],
                     help="another run directory whose finished seeds are skipped (repeatable)")
     a = ap.parse_args(argv)
@@ -669,14 +675,15 @@ def main(argv: list[str] | None = None) -> int:
     async def go() -> dict[str, Any]:
         try:
             return await run(todo, complete, cfg, sp, out, a.concurrency, a.seed, score,
-                             routes=len(a.endpoint) if len(a.endpoint) > 1 else 0)
+                             routes=len(a.endpoint) if len(a.endpoint) > 1 else 0, pin=a.pin)
         finally:
             await close()
             if close_score is not None:
                 await close_score()
 
     summary = asyncio.run(go())
-    (out / "run.json").write_text(json.dumps({"config": asdict(cfg), "sampling": sampling, "steer": parse_steer(a.steer),
+    (out / "run.json").write_text(json.dumps({"config": asdict(cfg), "sp": asdict(sp), "law": a.law, "sampling": sampling,
+                                              "pin": a.pin, "steer": parse_steer(a.steer),
                                               "steer_rule": a.steer_rule, "seed": a.seed, "seeds": a.seeds,
                                               "endpoints": a.endpoint, **summary}, indent=1))
     logger.info("done: %s", summary)
