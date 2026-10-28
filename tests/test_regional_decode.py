@@ -326,3 +326,37 @@ def test_regional_engine_refuses_what_does_not_apply(model: KotodamaModel) -> No
         eng.compile_step(regional=True, backend="aot_eager", cuda_graph=True)
     with pytest.raises(ValueError, match="regional step only"):
         eng.compile_step(backend="aot_eager")
+
+
+@torch.inference_mode()
+def test_a_served_build_compiles_a_bounded_number_of_graphs() -> None:
+    """The startup guard on CPU: an engine and two cascade buckets built and warmed the way the server warms them
+    (block buckets, the sampled and truncated steps, then each bucket's sampled and truncated variants) compile one
+    graph per layer signature per region set, plus a tail per set and one graph per sampler. A change that multiplies
+    the graphs a server compiles (the cause of hour-long cold starts) changes this count."""
+    deep = _model(DEEP)
+    eng = _engine(deep)
+    eng.block_buckets = BUCKETS
+    counter = CompileCounterWithBackend("aot_eager")
+    eng.compile_step(regional=True, backend=counter)
+    n_sigs = eng.regional_variants
+    sampled = SamplingParams(temperature=0.8, repetition_penalty=1.2)
+    trunc = SamplingParams(temperature=0.8, repetition_penalty=1.2, top_p=0.9, min_p=0.05)
+    eng.warm_blocks()
+    for law in (sampled, trunc):
+        eng.sample_first(eng.prefill(_ids(12, 1)), law)
+        for _ in range(3):
+            eng.step(eng.cur_token, law)
+    widths = (4, 2)
+    decs = []
+    for rows in widths:
+        dec = CascadeDecoder(eng, rows, tail_tokens=32, seeded=True, kv_from=decs[0] if decs else None)
+        dec.compile_step(regional=True, backend=counter)
+        for law in (sampled, trunc):
+            dec.start(eng.prefill(_ids(12, 2)), law)
+            for _ in range(3):
+                dec.step(law)
+        decs.append(dec)
+    engine_graphs = len(BUCKETS) * (n_sigs + 1) + (n_sigs + 1) + 2  # block sets + step set, each with a tail; 2 samplers
+    decoder_graphs = len(widths) * (n_sigs + 1 + 2)  # each width: its regions, its tail, 2 samplers
+    assert counter.frame_count == engine_graphs + decoder_graphs

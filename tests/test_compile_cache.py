@@ -64,8 +64,7 @@ def test_compile_first_starts_the_rest_after_the_first_is_ready(monkeypatch, tmp
 
     cfg = gateway.load_config(str(Path(__file__).resolve().parents[1] / "configs" / "gateway-tsumugi.example.yaml"),
                               [0, 1, 2])
-    cfg.workdir, cfg.spawn_stagger_s = str(tmp_path), 0.0
-    assert cfg.compile_first
+    cfg.workdir, cfg.spawn_stagger_s, cfg.compile_first = str(tmp_path), 0.0, True
     fleet = gateway.Fleet(cfg)
     events = []
     monkeypatch.setattr(fleet, "spawn", lambda r: events.append(("spawn", r.gpu)))
@@ -86,8 +85,13 @@ def test_compile_first_starts_the_rest_after_the_first_is_ready(monkeypatch, tmp
 def test_compile_first_without_a_store_is_reported(monkeypatch, tmp_path: Path) -> None:
     from kotodama.serve import gateway
 
+    import yaml
+
     monkeypatch.delenv("KOTODAMA_COMPILE_STORE", raising=False)
-    example = Path(__file__).resolve().parents[1] / "configs" / "gateway-tsumugi.example.yaml"
+    raw = yaml.safe_load((Path(__file__).resolve().parents[1] / "configs" / "gateway-tsumugi.example.yaml").read_text())
+    example = tmp_path / "configs" / "gateway.yaml"
+    example.parent.mkdir()
+    example.write_text(yaml.safe_dump({**raw, "compile_first": True}))
     cfg = gateway.load_config(str(example), [0, 1])
     spec = cfg.models[0]
     assert not gateway.compile_store_set(cfg, spec)
@@ -111,3 +115,39 @@ def test_the_key_moves_with_regional(monkeypatch, tmp_path: Path) -> None:
     (src / "a.py").write_text("x = 1\n")
     assert (compile_cache.cache_key(_fields(monkeypatch, src, regional=True))
             != compile_cache.cache_key(_fields(monkeypatch, src, regional=False)))
+
+
+def test_servers_starting_together_share_one_compile(monkeypatch, tmp_path: Path) -> None:
+    """The first acquire of a missing key claims it; a second one waits while the claim is fresh and loads the blob
+    once the claimant saves; a claim whose heartbeat stopped is taken over; a stored key is a hit with no claim."""
+    import threading
+
+    import torch
+
+    monkeypatch.setattr(torch.compiler, "save_cache_artifacts", lambda: (b"blob", "info"))
+    monkeypatch.setattr(torch.compiler, "load_cache_artifacts", lambda b: None)
+    hit, claim = compile_cache.acquire(tmp_path, "k", poll_s=0.01)
+    assert not hit and claim is not None and (tmp_path / "k.lock").is_file()
+
+    got = {}
+    waiter = threading.Thread(target=lambda: got.update(r=compile_cache.acquire(tmp_path, "k", poll_s=0.01)))
+    waiter.start()
+    waiter.join(0.3)
+    assert waiter.is_alive()  # waiting on the fresh claim
+    compile_cache.save(tmp_path, "k", {"f": 1})
+    claim.release()
+    waiter.join(5)
+    assert got["r"] == (True, None) and not (tmp_path / "k.lock").exists()
+
+    hit, dead = compile_cache.acquire(tmp_path, "k2", poll_s=0.01, beat_s=3600)
+    assert not hit and dead is not None
+    old = (tmp_path / "k2.lock").stat().st_mtime - 1000
+    import os
+    os.utime(tmp_path / "k2.lock", (old, old))  # its server died: no heartbeat since
+    hit, claim2 = compile_cache.acquire(tmp_path, "k2", poll_s=0.01, stale_s=300)
+    assert not hit and claim2 is not None
+    claim2.release()
+    dead._stop.set()
+
+    hit, none = compile_cache.acquire(tmp_path, "k", poll_s=0.01)
+    assert hit and none is None

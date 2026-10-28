@@ -77,6 +77,7 @@ try:
     from kotodama.model.decode_engine import DecodeEngine, SamplingParams as EngineSamplingParams
     from kotodama.model.multi_decode import CascadeDecoder, MultiSampleDecoder, decode_rows
     from kotodama.model.prefix_cache import PrefixKVCache
+    from kotodama.model.regional import check_norms as regional_check_norms
     from kotodama.serve.xbatch import XBatchJob, XBatchRunner, XBatchScheduler
     _ENGINE_AVAILABLE = True
 except Exception as _engine_exc:
@@ -228,6 +229,10 @@ _seeded_rows: bool = False
 _compile_mode: str = "max-autotune"
 _warm_truncated: bool = True
 _regional: bool = False
+# Startup: when this process started, how long it took to be ready (and against what budget), for /info.
+_PROCESS_T0 = time.time()
+_startup_info: dict | None = None
+_compile_store_state = "off"
 # Server-wide default repetition penalty (CLI --default_repetition_penalty):
 # used by /generate when the field is absent and by the OpenAI routes when
 # frequency_penalty is absent.
@@ -345,6 +350,7 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
 def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True, regional: bool = False) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
     global _row_token_cap, _cascade_info, _levers, _seeded_rows, _compile_mode, _warm_truncated, _regional
+    global _compile_store_state
     _compile_mode, _warm_truncated, _regional = compile_mode, bool(warm_truncated), bool(regional)
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
     _serve_mode = mode
@@ -438,6 +444,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         raise ValueError("--levers needs the fast engine (cuda + --engine fast + attn_res model)")
     store_key = store_fields = None
     store_hit = False
+    store_claim = None
     if use_engine and compile_store:
         # The compiled decode graphs depend on the model code, the runtime and these flags, not on the weights:
         # a stored blob for the same key turns the compiles below into cache hits.
@@ -452,7 +459,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             "compile_mode": compile_mode, "warm_truncated": bool(warm_truncated), "regional": bool(regional),
         })
         store_key = compile_cache.cache_key(store_fields)
-        store_hit = compile_cache.load(compile_store, store_key)
+        store_hit, store_claim = compile_cache.acquire(compile_store, store_key)
+        _compile_store_state = "hit" if store_hit else "miss"
     if use_engine:
         logger.info("Building fast decode engine (compile may take minutes on cold inductor cache)...")
         t0 = time.time()
@@ -467,6 +475,13 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             # --levers: per-request lever tables replace the broadcast rows (banks resolve into levers).
             eng = DecodeEngine(model, max_seq_len=_max_seq_len, steer_enabled=steer_npz is not None and not levers,
                                levers=levers)
+            global _regional
+            if _regional:
+                try:
+                    regional_check_norms(model, eng.eps)
+                except ValueError as exc:  # the decoders follow the engine's choice
+                    logger.warning("--regional: %s; compiling the whole-step graphs instead", exc)
+                    _regional = False
             eng.compile_step(mode=_compile_mode, regional=_regional)
             # Compile every block-forward bucket (incl. overlap plans) now:
             # an unwarmed bucket would pay its compile on a live request.
@@ -586,6 +601,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
                     "hit" if store_hit else ("miss" if store_key else "off"), compile_cache.cache_counters())
         if store_key and not store_hit:
             compile_cache.save(compile_store, store_key, store_fields)
+        if store_claim is not None:
+            store_claim.release()
     elif _device.type == "cuda" and warmup_sdpa:
         # Reference path only: prime cuDNN plan cache so per-shape ~300ms
         # stalls don't land on live requests. ~100s; opt-in for debug use.
@@ -711,6 +728,7 @@ class ModelInfo(BaseModel):
     xbatch: dict | None = None
     prefix_pool: dict | None = None
     cascade: dict | None = None
+    startup: dict | None = None
 
 
 # ── /logprobs: batched prefill-only scoring (the four-register rider battery) ──
@@ -1480,7 +1498,22 @@ _seeded_rows_arg = False
 _compile_store_arg: str | None = None
 _compile_mode_arg = "max-autotune"
 _warm_truncated_arg = True
-_regional_arg = False
+_regional_arg = True
+_startup_budget_s_arg = 1800.0
+
+
+def _record_startup() -> None:
+    """Seconds from process start to ready, against --startup_budget_s (a start over budget is logged loudly)."""
+    global _startup_info
+    seconds = time.time() - _PROCESS_T0
+    _startup_info = {"seconds": round(seconds, 1), "budget_s": _startup_budget_s_arg, "regional": _regional,
+                     "compile_mode": _compile_mode, "compile_store": _compile_store_state}
+    if _startup_budget_s_arg and seconds > _startup_budget_s_arg:
+        logger.warning("STARTUP OVER BUDGET: ready after %.0fs, budget %.0fs (%s). A start this slow usually means "
+                       "the compiled graphs multiplied: see the compile log above, or start with --regional",
+                       seconds, _startup_budget_s_arg, _startup_info)
+    else:
+        logger.info("startup: ready after %.0fs (budget %.0fs; %s)", seconds, _startup_budget_s_arg, _startup_info)
 
 
 @asynccontextmanager
@@ -1507,6 +1540,7 @@ async def lifespan(app: FastAPI):
         warm_truncated=_warm_truncated_arg,
         regional=_regional_arg,
     )
+    _record_startup()
     try:
         yield
     finally:
@@ -1588,6 +1622,7 @@ async def info():
                                                        "cached_blocks": len(_prefix_pool.index),
                                                        "stats": dict(_prefix_pool.stats)},
         cascade=_cascade_info,
+        startup=_startup_info,
     )
 
 
@@ -2180,11 +2215,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warm_truncated", action=argparse.BooleanOptionalAction, default=True,
                         help="Warmup compiles the truncated (top-p / min-p) step variants; --no-warm_truncated leaves "
                              "each to its first request, which then waits for that compile")
-    parser.add_argument("--regional", action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument("--regional", action=argparse.BooleanOptionalAction, default=True,
                         help="Regional compile (kotodama.model.regional): the engine and the row decoders compile one "
                              "graph per layer signature instead of one graph of the whole depth per variant and "
                              "width, and capture each step whole as one CUDA graph; a fraction of the compile time at "
-                             "the same or better step time")
+                             "the same or better step time. --no-regional compiles the whole-step graphs (a model "
+                             "whose norms the regions cannot run falls back to them, logged)")
+    parser.add_argument("--startup_budget_s", type=float, default=1800.0,
+                        help="Seconds from process start to ready this server should take; a start over it is logged "
+                             "as a warning and reported in /info (startup). 0 = no budget")
     parser.add_argument("--seeded_rows", action=argparse.BooleanOptionalAction, default=False,
                         help="Row decoders draw each candidate's noise from its own seed and step: a request's 'seed' "
                              "then reproduces its candidates whatever shares their batch (up to kernel rounding of "
@@ -2290,6 +2329,7 @@ if __name__ == "__main__":
     _compile_mode_arg = args.compile_mode
     _warm_truncated_arg = args.warm_truncated
     _regional_arg = args.regional
+    _startup_budget_s_arg = args.startup_budget_s
 
     import uvicorn
 

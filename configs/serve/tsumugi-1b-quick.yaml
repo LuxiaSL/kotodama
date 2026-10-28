@@ -4,7 +4,8 @@
 # pool, per-request steering levers, seeded candidates, top-p / min-p), sized to start in minutes and to fit a
 # 24 GB card: two row buckets, 512-token batched completions (longer ones are served one at a time), no kernel
 # benchmarking at compile time, and the top-p / min-p step compiled by the first request that uses it.
-# A fleet that serves sustained load runs tsumugi-1b instead (a longer one-time compile, more throughput).
+# A fleet that serves sustained load runs tsumugi-1b instead (wider buckets and kernel benchmarking: a longer
+# one-time compile, more throughput).
 
 extends: tsumugi-1b.yaml
 xbatch_rows: [8, 32]

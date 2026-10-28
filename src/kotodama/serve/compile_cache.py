@@ -14,6 +14,10 @@ cold and stores a new blob; nothing is reused across a change that could alter t
 
 Layout: ``<store>/<key>.bin`` (the artifacts) and ``<store>/<key>.json`` (what went into the key, its size, when
 it was made), written atomically.
+
+Servers that start together share one compile: ``acquire`` loads a stored key, and on a miss the first server takes
+``<store>/<key>.lock`` (kept fresh by a heartbeat while it compiles, released once it has saved) while the others wait
+for the blob and load it. A lock whose heartbeat stopped (its server died) is stale and is taken over.
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ import hashlib
 import json
 import logging
 import os
+import socket
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -102,6 +108,81 @@ def load(store: str | os.PathLike[str], key: str) -> bool:
     logger.info("compile store: loaded key %s (%.0f MB) in %.1fs%s", key, path.stat().st_size / 1e6,
                 time.perf_counter() - t0, f": {info}" if info is not None else "")
     return True
+
+
+class StoreClaim:
+    """This process's claim on compiling a key: the lock file exists and its mtime is refreshed every ``beat_s``
+    seconds until ``release``."""
+
+    def __init__(self, path: Path, beat_s: float) -> None:
+        self.path = path
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._beat, args=(beat_s,), name="compile-store-claim", daemon=True)
+        self._thread.start()
+
+    def _beat(self, beat_s: float) -> None:
+        while not self._stop.wait(beat_s):
+            try:
+                os.utime(self.path)
+            except OSError:
+                return
+
+    def release(self) -> None:
+        self._stop.set()
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+def acquire(store: str | os.PathLike[str], key: str, *, stale_s: float = 300.0, beat_s: float = 30.0,
+            poll_s: float = 10.0, wait_s: float = 4 * 3600.0) -> tuple[bool, Optional[StoreClaim]]:
+    """Load ``key`` from the store, or claim its compile. Returns (loaded, claim): (True, None) on a hit; (False,
+    claim) when this process compiles the key (``release`` the claim after ``save``); (False, None) when it compiles
+    without a claim (the store is unwritable, or another server's live claim outlasted ``wait_s``). While another
+    server holds a fresh claim (its lock touched within ``stale_s``), this one waits for its blob."""
+    root = Path(store)
+    blob, lock = root / f"{key}.bin", root / f"{key}.lock"
+    t0, last_log = time.monotonic(), 0.0
+    while True:
+        if blob.is_file():
+            if load(store, key):
+                return True, None
+            # a blob that does not load: compile cold and replace it (claimed, so the others wait for the new one)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except FileNotFoundError:
+                continue  # released between the two calls: look again
+            if age > stale_s:
+                logger.warning("compile store: claim on key %s is stale (%.0fs since its heartbeat); taking it over",
+                               key, age)
+                try:
+                    lock.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            waited = time.monotonic() - t0
+            if waited > wait_s:
+                logger.warning("compile store: waited %.0fs for key %s; compiling it here too", waited, key)
+                return False, None
+            if waited - last_log >= 60.0 or last_log == 0.0:
+                logger.info("compile store: another server is compiling key %s (claim %s); waiting for it (%.0fs)",
+                            key, lock.read_text(errors="replace").strip() if lock.exists() else "?", waited)
+                last_log = waited or 1e-9
+            time.sleep(poll_s)
+            continue
+        except OSError as exc:
+            logger.warning("compile store: cannot claim key %s under %s (%r); compiling without a claim", key, root,
+                           exc)
+            return False, None
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{socket.gethostname()} pid {os.getpid()} since {time.strftime('%H:%M:%S')}\n")
+        logger.info("compile store: no artifacts for key %s; this server compiles it (claimed)", key)
+        return False, StoreClaim(lock, beat_s)
 
 
 def save(store: str | os.PathLike[str], key: str, fields: dict[str, Any]) -> Optional[Path]:

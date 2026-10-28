@@ -15,7 +15,11 @@ way the server compiles it today (``compile_step(mode)``). Reports:
     regional forward (and the whole-step forward) against the eager forward;
   * ``rng``: unseeded sampling through the captured graphs: distinct continuations among repeats of one prompt on the
     engine, and among the rows of an unseeded regional cascade decoder (rows of one prompt) and across two of its
-    starts. A captured graph that replayed one fixed noise draw would give 1 distinct continuation.
+    starts. A captured graph that replayed one fixed noise draw would give 1 distinct continuation;
+  * ``rows`` (``--sections rows``): each row decoder class (per-row KV and cascade) compiled regionally and captured,
+    through every path a client takes (admit, the sampled / greedy / truncated steps, ``force`` and ``score``),
+    against the same decoder uneager: per-step KL and top-1 of the forced continuation, the largest score
+    difference, and whether the greedy rows agree.
 
 Usage (node, GPU):
   tools/run_py.sh scripts/benchmark/check_regional_engine.py --checkpoint <model.pt> --model_size 1b-tsumugi \\
@@ -151,6 +155,63 @@ def rng_check(a, eng: DecodeEngine, ids: torch.Tensor) -> dict:
     return out
 
 
+@torch.inference_mode()
+def rows_check(a, eng: DecodeEngine, ids: torch.Tensor, forced: torch.Tensor) -> dict:
+    from kotodama.model.multi_decode import MultiSampleDecoder
+
+    out = {}
+    laws = [SamplingParams(temperature=a.temperature, repetition_penalty=a.repetition_penalty),
+            SamplingParams(temperature=a.temperature, repetition_penalty=a.repetition_penalty, top_p=0.9, min_p=0.05),
+            SamplingParams(temperature=0.0, repetition_penalty=a.repetition_penalty)]
+    rows = 8
+    for name, make in (("per_row", lambda: MultiSampleDecoder(eng, rows, seeded=True)),
+                       ("cascade", lambda: CascadeDecoder(eng, rows, groups=2, group_rows=4, tail_tokens=256,
+                                                          seeded=True))):
+        ref, reg = make(), make()
+        t0 = time.perf_counter()
+        reg.compile_step(mode=a.mode, regional=True)
+        r = {}
+        for law in laws:  # every step variant, past its capture
+            reg.start(eng.prefill(ids), law)
+            for _ in range(6):
+                reg.step(law)
+        r["compile_and_warm_s"] = round(time.perf_counter() - t0, 1)
+        fz = forced.expand(rows, -1).contiguous()
+        sc = []
+        for dec in (ref, reg):
+            dec.start(eng.prefill(ids), laws[0])
+            sc.append(dec.score(fz).float().clone())
+        r["score_max_abs_diff"] = float((sc[0] - sc[1]).abs().max())
+        lps = []
+        for dec, fwd in ((ref, ref._forward_step), (reg, reg._regional_forward)):
+            dec.start(eng.prefill(ids), laws[0])
+            steps = []
+            for t in range(forced.shape[1]):
+                steps.append(F.log_softmax(fwd(fz[:, t:t + 1].clone()).float(), -1).clone())
+                dec._advance_host()
+            lps.append(steps)
+        kls, top1 = [], []
+        for x, y in zip(*lps):
+            kls.append(float((x.exp() * (x - y)).sum(-1).max()))
+            top1.append(float((x.argmax(-1) == y.argmax(-1)).float().mean()))
+        r["forward_kl_max"], r["forward_top1"] = max(kls), float(np.mean(top1))
+        seqs = []
+        for dec in (ref, reg):
+            dec.start(eng.prefill(ids), laws[2])
+            seqs.append([dec.step(laws[2]).view(-1).tolist() for _ in range(24)])
+        r["greedy_rows_agree_steps"] = next((i for i, (x, y) in enumerate(zip(*seqs)) if x != y), 24)
+        firsts = []
+        for dec in (ref, reg):  # the prompt fed through the decode step, then a greedy continuation
+            dec.admit_empty()
+            firsts.append(dec.force(ids, laws[2]))
+        r["force_first_tokens_agree"] = firsts[0] == firsts[1]
+        r["force_then_steps"] = len([reg.step(laws[0]) for _ in range(4)])
+        out[name] = r
+        del ref, reg
+        torch.cuda.empty_cache()
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
@@ -161,6 +222,8 @@ def main() -> int:
     ap.add_argument("--mode", default="max-autotune", help="the whole-step mode; the regions use its no-cudagraphs "
                                                            "form")
     ap.add_argument("--whole", action="store_true", help="also build and measure the whole-step engine")
+    ap.add_argument("--sections", default="engine", help="comma list: engine (the engine checks), rows (the row "
+                                                         "decoders over a regional engine)")
     ap.add_argument("--max_seq_len", type=int, default=4096)
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--cold", action="store_true", help="inductor caches off: cold compile seconds")
@@ -191,7 +254,16 @@ def main() -> int:
         slot = ref.levers.bind(plan)
     res: dict = {"checkpoint": a.checkpoint, "levers": a.levers, "mode": a.mode, "cold": a.cold,
                  "layers": cfg.num_layers}
-    for name, regional in (("regional", True), ("whole", False)) if a.whole else (("regional", True),):
+    sections = {x.strip() for x in a.sections.split(",") if x.strip()}
+    if "rows" in sections:
+        eng = DecodeEngine(model, max_seq_len=a.max_seq_len, levers=a.levers)
+        eng.compile_step(mode=a.mode, regional=True)
+        res["rows"] = rows_check(a, eng, ids, forced)
+        logger.info("rows: %s", json.dumps(res["rows"]))
+        del eng
+        torch.cuda.empty_cache()
+    for name, regional in ((("regional", True), ("whole", False)) if a.whole else (("regional", True),)) \
+            if "engine" in sections else ():
         eng = DecodeEngine(model, max_seq_len=a.max_seq_len, levers=a.levers)
         if plan is not None:
             assert eng.levers.bind(plan) == slot

@@ -213,6 +213,9 @@ class MultiSampleDecoder(nn.Module):
         self.v_caches = [getattr(self, f"v_cache_{li}") for li in range(self.n_layers)]
         self.register_buffer("attn_bias", torch.full((self.rows, 1, 1, self.max_seq_len), float("-inf"), device=dev,
                                                      dtype=dt), persistent=False)
+        # the value _open_step writes, on the device: a Python scalar would be a host tensor, which a captured step
+        # cannot copy from
+        self.register_buffer("_bias_open", torch.zeros((), device=dev, dtype=dt), persistent=False)
 
     def _kv_buffers(self) -> list[torch.Tensor]:
         """The KV storage the compiled step writes in place (static addresses for the CUDA graph)."""
@@ -262,7 +265,7 @@ class MultiSampleDecoder(nn.Module):
 
     def _open_step(self) -> None:
         """Each row opens its own position in the mask before attending."""
-        self.attn_bias[self.row_ids, 0, 0, self.pos] = 0.0
+        self.attn_bias[self.row_ids, 0, 0, self.pos] = self._bias_open
 
     def _advance_step(self) -> None:
         # Live rows never reach the last slot (callers budget each row); an idle row parks there.

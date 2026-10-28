@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from kotodama.serve import gateway  # noqa: E402
+from kotodama.serve import gateway, server  # noqa: E402
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "configs" / "gateway.example.yaml"
 
@@ -58,7 +58,9 @@ def test_a_pool_can_be_a_serve_profile() -> None:
     assert spec.profile == "tsumugi-1b"
     assert (spec.served_model_name, spec.model_size, spec.mode) == ("kotodama-tsumugi-1b", "1b-tsumugi", "base")
     assert spec.checkpoint == "hf:LuxiaSL/kotodama-tsumugi-1b"
-    assert cfg.warmup_grace_s >= 7200 and cfg.affinity_max_inflight > 0
+    # the grace covers a replica's cold start: at least the server's startup budget
+    budget = server.build_arg_parser().parse_args(["--checkpoint", "x"]).startup_budget_s
+    assert cfg.warmup_grace_s >= budget and cfg.affinity_max_inflight > 0
 
 
 def test_one_pool_is_one_spec_and_a_spec_needs_its_fields(tmp_path) -> None:

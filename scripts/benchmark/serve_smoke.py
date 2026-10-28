@@ -3,10 +3,12 @@
 on, then a concurrent burst for aggregate throughput.
 
 Checks (each reported pass/fail, with the measured values):
-  * ``/info`` answers and names what is served;
+  * ``/info`` answers and names what is served, and the server started within ``--startup_budget_s`` (its own
+    measure: process start to ready);
   * a seeded fan (``n`` candidates, ``seed``) reproduces exactly when repeated, and a different seed differs;
   * a prompt sent as token ids returns the same completion as the same prompt sent as text (greedy);
-  * a batched min-p law that keeps only the top token reproduces greedy, and a top-p fan is served batched;
+  * a batched min-p law that keeps only the top token reproduces greedy (its candidates part only where the top two
+    tie), and a top-p fan is served batched;
   * ``/score_tokens`` scores a completion;
   * a raw ``injection`` (steering) changes a greedy completion, and the unsteered request after it is unchanged;
   * an over-long prompt is a 4xx, not a 5xx;
@@ -41,6 +43,8 @@ def main() -> int:
     ap.add_argument("--hidden", type=int, default=1536, help="hidden size, for the steering injection")
     ap.add_argument("--site", type=int, default=46, help="effective layer of the steering injection")
     ap.add_argument("--dose", type=float, default=800.0, help="norm of the steering injection's random row")
+    ap.add_argument("--startup_budget_s", type=float, default=1800.0,
+                    help="the server's start (process start to ready, from /info) must be at most this")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     url = a.endpoint.rstrip("/")
@@ -56,6 +60,11 @@ def main() -> int:
     with httpx.Client(timeout=600) as http:
         info = http.get(f"{url}/info").json()
         check("info", bool(info.get("name")), name=info.get("name"))
+        # a start slower than the budget fails here even when everything else works: compile time that grows is a
+        # regression like any other (a server through the gateway reports its own start)
+        startup = info.get("startup") or {}
+        check("startup_budget", startup.get("seconds") is not None and startup["seconds"] <= a.startup_budget_s,
+              **startup, smoke_budget_s=a.startup_budget_s)
 
         def complete(**kw) -> dict:
             body = {"prompt": PROMPT, "max_tokens": 32, "temperature": 0.75, "top_p": 0, "frequency_penalty": 0.2,

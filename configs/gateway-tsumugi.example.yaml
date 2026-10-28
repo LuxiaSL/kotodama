@@ -26,10 +26,11 @@ completion_pool: base
 affinity_max_inflight: 32
 max_inflight_global: 256
 request_timeout_s: 1800.0
-# One replica per pool compiles first and stores its artifacts (set KOTODAMA_COMPILE_STORE for the replicas); the
-# rest start once it is ready and load them.
-compile_first: true
-# A cold replica (a new code version, no compile store) compiles every batch bucket before it serves, which can take
-# well over an hour: health checks count only after this long.
-warmup_grace_s: 7200.0
+# Replicas start together. With a compile store (KOTODAMA_COMPILE_STORE) they share one compile: on a new key the
+# first replica claims it and compiles while the others wait for its artifacts, and on a stored key every replica
+# loads at once. (compile_first: true starts the rest only after the first is ready, which a store makes moot.)
+compile_first: false
+# A cold replica (a new code version, nothing stored) compiles every batch bucket before it serves (about 25 minutes
+# on a B200 with the regional compile): health checks count only after this long.
+warmup_grace_s: 3600.0
 stuck_ceiling_s: 1800.0
