@@ -1,3 +1,8 @@
+<p align="center"><b>言霊 紬</b><br><sub>kotodama · tsumugi</sub></p>
+
+> **言霊 kotodama** — word-spirit: language as a thing with a life of its own.
+> **紬 tsumugi** — spun thread: words woven into more than the sum of their parts.
+
 # Kotodama
 
 > Research, code and development: Luxia ([@LuxiaSL](https://github.com/LuxiaSL)) and
