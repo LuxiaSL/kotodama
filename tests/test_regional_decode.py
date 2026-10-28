@@ -192,3 +192,137 @@ def test_regional_options_are_refused_where_they_do_not_apply(model: KotodamaMod
         dec.compile_step(regional=True, backend="aot_eager", cuda_graph=True)
     with pytest.raises(ValueError, match="regional step only"):
         dec.compile_step(backend="aot_eager")
+
+
+# ── DecodeEngine.compile_step(regional=True) ─────────────────────────────────
+
+BUCKETS = (32, 8)  # block buckets that fit the test cache
+
+
+def _regional_engine(model: KotodamaModel, backend="aot_eager", **kw) -> DecodeEngine:
+    eng = _engine(model, **kw)
+    eng.block_buckets = BUCKETS
+    eng.compile_step(regional=True, backend=backend)
+    return eng
+
+
+def _bind_levers(eng: DecodeEngine) -> tuple[int, int]:
+    """A uniform lever (it writes the prompt too) and a decode-span one; returns their slots."""
+    uniform = eng.levers.bind(LeverPlan(attn={4: _vec(1, 0.8)}, mlp={8: _vec(4, 0.5)}, span="uniform"))
+    decode = eng.levers.bind(LeverPlan(mlp={7: _vec(2, 0.8)}, span="decode"))
+    return uniform, decode
+
+
+def _eager_step(eng: DecodeEngine, token: torch.Tensor, params: SamplingParams) -> torch.Tensor:
+    """What a compiled engine's step runs, uncompiled: the in-graph Gumbel-max samplers at temperature > 0 (an
+    uncompiled engine's own step samples with multinomial instead)."""
+    if params.temperature == 0.0:
+        return eng.step(token, params)
+    eng._sync_sampling_buffers(params)
+    out = (eng._step_sampled_truncated if params.truncated else eng._step_sampled)(token)
+    eng._pos_cpu += 1
+    return out
+
+
+def _same_engine_run(ref: DecodeEngine, reg: DecodeEngine, prompt: torch.Tensor, slot: int,
+                     laws: list[SamplingParams], cached: bool = False) -> None:
+    """Prefill ``prompt`` on both engines at lever ``slot`` (``cached``: through prefill_cached), then step each law
+    a few times from the same RNG state: the same tokens, and logits within the parity tolerance."""
+    for params in laws:
+        if cached:
+            (want, _), (got, info) = ref.prefill_cached(prompt, slot=slot), reg.prefill_cached(prompt, slot=slot)
+        else:
+            want, got = ref.prefill(prompt, slot=slot), reg.prefill(prompt, slot=slot)
+        torch.testing.assert_close(got, want, **TOL)
+        tok_ref = ref.sample_first(want, params).clone()
+        reg.cur_token.copy_(tok_ref)
+        tok_reg = reg.cur_token
+        for t in range(5):
+            torch.manual_seed(100 + t)
+            a = _eager_step(ref, tok_ref, params).clone()
+            torch.manual_seed(100 + t)
+            b = reg.step(tok_reg, params)
+            assert a.item() == b.item(), (params, t)
+            tok_ref = a
+
+
+@torch.inference_mode()
+def test_regional_engine_matches_the_eager_engine(model: KotodamaModel) -> None:
+    ref, reg = _engine(model), _regional_engine(model)
+    ref.block_buckets = BUCKETS
+    for eng in (ref, reg):
+        eng.set_steer([(2, torch.from_numpy(_vec(3)), 0.5)])
+        uniform, decode = _bind_levers(eng)
+    laws = [SamplingParams(temperature=0.8, repetition_penalty=1.2),
+            SamplingParams(temperature=0.9, repetition_penalty=1.1, top_k=20, top_p=0.8, min_p=0.05),
+            SamplingParams(temperature=0.0, repetition_penalty=1.0)]
+    # an exact bucket, a bucket plus an overlap chunk, and a two-bucket cover; each at no lever and both spans
+    for n in (8, 13, 41):
+        for slot in (0, uniform, decode):
+            _same_engine_run(ref, reg, _ids(n, n + slot), slot, laws)
+
+    # forced continuation: the regional forward's logits along the eager engine's
+    prompt, forced = _ids(13, 7), _ids(1, 8).repeat(1, 1)
+    ref.prefill(prompt, slot=decode), reg.prefill(prompt, slot=decode)
+    for t in range(6):
+        tok = _ids(1, 50 + t)
+        torch.testing.assert_close(reg.step_logits(tok).clone(), ref.step_logits(tok), **TOL)
+
+    # prefix-cached extends (the block regions extend a suffix; a 1-token suffix runs the step graph)
+    base = _ids(24, 9)
+    for eng in (ref, reg):
+        eng.reset()
+        eng.prefill(base)
+    for extra in (_ids(11, 10), _ids(1, 11)):
+        prompt = torch.cat([base, extra], dim=1)
+        _same_engine_run(ref, reg, prompt, 0, laws[:1], cached=True)
+        for eng in (ref, reg):
+            eng.reset()
+            eng.prefill(base)
+
+
+@torch.inference_mode()
+def test_regional_engine_compiles_one_graph_per_signature() -> None:
+    deep = _model(DEEP)
+    eng = _engine(deep)
+    eng.block_buckets = BUCKETS
+    counter = CompileCounterWithBackend("aot_eager")
+    eng.compile_step(regional=True, backend=counter)
+    n_sigs = len(set(layer_signatures(deep._attn_res_boundary_set, DEEP["num_layers"])))
+    assert eng.regional_variants == n_sigs == 9
+    params = SamplingParams(temperature=0.8, repetition_penalty=1.2)
+    logits = eng.prefill(_ids(8, 2))  # one 8-token block
+    assert counter.frame_count == n_sigs + 1  # that bucket's layer signatures and the block tail
+    tok = eng.sample_first(logits, params)
+    eng.step(tok, params)
+    assert counter.frame_count == 2 * n_sigs + 3  # + the step's signatures, the step tail and the sampler
+    eng.step(eng.cur_token, params)
+    eng.step(eng.cur_token, SamplingParams(temperature=0.7, repetition_penalty=1.2, top_p=0.9))
+    assert counter.frame_count == 2 * n_sigs + 4  # the truncated sampler only
+    eng.prefill(_ids(40, 3))  # 32 + 8: the 32-token bucket compiles its own regions, the tail recompiles for S=32
+    assert counter.frame_count == 3 * n_sigs + 5
+
+
+@pytest.mark.skipif(shutil.which("c++") is None and shutil.which("g++") is None,
+                    reason="inductor's CPU backend needs a C++ compiler")
+@torch.inference_mode()
+def test_inductor_regional_engine_matches_the_eager_engine(model: KotodamaModel) -> None:
+    ref, reg = _engine(model, levers=0, steer=False), _regional_engine(model, backend="inductor", levers=0,
+                                                                       steer=False)
+    ref.block_buckets = BUCKETS
+    # inductor draws its sampling noise from its own generator, so sampled tokens are not comparable: greedy tokens
+    # and forced logits are
+    _same_engine_run(ref, reg, _ids(13, 3), 0, [SamplingParams(temperature=0.0, repetition_penalty=1.0)])
+    ref.prefill(_ids(41, 4)), reg.prefill(_ids(41, 4))
+    for t in range(4):
+        tok = _ids(1, 60 + t)
+        torch.testing.assert_close(reg.step_logits(tok).clone(), ref.step_logits(tok), **TOL)
+
+
+@torch.inference_mode()
+def test_regional_engine_refuses_what_does_not_apply(model: KotodamaModel) -> None:
+    eng = _engine(model)
+    with pytest.raises(ValueError, match="CUDA engine"):
+        eng.compile_step(regional=True, backend="aot_eager", cuda_graph=True)
+    with pytest.raises(ValueError, match="regional step only"):
+        eng.compile_step(backend="aot_eager")

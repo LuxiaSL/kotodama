@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import math
-import types
 from typing import Callable, Iterable, Optional, Sequence
 
 import torch
@@ -31,7 +30,9 @@ import torch.nn.functional as F
 
 from kotodama.model.cascade_attn import attend_for, merge, pack_group_queries, unpack_group_outputs
 from kotodama.model.decode_engine import DecodeEngine, SamplingParams
-from kotodama.model.llama import RMSNorm, apply_rope
+from kotodama.model.llama import apply_rope
+from kotodama.model.regional import (REGION_MODES, StepGraph, build_regions, check_norms, layer_signatures,
+                                     run_regions)
 
 logger = logging.getLogger(__name__)
 
@@ -61,51 +62,12 @@ def candidate_seed(seed: int, candidate: int) -> int:
     return x & _U31
 
 
-# ── regional compile: one compiled graph per decode-layer signature ─────────
-#
-# The whole-step compile traces every effective layer into one graph, so its compile time grows with depth and every
-# bucket width compiles the whole depth again. A decode layer's code is the same at every depth; what differs between
-# layers is only static structure: how many committed AttnRes sources its routing reads, whether it opens a block,
-# and whether its MLP input is captured. The regional path compiles one graph per such signature, with every weight,
-# norm gain, routing query, KV buffer and lever row passed in as a tensor (no module attribute is read inside a
-# region, so nothing guards on which layer's module it is), and runs the depth loop in Python. Each decoder's
-# signatures get code objects of their own, so each code object holds one compiled graph and dynamo's per-code-object
-# recompile limit stays out of reach however many signatures and bucket widths a server builds.
-
-
-def layer_signatures(boundaries: Iterable[int], n_layers: int) -> list[tuple[int, bool]]:
-    """Each effective layer's static decode structure: (committed sources its attention routing reads, whether it is a
-    block boundary). Layer i reads the blocks committed before it, one per boundary below i."""
-    bset = {int(b) for b in boundaries}
-    out, committed = [], 0
-    for i in range(n_layers):
-        out.append((committed, i in bset))
-        committed += i in bset
-    return out
-
-
-def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """kotodama.model.llama.RMSNorm's forward, on its weight."""
-    norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    return x * norm * weight
-
-
-def _route(sources: list[torch.Tensor], query: torch.Tensor, norm_weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """DecodeEngine._route's arithmetic, with eps passed in."""
-    qw = query * norm_weight
-    stacked = torch.stack(sources, dim=0)
-    rsqrt = torch.rsqrt(stacked.pow(2).mean(-1) + eps)
-    logits = (stacked * qw).sum(-1) * rsqrt
-    weights = F.softmax(logits, dim=0)
-    return (weights.unsqueeze(-1) * stacked).sum(0)
-
-
 def _slot_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[torch.Tensor, ...],
-                 state: tuple[torch.Tensor, ...], pos: torch.Tensor, row_ids: torch.Tensor) -> torch.Tensor:
-    """MultiSampleDecoder._attend on passed tensors: kv = (k_cache, v_cache), state = (attn_bias,)."""
+                 state: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """MultiSampleDecoder._attend on passed tensors: kv = (k_cache, v_cache), state = (attn_bias, pos, row_ids)."""
     B = q.shape[0]
     k_cache, v_cache = kv
-    (attn_bias,) = state
+    attn_bias, pos, row_ids = state
     k_cache[row_ids, :, pos] = k[:, :, 0]
     v_cache[row_ids, :, pos] = v[:, :, 0]
     out = F.scaled_dot_product_attention(q, k_cache, v_cache, attn_mask=attn_bias, enable_gqa=True)
@@ -114,13 +76,13 @@ def _slot_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[to
 
 def _cascade_attend_with(attend_fn: Callable) -> Callable:
     """CascadeDecoder._attend on passed tensors, over the part kernel ``attend_fn``: kv = (tail_k, tail_v, prompt_k,
-    prompt_v), state = (tail_pos, members, row_slot, prompt_lens)."""
+    prompt_v), state = (tail_pos, members, row_slot, prompt_lens, row_ids)."""
 
     def cascade_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[torch.Tensor, ...],
-                       state: tuple[torch.Tensor, ...], pos: torch.Tensor, row_ids: torch.Tensor) -> torch.Tensor:
+                       state: tuple[torch.Tensor, ...]) -> torch.Tensor:
         B, H, _, D = q.shape
         tail_k, tail_v, prompt_k, prompt_v = kv
-        tail_pos, members, row_slot, prompt_lens = state
+        tail_pos, members, row_slot, prompt_lens, row_ids = state
         tail_k[row_ids, tail_pos] = k[:, :, 0]
         tail_v[row_ids, tail_pos] = v[:, :, 0]
         q_rows = q[:, :, 0]
@@ -132,102 +94,6 @@ def _cascade_attend_with(attend_fn: Callable) -> Callable:
         return merge(o1, l1, o2[:, 0], l2[:, :, 0]).reshape(B, 1, H * D)
 
     return cascade_attend
-
-
-def _make_decode_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_heads: int, n_kv_heads: int,
-                       head_dim: int, intermediate: int, qk_norm: bool, levers: bool, steer: bool,
-                       attend: Callable) -> Callable:
-    """One decode layer as a function of tensors, mirroring the loop body of MultiSampleDecoder._forward_step:
-    pre-attention routing over ``committed + [partial]``, the attention sublayer (KV write and attend through
-    ``attend``), the lever and broadcast-steering adds, pre-MLP routing, the MLP and its lever add. A boundary layer
-    commits ``partial`` (the caller appends it to its list after the call) and starts the new block from zero.
-
-    Returns the layer's output partial, and with ``capture`` also the MLP input (B, 1, D). The function gets a code
-    object of its own named ``name``, so its compiled graphs are cached apart from every other signature's."""
-    q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
-
-    def decode_layer(partial, committed, attn_q, attn_g, mlp_q, mlp_g, attn_norm_w, ffn_norm_w, q_norm_w, k_norm_w,
-                     w_qkv, w_o, w_gate_up, w_down, rope_cos, rope_sin, pos, row_ids, kv, state, lever_a, lever_m,
-                     steer_row):
-        h_attn = _route(committed + [partial], attn_q, attn_g, eps) if committed else partial
-        if is_boundary:
-            sources = committed + [partial]
-            base = torch.zeros_like(partial)
-        else:
-            sources = committed
-            base = partial
-        x = _rms(h_attn, attn_norm_w, eps)
-        B = x.shape[0]
-        qkv = F.linear(x, w_qkv)
-        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
-        q = q.view(B, 1, n_heads, head_dim).transpose(1, 2)
-        k = k.view(B, 1, n_kv_heads, head_dim).transpose(1, 2)
-        v = v.view(B, 1, n_kv_heads, head_dim).transpose(1, 2)
-        if qk_norm:
-            q = _rms(q, q_norm_w, eps)
-            k = _rms(k, k_norm_w, eps)
-        cos = rope_cos.index_select(0, pos).unsqueeze(1)
-        sin = rope_sin.index_select(0, pos).unsqueeze(1)
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
-        attn_out = F.linear(attend(q, k, v, kv, state, pos, row_ids), w_o)
-        if levers:
-            attn_out = attn_out + lever_a.unsqueeze(1)
-        new = base + attn_out
-        if steer:
-            new = new + steer_row
-        x_mlp = _rms(_route(sources + [new], mlp_q, mlp_g, eps), ffn_norm_w, eps)
-        gate, up = F.linear(x_mlp, w_gate_up).split(intermediate, dim=-1)
-        mlp_out = F.linear(F.silu(gate) * up, w_down)
-        if levers:
-            mlp_out = mlp_out + lever_m.unsqueeze(1)
-        out = new + mlp_out
-        if capture:
-            return out, x_mlp
-        return out
-
-    code = decode_layer.__code__.replace(co_name=name, co_qualname=name)
-    return types.FunctionType(code, decode_layer.__globals__, name, None, decode_layer.__closure__)
-
-
-# The region mode for each whole-step mode: the same autotuning, without CUDA graphs (the whole step is captured as
-# one graph around the regions instead).
-_REGION_MODES = {"reduce-overhead": "default", "max-autotune": "max-autotune-no-cudagraphs"}
-
-
-class _StepGraph:
-    """A whole decode step replayed as one CUDA graph. The first ``warmup`` calls run the step eagerly on a side
-    stream (each is a real step: it compiles the regions and settles their workspaces), the next call captures the
-    step and replays it once, and every later call replays it. Every tensor the step reads or writes lives at a fixed
-    address (the decoder's and engine's buffers), so a replay is the step on whatever those buffers hold now; the
-    step's result is one of those buffers. ``tokens`` must be the buffer the graph was captured on."""
-
-    def __init__(self, fn: Callable[[torch.Tensor], torch.Tensor], tokens: torch.Tensor, pool, warmup: int = 2) -> None:
-        self.fn, self.tokens, self.pool, self.warmup = fn, tokens, pool, int(warmup)
-        self.calls = 0
-        self.graph: Optional[torch.cuda.CUDAGraph] = None
-        self.out: Optional[torch.Tensor] = None
-
-    def __call__(self, tokens: torch.Tensor) -> torch.Tensor:
-        if tokens.data_ptr() != self.tokens.data_ptr():
-            raise ValueError("a captured decode step reads its own token buffer; pass the decoder's cur_tokens")
-        if self.graph is not None:
-            self.graph.replay()
-            return self.out
-        if self.calls < self.warmup:
-            self.calls += 1
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                out = self.fn(tokens)
-            torch.cuda.current_stream().wait_stream(side)
-            return out
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.pool):
-            out = self.fn(tokens)
-        self.graph, self.out = graph, out
-        graph.replay()
-        return out
 
 
 class MultiSampleDecoder(nn.Module):
@@ -528,21 +394,7 @@ class MultiSampleDecoder(nn.Module):
 
     def _regional_attend(self) -> tuple[Callable, list[tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]]:
         """The attention a regional layer runs: (attend function, each layer's KV buffers, the per-step state)."""
-        return _slot_attend, list(zip(self.k_caches, self.v_caches)), (self.attn_bias,)
-
-    def _check_regional(self) -> None:
-        """The regions read every norm as kotodama RMSNorm's arithmetic on its weight; any other norm class (Liger's
-        kernels) would compute something else, so it is refused."""
-        model = self.engine.model
-        norms = [model.norm, model.final_res_norm]
-        for layer in model.layers:
-            norms += [layer.attn_norm, layer.ffn_norm, layer.attn_res_norm, layer.mlp_res_norm]
-            if layer.attn.qk_norm:
-                norms += [layer.attn.q_norm, layer.attn.k_norm]
-        bad = {type(n).__name__ for n in norms if type(n) is not RMSNorm or n.eps != self.engine.eps}
-        if bad:
-            raise ValueError(f"regional decode needs kotodama RMSNorm norms at eps {self.engine.eps}; the model has "
-                             f"{sorted(bad)} (build it with use_liger=False)")
+        return _slot_attend, list(zip(self.k_caches, self.v_caches)), (self.attn_bias, self.pos, self.row_ids)
 
     def regional_signatures(self) -> list[tuple[int, bool, bool]]:
         """Each effective layer's regional signature: (committed sources, block boundary, MLP input captured)."""
@@ -552,28 +404,10 @@ class MultiSampleDecoder(nn.Module):
     def _build_regions(self, **opts) -> None:
         """One compiled decode layer per distinct signature, and each layer's tensors in the order the layer takes."""
         eng = self.engine
-        model = eng.model
         attend, kvs, self._regional_state = self._regional_attend()
-        static = dict(eps=eng.eps, n_heads=eng.n_heads, n_kv_heads=eng.n_kv_heads, head_dim=eng.head_dim,
-                      intermediate=eng.config.intermediate_size, qk_norm=bool(eng.config.qk_norm),
-                      levers=eng.levers is not None, steer=bool(eng.steer_enabled), attend=attend)
-        fns: dict[tuple[int, bool, bool], Callable] = {}
-        self._regional_layers = []
-        for li, sig in enumerate(self.regional_signatures()):
-            c, boundary, capture = sig
-            if sig not in fns:
-                name = f"decode_layer_c{c}{'_boundary' if boundary else ''}{'_capture' if capture else ''}"
-                fns[sig] = torch.compile(_make_decode_layer(name, is_boundary=boundary, capture=capture, **static),
-                                         **opts)
-            layer = model.layers[li]
-            attn = layer.attn
-            tensors = (layer.attn_res_query, layer.attn_res_norm.weight, layer.mlp_res_query,
-                       layer.mlp_res_norm.weight, layer.attn_norm.weight, layer.ffn_norm.weight,
-                       attn.q_norm.weight if attn.qk_norm else None, attn.k_norm.weight if attn.qk_norm else None,
-                       eng.w_qkvs[li], attn.o_proj.weight, eng.w_gate_ups[li], layer.ffn.down_proj.weight)
-            col = self.capture_layers.index(li) if capture else -1
-            self._regional_layers.append((fns[sig], boundary, col, tensors, kvs[li]))
-        self.regional_variants = len(fns)
+        self._regional_layers, self.regional_variants = build_regions(
+            eng, self.regional_signatures(), kvs, "decode_layer", attend=attend, steer=bool(eng.steer_enabled),
+            capture_col=self.capture_layers.index, **opts)
 
     def _final_logits(self, committed: list[torch.Tensor], partial: torch.Tensor) -> torch.Tensor:
         """The step's tail after the last layer: final routing, norm and LM head, then every row's position advances.
@@ -595,19 +429,11 @@ class MultiSampleDecoder(nn.Module):
         if eng.levers is not None:
             lever_attn = eng.lever_attn.index_select(1, self.row_slots)
             lever_mlp = eng.lever_mlp.index_select(1, self.row_slots)
-        committed: list[torch.Tensor] = []
-        partial = embed
-        for li, (fn, boundary, col, tensors, kv) in enumerate(self._regional_layers):
-            out = fn(partial, committed, *tensors, eng.rope_cos_t, eng.rope_sin_t, self.pos, self.row_ids, kv,
-                     self._regional_state, lever_attn[li] if lever_attn is not None else None,
-                     lever_mlp[li] if lever_mlp is not None else None,
-                     eng.steer_buf[li] if eng.steer_enabled else None)
-            if col >= 0:
-                out, x_mlp = out
-                self.mlp_in[:, col] = x_mlp[:, 0]
-            if boundary:
-                committed.append(partial)
-            partial = out
+        cos = eng.rope_cos_t.index_select(0, self.pos).unsqueeze(1)  # (B, 1, head_dim): each row's own angle
+        sin = eng.rope_sin_t.index_select(0, self.pos).unsqueeze(1)
+        committed, partial = run_regions(self._regional_layers, embed, cos, sin, self._regional_state, lever_attn,
+                                         lever_mlp, eng.steer_buf if eng.steer_enabled else None, self.mlp_in
+                                         if self.capture_layers else None)
         return self._regional_final(committed, partial)
 
     def _sample_plain(self, logits: torch.Tensor) -> torch.Tensor:
@@ -625,14 +451,14 @@ class MultiSampleDecoder(nn.Module):
         return self.score_lp
 
     def _compile_regional(self, mode: str, backend, cuda_graph: Optional[bool]) -> None:
-        self._check_regional()
+        check_norms(self.engine.model, self.engine.eps)
         on_cuda = self.engine.device.type == "cuda"
         cuda_graph = on_cuda if cuda_graph is None else bool(cuda_graph)
         if cuda_graph and not on_cuda:
             raise ValueError("whole-step CUDA graph capture needs a CUDA engine")
         opts = dict(fullgraph=True, dynamic=False, backend=backend)
         if backend == "inductor":
-            opts["mode"] = _REGION_MODES.get(mode, mode)
+            opts["mode"] = REGION_MODES.get(mode, mode)
         self._build_regions(**opts)
         self._regional_final = torch.compile(self._final_logits, **opts)
         pool = torch.cuda.graph_pool_handle() if cuda_graph else None
@@ -643,7 +469,7 @@ class MultiSampleDecoder(nn.Module):
             def run(tokens: torch.Tensor) -> torch.Tensor:
                 return compiled(self._regional_forward(tokens))
 
-            return _StepGraph(run, self.cur_tokens, pool) if cuda_graph else run
+            return StepGraph(run, self.cur_tokens, pool) if cuda_graph else run
 
         self._compiled_step = step_with(self._sample_plain)
         self._compiled_greedy = step_with(self._sample_greedy)
@@ -1102,7 +928,7 @@ class CascadeDecoder(MultiSampleDecoder):
     def _regional_attend(self) -> tuple[Callable, list[tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]]:
         return (_cascade_attend_with(self._attend_fn), list(zip(self.tail_ks, self.tail_vs, self.prompt_ks,
                                                                  self.prompt_vs)),
-                (self.tail_pos, self.members, self.row_slot, self.prompt_lens))
+                (self.tail_pos, self.members, self.row_slot, self.prompt_lens, self.row_ids))
 
     # Every bucket compiles its own static graph: the symbolic-row-count graph a later bucket otherwise gets is slower
     # (the 1B's 8-row step: 13.5 ms symbolic, 9.7 ms static).

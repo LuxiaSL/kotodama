@@ -37,7 +37,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -47,6 +47,8 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from kotodama.model.gemv_kernels import decode_gemv, use_custom_gemv
 from kotodama.model.levers import LeverTables
 from kotodama.model.llama import KotodamaModel, apply_rope
+from kotodama.model.regional import (REGION_MODES, StepGraph, build_regions, cache_attend, check_norms, layer_signatures,
+                                     run_regions)
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +132,17 @@ def _graph_input(tokens: torch.Tensor) -> torch.Tensor:
     graph memory then grows with every new prompt length. A contiguous-format clone has one layout per shape.
     """
     return tokens.clone(memory_format=torch.contiguous_format)
+
+
+def decode_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """F.linear or the custom decode GEMV, decided per weight shape.
+
+    The branch resolves at trace time (decode shapes are static), so the
+    compiled graph bakes in one path per call site with zero replay cost.
+    """
+    if use_custom_gemv(w):
+        return decode_gemv(x, w)
+    return F.linear(x, w)
 
 
 class DecodeEngine(nn.Module):
@@ -393,14 +406,7 @@ class DecodeEngine(nn.Module):
     # ── Linear dispatch: custom Triton GEMV for tuned shapes ────────────────
 
     def _linear(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        """F.linear or the custom decode GEMV, decided per weight shape.
-
-        The branch resolves at trace time (decode shapes are static), so the
-        compiled graph bakes in one path per call site with zero replay cost.
-        """
-        if use_custom_gemv(w):
-            return decode_gemv(x, w)
-        return F.linear(x, w)
+        return decode_linear(x, w)
 
     # ── Routing (functional; matches llama._route_static math exactly) ──────
 
@@ -508,20 +514,7 @@ class DecodeEngine(nn.Module):
         prefill sets to a uniform lever's slot and to 0 otherwise.
         """
         model = self.model
-        S = tokens.shape[1]
-
-        positions = self.pos + torch.arange(S, device=tokens.device)  # (S,)
-        key_idx = torch.arange(self.max_seq_len, device=tokens.device)
-        bias = torch.where(
-            key_idx.view(1, 1, 1, -1) <= positions.view(1, 1, S, 1),
-            torch.zeros((), device=tokens.device, dtype=self.dtype),
-            torch.full((), float("-inf"), device=tokens.device, dtype=self.dtype),
-        )
-        cos = self.rope_cos_t.index_select(0, positions)  # (S, head_dim)
-        sin = self.rope_sin_t.index_select(0, positions)
-
-        self.token_history.index_copy_(0, positions, tokens.view(S))
-
+        positions, bias, cos, sin = self._block_inputs(tokens)
         embed = model.embed_tokens(tokens)  # (1, S, D)
         committed: list[torch.Tensor] = []
         if self.levers is not None:
@@ -562,6 +555,28 @@ class DecodeEngine(nn.Module):
                 mlp_out = mlp_out + lever_mlp[ls.layer_idx]
             partial = partial + mlp_out
 
+        return self._block_tail(committed, partial)
+
+    def _block_inputs(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """A block's positions (S,), causal-offset attention bias (1, 1, S, max_seq_len) and rope rows (S, head_dim);
+        records the block's tokens in token_history."""
+        S = tokens.shape[1]
+        positions = self.pos + torch.arange(S, device=tokens.device)  # (S,)
+        key_idx = torch.arange(self.max_seq_len, device=tokens.device)
+        bias = torch.where(
+            key_idx.view(1, 1, 1, -1) <= positions.view(1, 1, S, 1),
+            torch.zeros((), device=tokens.device, dtype=self.dtype),
+            torch.full((), float("-inf"), device=tokens.device, dtype=self.dtype),
+        )
+        cos = self.rope_cos_t.index_select(0, positions)  # (S, head_dim)
+        sin = self.rope_sin_t.index_select(0, positions)
+        self.token_history.index_copy_(0, positions, tokens.view(S))
+        return positions, bias, cos, sin
+
+    def _block_tail(self, committed: list[torch.Tensor], partial: torch.Tensor) -> torch.Tensor:
+        """A block's last-position logits (1, 1, V); advances pos by the block's length."""
+        model = self.model
+        S = partial.shape[1]
         # Routing is per-position independent — only the last position's
         # logits are consumed, so slice before the final route + lm_head.
         last = [c[:, -1:] for c in committed] + [partial[:, -1:]]
@@ -633,6 +648,11 @@ class DecodeEngine(nn.Module):
                 mlp_out = mlp_out + lever_mlp[ls.layer_idx]
             partial = partial + mlp_out
 
+        return self._step_tail(committed, partial)
+
+    def _step_tail(self, committed: list[torch.Tensor], partial: torch.Tensor) -> torch.Tensor:
+        """The step's final routing, norm and LM head: logits (1, 1, V); advances pos by one."""
+        model = self.model
         x = self._route(committed + [partial], model.final_res_query, model.final_res_norm.weight)
         x = model.norm(x)
         logits = self._linear(x, model.get_lm_head_weight())  # (1, 1, V)
@@ -651,7 +671,11 @@ class DecodeEngine(nn.Module):
         rep_penalty == 1.0 passes through unchanged (identity by algebra),
         so no Python branch is needed.
         """
-        logits = self._forward_step(token)[0, -1].float()  # (V,)
+        return self._sample_plain(self._forward_step(token))
+
+    def _sample_plain(self, logits: torch.Tensor) -> torch.Tensor:
+        """_step_sampled's sampler on the step's logits (1, 1, V)."""
+        logits = logits[0, -1].float()  # (V,)
 
         rp = self.rep_penalty
         penalized = torch.where(logits > 0, logits / rp, logits * rp)
@@ -678,7 +702,11 @@ class DecodeEngine(nn.Module):
         Costs one full-vocab sort (~121 us measured on B200 @49152) over the
         pure-temperature step, which keeps its own unchanged graph.
         """
-        logits = self._forward_step(token)[0, -1].float()  # (V,)
+        return self._sample_truncated(self._forward_step(token))
+
+    def _sample_truncated(self, logits: torch.Tensor) -> torch.Tensor:
+        """_step_sampled_truncated's sampler on the step's logits (1, 1, V)."""
+        logits = logits[0, -1].float()  # (V,)
 
         rp = self.rep_penalty
         penalized = torch.where(logits > 0, logits / rp, logits * rp)
@@ -1292,8 +1320,22 @@ class DecodeEngine(nn.Module):
         self._pos_cpu += 1
         return out
 
-    def compile_step(self, mode: str = "reduce-overhead") -> None:
-        """torch.compile the decode-step variants and the block forward."""
+    def compile_step(self, mode: str = "reduce-overhead", regional: bool = False, backend="inductor",
+                     cuda_graph: Optional[bool] = None) -> None:
+        """torch.compile the decode-step variants and the block forward.
+
+        Default: each is one graph of the whole depth under ``mode`` (CUDA graphs come from the mode).
+        ``regional`` (kotodama.model.regional): each layer runs as the compiled graph of its signature, one graph per
+        distinct signature shared by the forward, sampled and truncated steps, and one set per block bucket; the
+        tails and samplers are graphs of their own, all without CUDA graphs (``mode`` maps to its no-cudagraphs
+        form). With ``cuda_graph`` (default: on a CUDA engine) each step variant and each block bucket is captured
+        whole as one CUDA graph on its third call and replayed after. ``backend`` (regional only): the torch.compile
+        backend of the regions."""
+        if regional:
+            self._compile_regional(mode, backend, cuda_graph)
+            return
+        if backend != "inductor" or cuda_graph is not None:
+            raise ValueError("backend and cuda_graph apply to the regional step only (regional=True)")
         logger.info("Compiling decode step (mode=%s)...", mode)
         import torch._dynamo
 
@@ -1304,6 +1346,85 @@ class DecodeEngine(nn.Module):
         self._compiled_step_sampled = torch.compile(self._step_sampled, mode=mode, fullgraph=True)
         self._compiled_step_truncated = torch.compile(self._step_sampled_truncated, mode=mode, fullgraph=True)
         self._compiled_block = torch.compile(self._forward_block, mode=mode, fullgraph=True)
+
+    # ── The regional step and block forward (compile_step(regional=True)) ──
+
+    def _regional_levers(self) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.levers is None:
+            return None, None
+        return self.lever_attn.index_select(1, self.lever_slot), self.lever_mlp.index_select(1, self.lever_slot)
+
+    def _regional_step_forward(self, token: torch.Tensor) -> torch.Tensor:
+        """``_forward_step`` with each layer run as its signature's compiled region: token (1, 1) -> logits
+        (1, 1, V)."""
+        self.attn_bias.index_fill_(3, self.pos, 0.0)
+        self.token_history.index_copy_(0, self.pos, token.view(1))
+        embed = self.model.embed_tokens(token)
+        lever_attn, lever_mlp = self._regional_levers()
+        cos = self.rope_cos_t.index_select(0, self.pos)
+        sin = self.rope_sin_t.index_select(0, self.pos)
+        committed, partial = run_regions(self._step_regions, embed, cos, sin, (self.attn_bias, self.pos), lever_attn,
+                                         lever_mlp, self.steer_buf if self.steer_enabled else None, None)
+        return self._regional_step_tail(committed, partial)
+
+    def _regional_block_forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """``_forward_block`` over the regions of the bucket ``tokens.shape[1]``: last-position logits (1, 1, V)."""
+        positions, bias, cos, sin = self._block_inputs(tokens)
+        embed = self.model.embed_tokens(tokens)
+        lever_attn, lever_mlp = self._regional_levers()
+        committed, partial = run_regions(self._block_regions[tokens.shape[1]], embed, cos, sin, (bias, positions),
+                                         lever_attn, lever_mlp, None, None)
+        return self._regional_block_tail(committed, partial)
+
+    def _regional_block(self, tokens: torch.Tensor) -> torch.Tensor:
+        S = tokens.shape[1]
+        if S not in self._block_runs:
+            raise ValueError(f"no regional block forward for {S} tokens (buckets {self.block_buckets})")
+        return self._block_runs[S](tokens)
+
+    def _compile_regional(self, mode: str, backend, cuda_graph: Optional[bool]) -> None:
+        check_norms(self.model, self.eps)
+        on_cuda = self.device.type == "cuda"
+        cuda_graph = on_cuda if cuda_graph is None else bool(cuda_graph)
+        if cuda_graph and not on_cuda:
+            raise ValueError("whole-step CUDA graph capture needs a CUDA engine")
+        opts = dict(fullgraph=True, dynamic=False, backend=backend)
+        if backend == "inductor":
+            opts["mode"] = REGION_MODES.get(mode, mode)
+        kvs = list(zip(self.k_caches, self.v_caches))
+        sigs = [(c, b, False) for c, b in layer_signatures(self._boundaries, self.n_layers)]
+        build = dict(attend=cache_attend, linear=decode_linear, **opts)
+        self._step_regions, self.regional_variants = build_regions(
+            self, sigs, kvs, "engine_step_layer", steer=self.steer_enabled, **build)
+        self._regional_step_tail = torch.compile(self._step_tail, **opts)
+        self._regional_block_tail = torch.compile(self._block_tail, **opts)
+        pool = torch.cuda.graph_pool_handle() if cuda_graph else None
+
+        def step_with(head: Optional[Callable[[torch.Tensor], torch.Tensor]]) -> Callable[[torch.Tensor], torch.Tensor]:
+            compiled = torch.compile(head, **opts) if head is not None else None
+
+            def run(token: torch.Tensor) -> torch.Tensor:
+                logits = self._regional_step_forward(token)
+                return compiled(logits) if compiled is not None else logits
+
+            return StepGraph(run, self.cur_token, pool) if cuda_graph else run
+
+        self._compiled_forward = step_with(None)
+        self._compiled_step_sampled = step_with(self._sample_plain)
+        self._compiled_step_truncated = step_with(self._sample_truncated)
+        # Each block bucket: its own regions (a static S), and on CUDA its own captured graph reading its own input.
+        self._block_regions, self._block_runs = {}, {}
+        for b in self.block_buckets:
+            self._block_regions[b], _ = build_regions(self, sigs, kvs, f"engine_block{b}_layer", steer=False, **build)
+            if cuda_graph:
+                buf = torch.zeros((1, b), device=self.device, dtype=torch.long)
+                self._block_runs[b] = StepGraph(self._regional_block_forward, buf, pool)
+            else:
+                self._block_runs[b] = self._regional_block_forward
+        self._compiled_block = self._regional_block
+        logger.info("DecodeEngine: regional step and block forward, %d layer signatures over %d layers (blocks %s), "
+                    "regions %s, %s", self.regional_variants, self.n_layers, self.block_buckets,
+                    opts.get("mode", backend), "whole-forward CUDA graphs" if cuda_graph else "no CUDA graph")
 
     @torch.inference_mode()
     def warm_blocks(self) -> None:
