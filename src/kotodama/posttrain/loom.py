@@ -30,7 +30,9 @@ character budget (early dialogue rotates out, so branches run past the context a
 ~4K tokens in which no turn trains more than ``--max_uses`` times, so shared trunks are not overweighted. Each
 document trains a run of new turns and fills the rest of its budget with the conversation just before them
 (context, no loss), so a long path becomes consecutive documents that step forward through it. Only finished trees
-(those with a row in ``<out>/trees.jsonl``) contribute paths.
+(those with a row in ``<out>/trees.jsonl``) contribute paths. ``assemble --anthology`` instead keeps every ended
+branch as one whole scene, cleans it (loop, frame and closing cuts, tail cleaning, gates) and stacks scenes from
+different seeds into documents (``kotodama.posttrain.anthology``).
 
 Growing deeper: ``python -m kotodama.posttrain.loom extend-seeds <runs> --out seeds.jsonl`` turns each finished
 tree's deepest leaves into seeds whose ``history`` is the conversation so far; a loom run over them continues those
@@ -621,6 +623,20 @@ def assemble_main(argv: list[str]) -> int:
     ap.add_argument("--blocklist", default="", help="drop documents with a turn whose hash is in this file "
                                                   "(python -m kotodama.posttrain.compliance scan)")
     ap.add_argument("--redact_pii", action="store_true", help="replace PII in documents with placeholders")
+    g = ap.add_argument_group("whole scenes (kotodama.posttrain.anthology)")
+    g.add_argument("--anthology", action="store_true",
+                   help="whole cleaned scenes, stacked from different seeds into documents of up to --max_chars")
+    g.add_argument("--frame_gate", action="store_true",
+                   help="a scene ends before its first out-of-frame or self-described turn")
+    g.add_argument("--cut_closings", type=float, default=0.0,
+                   help="> 0: cut a scene after a farewell episode where at least this share of the candidates "
+                        "ends the document, ending it with one of those candidates (reads <run>/nodes.jsonl)")
+    g.add_argument("--clean_tail", action="store_true",
+                   help="cut a final turn at its first paragraph that is no longer the scene")
+    g.add_argument("--max_template", type=float, default=1.0, help="drop a scene above this own-opening template share")
+    g.add_argument("--min_scene_turns", type=int, default=1, help="drop a scene left with fewer turns")
+    g.add_argument("--scenes_out", default="", help="also write each cleaned scene as its own transcript row")
+    g.add_argument("--records_out", default="", help="per-scene cleaning records (JSONL)")
     a = ap.parse_args(argv)
     paths = []
     for ri, r in enumerate(a.runs):  # tree ids restart in every run directory: namespace them by run
@@ -632,6 +648,8 @@ def assemble_main(argv: list[str]) -> int:
                     continue
                 p["tree"], p["leaf"] = f"{ri}:{p['tree']}", f"{ri}:{p['leaf']}"
                 paths.append(p)
+    if a.anthology:
+        return _assemble_anthology(a, paths)
     docs = assemble(paths, a.max_chars, a.train_chars or a.max_chars // 2, a.max_uses, a.min_new, a.seed,
                     Clean(a.truncate_loops, a.untrain_repeats, a.untrain_format, a.drop_minor_explicit,
                           compliance.load_blocklist(a.blocklist) if a.blocklist else frozenset(), a.redact_pii))
@@ -641,6 +659,30 @@ def assemble_main(argv: list[str]) -> int:
     n_turns = sum(len(d["turns"]) for d in docs)
     logger.info("%d paths -> %d documents, %d turns (%.1f per document)", len(paths), len(docs), n_turns,
                 n_turns / max(len(docs), 1))
+    return 0
+
+
+def _assemble_anthology(a: argparse.Namespace, paths: list[dict[str, Any]]) -> int:
+    from kotodama.posttrain import anthology as an
+
+    nodes = None
+    if a.cut_closings > 0:
+        nodes = an.NodeIndex()
+        for ri, r in enumerate(a.runs):
+            nodes.extend(Path(r) / "nodes.jsonl", prefix=f"{ri}:")
+    cfg = an.SceneConfig(truncate_loops=a.truncate_loops, frame_gate=a.frame_gate, cut_closings=a.cut_closings,
+                         clean_tail=a.clean_tail, max_template=a.max_template, untrain_repeats=a.untrain_repeats,
+                         untrain_format=a.untrain_format, drop_minor_explicit=a.drop_minor_explicit,
+                         blocklist=compliance.load_blocklist(a.blocklist) if a.blocklist else frozenset(),
+                         redact_pii=a.redact_pii, min_scene_turns=a.min_scene_turns)
+    docs, scenes, recs = an.assemble_scenes(paths, nodes, cfg, a.max_chars, a.seed)
+    outs = [(a.out, docs)] + [(x, rows) for x, rows in ((a.scenes_out, scenes), (a.records_out, recs)) if x]
+    for path, rows in outs:
+        with open(path, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    logger.info("%d scenes kept -> %d documents (%.2f scenes per document)", len(scenes), len(docs),
+                len(scenes) / max(len(docs), 1))
     return 0
 
 
