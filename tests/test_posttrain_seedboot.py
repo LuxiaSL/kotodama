@@ -44,6 +44,8 @@ def fake(seed: int = 0):
                 text = f" forty, a {phrase(4)} keeper"
             elif prompt.endswith("\n") and " — " in prompt.rsplit("\n\n", 1)[1]:
                 text = f"{phrase(8).capitalize()}. Then {phrase(7)} happens at night. A comedy about {phrase(3)}."
+                if "\n" + sb.LISTING_TAIL in stops:  # a model that runs on into the cast tail; the server returns
+                    text += f"\n{sb.LISTING_TAIL}"     # the text through the stop, and the step cuts it there
             elif re.search(r"\d+\.$", prompt) or re.search(r"\d+\. \w+$", prompt):
                 text = f" {phrase(5)}\n{phrase(1)}. second {phrase(5)}"
                 if "Guest List" in prompt:

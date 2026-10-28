@@ -313,7 +313,8 @@ async def grow_boot(complete: sp.Complete, score: Optional[sp.Score], st: dict[s
     k = len(exemplars) + 1
     plan = [("listing", 0)] + [("character", i) for i in range(len(st["names"]))] + [("scene", 0)]
     for step, i in plan:
-        stops = ["\n\n", f"\n{k + 1}."] if step == "listing" else ["\n"]
+        # a listing is followed by its cast tail; a model that has seen listings writes straight into it
+        stops = ["\n\n", f"\n{k + 1}.", f"\n{LISTING_TAIL}"] if step == "listing" else ["\n"]
         value, reasons = None, []
         for _ in range(draws):
             for text, _f, hit in await complete(boot_prompt(frame, exemplars, st, step, i), n, stops,
@@ -321,7 +322,8 @@ async def grow_boot(complete: sp.Complete, score: Optional[sp.Score], st: dict[s
                 if hit:
                     reasons.append("overlong")
                     continue
-                value, why = check_step(step, text, st)
+                cut = min((i for i in (text.find(x) for x in stops) if i >= 0), default=len(text))
+                value, why = check_step(step, text[:cut], st)  # the server returns text through its stop
                 if value is not None:
                     break
                 reasons.append(why)
