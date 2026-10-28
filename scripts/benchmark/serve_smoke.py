@@ -6,6 +6,7 @@ Checks (each reported pass/fail, with the measured values):
   * ``/info`` answers and names what is served;
   * a seeded fan (``n`` candidates, ``seed``) reproduces exactly when repeated, and a different seed differs;
   * a prompt sent as token ids returns the same completion as the same prompt sent as text (greedy);
+  * a batched min-p law that keeps only the top token reproduces greedy, and a top-p fan is served batched;
   * ``/score_tokens`` scores a completion;
   * a raw ``injection`` (steering) changes a greedy completion, and the unsteered request after it is unchanged;
   * an over-long prompt is a 4xx, not a 5xx;
@@ -80,6 +81,12 @@ def main() -> int:
         g_ids = complete(temperature=0, prompt=prompt_ids)
         check("token_id_prompt", g_ids["status"] == 200 and ids_of(g_ids) == ids_of(g_text),
               prompt_tokens=len(prompt_ids))
+
+        trunc = complete(temperature=1.5, min_p=0.999, n=4)  # keeps only the top token: must be greedy
+        check("min_p_batched", trunc["status"] == 200 and all(x == ids_of(g_text)[0] for x in ids_of(trunc)),
+              status=trunc["status"])
+        tp = complete(temperature=1.0, top_p=0.9, n=8, seed=3)
+        check("top_p_batched", tp["status"] == 200 and len(ids_of(tp)) == 8, status=tp["status"])
 
         comp = ids_of(g_text)[0]
         r = http.post(f"{url}/score_tokens", json={"items": [{"id": "0", "prompt_ids": prompt_ids,

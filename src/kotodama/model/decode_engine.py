@@ -524,6 +524,10 @@ class DecodeEngine(nn.Module):
 
         embed = model.embed_tokens(tokens)  # (1, S, D)
         committed: list[torch.Tensor] = []
+        if self.levers is not None:
+            # every layer's lever rows in one gather per forward ([n_layers, 1, hidden]): each layer adds its slice
+            lever_attn = self.lever_attn.index_select(1, self.lever_slot)
+            lever_mlp = self.lever_mlp.index_select(1, self.lever_slot)
         partial = embed
 
         for ls in self.schedule:
@@ -544,7 +548,7 @@ class DecodeEngine(nn.Module):
                 ls.layer_idx, layer.attn_norm(h_attn), cos, sin, positions, bias
             )
             if self.levers is not None:
-                attn_out = attn_out + self.lever_attn[ls.layer_idx].index_select(0, self.lever_slot)
+                attn_out = attn_out + lever_attn[ls.layer_idx]
             partial = partial + attn_out
 
             h_mlp = self._route(committed + [partial], layer.mlp_res_query, layer.mlp_res_norm.weight)
@@ -555,7 +559,7 @@ class DecodeEngine(nn.Module):
             gate, up = gu.split(self.config.intermediate_size, dim=-1)
             mlp_out = self._linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
             if self.levers is not None:
-                mlp_out = mlp_out + self.lever_mlp[ls.layer_idx].index_select(0, self.lever_slot)
+                mlp_out = mlp_out + lever_mlp[ls.layer_idx]
             partial = partial + mlp_out
 
         # Routing is per-position independent — only the last position's
@@ -582,6 +586,10 @@ class DecodeEngine(nn.Module):
 
         embed = model.embed_tokens(token)  # (1, 1, D)
         committed: list[torch.Tensor] = []
+        if self.levers is not None:
+            # every layer's lever rows in one gather per forward ([n_layers, 1, hidden]): each layer adds its slice
+            lever_attn = self.lever_attn.index_select(1, self.lever_slot)
+            lever_mlp = self.lever_mlp.index_select(1, self.lever_slot)
         partial = embed
 
         for ls in self.schedule:
@@ -601,7 +609,7 @@ class DecodeEngine(nn.Module):
 
             attn_out = self._attn(ls.layer_idx, layer.attn_norm(h_attn))
             if self.levers is not None:
-                attn_out = attn_out + self.lever_attn[ls.layer_idx].index_select(0, self.lever_slot)
+                attn_out = attn_out + lever_attn[ls.layer_idx]
             partial = partial + attn_out
 
             # Block-persistent steering write (decode/generated tokens only).
@@ -622,7 +630,7 @@ class DecodeEngine(nn.Module):
             gate, up = gu.split(self.config.intermediate_size, dim=-1)
             mlp_out = self._linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
             if self.levers is not None:
-                mlp_out = mlp_out + self.lever_mlp[ls.layer_idx].index_select(0, self.lever_slot)
+                mlp_out = mlp_out + lever_mlp[ls.layer_idx]
             partial = partial + mlp_out
 
         x = self._route(committed + [partial], model.final_res_query, model.final_res_norm.weight)

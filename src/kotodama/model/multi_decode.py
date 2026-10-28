@@ -239,6 +239,10 @@ class MultiSampleDecoder(nn.Module):
         self._open_step()
         embed = model.embed_tokens(tokens)  # (B, 1, D)
         committed: list[torch.Tensor] = []
+        if eng.levers is not None:
+            # every layer's lever rows in one gather per step ([n_layers, B, hidden]): each layer adds its slice
+            lever_attn = eng.lever_attn.index_select(1, self.row_slots)
+            lever_mlp = eng.lever_mlp.index_select(1, self.row_slots)
         partial = embed
         for ls in eng.schedule:
             layer = model.layers[ls.layer_idx]
@@ -251,7 +255,7 @@ class MultiSampleDecoder(nn.Module):
                 partial = torch.zeros_like(embed)
             attn_out = self._attn(ls.layer_idx, layer.attn_norm(h_attn))
             if eng.levers is not None:
-                attn_out = attn_out + eng.lever_attn[ls.layer_idx].index_select(0, self.row_slots).unsqueeze(1)
+                attn_out = attn_out + lever_attn[ls.layer_idx].unsqueeze(1)
             partial = partial + attn_out
             if eng.steer_enabled:
                 partial = partial + eng.steer_buf[ls.layer_idx]
@@ -265,7 +269,7 @@ class MultiSampleDecoder(nn.Module):
             gate, up = gu.split(eng.config.intermediate_size, dim=-1)
             mlp_out = F.linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
             if eng.levers is not None:
-                mlp_out = mlp_out + eng.lever_mlp[ls.layer_idx].index_select(0, self.row_slots).unsqueeze(1)
+                mlp_out = mlp_out + lever_mlp[ls.layer_idx].unsqueeze(1)
             partial = partial + mlp_out
         x = eng._route(committed + [partial], model.final_res_query, model.final_res_norm.weight)
         x = model.norm(x)
