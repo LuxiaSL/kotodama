@@ -340,6 +340,74 @@ def test_novel_selection_prefers_turns_with_new_content() -> None:
     st, recs = grow(cfg, fake(script)[0])
     chosen = [r for r in recs["node"] if r["status"] == "child"]
     assert chosen and all(r["text"].startswith("The ") for r in chosen)
+    assert all("novelty" in r and "words" in r for r in chosen)  # the selector's inputs are recorded per candidate
+
+
+def test_length_residuals() -> None:
+    import math
+
+    lengths = [2, 5, 9, 20]
+    exact = [0.3 + 0.1 * math.log1p(n) for n in lengths]  # novelty fully explained by length
+    assert all(abs(r) < 1e-12 for r in loom.length_residuals(exact, lengths))
+    assert loom.length_residuals([1.0, 0.0], [4, 4]) == [0.5, -0.5]  # one length: centred on the mean
+    res = loom.length_residuals([0.9, 0.1, 0.9, 0.1], [3, 3, 12, 12])  # within each length the novel turn stays ahead
+    assert res[0] > res[1] and res[2] > res[3]
+
+
+def test_novelty_norm_length_stops_selection_tracking_length() -> None:
+    """Long candidates are all-new, short ones half-new: raw novelty picks the long ones every time, while the
+    length-normalised choice has nothing left to prefer and picks either."""
+
+    def script(prompt, i):
+        d = prompt.count("\n\n")
+        return f"w{d}a{i} w{d}b{i} w{d}c{i} w{d}d{i}." if i % 2 == 0 else f"w{d}e{i} tide."
+
+    def long_share(norm: str) -> float:
+        picks = []
+        for salt in "abc":
+            cfg = loom.LoomConfig(candidates=6, children=1, width=1, max_depth=16, min_turns=1, select="novel",
+                                  select_lambda=4.0, novelty_norm=norm)
+            _, recs = grow(cfg, fake(script)[0], salt=salt)
+            picks += [r["text"].count(" ") == 3 for r in recs["node"] if r["status"] == "child"]
+        return sum(picks) / len(picks)
+
+    assert long_share("none") > 0.9
+    assert 0.2 < long_share("length") < 0.8
+
+
+def test_rerolls_redraw_before_degrading() -> None:
+    draws: dict[str, int] = {}
+
+    async def complete(prompt: str, n: int, stops: list[str]):
+        d = prompt.count("\n\n")
+        draws[prompt] = draws.get(prompt, 0) + 1
+        if d == 2 and draws[prompt] == 1:  # the first draw after one generated turn: every candidate empty (vetoed)
+            return [("" + stops[0], "stop", False) for _ in range(n)]
+        return [(f"line {d}-{i} about the {['tide', 'map', 'rope'][i % 3]}" + stops[0], "stop", False)
+                for i in range(n)]
+
+    st0, _ = grow(loom.LoomConfig(candidates=3, children=1, width=1, max_depth=5, min_turns=1), complete)
+    assert st0["ended"]["degraded"] == 1 and st0["max_depth"] == 1
+    draws.clear()
+    st1, recs = grow(loom.LoomConfig(candidates=3, children=1, width=1, max_depth=5, min_turns=1, rerolls=2), complete)
+    assert st1["ended"] == {**st1["ended"], "degraded": 0, "depth": 1} and st1["rerolls"] == 1
+    sibs: dict[str, list] = {}
+    for r in recs["node"]:
+        sibs.setdefault(r["parent"], []).append(r)
+    assert sorted(len(v) for v in sibs.values()) == [3, 3, 3, 3, 6]  # the rerolled node keeps both draws' candidates
+    assert len({r["id"] for r in recs["node"]}) == len(recs["node"])
+
+
+def test_deep_children_branches_only_in_the_opening() -> None:
+    cfg = loom.LoomConfig(candidates=4, children=2, width=16, max_depth=6, min_turns=1, deep_after=2,
+                          deep_width=16, deep_children=1)
+    st, recs = grow(cfg, fake()[0])
+    assert st["ended"]["depth"] == 4 and st["ended"]["pruned"] == 0  # 2 at the root, 2 each at depth 1, then 1
+    kids: dict[str, int] = {}
+    for r in recs["node"]:
+        kids[r["parent"]] = kids.get(r["parent"], 0) + (r["status"] == "child")
+    depth_of = {r["id"]: r["depth"] for r in recs["node"]}
+    assert all(n == 1 for p, n in kids.items() if depth_of.get(p, 0) >= 2)
 
 
 def _path(texts, tree="t0", cast=("A", "B")):
