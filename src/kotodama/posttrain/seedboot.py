@@ -124,6 +124,18 @@ def parse_numbered(text: str, hit_cap: bool, lead: str = "") -> list[str]:
 # ── frames ───────────────────────────────────────────────────────────────────
 
 
+def trim_intro(text: str, hit_cap: bool) -> str:
+    """An intro as written; one cut by the token cap ends at its last paragraph break, else its last sentence end,
+    so a frame never stops mid-sentence."""
+    t = text.strip()
+    if not hit_cap:
+        return t
+    if "\n\n" in t:
+        return t[:t.rindex("\n\n")].strip()
+    ends = [m.end() for m in re.finditer(r"[.!?](?=\s|$)", t)]
+    return t[:ends[-1]].strip() if ends else ""
+
+
 async def write_frames(complete: sp.Complete, out: Path, titles: Sequence[str], per_title: int,
                        score: Optional[sp.Score]) -> list[dict[str, Any]]:
     """``per_title`` introductions per bare title line; writes ``<out>/frames.candidates.jsonl``."""
@@ -132,9 +144,11 @@ async def write_frames(complete: sp.Complete, out: Path, titles: Sequence[str], 
                                   for t in titles))
     for t, raw in zip(titles, outs):
         for k, (text, _f, hit) in enumerate(raw):
-            intro = text.strip()
-            ok = not hit and 80 <= len(intro) <= 1500 and not sp.mojibake(intro)
-            rows.append({"id": f"{t.lower()}-{k}", "title": t, "intro": intro, "mechanical_ok": ok})
+            intro = trim_intro(text, hit)
+            g = repetition_guards(intro)
+            ok = 80 <= len(intro) <= 1500 and not sp.mojibake(intro) and not g["loop8"] and g["rep4"] < 0.3
+            rows.append({"id": f"{t.lower()}-{k}", "title": t, "intro": intro, "mechanical_ok": ok,
+                         "truncated": hit})
     if score is not None:
         lps = await score([(sp.DOC_START, f"{r['title']}\n\n{r['intro']}") for r in rows])
         for r, lp in zip(rows, lps):

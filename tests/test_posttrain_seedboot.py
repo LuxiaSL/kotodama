@@ -74,6 +74,12 @@ def test_pieces() -> None:
     assert not sb.repetition_guards("a quiet room at dawn with nobody in it")["loop8"]
 
 
+def test_trim_intro() -> None:
+    assert sb.trim_intro("One para.\n\nTwo para cut mid", True) == "One para."
+    assert sb.trim_intro("First sentence. Second cut mid", True) == "First sentence."
+    assert sb.trim_intro("Whole thing, not capped", False) == "Whole thing, not capped"
+
+
 def test_frames_and_pick(tmp_path: Path) -> None:
     rows = asyncio.run(sb.write_frames(fake(), tmp_path, ["Catalogue", "Index"], 3, _score))
     assert len(rows) == 6 and all(r["mechanical_ok"] and "nll" in r for r in rows)
