@@ -181,29 +181,35 @@ def fluency_items(transcripts: list[dict[str, Any]], tokenizer: Any) -> list[dic
 
 
 def score_fluency(items: list[dict[str, Any]], endpoint: str, timeout: float = 600.0,
-                  transport: Any = None) -> dict[str, Any]:
-    """Token-weighted mean NLL (and per-turn quantiles) from the server's ``/score_tokens``. ``transport``: an
-    httpx transport (tests pass a mock)."""
+                  transport: Any = None, per_item: bool = False) -> dict[str, Any]:
+    """Token-weighted mean NLL (and per-turn quantiles) from the server's ``/score_tokens``. ``per_item``: also
+    ``{"items": {id: [sum_nll, n_tokens]}}``. ``transport``: an httpx transport (tests pass a mock)."""
     import httpx
 
     from kotodama.eval.riders.score import plan_batches
 
     lens = [len(it["prompt_ids"]) + len(it["completion_ids"]) for it in items]
     per_turn: list[float] = []
+    by_id: dict[str, list[float]] = {}
     tot_nll = tot_tok = 0.0
     with httpx.Client(timeout=timeout, transport=transport) as client:
         for batch in plan_batches(lens):
             r = client.post(endpoint.rstrip("/") + "/score_tokens", json={"items": [items[i] for i in batch]})
             r.raise_for_status()
             for res in r.json()["results"]:
+                if per_item:
+                    by_id[str(res["id"])] = [round(float(res["sum_nll"]), 4), int(res["n_tokens"])]
                 if res["n_tokens"]:
                     tot_nll += res["sum_nll"]
                     tot_tok += res["n_tokens"]
                     per_turn.append(res["mean_nll"])
     per_turn.sort()
     q = (lambda p: round(per_turn[min(len(per_turn) - 1, int(p * len(per_turn)))], 4)) if per_turn else (lambda p: None)
-    return {"turns": len(per_turn), "tokens": int(tot_tok), "mean_nll": round(tot_nll / max(tot_tok, 1), 4),
-            "turn_nll_p10_p50_p90": [q(.1), q(.5), q(.9)]}
+    out = {"turns": len(per_turn), "tokens": int(tot_tok), "mean_nll": round(tot_nll / max(tot_tok, 1), 4),
+           "turn_nll_p10_p50_p90": [q(.1), q(.5), q(.9)]}
+    if per_item:
+        out["items"] = by_id
+    return out
 
 
 def compare_rows(runs: list[str]) -> list[dict[str, Any]]:

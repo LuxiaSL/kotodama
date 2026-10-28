@@ -114,6 +114,7 @@ single-process job inside the launcher environment.
 | self-play seeds | `python -m kotodama.posttrain.seeds --endpoint <url> --n 2000 --out <seeds.jsonl>` (the model writes each cast and setting) |
 | self-play transcripts | `python -m kotodama.posttrain.selfplay --seeds <seeds.jsonl> --endpoint <url> --out <run>` (K candidates per turn, mechanical vetoes, uniform choice among survivors, every candidate banked) |
 | self-play → SFT data / health / coherence study | `python -m kotodama.posttrain.corpus {assemble,meters,precision-sample,rate,score} <run> ...` |
+| sampling-law bench (sampler dials and steering dials on fixed panels) | `python -m kotodama.posttrain.lawbench {stage-a,generate,fluency,damage-set,summary} ...` against a gateway fleet (cells share batches: per-row laws and levers; seeds shared across cells), then the damage readout `tools/run_py.sh scripts/eval/law_damage.py --cells <run>/cells.jsonl --set <run>/damage_set.jsonl ...` (each cell's NLL of a fixed continuation set under its whole law, teacher-forced) |
 
 Conversations are plain-text transcripts with no special tokens: an optional prose header, then `Name: text`
 turns separated by blank lines (`kotodama.posttrain.transcript`); `--train_speakers all` puts loss on every turn.
