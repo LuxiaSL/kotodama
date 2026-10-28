@@ -359,6 +359,13 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
+    # first: a tokenizer that cannot load fails the start in seconds, not after the engine has compiled
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if mode == "chat":
+        tokenizer.chat_template = CHATML_TEMPLATE
+    logger.info("Tokenizer loaded: %s (vocab %d, mode=%s)", TOKENIZER_NAME, len(tokenizer), mode)
     if device.startswith("cuda") and torch.cuda.is_available():
         _device = torch.device(device)
     else:
@@ -631,12 +638,6 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
         reserved = torch.cuda.memory_reserved(_device) / 1e9
         logger.info("Post-warmup memory: %.3f GB allocated, %.3f GB reserved", alloc, reserved)
 
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    if mode == "chat":
-        tokenizer.chat_template = CHATML_TEMPLATE
-    logger.info("Tokenizer loaded: %s (vocab %d, mode=%s)", TOKENIZER_NAME, len(tokenizer), mode)
 
     return model, tokenizer
 
