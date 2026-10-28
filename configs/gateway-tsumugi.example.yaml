@@ -1,0 +1,29 @@
+# Example only: a kotodama-tsumugi fleet behind one port. Choose GPUs and ports for the host; keep host-specific
+# copies out of the repository. Every replica runs the tsumugi-1b serve profile (configs/serve/tsumugi-1b.yaml).
+#   tools/run_gateway.sh --config configs/gateway-tsumugi.example.yaml
+name: tsumugi-fleet
+models:
+  - key: base
+    profile: tsumugi-1b
+
+gpus: [0, 1, 2, 3]
+replica_base_port: 2380
+gateway_host: 0.0.0.0
+gateway_port: 2379
+
+python: python
+workdir: .
+hf_home: .cache/huggingface
+log_dir: logs/gateway
+
+chat_pool: base
+completion_pool: base
+
+# A tsumugi replica batches many requests at once (cross-request batching up to 128 rows), so a conversation stays
+# on its replica (and its prefix cache) until that replica holds this many requests.
+affinity_max_inflight: 32
+max_inflight_global: 256
+request_timeout_s: 1800.0
+# A cold replica compiles every batch bucket before it serves: give it that long before health checks count.
+warmup_grace_s: 3600.0
+stuck_ceiling_s: 1800.0

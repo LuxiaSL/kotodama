@@ -60,10 +60,14 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 class ModelSpec(BaseModel):
     key: str                       # routing pool name, e.g. "base" / "instruct"
-    checkpoint: str
-    mode: str                      # "base" | "chat"
-    served_model_name: str
-    model_size: str = "3b"
+    # A serve profile (kotodama.serve.profiles: a name in configs/serve/ or a path): every replica of this pool runs
+    # server.py --profile <it>, and the fields below default to the profile's values. One pool is one spec, so all
+    # of a pool's replicas run one engine configuration (draws routed to different replicas stay comparable).
+    profile: Optional[str] = None
+    checkpoint: Optional[str] = None
+    mode: Optional[str] = None     # "base" | "chat"
+    served_model_name: Optional[str] = None
+    model_size: Optional[str] = None
     # Optional per-model GPU placement. When set, this model's replicas spawn
     # only on the intersection of this list with the fleet's effective GPUs;
     # when unset (default), the model spawns on EVERY effective GPU (every
@@ -79,6 +83,8 @@ class ModelSpec(BaseModel):
 
 
 class GatewayConfig(BaseModel):
+    # The fleet's name: /info reports it, so a client can check what it is talking to before sending traffic.
+    name: str = "kotodama-gateway"
     models: list[ModelSpec]
     gpus: list[int] = Field(default_factory=lambda: list(range(8)))
     replica_base_port: int = 2300
@@ -138,12 +144,38 @@ def load_config(path: Optional[str], gpus_override: Optional[list[int]]) -> Gate
         raise SystemExit("--config is required (no embedded default fleet)")
     if gpus_override is not None:
         cfg.gpus = gpus_override
+    seen: set[str] = set()
+    for spec in cfg.models:
+        if spec.key in seen:
+            raise SystemExit(f"pool '{spec.key}' is configured twice: one pool is one model spec (one profile)")
+        seen.add(spec.key)
+        _resolve_profile(spec)
     # Validate routing targets exist
     keys = cfg.pool_keys()
     for target in (cfg.chat_pool, cfg.completion_pool):
         if target not in keys:
             raise SystemExit(f"routing target '{target}' is not a configured model key {sorted(keys)}")
     return cfg
+
+
+_SPEC_FROM_PROFILE = ("checkpoint", "mode", "served_model_name", "model_size")
+
+
+def _resolve_profile(spec: ModelSpec) -> None:
+    """Fill a spec's unset fields from its profile; refuse a spec that still lacks one (every replica needs a
+    checkpoint, a mode, a model size and the served name /info is checked against)."""
+    if spec.profile is not None:
+        from kotodama.serve import profiles
+
+        flags, _env = profiles.load(spec.profile)
+        for field in _SPEC_FROM_PROFILE:
+            if getattr(spec, field) is None and flags.get(field) is not None:
+                setattr(spec, field, str(flags[field]))
+    if spec.model_size is None and spec.profile is None:
+        spec.model_size = "3b"
+    missing = [f for f in _SPEC_FROM_PROFILE if getattr(spec, f) is None]
+    if missing:
+        raise SystemExit(f"model '{spec.key}' sets no {missing} (directly or through a profile)")
 
 
 def effective_gpus(cfg: GatewayConfig) -> list[int]:
@@ -275,8 +307,10 @@ class Fleet:
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             **self.cfg.env_extra,
         })
-        cmd = [
-            self.cfg.python, "-m", self.cfg.serve_module,
+        cmd = [self.cfg.python, "-m", self.cfg.serve_module]
+        if r.spec.profile is not None:
+            cmd += ["--profile", r.spec.profile]
+        cmd += [
             "--checkpoint", r.spec.checkpoint,
             "--model_size", r.spec.model_size,
             "--mode", r.spec.mode,
@@ -536,7 +570,7 @@ def _affinity_key(body: dict[str, Any]) -> Optional[str]:
       * explicit OpenAI `user` field, if the client sets one (explicit wins);
       * chat: the system message head plus the FIRST user message head
         (system alone would collide every conversation sharing a template);
-      * completion/native: the first 256 chars of the prompt.
+      * completion/native: the first 256 chars of the prompt (a token-id prompt: its first 64 ids).
     Returns None when nothing usable exists (-> plain least-busy routing).
     """
     user = body.get("user")
@@ -555,6 +589,9 @@ def _affinity_key(body: dict[str, Any]) -> Optional[str]:
     prompt = body.get("prompt")
     if isinstance(prompt, str) and prompt:
         return prompt[:256]
+    ids = body.get("prompt_ids", prompt)
+    if isinstance(ids, list) and ids and all(isinstance(t, int) for t in ids[:64]):
+        return "ids:" + ",".join(str(t) for t in ids[:64])  # a token-id prompt: its first 64 ids
     return None
 
 
@@ -655,6 +692,33 @@ async def generate(request: Request):
     # Native passthrough. No messages-vs-prompt knowledge here, so default to the
     # completion pool unless the body's "model" field says otherwise.
     return await _proxy(request, endpoint="completion", path="/generate")
+
+
+@app.post("/score_tokens")
+async def score_tokens(request: Request):
+    return await _proxy(request, endpoint="completion", path="/score_tokens")
+
+
+@app.post("/logprobs")
+async def logprobs(request: Request):
+    return await _proxy(request, endpoint="completion", path="/logprobs")
+
+
+@app.get("/info")
+async def info():
+    """The fleet: its name, and per pool the served model, its profile and how many replicas are ready."""
+    return {
+        "name": _cfg.name,
+        "gateway": True,
+        "pools": {
+            m.key: {"model": m.served_model_name, "profile": m.profile, "mode": m.mode,
+                    "replicas_ready": sum(r.healthy for r in _fleet.by_pool.get(m.key, [])),
+                    "replicas_total": len(_fleet.by_pool.get(m.key, []))}
+            for m in _cfg.models
+        },
+        "chat_pool": _cfg.chat_pool,
+        "completion_pool": _cfg.completion_pool,
+    }
 
 
 @app.get("/v1/models")
