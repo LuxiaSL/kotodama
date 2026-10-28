@@ -269,8 +269,9 @@ def main() -> int:
                     stats["gen_tokens"] += sum(r["n_gen"] for r in rec_rows["records"])
                     stats["t_decode"] += dt
                     if stats["batches"] % 20 == 1:
-                        logger.info("L%d %s: %d rollouts in %.2fs (%.0f rows-tok/s); total %d rollouts, %.0f tok/s",
-                                    L, pk, len(batch), dt, a.rows * (a.damage_tokens + a.max_tokens) / dt,
+                        logger.info("L%d %s: %d rollouts in %.2fs (%.0f rows-tok/s; ms %s); total %d rollouts, "
+                                    "%.0f tok/s", L, pk, len(batch), dt,
+                                    a.rows * (a.damage_tokens + a.max_tokens) / dt, json.dumps(rec_rows["timing_ms"]),
                                     stats["rollouts"], stats["gen_tokens"] / max(stats["t_decode"], 1e-9))
     logger.info("done: %s", json.dumps(stats))
     return 0
@@ -291,6 +292,13 @@ def run_batch(a, eng: DecodeEngine, dec: CascadeDecoder, units: Units, batch: li
               first_layers: list[int], dec_caps: list[int]) -> dict:
     """One prompt's rollouts in one decoder batch: row 0 unsteered (the damage reference), rows 1.. the jobs."""
     L = units.layer
+    sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+    marks = [("start", time.perf_counter())]
+
+    def mark(name: str) -> None:
+        sync()
+        marks.append((name, time.perf_counter()))
+
     for s in eng.levers.bound:
         eng.levers.release(s)
     slots, adds = [0], [0.0]
@@ -304,6 +312,7 @@ def run_batch(a, eng: DecodeEngine, dec: CascadeDecoder, units: Units, batch: li
         adds.append(add)
     pad = dec.rows - len(slots)
     slots += [0] * pad
+    mark("levers")
     if a.mode == "decode":
         logits = eng.prefill(ids)
         first = dec.admit(list(range(dec.rows)), logits, params, slots=slots)
@@ -313,9 +322,11 @@ def run_batch(a, eng: DecodeEngine, dec: CascadeDecoder, units: Units, batch: li
     first_lp = dec.step_logprob.clone()
     first_ids, first_lps = dec.step_top_ids.clone(), dec.step_top_lps.clone()
     prompt_caps = dec.mlp_in.clone() if (a.mode == "uniform" and dec_caps) else None
+    mark("prompt")
     # damage: the continuation's tokens 1.. under each row's lever, against row 0
     lp = dec.score(cont)  # (rows, D - 1)
     damage = (lp[0:1] - lp).mean(dim=1)
+    mark("score")
     dec.rewind(plen, first)
     gen = [torch.tensor(first, device=lp.device)]
     lps, top_ids, top_lps = [first_lp], [first_ids], [first_lps]
@@ -327,6 +338,7 @@ def run_batch(a, eng: DecodeEngine, dec: CascadeDecoder, units: Units, batch: li
         top_lps.append(dec.step_top_lps.clone())
         if t == 0 and a.mode == "decode" and dec_caps:
             first_caps = dec.mlp_in.clone()  # the state the first generated token fed in
+    mark("decode")
     gen_t = torch.stack(gen, 1).cpu().numpy()  # (rows, T)
     lps_t = torch.stack(lps, 1).cpu().numpy()
     top_ids_t = torch.stack(top_ids, 1).cpu().numpy().astype(np.int32)
@@ -360,7 +372,9 @@ def run_batch(a, eng: DecodeEngine, dec: CascadeDecoder, units: Units, batch: li
     if first_caps is not None and first_layers:
         arrays["mlp_in_first"] = first_caps[keep][:, [dec_caps.index(x) for x in first_layers]].float().cpu().numpy() \
             .astype(np.float16)
-    return {"records": records, "arrays": arrays}
+    mark("host")
+    timing = {name: round((t - marks[i][1]) * 1000, 1) for i, (name, t) in enumerate(marks[1:])}
+    return {"records": records, "arrays": arrays, "timing_ms": timing}
 
 
 if __name__ == "__main__":
