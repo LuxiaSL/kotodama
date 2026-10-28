@@ -100,7 +100,13 @@ class MultiSampleDecoder(nn.Module):
         self._pos_host = [0] * self.rows  # host mirror of pos (no device syncs for capacity checks)
         self._compiled_step = None
         self._compiled_greedy = None
+        self._compiled_score = None
         self._greedy = False
+        # score(): the token each row is scored on at the current step, and its logprob
+        self.register_buffer("score_target", torch.zeros((self.rows, 1), device=dev, dtype=torch.long),
+                             persistent=False)
+        self.register_buffer("score_lp", torch.zeros((self.rows,), device=dev, dtype=torch.float32),
+                             persistent=False)
         # Eager taps (kotodama.model.levers.capture): None outside a capture; a compiled step never runs inside one.
         self._taps = None
         logger.info("%s: %d rows, kv cache %.0f MB%s", type(self).__name__, self.rows, self.kv_bytes() / 1e6,
@@ -247,6 +253,11 @@ class MultiSampleDecoder(nn.Module):
 
     def _step_greedy(self, tokens: torch.Tensor) -> torch.Tensor:
         return self._sample_rows(self._forward_step(tokens), greedy=True)
+
+    def _step_scored(self, tokens: torch.Tensor) -> torch.Tensor:
+        lp = torch.log_softmax(self._forward_step(tokens).float(), dim=-1)
+        self.score_lp.copy_(lp.gather(1, self.score_target).view(-1))
+        return self.score_lp
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -445,6 +456,45 @@ class MultiSampleDecoder(nn.Module):
         return [True] * self.rows
 
     @torch.inference_mode()
+    def score(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Teacher-force ``tokens`` ((B, S) or (1, S)) through the decode step from where every row stands: step t
+        feeds tokens[:, t] and scores tokens[:, t + 1] under the row's own lever (raw log-softmax). Returns the
+        logprobs (B, S - 1); the rows end S - 1 positions further on (``rewind`` takes them back)."""
+        if tokens.ndim != 2 or tokens.shape[0] not in (1, self.rows) or tokens.shape[1] < 2:
+            raise ValueError(f"tokens must be (1, S) or ({self.rows}, S) with S >= 2, got {tuple(tokens.shape)}")
+        S = tokens.shape[1]
+        if not all(self._room_for(S)) or any(p + S >= self.max_seq_len for p in self._pos_host):
+            raise ValueError(f"{S} scored tokens do not fit the rows' caches")
+        tokens = tokens.to(self.pos.device).expand(self.rows, S)
+        fn = self._compiled_score if self._compiled_score is not None and self._taps is None else self._step_scored
+        out = []
+        for t in range(S - 1):
+            self.cur_tokens.copy_(tokens[:, t:t + 1])
+            self.score_target.copy_(tokens[:, t + 1:t + 2])
+            out.append(fn(self.cur_tokens).clone())
+            self._advance_host()
+        return torch.stack(out, dim=1)
+
+    @torch.inference_mode()
+    def rewind(self, length: int, first: Sequence[int]) -> None:
+        """Take every row back to the first ``length`` tokens of its sequence (later positions are closed and
+        rewritten as decoding proceeds); ``first`` is the token each row feeds next, its presence set holds only
+        that token."""
+        if not 0 < length < self.max_seq_len or len(first) != self.rows:
+            raise ValueError(f"rewind needs 0 < length < {self.max_seq_len} and one first token per row")
+        dev = self.pos.device
+        self.pos.fill_(length)
+        self._pos_host = [length] * self.rows
+        self._rewind_storage(length)
+        first_t = torch.tensor(list(first), device=dev, dtype=torch.long).view(-1, 1)
+        self.cur_tokens.copy_(first_t)
+        self.presence.zero_()
+        self.presence.scatter_(1, first_t, True)
+
+    def _rewind_storage(self, length: int) -> None:
+        self.attn_bias[:, :, :, length:] = float("-inf")
+
+    @torch.inference_mode()
     def step_logits(self, tokens: torch.Tensor) -> torch.Tensor:
         """Forward only (parity testing, captures): tokens (B, 1) -> logits (B, V), eager."""
         out = self._forward_step(tokens)
@@ -464,6 +514,8 @@ class MultiSampleDecoder(nn.Module):
                                             dynamic=self._compile_dynamic)
         self._compiled_greedy = torch.compile(self._step_greedy, mode=mode, fullgraph=True,
                                               dynamic=self._compile_dynamic)
+        self._compiled_score = torch.compile(self._step_scored, mode=mode, fullgraph=True,
+                                             dynamic=self._compile_dynamic)
 
     # torch.compile's ``dynamic``: None lets a second bucket width recompile the shared step function with symbolic
     # row counts (automatic dynamic shapes).
@@ -627,6 +679,17 @@ class CascadeDecoder(MultiSampleDecoder):
 
     def _room_for(self, n: int) -> list[bool]:
         return [t + n < self.tail_tokens for t in self._tail_host]
+
+    def _rewind_storage(self, length: int) -> None:
+        tails = []
+        for r in range(self.rows):
+            g = self._row_group[r]
+            glen = self._group_len[g] if g >= 0 else 0
+            if not 0 <= length - glen <= self.tail_tokens - 1:
+                raise ValueError(f"row {r}: length {length} is not inside its group prompt + tail")
+            tails.append(length - glen)
+        self.tail_pos.copy_(torch.tensor(tails, device=self.pos.device, dtype=torch.long))
+        self._tail_host = tails
 
     def token_room(self, prompt_len: int) -> int:
         return min(super().token_room(prompt_len), self.tail_tokens)

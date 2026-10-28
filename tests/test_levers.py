@@ -433,3 +433,29 @@ def test_decoder_capture_buffer_holds_the_last_prompt_mlp_input(model: KotodamaM
     assert not torch.allclose(dec.mlp_in[0], dec.mlp_in[1])  # the uniform lever changed the prompt's last state
     # identity rows at different batch positions: equal up to how the batched GEMM rounds by row
     torch.testing.assert_close(dec.mlp_in[1], dec.mlp_in[3], **TOL)
+
+
+@pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])
+@torch.inference_mode()
+def test_score_and_rewind(model: KotodamaModel, cls) -> None:
+    """score: teacher-forced logprobs under each row's lever (the eager hooks' log-softmax); rewind back to the
+    prompt's end then decodes as if the scored tokens were never fed."""
+    eng = _engine(model, levers=2)
+    s = eng.levers.bind(_plans()["attn-K-decode"])
+    dec = _dec(cls, eng)
+    slots = [s, 0, s, 0]
+    prompt, cont = _ids(9, 17), _ids(6, 18)
+    params = SamplingParams(temperature=0.0, repetition_penalty=1.0)
+    logits0 = eng.prefill(prompt)
+    first = dec.admit(list(range(ROWS)), logits0, params, slots=slots)
+    lp = dec.score(cont)
+    assert lp.shape == (ROWS, cont.shape[1] - 1)
+    for r, sl in enumerate(slots):
+        plan = eng.levers.plan(sl) or LeverPlan(attn={0: np.zeros(H, np.float32)}, span="decode")
+        want = torch.log_softmax(_oracle_logits(model, plan, prompt, cont)[1:], -1)  # given cont[:t+1]
+        torch.testing.assert_close(lp[r], want.gather(1, cont[0, 1:].view(-1, 1)).view(-1), atol=1e-4, rtol=1e-4)
+    dec.rewind(prompt.shape[1], first)
+    after = [dec.step(params).view(-1).tolist() for _ in range(3)]
+    fresh = _dec(cls, eng)
+    fresh.admit(list(range(ROWS)), eng.prefill(prompt), params, slots=slots)
+    assert after == [fresh.step(params).view(-1).tolist() for _ in range(3)]
