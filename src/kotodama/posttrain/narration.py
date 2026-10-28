@@ -110,3 +110,23 @@ def out_of_frame(text: str) -> bool:
             return True
         weak |= {m.group(1).lower().rstrip("s") for m in _FRAME_WEAK.finditer(sent)}
     return len(weak) >= 2
+
+
+_DESCRIBE_AFTER = r"(?:\s+[A-Z][\w'.-]+)?(?:,|\s+(?:is|was|has|had|believes|claims|thinks|feels|argues|wants)\b)"
+
+
+def self_described(text: str, speaker: str, min_words: int = 12) -> bool:
+    """Whether a turn describes its own speaker in the third person instead of speaking: its first paragraph has no
+    quotation, no first or second person, at least ``min_words`` words, and opens with the speaker's name followed by
+    a comma or a describing verb ("Nick: Nick Olsson, as the leader of the party, calls for ...", "Bonnie: Bonnie is
+    a twenty-nine-year-old member of ..."). A character sheet or biography under the speaker's label: the scene has
+    stopped. A label-less narration paragraph after the speech is not read."""
+    paras = split_turn(text)
+    if not paras or not speaker.strip():
+        return False
+    first = paras[0]
+    if _QUOTED.search(first) or _FIRST_SECOND.search(first) or len(first.split()) < min_words:
+        return False
+    names = sorted({speaker.strip(), speaker.strip().split()[0]}, key=len, reverse=True)
+    pat = r"^\s*(?:" + "|".join(re.escape(n) for n in names) + r")" + _DESCRIBE_AFTER
+    return re.match(pat, first) is not None

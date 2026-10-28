@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from kotodama.posttrain.narration import classify_paragraph, out_of_frame, split_turn
+from kotodama.posttrain.narration import classify_paragraph, out_of_frame, self_described, split_turn
 
 CAST = ["Mara", "Teo"]
 
@@ -53,3 +53,17 @@ def test_unclear_and_split() -> None:
 ])
 def test_out_of_frame(text: str, off: bool) -> None:
     assert out_of_frame(text) is off
+
+
+def test_self_described() -> None:
+    bio = ("Nick Olsson, as the leader of the left faction, calls for all three to be expelled from the party. He is a "
+           "fifty-five-year-old member of parliament.")
+    assert self_described(bio, "Nick")
+    assert self_described("Bonnie is a twenty-nine-year-old member of parliament for an area in the Northwest, and "
+                          "she believes Nick should resign.", "Bonnie")
+    assert not self_described(bio, "Bonnie")  # another character's name: narration about someone else
+    assert not self_described("Nick, I am telling you, the party will split if we expel all three of them now.", "Nick")
+    assert not self_described('"Nick is a fool," he says, and the whole room laughs at the long old joke again.', "Nick")
+    assert not self_described("Nick is late.", "Nick")  # too short to be a description
+    assert not self_described("Fine.\n\nNick Olsson, the party leader, walks out of the room without another word "
+                              "to any of them.", "Nick")  # narration after speech is not read
