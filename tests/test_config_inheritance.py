@@ -26,7 +26,7 @@ from kotodama.training.train import ConfigError, _load_yaml_config
 REPO = Path(__file__).resolve().parents[1]
 CONFIG_DIR = REPO / "configs"
 SNAPSHOT = Path(__file__).resolve().parent / "data" / "config_snapshot.json"
-NOT_TRAINING = {"gateway.example.yaml", "checkpoints.yaml"}
+NOT_TRAINING = {"gateway.example.yaml", "gateway-tsumugi.example.yaml", "checkpoints.yaml"}
 
 
 def _training_configs() -> list[Path]:

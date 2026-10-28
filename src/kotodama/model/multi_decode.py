@@ -21,6 +21,7 @@ rebuilt.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Callable, Iterable, Optional, Sequence
 
 import torch
@@ -95,8 +96,17 @@ class MultiSampleDecoder(nn.Module):
                                                      dtype=torch.bool), persistent=False)
         self.register_buffer("cur_tokens", torch.zeros((self.rows, 1), device=dev, dtype=torch.long),
                              persistent=False)
-        self.register_buffer("inv_temp", torch.tensor(1.0 / 0.9, device=dev, dtype=torch.float32), persistent=False)
-        self.register_buffer("rep_penalty", torch.tensor(1.2, device=dev, dtype=torch.float32), persistent=False)
+        # Each row's sampling law, set when the row is admitted (so rows of different laws decode in one batch):
+        # 1 / temperature, repetition penalty, top-p (2.0 = off: the exclusive cumsum never reaches it) and log
+        # min-p (-inf = off). The truncation pair is read only by the truncated step variant.
+        self.register_buffer("row_inv_temp", torch.full((self.rows, 1), 1.0 / 0.9, device=dev, dtype=torch.float32),
+                             persistent=False)
+        self.register_buffer("row_rp", torch.full((self.rows, 1), 1.2, device=dev, dtype=torch.float32),
+                             persistent=False)
+        self.register_buffer("row_top_p", torch.full((self.rows, 1), 2.0, device=dev, dtype=torch.float32),
+                             persistent=False)
+        self.register_buffer("row_log_min_p", torch.full((self.rows, 1), float("-inf"), device=dev,
+                                                         dtype=torch.float32), persistent=False)
         # Each row's lever slot (0: the identity), read at every lever add of the step.
         if engine.levers is not None:
             self.register_buffer("row_slots", torch.zeros((self.rows,), device=dev, dtype=torch.long),
@@ -130,13 +140,14 @@ class MultiSampleDecoder(nn.Module):
                                  persistent=False)
             self.register_buffer("row_step", torch.zeros((self.rows,), device=dev, dtype=torch.int64),
                                  persistent=False)
-        self._cur_temp, self._cur_rp = 0.9, 1.2
+        self._row_truncated = [False] * self.rows  # host: which rows' laws truncate (picks the step variant)
+        self._row_scope = ["generated"] * self.rows  # host: each row's penalty scope
         self._pos_host = [0] * self.rows  # host mirror of pos (no device syncs for capacity checks)
         self._compiled_step = None
         self._compiled_greedy = None
+        self._compiled_truncated = None
         self._compiled_score = None
         self._greedy = False
-        self._scope = "generated"  # the penalty scope of the last law synced
         # each row's prompt ids (device), for penalty_scope "row": restart and rewind re-seed presence from them
         self._row_prompt: list[Optional[torch.Tensor]] = [None] * self.rows
         # score(): the token each row is scored on at the current step, and its logprob
@@ -177,8 +188,9 @@ class MultiSampleDecoder(nn.Module):
 
     @staticmethod
     def supports(params: SamplingParams) -> bool:
-        """The laws this decoder samples: pure temperature (> 0) with any repetition penalty."""
-        return params.temperature > 0.0 and not params.truncated
+        """The laws this decoder samples: temperature > 0 with any repetition penalty, top-p and min-p (top-k is the
+        single-stream engine's)."""
+        return params.temperature > 0.0 and params.top_k == 0
 
     # ── the batched decode step ─────────────────────────────────────────────
 
@@ -261,17 +273,33 @@ class MultiSampleDecoder(nn.Module):
         self._advance_step()
         return logits[:, -1]
 
-    def _sample_rows(self, logits: torch.Tensor, greedy: bool = False) -> torch.Tensor:
-        """Per-row repetition penalty over the row's own presence set, then Gumbel-max at 1/inv_temp (``greedy``:
-        the argmax of the penalized logits)."""
+    @staticmethod
+    def _truncate(scaled: torch.Tensor, top_p: torch.Tensor, log_min_p: torch.Tensor) -> torch.Tensor:
+        """Top-p over the temperature-scaled logits (the smallest prefix of the sorted distribution whose exclusive
+        cumulative probability stays below p; ties keep their sort order), then min-p over what survives (drop a
+        token whose probability is below min_p times the top token's). Per row; off values are no-ops."""
+        sorted_logits, sorted_idx = torch.sort(scaled, dim=-1, descending=True)
+        probs = sorted_logits.softmax(dim=-1)
+        cut = probs.cumsum(dim=-1) - probs >= top_p
+        sorted_logits = torch.where(cut, torch.full_like(sorted_logits, float("-inf")), sorted_logits)
+        floor = sorted_logits[:, :1] + log_min_p  # log(min_p * p_max) relative to the shared normaliser
+        sorted_logits = torch.where(sorted_logits < floor, torch.full_like(sorted_logits, float("-inf")),
+                                    sorted_logits)
+        return torch.full_like(scaled, float("-inf")).scatter(1, sorted_idx, sorted_logits)
+
+    def _sample_rows(self, logits: torch.Tensor, greedy: bool = False, truncated: bool = False) -> torch.Tensor:
+        """Per-row repetition penalty over the row's own presence set, then Gumbel-max at each row's temperature
+        (``truncated``: after each row's top-p / min-p; ``greedy``: the argmax of the penalized logits)."""
         raw = logits.float()
-        rp = self.rep_penalty
+        rp = self.row_rp
         penalized = torch.where(raw > 0, raw / rp, raw * rp)
         logits = torch.where(self.presence, penalized, raw)
         if greedy:
             nxt = logits.argmax(dim=-1, keepdim=True)  # (B, 1)
         else:
-            scaled = logits * self.inv_temp
+            scaled = logits * self.row_inv_temp
+            if truncated:
+                scaled = self._truncate(scaled, self.row_top_p, self.row_log_min_p)
             if self.seeded:
                 u = seeded_uniform(self.row_seed, self.row_step, scaled.shape[-1])
             else:
@@ -296,6 +324,9 @@ class MultiSampleDecoder(nn.Module):
     def _step_greedy(self, tokens: torch.Tensor) -> torch.Tensor:
         return self._sample_rows(self._forward_step(tokens), greedy=True)
 
+    def _step_truncated(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self._sample_rows(self._forward_step(tokens), truncated=True)
+
     def _step_scored(self, tokens: torch.Tensor) -> torch.Tensor:
         lp = torch.log_softmax(self._forward_step(tokens).float(), dim=-1)
         self.score_lp.copy_(lp.gather(1, self.score_target).view(-1))
@@ -303,22 +334,30 @@ class MultiSampleDecoder(nn.Module):
 
     # ── public API ──────────────────────────────────────────────────────────
 
+    def _check_law(self, params: SamplingParams) -> None:
+        if params.top_k > 0 or params.temperature < 0.0:
+            raise ValueError("MultiSampleDecoder samples temperature >= 0 with repetition penalty, top-p and min-p "
+                             "(no top-k)")
+
     def _sync_sampling(self, params: SamplingParams) -> None:
-        if params.truncated or params.temperature < 0.0:
-            raise ValueError("MultiSampleDecoder samples pure-temperature laws only (temperature >= 0, no top-k/top-p)")
+        """A step's law: greedy (temperature 0) for every row, else each row's own law, set when it was admitted."""
+        self._check_law(params)
         self._greedy = params.temperature == 0.0
-        self._scope = params.penalty_scope
-        if self._greedy:  # the argmax variant, inv_temp unused
-            if params.repetition_penalty != self._cur_rp:
-                self.rep_penalty.fill_(params.repetition_penalty)
-                self._cur_rp = params.repetition_penalty
-            return
-        if params.temperature != self._cur_temp:
-            self.inv_temp.fill_(1.0 / params.temperature)
-            self._cur_temp = params.temperature
-        if params.repetition_penalty != self._cur_rp:
-            self.rep_penalty.fill_(params.repetition_penalty)
-            self._cur_rp = params.repetition_penalty
+
+    def _set_row_law(self, rows: list[int], idx: torch.Tensor, params: SamplingParams) -> None:
+        """``rows`` sample under ``params`` from here on (temperature, repetition penalty, top-p, min-p, scope)."""
+        self._check_law(params)
+        self._greedy = params.temperature == 0.0
+        inv_t = 1.0 / params.temperature if params.temperature > 0.0 else 1.0
+        top_p = params.top_p if 0.0 < params.top_p < 1.0 else 2.0
+        log_min_p = math.log(params.min_p) if params.min_p > 0.0 else float("-inf")
+        for buf, val in ((self.row_inv_temp, inv_t), (self.row_rp, params.repetition_penalty),
+                         (self.row_top_p, top_p), (self.row_log_min_p, log_min_p)):
+            buf.index_fill_(0, idx, val)
+        trunc = params.truncated
+        for r in rows:
+            self._row_truncated[r] = trunc
+            self._row_scope[r] = params.penalty_scope
 
     @torch.inference_mode()
     def admit(self, rows: Sequence[int], prefill_logits: torch.Tensor, params: SamplingParams,
@@ -334,10 +373,10 @@ class MultiSampleDecoder(nn.Module):
         self.set_slots(rows, slots)
         if eng._pos_cpu <= 0 or eng._pos_cpu >= self.max_seq_len:
             raise RuntimeError(f"engine position {eng._pos_cpu} is not a prefilled prompt")
-        self._sync_sampling(params)
         n = len(rows)
         p = eng._pos_cpu
         idx = torch.tensor(rows, device=self.pos.device, dtype=torch.long)
+        self._set_row_law(rows, idx, params)
         contiguous = rows == list(range(rows[0], rows[0] + n))
         for li in range(self.n_layers):
             for dst, src in ((self.k_caches[li], eng.k_caches[li]), (self.v_caches[li], eng.v_caches[li])):
@@ -360,8 +399,8 @@ class MultiSampleDecoder(nn.Module):
         rows = self._check_rows(rows)
         if not 0 < prompt_len < self.max_seq_len:
             raise ValueError(f"prompt_len {prompt_len} outside (0, {self.max_seq_len})")
-        self._sync_sampling(params)
         idx = torch.tensor(rows, device=self.pos.device, dtype=torch.long)
+        self._set_row_law(rows, idx, params)
         self.attn_bias[idx, :, :, prompt_len:] = float("-inf")
         return self._seed(rows, idx, prompt_len, prefill_logits, seeds)
 
@@ -427,11 +466,11 @@ class MultiSampleDecoder(nn.Module):
             self._row_prompt[r] = ids
 
     def _seed_presence(self, rows: list[int], idx: torch.Tensor) -> None:
-        """Empty presence for ``rows``, or (penalty_scope "row") each row's prompt ids."""
+        """Empty presence for ``rows``, or (a row whose penalty_scope is "row") the row's prompt ids."""
         self.presence.index_fill_(0, idx, False)
-        if self._scope != "row":
-            return
         for r in rows:
+            if self._row_scope[r] != "row":
+                continue
             ids = self._row_prompt[r]
             if ids is not None and ids.numel():
                 self.presence[r].index_fill_(0, ids, True)
@@ -448,14 +487,17 @@ class MultiSampleDecoder(nn.Module):
         self._seed_presence(rows, idx)
         raw = prefill_logits.reshape(1, -1).float().expand(n, -1)
         logits = raw
-        if self._scope == "row":  # the penalty over the prompt applies to the first token too
-            rp = self.rep_penalty
+        if any(self._row_scope[r] == "row" for r in rows):  # the penalty over the prompt applies to the first token
+            rp = self.row_rp.index_select(0, idx)
             pres = self.presence.index_select(0, idx)
             logits = torch.where(pres, torch.where(raw > 0, raw / rp, raw * rp), raw)
         if self._greedy:
             first = logits.argmax(dim=-1, keepdim=True)  # (n, 1)
         else:
-            scaled = logits * self.inv_temp
+            scaled = logits * self.row_inv_temp.index_select(0, idx)
+            if any(self._row_truncated[r] for r in rows):
+                scaled = self._truncate(scaled, self.row_top_p.index_select(0, idx),
+                                        self.row_log_min_p.index_select(0, idx))
             if self.seeded:
                 u = seeded_uniform(self.row_seed.index_select(0, idx), self.row_step.index_select(0, idx),
                                    scaled.shape[-1])
@@ -489,10 +531,13 @@ class MultiSampleDecoder(nn.Module):
         """Feed every row its last token, sample the next (temperature 0: the argmax). Returns cur_tokens (B, 1)."""
         self._sync_sampling(params)
         greedy = params.temperature == 0.0
+        truncated = not greedy and any(self._row_truncated)
         if self._taps is not None:
-            fn = self._step_greedy if greedy else self._step_sampled
+            fn = self._step_greedy if greedy else (self._step_truncated if truncated else self._step_sampled)
         elif greedy:
             fn = self._compiled_greedy or self._step_greedy
+        elif truncated:
+            fn = self._compiled_truncated or self._step_truncated
         else:
             fn = self._compiled_step or self._step_sampled
         out = fn(self.cur_tokens)
@@ -532,7 +577,7 @@ class MultiSampleDecoder(nn.Module):
         if any(p + S >= self.max_seq_len for p in self._pos_host) or not all(self._room_for(S)):
             raise ValueError(f"a {S}-token prompt does not fit the rows' caches")
         prompt = prompt.to(self.pos.device).expand(self.rows, S)
-        self._sync_sampling(params)
+        self._set_row_law(list(range(self.rows)), self.row_ids, params)
         for r in range(self.rows):
             self._row_prompt[r] = prompt[r].clone()
         for t in range(S):
@@ -609,6 +654,8 @@ class MultiSampleDecoder(nn.Module):
                                             dynamic=self._compile_dynamic)
         self._compiled_greedy = torch.compile(self._step_greedy, mode=mode, fullgraph=True,
                                               dynamic=self._compile_dynamic)
+        self._compiled_truncated = torch.compile(self._step_truncated, mode=mode, fullgraph=True,
+                                                 dynamic=self._compile_dynamic)
         self._compiled_score = torch.compile(self._step_scored, mode=mode, fullgraph=True,
                                              dynamic=self._compile_dynamic)
 
@@ -854,6 +901,7 @@ class CascadeDecoder(MultiSampleDecoder):
         for r in rows:
             self._tail_host[r] = 0
         self._set_prompt(rows, eng.token_history[:p])
+        self._set_row_law(rows, idx, params)
         return self._seed(rows, idx, p, prefill_logits, seeds)
 
     @torch.inference_mode()
@@ -867,8 +915,8 @@ class CascadeDecoder(MultiSampleDecoder):
             g = self._row_group[r]
             if g < 0 or self._group_len[g] != prompt_len:
                 raise ValueError(f"row {r} holds no {prompt_len}-token prompt")
-        self._sync_sampling(params)
         idx = torch.tensor(rows, device=self.pos.device, dtype=torch.long)
+        self._set_row_law(rows, idx, params)
         self.tail_pos.index_fill_(0, idx, 0)
         for r in rows:
             self._tail_host[r] = 0

@@ -123,7 +123,7 @@ def test_decode_rows_stops_per_row(model: KotodamaModel) -> None:
     with pytest.raises(ValueError):
         decode_rows(dec, logits0, params, n=ROWS + 1, max_new_tokens=4, stop_ids=frozenset())
     with pytest.raises(ValueError):
-        dec.start(logits0, SamplingParams(temperature=0.8, top_p=0.9))
+        dec.start(logits0, SamplingParams(temperature=0.8, top_k=5))
 
 
 class _CharTok:
@@ -167,7 +167,7 @@ def test_server_routes_n_candidates_through_the_batched_decoder(monkeypatch, mod
     assert eng.steer_buf.abs().sum() == 0  # steering state cleared after the request
     calls.clear()
     r = client.post("/v1/completions", json={"prompt": "two friends talk", "max_tokens": 4, "n": 2,
-                                             "temperature": 0.9, "top_p": 0.9})  # truncated law: serial path
+                                             "temperature": 0})  # greedy: the single-stream path
     assert r.status_code == 200 and calls == ["engine_generate", "engine_generate"]
 
 

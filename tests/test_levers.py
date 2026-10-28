@@ -629,3 +629,51 @@ def test_seeded_forced_prompts_and_rewind(model: KotodamaModel) -> None:
     fresh = MultiSampleDecoder(eng, ROWS, seeded=True)
     fresh.admit(list(range(ROWS)), eng.prefill(prompt), params, seeds=[5, 6, 7, 8])
     assert after == fresh.step(params).view(-1).tolist()
+
+
+# ── per-row sampling laws (top-p, min-p) ────────────────────────────────────
+
+
+@pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])
+@pytest.mark.parametrize("law", [dict(min_p=0.999), dict(top_p=1e-6)])
+@torch.inference_mode()
+def test_truncation_that_keeps_one_token_is_greedy(model: KotodamaModel, cls, law) -> None:
+    eng = _engine(model, levers=1)
+    dec = _dec(cls, eng)
+    prompt = _ids(10, 41)
+    trunc = SamplingParams(temperature=1.5, repetition_penalty=1.0, **law)
+    greedy = SamplingParams(temperature=0.0, repetition_penalty=1.0)
+    toks = [dec.admit(list(range(ROWS)), eng.prefill(prompt), trunc)]
+    toks += [dec.step(trunc).view(-1).tolist() for _ in range(6)]
+    ref = _dec(cls, eng)
+    want = [ref.admit(list(range(ROWS)), eng.prefill(prompt), greedy)]
+    want += [ref.step(greedy).view(-1).tolist() for _ in range(6)]
+    assert toks == want
+    eng2 = _engine(model, levers=1)
+    single = [int(eng2.sample_first(eng2.prefill(prompt), trunc))]
+    t = eng2.cur_token
+    for _ in range(6):
+        t = eng2.step(t, trunc)
+        single.append(int(t))
+    assert single == [w[0] for w in want]  # the single-stream sampler applies the same law
+
+
+@torch.inference_mode()
+def test_rows_of_different_laws_share_a_batch(model: KotodamaModel) -> None:
+    """Each row samples under the law it was admitted with: a seeded row draws the same tokens beside rows of
+    other laws as in a batch of its own law."""
+    eng = _engine(model, levers=1)
+    prompt = _ids(10, 42)
+    laws = [SamplingParams(temperature=0.7, repetition_penalty=1.3),
+            SamplingParams(temperature=1.2, repetition_penalty=1.0, min_p=0.1),
+            SamplingParams(temperature=1.0, repetition_penalty=1.1, top_p=0.8),
+            SamplingParams(temperature=0.9, repetition_penalty=1.2, penalty_scope="row")]
+    logits = eng.prefill(prompt)
+    mixed = MultiSampleDecoder(eng, ROWS, seeded=True)
+    first = [mixed.admit([r], logits, laws[r], seeds=[100 + r])[0] for r in range(ROWS)]
+    got = [first] + [mixed.step(laws[0]).view(-1).tolist() for _ in range(6)]
+    for r, law in enumerate(laws):
+        solo = MultiSampleDecoder(eng, ROWS, seeded=True)
+        want = [solo.admit(list(range(ROWS)), logits, law, seeds=[100 + r] * ROWS)]
+        want += [solo.step(law).view(-1).tolist() for _ in range(6)]
+        assert [g[r] for g in got] == [w[0] for w in want], r

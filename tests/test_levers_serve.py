@@ -271,8 +271,8 @@ def test_seeded_requests_reproduce_whatever_shares_their_batch(monkeypatch, mode
     r = client.post("/generate", json={"prompt": "two friends talk", "max_new_tokens": 6, "temperature": 1.0,
                                        "repetition_penalty": 1.0, "seed": 5})
     assert r.status_code == 200 and r.json()["completion_ids"] == a[0]
-    r = client.post("/v1/completions", json={**base, "seed": 5, "top_p": 0.9})
-    assert r.status_code == 400  # a truncated law has no seeded path
+    r = client.post("/v1/completions", json={**base, "seed": 5, "temperature": 0})
+    assert r.status_code == 400  # greedy draws take the single-stream path, which has no seeds
 
 
 def test_a_seed_without_seeded_rows_is_refused(monkeypatch, model: KotodamaModel) -> None:

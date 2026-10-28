@@ -629,6 +629,8 @@ class GenerateRequest(BaseModel):
     temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=0.0, le=2.0)
     top_k: int = Field(default=DEFAULT_TOP_K, ge=0)
     top_p: float = Field(default=DEFAULT_TOP_P, ge=0.0, le=1.0)
+    # Keep the tokens whose probability is at least min_p times the most likely token's (0 = off).
+    min_p: float = Field(default=0.0, ge=0.0, lt=1.0)
     repetition_penalty: float = Field(
         default_factory=lambda: _default_repetition_penalty, ge=1.0, le=2.0)
     stop_strings: list[str] = Field(default_factory=list)
@@ -771,6 +773,13 @@ def _resolve_prompt(request: GenerateRequest, tokenizer: AutoTokenizer) -> str:
 
 
 # ── Steering composition ────────────────────────────────────────────────────────
+
+def _engine_params(request: GenerateRequest) -> "EngineSamplingParams":
+    """The request's sampling law for the engine and the row decoders."""
+    return EngineSamplingParams(temperature=request.temperature, repetition_penalty=request.repetition_penalty,
+                                top_k=request.top_k, top_p=request.top_p, penalty_scope=request.penalty_scope,
+                                min_p=request.min_p)
+
 
 def _penalty_ids(request: GenerateRequest, input_ids: "torch.Tensor", generated_ids: list[int]) -> list[int]:
     """The tokens the repetition penalty counts on the reference path (``penalty_scope``)."""
@@ -929,6 +938,7 @@ def sample_next_token(
     top_p: float,
     repetition_penalty: float,
     generated_ids: list[int],
+    min_p: float = 0.0,
 ) -> int:
     logits = logits.float()
 
@@ -958,6 +968,9 @@ def sample_next_token(
         mask = cumulative_probs - sorted_logits.softmax(dim=-1) >= top_p
         sorted_logits[mask] = float("-inf")
         logits = sorted_logits.scatter(0, sorted_indices, sorted_logits)
+
+    if min_p > 0.0:
+        logits = logits.masked_fill(logits < logits.max() + math.log(min_p), float("-inf"))
 
     probs = logits.softmax(dim=-1)
     return torch.multinomial(probs, num_samples=1).item()
@@ -1017,7 +1030,7 @@ def generate(
     next_logits = logits[0, -1]
     token_id = sample_next_token(
         next_logits, request.temperature, request.top_k, request.top_p,
-        request.repetition_penalty, _penalty_ids(request, input_ids, generated_ids),
+        request.repetition_penalty, _penalty_ids(request, input_ids, generated_ids), request.min_p,
     )
     timing["first_sample_ms"] = (time.perf_counter() - t_sample) * 1000
 
@@ -1057,7 +1070,7 @@ def generate(
         next_logits = logits[0, -1]
         token_id = sample_next_token(
             next_logits, request.temperature, request.top_k, request.top_p,
-            request.repetition_penalty, _penalty_ids(request, input_ids, generated_ids),
+            request.repetition_penalty, _penalty_ids(request, input_ids, generated_ids), request.min_p,
         )
         decode_sample_ms += (time.perf_counter() - t_samp) * 1000
 
@@ -1129,10 +1142,7 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
     if prompt_len >= max_pos:
         raise HTTPException(400, f"Prompt too long: {prompt_len} tokens (max {max_pos})")
 
-    params = EngineSamplingParams(
-        temperature=request.temperature, repetition_penalty=request.repetition_penalty,
-        top_k=request.top_k, top_p=request.top_p, penalty_scope=request.penalty_scope,
-    )
+    params = _engine_params(request)
     t0 = time.perf_counter()
     with _steering(request, timing) as slot:
         t_prefill = time.perf_counter()
@@ -1223,10 +1233,7 @@ async def engine_generate_stream(
                 yield f'data: {{"error": "Prompt too long: {prompt_len} tokens"}}\n\n'
                 return
 
-            params = EngineSamplingParams(
-                temperature=request.temperature, repetition_penalty=request.repetition_penalty,
-                top_k=request.top_k, top_p=request.top_p, penalty_scope=request.penalty_scope,
-            )
+            params = _engine_params(request)
             t_prefill = time.perf_counter()
             prefill_logits, pc_info = await loop.run_in_executor(
                 _generate_executor, _engine_prefill, input_ids, slot
@@ -1351,7 +1358,7 @@ async def generate_stream(
 
             token_id = sample_next_token(
                 next_logits, request.temperature, request.top_k, request.top_p,
-                request.repetition_penalty, _penalty_ids(request, input_ids, generated_ids),
+                request.repetition_penalty, _penalty_ids(request, input_ids, generated_ids), request.min_p,
             )
 
             if token_id in _stop_token_ids:
@@ -1385,7 +1392,7 @@ async def generate_stream(
 
                 token_id = sample_next_token(
                     next_logits, request.temperature, request.top_k, request.top_p,
-                    request.repetition_penalty, _penalty_ids(request, input_ids, generated_ids),
+                    request.repetition_penalty, _penalty_ids(request, input_ids, generated_ids), request.min_p,
                 )
 
                 if token_id in _stop_token_ids:
@@ -1639,6 +1646,7 @@ class OAICompletionRequest(BaseModel):
     injection: InjectionSpec | None = None
     penalty_scope: Literal["generated", "row"] = "generated"
     seed: int | None = Field(default=None, ge=0)
+    min_p: float = Field(default=0.0, ge=0.0, lt=1.0)
 
     @model_validator(mode="before")
     @classmethod
@@ -1668,8 +1676,7 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
     prompt_len = input_ids.shape[1]
     if prompt_len >= _max_seq_len:
         raise HTTPException(400, f"Prompt too long: {prompt_len} tokens (max {_max_seq_len})")
-    params = EngineSamplingParams(temperature=request.temperature, repetition_penalty=request.repetition_penalty,
-                                  top_k=request.top_k, top_p=request.top_p, penalty_scope=request.penalty_scope)
+    params = _engine_params(request)
     stops = request.stop_strings
 
     def stop_check(ids: list[int]) -> bool:
@@ -1723,11 +1730,13 @@ def build_and_warm_row_decoder(eng: "DecodeEngine", rows: int, kv_from: "MultiSa
     dec.compile_step(mode="max-autotune")
     with torch.inference_mode():
         params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2)
+        trunc = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2, top_p=0.9, min_p=0.05)
         for plen in sorted({min(plen, eng.max_seq_len - 8) for plen in [16, 256]}):
             logits = eng.prefill(torch.randint(4, eng.config.vocab_size, (1, plen), device=eng.device))
-            dec.start(logits, params)
-            for _ in range(4):
-                dec.step(params)
+            for law in (params, trunc):  # the plain and the truncated (top-p / min-p) step variants
+                dec.start(logits, law)
+                for _ in range(4):
+                    dec.step(law)
         torch.cuda.synchronize(eng.device)
     eng.reset()
     return dec
@@ -1739,24 +1748,22 @@ def _within_row_cap(request: GenerateRequest) -> bool:
 
 def _multi_compatible(request: GenerateRequest, n: int) -> bool:
     return ((n > 1 or request.seed is not None) and _multi_bucket(n) is not None and _within_row_cap(request)
-            and MultiSampleDecoder.supports(EngineSamplingParams(temperature=request.temperature,
-                                                                 top_k=request.top_k, top_p=request.top_p)))
+            and MultiSampleDecoder.supports(_engine_params(request)))
 
 
 def _xbatch_compatible(request: GenerateRequest, n: int) -> bool:
     return (_xbatch is not None and 1 <= n <= _xbatch.runner.max_rows and _within_row_cap(request)
-            and MultiSampleDecoder.supports(EngineSamplingParams(temperature=request.temperature,
-                                                                 top_k=request.top_k, top_p=request.top_p)))
+            and MultiSampleDecoder.supports(_engine_params(request)))
 
 
 def _xbatch_key(request: GenerateRequest, steered: bool) -> tuple:
-    """Requests with equal keys may share a batch: the same sampling law and the same steering config (with
-    --levers every request carries its own lever, so steering is not part of the key)."""
+    """Requests with equal keys may share a batch: the same steering config (with --levers every request carries its
+    own lever, so none). Each row carries its own sampling law, so the law is not part of the key."""
     steer = None
     if steered and not _levers:
         steer = (tuple((v.name, v.alpha) for v in request.vectors or ()), request.steer_model, request.steer_alpha,
                  request.steer_rule)
-    return (request.temperature, request.repetition_penalty, request.penalty_scope, steer)
+    return (steer,)
 
 
 async def engine_generate_xbatch(request: GenerateRequest, n: int) -> list[GenerateResponse]:
@@ -1771,8 +1778,7 @@ async def engine_generate_xbatch(request: GenerateRequest, n: int) -> list[Gener
     lever = _request_lever(request) if _levers else None
     steer_writes = _compose_steer_writes(request) if not _levers else None
     steer_kwargs = _steer_rule_kwargs(request) if steer_writes is not None else {}
-    params = EngineSamplingParams(temperature=request.temperature, repetition_penalty=request.repetition_penalty,
-                                  penalty_scope=request.penalty_scope)
+    params = _engine_params(request)
     steered = steer_writes is not None or lever is not None
     job = XBatchJob(key=_xbatch_key(request, steered), prompt_ids=prompt_ids, n=n,
                     max_new_tokens=request.max_new_tokens, params=params, done=lambda _outcome: None,
@@ -1832,6 +1838,7 @@ def oai_completion_to_generate(request: OAICompletionRequest) -> GenerateRequest
         injection=request.injection,
         penalty_scope=request.penalty_scope,
         seed=request.seed,
+        min_p=request.min_p,
     )
 
 

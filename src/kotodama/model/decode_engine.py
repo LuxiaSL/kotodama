@@ -80,7 +80,9 @@ def compute_steer_points(steer_site: int, boundaries: set[int] | list[int], n_la
 class SamplingParams:
     """server.py sampling controls supported by the fast path.
 
-    top_k == 0 and top_p in {0.0, 1.0} mean "disabled" (server.py convention).
+    top_k == 0, top_p in {0.0, 1.0} and min_p == 0.0 mean "disabled" (server.py
+    convention). min_p keeps the tokens whose probability (after temperature,
+    top-k and top-p) is at least min_p times the most likely token's.
     Truncated sampling (top_k > 0 or 0 < top_p < 1) routes through a separate
     compiled sampler variant; the pure-temperature graph is untouched.
 
@@ -97,6 +99,7 @@ class SamplingParams:
         top_k: int = 0,
         top_p: float = 0.0,
         penalty_scope: str = "generated",
+        min_p: float = 0.0,
     ) -> None:
         if penalty_scope not in ("generated", "row"):
             raise ValueError(f"penalty_scope must be 'generated' or 'row', got {penalty_scope!r}")
@@ -104,15 +107,18 @@ class SamplingParams:
             raise ValueError(f"top_k must be >= 0, got {top_k}")
         if not 0.0 <= top_p <= 1.0:
             raise ValueError(f"top_p must be in [0, 1], got {top_p}")
+        if not 0.0 <= min_p < 1.0:
+            raise ValueError(f"min_p must be in [0, 1), got {min_p}")
         self.temperature = float(temperature)
         self.repetition_penalty = float(repetition_penalty)
         self.top_k = int(top_k)
         self.top_p = float(top_p)
         self.penalty_scope = penalty_scope
+        self.min_p = float(min_p)
 
     @property
     def truncated(self) -> bool:
-        return self.top_k > 0 or 0.0 < self.top_p < 1.0
+        return self.top_k > 0 or 0.0 < self.top_p < 1.0 or self.min_p > 0.0
 
 
 def _graph_input(tokens: torch.Tensor) -> torch.Tensor:
@@ -316,8 +322,12 @@ class DecodeEngine(nn.Module):
             "top_k_eff", torch.tensor(cfg.vocab_size, device=self.device, dtype=torch.long), persistent=False
         )
         self.register_buffer("top_p_val", torch.tensor(2.0, device=self.device, dtype=torch.float32), persistent=False)
+        # log(min_p); -inf (disabled) keeps every token
+        self.register_buffer("log_min_p", torch.tensor(float("-inf"), device=self.device, dtype=torch.float32),
+                             persistent=False)
         self._cur_top_k = 0
         self._cur_top_p = 0.0
+        self._cur_min_p = 0.0
 
         self._compiled_forward = None
         self._compiled_step_sampled = None
@@ -679,6 +689,10 @@ class DecodeEngine(nn.Module):
         sorted_logits = torch.where(
             cutoff, torch.full_like(sorted_logits, float("-inf")), sorted_logits
         )
+        floor = sorted_logits[:1] + self.log_min_p  # min-p: probability >= min_p * the top token's
+        sorted_logits = torch.where(
+            sorted_logits < floor, torch.full_like(sorted_logits, float("-inf")), sorted_logits
+        )
         final = torch.full_like(scaled, float("-inf")).scatter(0, sorted_idx, sorted_logits)
 
         u = torch.rand_like(final)
@@ -714,6 +728,8 @@ class DecodeEngine(nn.Module):
                 mask = probs_sorted.cumsum(dim=-1) - probs_sorted >= params.top_p
                 sorted_logits = sorted_logits.masked_fill(mask, float("-inf"))
                 logits = torch.full_like(logits, float("-inf")).scatter(0, sorted_indices, sorted_logits)
+            if params.min_p > 0.0:
+                logits = logits.masked_fill(logits < logits.max() + math.log(params.min_p), float("-inf"))
             probs = F.softmax(logits, dim=-1)
             token = torch.multinomial(probs, num_samples=1)
 
@@ -1212,6 +1228,9 @@ class DecodeEngine(nn.Module):
             k = params.top_k if params.top_k > 0 else self.config.vocab_size
             self.top_k_eff.fill_(min(k, self.config.vocab_size))
             self._cur_top_k = params.top_k
+        if params.min_p != self._cur_min_p:
+            self.log_min_p.fill_(math.log(params.min_p) if params.min_p > 0.0 else float("-inf"))
+            self._cur_min_p = params.min_p
         if params.top_p != self._cur_top_p:
             # 0.0/1.0 (disabled) -> 2.0: unreachable even when fp32 cumsum
             # saturates to 1.0 (which it does — see the buffer comment).

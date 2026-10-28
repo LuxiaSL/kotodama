@@ -407,7 +407,7 @@ def test_server_routes_compatible_requests_through_the_batcher(monkeypatch, mode
     assert all("q" not in c["text"][:-1] for c in choices)  # a stop string ends the row where it appears
     used.clear()
     r = client.post("/v1/completions", json={"prompt": "two friends talk", "max_tokens": 4, "n": 2,
-                                             "temperature": 0.9, "top_p": 0.9})  # truncated law: serial fallback
+                                             "temperature": 0})  # greedy: the single-stream path
     assert r.status_code == 200 and used == ["engine_generate", "engine_generate"]
     used.clear()
     r = client.post("/v1/completions", json={"prompt": "x" * MAX_SEQ, "max_tokens": 4, "n": 2, "temperature": 0.9})
