@@ -157,6 +157,8 @@ runner per eval, scored with the same math.
 | the released kotodama-tsumugi 1B base | `tools/run_serve.sh --checkpoint hf:LuxiaSL/kotodama-tsumugi-1b --model_size 1b-tsumugi --rope_fp32 --mode base` (published weights load from the Hub or a downloaded directory; requests set sampling: the `tsumugi` law in `kotodama.serve.laws` is temperature 0.75, top-p off, repetition 1.2, which is also the server's default repetition penalty) |
 | a fleet behind one port | `tools/run_gateway.sh --config configs/gateway.example.yaml` |
 | chat / completion client | `python -m kotodama.serve.chat [complete]` (sampling laws: `kotodama.serve.laws`) |
+| per-request steering | add `--levers <slots> [--steer-npz <banks>]` to the server: every steered request carries its own lever (bank `vectors`, or a raw `injection` at an attention or MLP site), `steer_span` `decode` or `uniform` (the prompt too), and steered and unsteered requests batch together (`kotodama/model/levers.py`) |
+| neuron steering sweep (one process per GPU) | `tools/run_py.sh scripts/sweep/steer_sweep.py --checkpoint <ckpt> --model_size 1b-tsumugi --rope_fp32 --dose_norms <p50.json> --mode decode\|uniform --layers <L> --shard <i> --n_shards <n> --out <dir>`, then `scripts/sweep/merge.py --sweep <dir> --mode <mode>` (per-layer run files a neuron explorer ranks) |
 
 The server exposes `/v1/chat/completions`, `/v1/completions`, `/generate` (full
 sampling control, streaming), `/logprobs` (batched prefill scoring, the
