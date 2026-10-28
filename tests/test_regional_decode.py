@@ -26,7 +26,7 @@ from torch.nn.attention import SDPBackend
 
 from kotodama import presets
 from kotodama.model.decode_engine import DecodeEngine, SamplingParams
-from kotodama.model.levers import LeverPlan
+from kotodama.model.levers import LeverPlan, act_rows
 from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.model.multi_decode import CascadeDecoder, MultiSampleDecoder, layer_signatures
 
@@ -75,12 +75,19 @@ def _vec(seed: int, scale: float = 1.0) -> np.ndarray:
     return (scale * np.random.default_rng(seed).standard_normal(H)).astype(np.float32)
 
 
+def _act(layer: int) -> dict:
+    """An act write: 8 neurons of ``layer`` replaced by fixed values."""
+    rng = np.random.default_rng(layer)
+    return act_rows([(layer, int(n), float(m)) for n, m in zip(rng.choice(CFG["intermediate_size"], 8, replace=False),
+                                                              rng.uniform(-3, 3, 8))], 1.0, CFG["intermediate_size"])
+
+
 def _steered_engine(model: KotodamaModel) -> tuple[DecodeEngine, list[int]]:
     """An engine with two decode-span levers bound and a broadcast steering row engaged; returns it and the row
     slots (two lever rows, two identity rows)."""
     eng = _engine(model)
     s1 = eng.levers.bind(LeverPlan(attn={4: _vec(1, 0.8)}, span="decode"))
-    s2 = eng.levers.bind(LeverPlan(mlp={7: _vec(2, 0.8)}, span="decode"))
+    s2 = eng.levers.bind(LeverPlan(mlp={7: _vec(2, 0.8)}, act=_act(5), span="decode"))
     eng.set_steer([(2, torch.from_numpy(_vec(3)), 0.5)])
     return eng, [s1, 0, s2, 0]
 
@@ -209,7 +216,7 @@ def _regional_engine(model: KotodamaModel, backend="aot_eager", **kw) -> DecodeE
 def _bind_levers(eng: DecodeEngine) -> tuple[int, int]:
     """A uniform lever (it writes the prompt too) and a decode-span one; returns their slots."""
     uniform = eng.levers.bind(LeverPlan(attn={4: _vec(1, 0.8)}, mlp={8: _vec(4, 0.5)}, span="uniform"))
-    decode = eng.levers.bind(LeverPlan(mlp={7: _vec(2, 0.8)}, span="decode"))
+    decode = eng.levers.bind(LeverPlan(mlp={7: _vec(2, 0.8)}, act=_act(8), span="decode"))
     return uniform, decode
 
 

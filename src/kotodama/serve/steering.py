@@ -218,6 +218,22 @@ def writes_to_plan(writes: list[tuple[int, torch.Tensor, float]], rule: str, nor
     return LeverPlan(attn=plan, span=span)
 
 
+def act_injection_to_plan(sites: list[int], neurons: list[int], mu: list[float], alpha: float,
+                          vectors: list[list[float]], span: str, n_layers: int, intermediate: int) -> "LeverPlan":
+    """An ``act`` injection as one lever: neuron ``neurons[j]`` at effective layer ``sites[j]`` moves toward
+    ``mu[j]`` by ``alpha`` (kotodama.model.levers.act_rows)."""
+    from kotodama.model.levers import LeverError, LeverPlan, act_rows
+
+    if vectors:
+        raise LeverError("an act injection takes neurons and mu, not vectors")
+    if not len(sites) == len(neurons) == len(mu) or not sites:
+        raise LeverError(f"an act injection needs one site, neuron and mu per entry, got {len(sites)} sites, "
+                         f"{len(neurons)} neurons, {len(mu)} mu")
+    if any(not 0 <= int(s) < n_layers for s in sites):
+        raise LeverError(f"sites outside [0, {n_layers})")
+    return LeverPlan(act=act_rows(zip(sites, neurons, mu), alpha, intermediate), span=span)
+
+
 def injection_to_plan(sites: list[int], vectors: list[list[float]], alpha: float, rule: str, kind: str, span: str,
                       norms: dict[int, float] | None, boundaries: list[int], n_layers: int,
                       hidden: int) -> "LeverPlan":

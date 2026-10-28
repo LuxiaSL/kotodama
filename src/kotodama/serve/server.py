@@ -97,6 +97,7 @@ DD3B_BOUNDARIES = list(presets.DD3B)
 from kotodama.serve import compile_cache  # noqa: E402
 from kotodama.serve.steering import (  # noqa: E402
     STEER_DEFAULT_ALPHA,
+    act_injection_to_plan,
     injection_to_plan,
     load_partial_norms,
     load_steer_banks,
@@ -659,13 +660,17 @@ class SteerVectorSpec(BaseModel):
 class InjectionSpec(BaseModel):
     """A raw steering write (--levers): ``alpha * vectors[j]`` at effective layer ``sites[j]``, the vectors already
     carrying their dose. ``kind`` "attn" writes the attention output (block-persistent by ``rule``), "mlp" the MLP
-    output at the site only (rule S)."""
+    output at the site only (rule S). ``kind`` "act" moves MLP neurons toward fixed values instead: entry j is
+    neuron ``neurons[j]`` at effective layer ``sites[j]``, whose activation (the input of down_proj) becomes
+    ``act + alpha * (mu[j] - act)`` (alpha 1 replaces it with ``mu[j]``); it takes no vectors."""
 
     sites: list[int]
-    vectors: list[list[float]]
+    vectors: list[list[float]] = Field(default_factory=list)
     alpha: float = 1.0
     rule: Literal["K", "N", "S"] = "K"
-    kind: Literal["attn", "mlp"] = "attn"
+    kind: Literal["attn", "mlp", "act"] = "attn"
+    neurons: list[int] = Field(default_factory=list)
+    mu: list[float] = Field(default_factory=list)
 
 
 class GenerateRequest(BaseModel):
@@ -886,6 +891,9 @@ def _request_lever(request: GenerateRequest) -> "LeverPlan | None":
             inj = request.injection
             if inj.rule == "N" and not _steer_partial_norms:
                 raise HTTPException(400, "injection rule N needs per-layer partial norms (partial_norm_l* keys)")
+            if inj.kind == "act":
+                return act_injection_to_plan(inj.sites, inj.neurons, inj.mu, inj.alpha, inj.vectors,
+                                             request.steer_span, cfg.num_layers, cfg.intermediate_size)
             return injection_to_plan(inj.sites, inj.vectors, inj.alpha, inj.rule, inj.kind, request.steer_span,
                                      _steer_partial_norms or None, boundaries, cfg.num_layers, cfg.hidden_size)
         writes = _compose_steer_writes(request) if _request_wants_steering(request) and (

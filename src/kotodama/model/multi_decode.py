@@ -282,6 +282,8 @@ class MultiSampleDecoder(nn.Module):
             # every layer's lever rows in one gather per step ([n_layers, B, hidden]): each layer adds its slice
             lever_attn = eng.lever_attn.index_select(1, self.row_slots)
             lever_mlp = eng.lever_mlp.index_select(1, self.row_slots)
+            act_keep = eng.lever_act_keep.index_select(1, self.row_slots)
+            act_add = eng.lever_act_add.index_select(1, self.row_slots)
         partial = embed
         for ls in eng.schedule:
             layer = model.layers[ls.layer_idx]
@@ -306,7 +308,10 @@ class MultiSampleDecoder(nn.Module):
                 self._taps.record(ls.layer_idx, partial, x_mlp)
             gu = F.linear(x_mlp, eng.w_gate_ups[ls.layer_idx])
             gate, up = gu.split(eng.config.intermediate_size, dim=-1)
-            mlp_out = F.linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
+            act = F.silu(gate) * up
+            if eng.levers is not None:
+                act = act * act_keep[ls.layer_idx].unsqueeze(1) + act_add[ls.layer_idx].unsqueeze(1)
+            mlp_out = F.linear(act, layer.ffn.down_proj.weight)
             if eng.levers is not None:
                 mlp_out = mlp_out + lever_mlp[ls.layer_idx].unsqueeze(1)
             partial = partial + mlp_out
@@ -428,15 +433,15 @@ class MultiSampleDecoder(nn.Module):
         eng = self.engine
         self._open_step()
         embed = eng.model.embed_tokens(tokens)
-        lever_attn = lever_mlp = None
+        levers = None
         if eng.levers is not None:
-            lever_attn = eng.lever_attn.index_select(1, self.row_slots)
-            lever_mlp = eng.lever_mlp.index_select(1, self.row_slots)
+            levers = tuple(t.index_select(1, self.row_slots)
+                           for t in (eng.lever_attn, eng.lever_mlp, eng.lever_act_keep, eng.lever_act_add))
         cos = eng.rope_cos_t.index_select(0, self.pos).unsqueeze(1)  # (B, 1, head_dim): each row's own angle
         sin = eng.rope_sin_t.index_select(0, self.pos).unsqueeze(1)
-        committed, partial = run_regions(self._regional_layers, embed, cos, sin, self._regional_state, lever_attn,
-                                         lever_mlp, eng.steer_buf if eng.steer_enabled else None, self.mlp_in
-                                         if self.capture_layers else None)
+        committed, partial = run_regions(self._regional_layers, embed, cos, sin, self._regional_state, levers,
+                                         eng.steer_buf if eng.steer_enabled else None,
+                                         self.mlp_in if self.capture_layers else None)
         return self._regional_final(committed, partial)
 
     def _sample_plain(self, logits: torch.Tensor) -> torch.Tensor:

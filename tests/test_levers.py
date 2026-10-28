@@ -5,8 +5,9 @@ What is pinned here:
     batched, while other slots are bound;
   * ``write_plan`` is the block-persistent law (rules K/N/S) and agrees with the broadcast ``set_steer`` rows;
   * a lever's write lands where an eager hook on the reference forward lands it (``attn``: the attention output,
-    ``mlp``: the MLP output, both keyed on the effective layer, so the two passes of a loop are distinct sites), for
-    both spans, in the single-stream engine and in the batched decoders;
+    ``mlp``: the MLP output, ``act``: the MLP activation moved toward fixed values, all keyed on the effective layer,
+    so the two passes of a loop are distinct sites), for both spans, in the single-stream engine and in the batched
+    decoders;
   * rows of one batch never mix: each row equals its solo run, and identity rows equal an engine without tables;
   * prompt KV written under a uniform lever is reused only by the same lever.
 """
@@ -25,7 +26,7 @@ import torch
 from torch.nn.attention import SDPBackend
 
 from kotodama.model.decode_engine import DecodeEngine, SamplingParams, compute_steer_points
-from kotodama.model.levers import LeverError, LeverPlan, LeverTables, neuron_row, write_plan
+from kotodama.model.levers import LeverError, LeverPlan, LeverTables, act_rows, neuron_row, write_plan
 from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.model.multi_decode import CascadeDecoder, MultiSampleDecoder
 
@@ -79,7 +80,7 @@ def _oracle(model: KotodamaModel, plan: LeverPlan, prompt_len: int):
     norms). ``decode`` span rows write positions >= prompt_len only (a full no-cache forward sees every position)."""
     state = {"attn": None, "mlp": None}
     handles = []
-    rows = {k: {L: torch.from_numpy(r) for L, r in plan.rows(k).items()} for k in ("attn", "mlp")}
+    rows = {k: {L: torch.from_numpy(r) for L, r in plan.rows(k).items()} for k in ("attn", "mlp", "act")}
 
     def arm(kind, layer):
         def hook(_m, _a, _o):
@@ -98,8 +99,21 @@ def _oracle(model: KotodamaModel, plan: LeverPlan, prompt_len: int):
             return out + w.view(1, -1, 1) * row.to(out.dtype)
         return hook
 
+    def act(_m, args):
+        pair = rows["act"].get(state["mlp"])  # the MLP armed by its layer's ffn_norm, not yet run
+        if pair is None:
+            return None
+        (x,) = args
+        new = x * pair[0].to(x.dtype) + pair[1].to(x.dtype)
+        if plan.span == "decode":
+            new = torch.cat([x[:, :prompt_len], new[:, prompt_len:]], dim=1)
+        return (new,)
+
     seen: set[tuple[str, int]] = set()
     for p, layer in enumerate(model.layers):
+        if ("act", id(layer.ffn.down_proj)) not in seen:
+            seen.add(("act", id(layer.ffn.down_proj)))
+            handles.append(layer.ffn.down_proj.register_forward_pre_hook(act))
         handles.append(layer.attn_norm.register_forward_hook(arm("attn", p)))
         handles.append(layer.ffn_norm.register_forward_hook(arm("mlp", p)))
         for kind, mod in (("attn", layer.attn.o_proj), ("mlp", layer.ffn)):
@@ -217,7 +231,18 @@ def _plans() -> dict[str, LeverPlan]:
         "attn-S-pass2": LeverPlan(attn={7: _vec(6, 0.8)}, span="uniform"),  # effective 7 runs module 4's attention
         "mlp-pass1": LeverPlan(mlp={4: _vec(7, 0.8)}, span="uniform"),
         "mlp-pass2-decode": LeverPlan(mlp={7: _vec(7, 0.8)}, span="decode"),
+        "act-pass1": LeverPlan(act=_act(4, alpha=1.0), span="uniform"),
+        "act-pass2-decode-half": LeverPlan(act=_act(7, alpha=0.5), span="decode"),
+        "act-two-layers": LeverPlan(act={**_act(2, 0.75), **_act(9, 1.0)}, span="uniform"),
     }
+
+
+def _act(layer: int, alpha: float) -> dict[int, np.ndarray]:
+    """An act plan moving 12 neurons of ``layer`` toward values well away from their activations."""
+    rng = np.random.default_rng(layer)
+    neurons = rng.choice(CFG["intermediate_size"], 12, replace=False)
+    return act_rows([(layer, int(n), float(m)) for n, m in zip(neurons, rng.uniform(-3, 3, 12))], alpha,
+                    CFG["intermediate_size"])
 
 
 @pytest.mark.parametrize("name", list(_plans()))
@@ -242,10 +267,10 @@ def test_looped_passes_are_distinct_sites(model: KotodamaModel) -> None:
     assert model.layers[4].attn is model.layers[7].attn and model.layers[4].ffn is model.layers[7].ffn
     prompt, cont = _ids(10, 5), _ids(5, 6)
     v = _vec(8, 0.8)
-    for kind in ("attn", "mlp"):
+    for kind in ("attn", "mlp", "act"):
         out = []
         for layer in (4, 7):
-            plan = LeverPlan(**{kind: {layer: v}}, span="uniform")
+            plan = LeverPlan(**{kind: {layer: v}}, span="uniform") if kind != "act" else LeverPlan(act=_act(layer, 1.0))
             eng = _engine(model, levers=1)
             slot = eng.levers.bind(plan)
             got = [eng.prefill(prompt, slot=slot)[0]]
@@ -685,3 +710,49 @@ def test_the_chunked_exclusive_cumsum_is_the_cumsum() -> None:
         p = torch.rand((5, V), generator=g, dtype=torch.float64)
         want = p.cumsum(-1) - p
         torch.testing.assert_close(MultiSampleDecoder._exclusive_cumsum(p), want, rtol=1e-12, atol=1e-9)
+
+
+
+def test_act_rows_and_their_tables() -> None:
+    """act_rows: keep 1 - alpha and add alpha * mu at the listed neurons, the identity (1, 0) elsewhere; the act
+    tables start at the identity (keep 1.0, add -0.0) and release restores it."""
+    pair = act_rows([(3, 5, 2.0), (3, 7, -1.0), (6, 0, 4.0)], 0.25, 16)
+    assert sorted(pair) == [3, 6] and pair[3].shape == (2, 16)
+    assert pair[3][0, 5] == np.float32(0.75) and pair[3][1, 5] == np.float32(0.5) and pair[3][1, 7] == np.float32(-0.25)
+    assert pair[3][0, 0] == 1 and pair[3][1, 0] == 0
+    with pytest.raises(LeverError):
+        act_rows([(3, 5, 1.0), (3, 5, 2.0)], 1.0, 16)
+    with pytest.raises(LeverError):
+        act_rows([(3, 16, 1.0)], 1.0, 16)
+    t = LeverTables(8, 4, 2, torch.float32, torch.device("cpu"), intermediate=16)
+    assert t.is_identity() and bool((t.tables["act_keep"] == 1).all())
+    s = t.bind(LeverPlan(act=pair))
+    assert t.tables["act_keep"][3, s, 5] == 0.75 and t.tables["act_add"][6, s, 0] == 1.0
+    t.release(s)
+    assert t.is_identity()
+    with pytest.raises(LeverError):
+        LeverTables(8, 4, 2, torch.float32, torch.device("cpu")).bind(LeverPlan(act=pair))  # no act tables
+
+
+@pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])
+@torch.inference_mode()
+def test_act_rows_of_a_batch_match_their_solo_runs(model: KotodamaModel, cls) -> None:
+    """A decode-span act lever on some rows of a batch: those rows follow the engine's own act-steered steps, the
+    others are untouched."""
+    eng = _engine(model, levers=2)
+    s = eng.levers.bind(LeverPlan(act=_act(5, 1.0), span="decode"))
+    prompt = _ids(10, 8)
+    forced = _ids(5, 9)
+    want = {}
+    for slot in (0, s):
+        eng.prefill(prompt, slot=slot)
+        want[slot] = torch.stack([eng.step_logits(forced[:, t:t + 1])[0, -1].float().clone()
+                                  for t in range(forced.shape[1])])
+    dec = _dec(cls, eng)
+    slots = [s, 0, s, 0]
+    dec.start(eng.prefill(prompt), SamplingParams(temperature=0.8, repetition_penalty=1.0), slots=slots)
+    got = torch.stack([dec.step_logits(forced.expand(ROWS, -1)[:, t:t + 1].contiguous()).float()
+                       for t in range(forced.shape[1])])  # (T, B, V)
+    for r, slot in enumerate(slots):
+        torch.testing.assert_close(got[:, r], want[slot], **TOL)
+    assert (want[s] - want[0]).abs().max() > 1e-3

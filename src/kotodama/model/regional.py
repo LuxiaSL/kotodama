@@ -75,7 +75,7 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
     """One layer as a function of tensors, mirroring the loop body of MultiSampleDecoder._forward_step and of
     DecodeEngine's step and block forwards: pre-attention routing over ``committed + [partial]``, the attention
     sublayer (KV write and attend through ``attend(q, k, v, kv, state)``), the lever and broadcast-steering adds,
-    pre-MLP routing, the MLP and its lever add. A boundary layer commits ``partial`` (the caller appends it to its list
+    pre-MLP routing, the MLP (its activation rewritten by the act lever) and its lever add. A boundary layer commits ``partial`` (the caller appends it to its list
     after the call) and starts the new block from zero. ``partial`` is (B, S, D): B rows of one token, or one row of
     S tokens; ``cos`` / ``sin`` are the rope rows of its positions, as apply_rope takes them; ``linear(x, w)`` is the
     projection (the engine's GEMV dispatch).
@@ -85,7 +85,8 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
     q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
 
     def decode_layer(partial, committed, attn_q, attn_g, mlp_q, mlp_g, attn_norm_w, ffn_norm_w, q_norm_w, k_norm_w,
-                     w_qkv, w_o, w_gate_up, w_down, cos, sin, kv, state, lever_a, lever_m, steer_row):
+                     w_qkv, w_o, w_gate_up, w_down, cos, sin, kv, state, lever_a, lever_m, act_keep, act_add,
+                     steer_row):
         h_attn = _route(committed + [partial], attn_q, attn_g, eps) if committed else partial
         if is_boundary:
             sources = committed + [partial]
@@ -113,7 +114,10 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
             new = new + steer_row
         x_mlp = _rms(_route(sources + [new], mlp_q, mlp_g, eps), ffn_norm_w, eps)
         gate, up = linear(x_mlp, w_gate_up).split(intermediate, dim=-1)
-        mlp_out = linear(F.silu(gate) * up, w_down)
+        act = F.silu(gate) * up
+        if levers:
+            act = act * act_keep.unsqueeze(1) + act_add.unsqueeze(1)
+        mlp_out = linear(act, w_down)
         if levers:
             mlp_out = mlp_out + lever_m.unsqueeze(1)
         out = new + mlp_out
@@ -215,18 +219,18 @@ def build_regions(eng, signatures: Sequence[tuple[int, bool, bool]], kvs: Sequen
 
 
 def run_regions(regions: Sequence[Region], embed: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                state: tuple[torch.Tensor, ...], lever_attn: Optional[torch.Tensor],
-                lever_mlp: Optional[torch.Tensor], steer_buf: Optional[torch.Tensor],
+                state: tuple[torch.Tensor, ...], levers: Optional[tuple[torch.Tensor, ...]],
+                steer_buf: Optional[torch.Tensor],
                 capture_buf: Optional[torch.Tensor]) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """The depth loop over ``regions`` from the embedding: each layer's lever rows (``lever_*[li]``), broadcast
-    steering row (``steer_buf[li]``) and, for a captured layer, its MLP input written to ``capture_buf[:, col]``
-    (the last position's). Returns (the committed block outputs, the last partial) for the tail."""
+    """The depth loop over ``regions`` from the embedding: each layer's lever rows (``levers``: attn, mlp, act keep,
+    act add, each indexed by layer), broadcast steering row (``steer_buf[li]``) and, for a captured layer, its MLP
+    input written to ``capture_buf[:, col]`` (the last position's). Returns (the committed block outputs, the last
+    partial) for the tail."""
     committed: list[torch.Tensor] = []
     partial = embed
     for li, (fn, boundary, col, tensors, kv) in enumerate(regions):
-        out = fn(partial, committed, *tensors, cos, sin, kv, state,
-                 lever_attn[li] if lever_attn is not None else None,
-                 lever_mlp[li] if lever_mlp is not None else None,
+        rows = (None,) * 4 if levers is None else tuple(t[li] for t in levers)
+        out = fn(partial, committed, *tensors, cos, sin, kv, state, *rows,
                  steer_buf[li] if steer_buf is not None else None)
         if col >= 0:
             out, x_mlp = out

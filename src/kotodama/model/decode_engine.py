@@ -281,9 +281,12 @@ class DecodeEngine(nn.Module):
         # per row. levers == 0 (a trace-time constant) traces no lever op at all.
         self.levers = None
         if int(levers) > 0:
-            self.levers = LeverTables(self.n_layers, self.hidden, int(levers), dtype, self.device)
+            self.levers = LeverTables(self.n_layers, self.hidden, int(levers), dtype, self.device,
+                                      intermediate=cfg.intermediate_size)
             self.register_buffer("lever_attn", self.levers.tables["attn"], persistent=False)
             self.register_buffer("lever_mlp", self.levers.tables["mlp"], persistent=False)
+            self.register_buffer("lever_act_keep", self.levers.tables["act_keep"], persistent=False)
+            self.register_buffer("lever_act_add", self.levers.tables["act_add"], persistent=False)
             self.register_buffer("lever_slot", torch.zeros((1,), device=self.device, dtype=torch.long),
                                  persistent=False)
         # Digest of the uniform lever that wrote the prompt KV in the cache (None: unsteered). A cached prefix is
@@ -521,6 +524,8 @@ class DecodeEngine(nn.Module):
             # every layer's lever rows in one gather per forward ([n_layers, 1, hidden]): each layer adds its slice
             lever_attn = self.lever_attn.index_select(1, self.lever_slot)
             lever_mlp = self.lever_mlp.index_select(1, self.lever_slot)
+            act_keep = self.lever_act_keep.index_select(1, self.lever_slot)
+            act_add = self.lever_act_add.index_select(1, self.lever_slot)
         partial = embed
 
         for ls in self.schedule:
@@ -550,7 +555,10 @@ class DecodeEngine(nn.Module):
                 self._taps.record(ls.layer_idx, partial, x_mlp)
             gu = self._linear(x_mlp, self.w_gate_ups[ls.layer_idx])
             gate, up = gu.split(self.config.intermediate_size, dim=-1)
-            mlp_out = self._linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
+            act = F.silu(gate) * up
+            if self.levers is not None:
+                act = act * act_keep[ls.layer_idx] + act_add[ls.layer_idx]
+            mlp_out = self._linear(act, layer.ffn.down_proj.weight)
             if self.levers is not None:
                 mlp_out = mlp_out + lever_mlp[ls.layer_idx]
             partial = partial + mlp_out
@@ -605,6 +613,8 @@ class DecodeEngine(nn.Module):
             # every layer's lever rows in one gather per forward ([n_layers, 1, hidden]): each layer adds its slice
             lever_attn = self.lever_attn.index_select(1, self.lever_slot)
             lever_mlp = self.lever_mlp.index_select(1, self.lever_slot)
+            act_keep = self.lever_act_keep.index_select(1, self.lever_slot)
+            act_add = self.lever_act_add.index_select(1, self.lever_slot)
         partial = embed
 
         for ls in self.schedule:
@@ -643,7 +653,10 @@ class DecodeEngine(nn.Module):
                 self._taps.record(ls.layer_idx, partial, x_mlp)
             gu = self._linear(x_mlp, self.w_gate_ups[ls.layer_idx])
             gate, up = gu.split(self.config.intermediate_size, dim=-1)
-            mlp_out = self._linear(F.silu(gate) * up, layer.ffn.down_proj.weight)
+            act = F.silu(gate) * up
+            if self.levers is not None:
+                act = act * act_keep[ls.layer_idx] + act_add[ls.layer_idx]
+            mlp_out = self._linear(act, layer.ffn.down_proj.weight)
             if self.levers is not None:
                 mlp_out = mlp_out + lever_mlp[ls.layer_idx]
             partial = partial + mlp_out
@@ -1351,10 +1364,12 @@ class DecodeEngine(nn.Module):
 
     # ── The regional step and block forward (compile_step(regional=True)) ──
 
-    def _regional_levers(self) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def _regional_levers(self) -> Optional[tuple[torch.Tensor, ...]]:
+        """Every layer's lever rows at the engine's slot: (attn, mlp, act keep, act add), each [n_layers, 1, width]."""
         if self.levers is None:
-            return None, None
-        return self.lever_attn.index_select(1, self.lever_slot), self.lever_mlp.index_select(1, self.lever_slot)
+            return None
+        return tuple(t.index_select(1, self.lever_slot)
+                     for t in (self.lever_attn, self.lever_mlp, self.lever_act_keep, self.lever_act_add))
 
     def _regional_step_forward(self, token: torch.Tensor) -> torch.Tensor:
         """``_forward_step`` with each layer run as its signature's compiled region: token (1, 1) -> logits
@@ -1362,20 +1377,18 @@ class DecodeEngine(nn.Module):
         self.attn_bias.index_fill_(3, self.pos, 0.0)
         self.token_history.index_copy_(0, self.pos, token.view(1))
         embed = self.model.embed_tokens(token)
-        lever_attn, lever_mlp = self._regional_levers()
         cos = self.rope_cos_t.index_select(0, self.pos)
         sin = self.rope_sin_t.index_select(0, self.pos)
-        committed, partial = run_regions(self._step_regions, embed, cos, sin, (self.attn_bias, self.pos), lever_attn,
-                                         lever_mlp, self.steer_buf if self.steer_enabled else None, None)
+        committed, partial = run_regions(self._step_regions, embed, cos, sin, (self.attn_bias, self.pos),
+                                         self._regional_levers(), self.steer_buf if self.steer_enabled else None, None)
         return self._regional_step_tail(committed, partial)
 
     def _regional_block_forward(self, tokens: torch.Tensor) -> torch.Tensor:
         """``_forward_block`` over the regions of the bucket ``tokens.shape[1]``: last-position logits (1, 1, V)."""
         positions, bias, cos, sin = self._block_inputs(tokens)
         embed = self.model.embed_tokens(tokens)
-        lever_attn, lever_mlp = self._regional_levers()
         committed, partial = run_regions(self._block_regions[tokens.shape[1]], embed, cos, sin, (bias, positions),
-                                         lever_attn, lever_mlp, None, None)
+                                         self._regional_levers(), None, None)
         return self._regional_block_tail(committed, partial)
 
     def _regional_block(self, tokens: torch.Tensor) -> torch.Tensor:

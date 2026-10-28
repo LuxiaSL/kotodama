@@ -19,7 +19,7 @@ import torch
 from torch.nn.attention import SDPBackend
 
 from kotodama.model.decode_engine import DecodeEngine, SamplingParams
-from kotodama.model.levers import LeverPlan, write_plan
+from kotodama.model.levers import LeverPlan, act_rows, write_plan
 from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.model.multi_decode import MultiSampleDecoder
 from kotodama.serve.xbatch import XBatchJob, XBatchRunner, XBatchScheduler
@@ -185,11 +185,19 @@ def test_server_maps_bank_vectors_injections_and_spans(monkeypatch, model: Kotod
     # an MLP-site injection (a neuron-style write) at the loop's second pass
     got_m = completion(injection={"sites": [7], "vectors": [(4.0 * unit).tolist()], "rule": "S", "kind": "mlp"})
     assert got_m == _solo_greedy(eng, prompt, LeverPlan(mlp={7: (4.0 * unit).numpy()}, span="decode"), 5)
+    # an act injection: neurons moved toward fixed values (alpha 1 replaces them), uniform span
+    act = {"kind": "act", "sites": [2, 2, 7], "neurons": [3, 40, 11], "mu": [2.5, -1.5, 3.0], "alpha": 1.0}
+    got_a = completion(injection=act, steer_span="uniform")
+    want_plan = LeverPlan(act=act_rows([(2, 3, 2.5), (2, 40, -1.5), (7, 11, 3.0)], 1.0, CFG["intermediate_size"]))
+    assert got_a == _solo_greedy(eng, prompt, want_plan, 5)
     assert eng.levers.bound == ()
     # refusals, before anything is engaged
     for bad in ({"injection": {"sites": [4], "vectors": [[1.0] * 3]}},
                 {"injection": {"sites": [7], "vectors": [unit.tolist()], "kind": "mlp", "rule": "K"}},
-                {"injection": inj, "vectors": [{"name": "v"}]}):
+                {"injection": inj, "vectors": [{"name": "v"}]},
+                {"injection": {**act, "neurons": [3, 40]}},  # one neuron short
+                {"injection": {**act, "neurons": [3, 3, 11]}},  # a neuron twice at one layer
+                {"injection": {**act, "vectors": [unit.tolist()]}}):
         r = client.post("/v1/completions", json={**base, **bad})
         assert r.status_code == 400, (bad, r.text)
     assert eng.levers.bound == ()

@@ -7,17 +7,21 @@ A LEVER is one request's whole steering write, resolved to the effective layers 
     re-assert a site's row.
   * ``mlp``: the MLP sublayer's output (``partial + (mlp_out + row)``), written once; a neuron unit ``(L, n)`` writes
     ``dose * W_down[:, n]`` here (``neuron_row``).
+  * ``act``: the MLP's activation (the input of down_proj, one entry per neuron), rewritten in place as
+    ``act * keep + add``; ``act_rows`` moves chosen neurons toward fixed values (``act + alpha * (mu - act)``:
+    keep ``1 - alpha``, add ``alpha * mu``; alpha 1 replaces the activation with ``mu``).
 
 Every write is keyed on the EFFECTIVE layer: in a looped model the repeats of the core run the same modules, and a
 write at one pass must not land at the other.
 
-``LeverTables`` holds, per site kind, one table ``[n_layers, 1 + max_levers, hidden]`` in the engine dtype. Row 0
-of every layer is the identity and holds ``-0.0`` in every element, never written: IEEE addition gives
-``x + (-0.0) == x`` bit for bit for every non-NaN ``x``, so a row reading slot 0 computes exactly what an engine
-without tables computes at that add. ``bind`` writes a lever's rows into a free slot (one slot index across every
-layer; a layer the lever does not write keeps ``-0.0`` in that slot) and returns the slot; a decode row reads its
-slot through ``index_select``, so every replay of a captured graph reads the slot and table values current at
-replay. Tables are allocated once and only written in place.
+``LeverTables`` holds, per site kind, one table ``[n_layers, 1 + max_levers, hidden]`` in the engine dtype (the
+``act`` pair: ``act_keep`` and ``act_add``, ``[n_layers, 1 + max_levers, intermediate]``, when the engine builds
+them). Row 0 of every layer is the identity, never written: ``-0.0`` in every add table (IEEE addition gives
+``x + (-0.0) == x`` bit for bit for every non-NaN ``x``) and ``1.0`` in ``act_keep`` (``x * 1.0 == x``), so a row
+reading slot 0 computes exactly what an engine without tables computes there. ``bind`` writes a lever's rows into
+a free slot (one slot index across every layer; a layer the lever does not write keeps the identity in that slot)
+and returns the slot; a decode row reads its slot through ``index_select``, so every replay of a captured graph
+reads the slot and table values current at replay. Tables are allocated once and only written in place.
 
 The span is per lever: ``uniform`` writes every position (prompt included: a steered prefill reads the slot), and
 ``decode`` writes generated positions only (the prefill stays unsteered and is shared across rows).
@@ -36,6 +40,8 @@ import numpy as np
 import torch
 
 KINDS: tuple[str, ...] = ("attn", "mlp")
+ACT_TABLES: tuple[str, ...] = ("act_keep", "act_add")  # the act kind's tables, and the identity each holds
+_IDENTITY: dict[str, float] = {"attn": -0.0, "mlp": -0.0, "act_keep": 1.0, "act_add": -0.0}
 SPANS: tuple[str, ...] = ("uniform", "decode")
 IDENTITY_SLOT: int = 0
 Span = Literal["uniform", "decode"]
@@ -86,11 +92,13 @@ def write_plan(sites: Sequence[int], rows: np.ndarray, boundaries: Iterable[int]
 @dataclass(frozen=True)
 class LeverPlan:
     """One lever: ``attn`` / ``mlp`` map effective layers to the float32 row added at that site (dose baked in),
-    and ``span`` says which positions it writes."""
+    ``act`` maps effective layers to a float32 ``[2, intermediate]`` pair (keep, add) applied to the MLP activation
+    (``act_rows``), and ``span`` says which positions it writes."""
 
     attn: Mapping[int, np.ndarray] = field(default_factory=dict)
     mlp: Mapping[int, np.ndarray] = field(default_factory=dict)
     span: Span = "uniform"
+    act: Mapping[int, np.ndarray] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.span not in SPANS:
@@ -107,22 +115,59 @@ class LeverPlan:
                     raise LeverError(f"{kind} row at layer {int(layer)} contains NaN/inf")
                 rows[int(layer)] = arr
             object.__setattr__(self, kind, rows)
+        pairs = {}
+        for layer, pair in self.act.items():
+            if isinstance(layer, bool) or not isinstance(layer, (int, np.integer)):
+                raise LeverError(f"act plan keys must be effective layer ints, got {layer!r}")
+            arr = np.ascontiguousarray(pair, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[0] != 2:
+                raise LeverError(f"act rows at layer {int(layer)} must be [2, intermediate] (keep, add), got "
+                                 f"{arr.shape}")
+            if not np.isfinite(arr).all():
+                raise LeverError(f"act rows at layer {int(layer)} contain NaN/inf")
+            pairs[int(layer)] = arr
+        object.__setattr__(self, "act", pairs)
 
     def rows(self, kind: str) -> Mapping[int, np.ndarray]:
         return getattr(self, kind)
 
     @property
     def empty(self) -> bool:
-        return not self.attn and not self.mlp
+        return not self.attn and not self.mlp and not self.act
 
     def digest(self) -> str:
         """A content hash of the lever (span + every row's bits): equal digests write identical rows."""
         h = hashlib.sha256(self.span.encode())
-        for kind in KINDS:
+        for kind in (*KINDS, "act"):
             for layer in sorted(self.rows(kind)):
                 h.update(f"|{kind}{layer}|".encode())
                 h.update(self.rows(kind)[layer].tobytes())
         return h.hexdigest()[:16]
+
+
+def act_rows(entries: Iterable[tuple[int, int, float]], alpha: float, intermediate: int) -> dict[int, np.ndarray]:
+    """The ``act`` plan that moves each listed neuron's activation toward its value: ``entries`` are
+    (effective layer, neuron, mu), and every listed activation becomes ``act + alpha * (mu - act)`` (keep
+    ``1 - alpha``, add ``alpha * mu``; the others keep 1 and add 0). A neuron listed twice at one layer is refused."""
+    if not math.isfinite(alpha):
+        raise LeverError("act alpha must be finite")
+    out: dict[int, np.ndarray] = {}
+    seen: set[tuple[int, int]] = set()
+    for layer, neuron, mu in entries:
+        layer, neuron = int(layer), int(neuron)
+        if not 0 <= neuron < intermediate:
+            raise LeverError(f"neuron {neuron} outside [0, {intermediate})")
+        if (layer, neuron) in seen:
+            raise LeverError(f"neuron {neuron} is listed twice at layer {layer}")
+        if not math.isfinite(float(mu)):
+            raise LeverError(f"mu of neuron ({layer}, {neuron}) must be finite")
+        seen.add((layer, neuron))
+        pair = out.get(layer)
+        if pair is None:
+            pair = out[layer] = np.stack([np.ones(intermediate, np.float32), np.zeros(intermediate, np.float32)])
+        pair[0, neuron] = np.float32(1.0 - alpha)
+        pair[1, neuron] = np.float32(alpha) * np.float32(mu)
+    return out
 
 
 def neuron_row(model: torch.nn.Module, layer: int, neuron: int, dose: float) -> np.ndarray:
@@ -141,7 +186,7 @@ class LeverTables:
     per-row slot buffers name which slot each row reads."""
 
     def __init__(self, n_layers: int, hidden: int, max_levers: int, dtype: torch.dtype,
-                 device: torch.device) -> None:
+                 device: torch.device, intermediate: int = 0) -> None:
         if int(max_levers) < 1:
             raise LeverError(f"max_levers must be >= 1, got {max_levers}")
         if not dtype.is_floating_point:
@@ -155,6 +200,11 @@ class LeverTables:
             kind: torch.full((self.n_layers, 1 + self.max_levers, self.hidden), -0.0, dtype=dtype,
                              device=self.device)
             for kind in KINDS}
+        # the act kind's pair, when the engine builds it (intermediate > 0)
+        self.intermediate = int(intermediate)
+        for name in ACT_TABLES if self.intermediate > 0 else ():
+            self.tables[name] = torch.full((self.n_layers, 1 + self.max_levers, self.intermediate), _IDENTITY[name],
+                                           dtype=dtype, device=self.device)
         self._plans: dict[int, LeverPlan] = {}
         self._free: list[int] = list(range(1, 1 + self.max_levers))
         self._lock = threading.Lock()
@@ -175,6 +225,16 @@ class LeverTables:
                     raise LeverError(f"{kind} row at layer {layer} has {row.shape[0]} elements, "
                                      f"hidden is {self.hidden}")
                 staged.setdefault(kind, []).append((layer, torch.from_numpy(row)))
+        for layer, pair in plan.act.items():
+            if not self.intermediate:
+                raise LeverError("this engine has no act tables (built without them)")
+            if not 0 <= layer < self.n_layers:
+                raise LeverError(f"act rows at layer {layer} outside [0, {self.n_layers})")
+            if pair.shape[1] != self.intermediate:
+                raise LeverError(f"act rows at layer {layer} have {pair.shape[1]} elements, intermediate is "
+                                 f"{self.intermediate}")
+            staged.setdefault("act_keep", []).append((layer, torch.from_numpy(pair[0])))
+            staged.setdefault("act_add", []).append((layer, torch.from_numpy(pair[1])))
         with self._lock:
             if not self._free:
                 raise LeverError(f"all {self.max_levers} lever slots are bound; release one first")
@@ -185,21 +245,22 @@ class LeverTables:
                         # the row cast to the engine dtype, as an eager hook casts it onto a sublayer output
                         self.tables[kind][layer, slot].copy_(row.to(device=self.device, dtype=self.dtype))
             except BaseException:
-                for t in self.tables.values():
-                    t[:, slot].fill_(-0.0)
+                for name, t in self.tables.items():
+                    t[:, slot].fill_(_IDENTITY[name])
                 self._free.insert(0, slot)
                 raise
             self._plans[slot] = plan
         return slot
 
     def release(self, slot: int) -> None:
-        """Refill ``slot`` with ``-0.0`` at every layer and free it. Releasing an unbound slot is refused."""
+        """Refill ``slot`` with each table's identity at every layer and free it. Releasing an unbound slot is
+        refused."""
         slot = int(slot)
         with self._lock:
             if slot not in self._plans:
                 raise LeverError(f"slot {slot} is not bound")
-            for t in self.tables.values():
-                t[:, slot].fill_(-0.0)
+            for name, t in self.tables.items():
+                t[:, slot].fill_(_IDENTITY[name])
             del self._plans[slot]
             self._free.append(slot)
             self._free.sort()
@@ -234,10 +295,14 @@ class LeverTables:
         return len(self._free)
 
     def is_identity(self) -> bool:
-        """True when slot 0 and every free slot is bitwise ``-0.0`` at every layer (one device sync)."""
+        """True when slot 0 and every free slot holds each table's identity bit for bit at every layer (``-0.0``,
+        ``act_keep`` 1.0)."""
         cols = [IDENTITY_SLOT, *self._free]
-        return all(bool(torch.all(torch.signbit(t[:, cols]) & (t[:, cols] == 0)).item())
-                   for t in self.tables.values())
+        ok = []
+        for name, t in self.tables.items():
+            v = t[:, cols]
+            ok.append(torch.all(v == 1) if _IDENTITY[name] == 1.0 else torch.all(torch.signbit(v) & (v == 0)))
+        return bool(torch.stack(ok).all().item())
 
     def nbytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in self.tables.values())
