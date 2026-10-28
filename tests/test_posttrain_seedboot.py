@@ -191,6 +191,34 @@ def test_fan_and_cli(tmp_path: Path) -> None:
                     "--pass", "0"])
 
 
+def test_copy_guard_pools_drift_pick(tmp_path: Path) -> None:
+    ex = {"id": "e1", "names": [{"text": "Ines Moreau", "label": "Ines"}], "theme": "t", "pair": "", "moment": "",
+          "listing": "Two bakers fight over one oven in a cold kitchen at dawn.", "people": ["forty, a baker"],
+          "scene": "A kitchen."}
+    assert sb.copies_exemplar("x y. Two bakers fight over one oven in a cold room.", [ex])
+    assert not sb.copies_exemplar("Two bakers argue about the oven.", [ex])
+    pools, frames = _setup(tmp_path)
+    frames = [dict(frames[0], pool="cat"), dict(frames[1], pool="thr"), dict(frames[1], frame="F2", pool="thr")]
+    starts = sb.draw_boot_starts(pools, LISTS, frames, 400, seed=0, pass_no=0)
+    by = collections.Counter(s["frame_pool"] for s in starts)
+    assert abs(by["cat"] - by["thr"]) < 60  # pools drawn uniformly, not frames
+    complete = fake()
+    fm = {f["frame"]: f["text"] for f in frames}
+    for p in (0, 1):
+        d = tmp_path / f"pass{p}"
+        d.mkdir()
+        st = sb.draw_boot_starts(pools, LISTS, frames, 12, seed=0, pass_no=p)
+        prev = sp.read_jsonl(tmp_path / "pass0" / "seeds.all.jsonl") if p else []
+        asyncio.run(sb.run_boot(complete, _score, st, fm, prev, d, (2, 3), 0))
+    rows = sp.read_jsonl(tmp_path / "pass0" / "seeds.all.jsonl") + sp.read_jsonl(tmp_path / "pass1" / "seeds.all.jsonl")
+    verdicts = {r["id"]: ("keep" if i % 3 else "reject") for i, r in enumerate(rows)}
+    rep = sb.drift(tmp_path, [0, 1], verdicts)
+    assert rep["pass1"]["chains"] == 12 and rep["pass1"]["gate_pass"] + rep["pass1"]["copy_rejected"] <= 12
+    assert {"pass0/cat", "pass0/thr"} <= set(rep) and rep["pass0"]["six_gram_overlap_share"] == 0.0
+    stats = sb.boot_pick(tmp_path, [1], verdicts, nll_cut=0.0)
+    assert set(stats["by_pass"]) <= {1} and stats["total"] == len(sp.read_jsonl(tmp_path / "seeds.jsonl"))
+
+
 def test_exemplars_from_native_rows_and_same_roots(tmp_path: Path) -> None:
     native = {"id": "sc-ch00001", "form": "native", "theme": "peace and despair", "relationship": "two rival bakers",
               "blurb": "Two bakers share a kitchen. A comedy.", "scene": "A kitchen at dawn. Ines waits.",

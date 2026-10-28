@@ -344,6 +344,8 @@ async def grow_boot(complete: sp.Complete, score: Optional[sp.Score], st: dict[s
                         for x, p in zip(st["names"], st["people"])]}
     why = sp.gate_page({"wants": [], "secret": "", "page": header if st["arm"] == "bare" else
                         header.split("\n\n", 1)[1]}, c, wants_required=0)
+    if not why and copies_exemplar(header, exemplars):
+        why = "copy"  # a run of 6+ words lifted from one of the listings this seed was shown
     if why:
         st.update(status="fail", failed_step="page", rejections={**st["rejections"], "page": [why]})
         return st
@@ -359,16 +361,38 @@ async def grow_boot(complete: sp.Complete, score: Optional[sp.Score], st: dict[s
     return st
 
 
+COPY_RUN = 6
+THEATRE_META = re.compile(r"\b(?:theat(?:re|er)s?|rehears\w*|stage[sd]?|playwright|actors?|actress(?:es)?|"
+                          r"audiences?|curtain|scripts?|drama (?:club|school|class)|director|backstage|"
+                          r"performances?|the play\b)", re.I)
+
+
+def word_runs(text: str, n: int = COPY_RUN) -> set[tuple[str, ...]]:
+    w = re.findall(r"\w+", text.lower())
+    return {tuple(w[i:i + n]) for i in range(len(w) - n + 1)}
+
+
+def copies_exemplar(header: str, exemplars: Sequence[dict[str, Any]], n: int = COPY_RUN) -> bool:
+    """The header shares a run of ``n`` or more words with one of the listings shown to it."""
+    runs = word_runs(header, n)
+    return any(runs & word_runs(render_listing(1, e), n) for e in exemplars)
+
+
 def draw_boot_starts(pools: dict[str, list[dict[str, Any]]], lists: dict[str, list[str]], frames: list[dict],
                      n: int, seed: int, pass_no: int, cast_share: float = 0.3,
                      lineage: str = "") -> list[dict[str, Any]]:
     """Roots and arms for ``n`` seeds: theme least-used from the pool, relationship = (antisyzygy, life moment)
     atoms, names; cast arm by quota, note/bare arm alternating; the frame drawn at random per seed from the whole
-    pool (rotation: no frame's imprint is shared by the corpus), its title recorded for grouping."""
+    pool (rotation: no frame's imprint is shared by the corpus), its title recorded for grouping. Frames tagged with
+    a ``pool`` are drawn pool first (uniformly), then frame within the pool."""
     rng = random.Random(f"{seed}:{pass_no}")
     frame_rng = random.Random(f"{seed}:{pass_no}:frame")  # its own stream: the frame pool never shifts the roots
     uses: collections.Counter = collections.Counter()
     sched = sp.arm_schedule(n, cast_share, rng)
+    by_pool: dict[str, list[dict]] = collections.defaultdict(list)
+    for f in frames:
+        by_pool[f.get("pool", "")].append(f)
+    pool_names = sorted(by_pool)
     out = []
     for i, (_f, _s, cast_arm) in enumerate(sched):
         k = 2 if cast_arm == "pair" else rng.choice((3, 4))
@@ -377,7 +401,8 @@ def draw_boot_starts(pools: dict[str, list[dict[str, Any]]], lists: dict[str, li
         for e in (theme, *names):
             uses[e["id"]] += 1
         out.append({"id": f"p{pass_no}-{i:05d}", "pass": pass_no, "cast_arm": cast_arm,
-                    "arm": ("note", "bare")[i % 2], **_frame_fields(frame_rng.choice(frames)), "lineage": lineage,
+                    "arm": ("note", "bare")[i % 2],
+                    **_frame_fields(frame_rng.choice(by_pool[frame_rng.choice(pool_names)])), "lineage": lineage,
                     "theme": theme["text"], "pair": rng.choice(lists["antisyzygies"]),
                     "moment": rng.choice(lists["moments"]),
                     "roots": {"theme": theme["id"], "names": [x["id"] for x in names]},
@@ -386,7 +411,8 @@ def draw_boot_starts(pools: dict[str, list[dict[str, Any]]], lists: dict[str, li
 
 
 def _frame_fields(f: dict[str, Any]) -> dict[str, Any]:
-    return {"frame": f["frame"], "frame_title": f.get("title", ""), "frame_control": bool(f.get("control"))}
+    return {"frame": f["frame"], "frame_title": f.get("title", ""), "frame_control": bool(f.get("control")),
+            "frame_pool": f.get("pool", "")}
 
 
 def exemplar_pool(kept: list[dict[str, Any]], select: str, size: int, seed: int,
@@ -468,6 +494,7 @@ def boot_seed(st: dict[str, Any]) -> dict[str, Any]:
     """A loom seed (``kotodama.posttrain.selfplay.parse_seed`` reads it) with its provenance."""
     return {"id": st["id"], "cast": [x["label"] for x in st["names"]], "header": st["header"], "form": "boot",
             "pass": st["pass"], "lineage": st.get("lineage", ""), "frame": st["frame"],
+            "frame_pool": st.get("frame_pool", ""),
             "frame_title": st.get("frame_title", ""),
             "frame_control": st.get("frame_control", False), "arm": st["arm"], "cast_arm": st["cast_arm"],
             "exemplars": st.get("exemplars", []), "genre": st["genre"], "theme": st["theme"], "pair": st["pair"],
@@ -651,7 +678,7 @@ def variety(rows: list[dict[str, Any]], embedder: str = "tfidf", metric: str = "
     lengths = [len(r[field]) for r in rows]
     out: dict[str, Any] = {"embedder": embedder, "metric": metric, "field": field, "n": len(rows), "groups": {},
                            "contrasts": {}}
-    for key in ("frame_title", "frame", "pass", "arm"):
+    for key in ("frame_pool", "frame_title", "frame", "pass", "arm"):
         groups: dict[str, list[int]] = collections.defaultdict(list)
         for i, r in enumerate(rows):
             groups[str(r.get(key, ""))].append(i)
@@ -799,6 +826,8 @@ def main_boot(argv: list[str]) -> int:
                     help="JSONL of kept seed rows (boot or seedchain native) to draw few-shot from on THIS pass, "
                          "pass 0 included; each seed draws a fresh 2-4 from the whole file")
     ap.add_argument("--lineage", default="", help="generation-lineage tag written on every row")
+    ap.add_argument("--from_passes", default=None,
+                    help="comma list of earlier passes whose kept seeds are the exemplars (default: the previous one)")
     ap.add_argument("--concurrency", type=int, default=128)
     a = ap.parse_args(argv)
     out = Path(a.out)
@@ -815,7 +844,8 @@ def main_boot(argv: list[str]) -> int:
         exemplars = [as_exemplar(r) for r in sp.read_jsonl(Path(a.exemplar_file))]
     elif a.pass_no > 0:
         keep = {v["id"] for vf in a.verdicts for v in sp.read_jsonl(Path(vf)) if v.get("verdict") == "keep"}
-        earlier = [r for p in range(a.pass_no) for r in sp.read_jsonl(out / f"pass{p}" / "seeds.all.jsonl")]
+        src = [int(x) for x in a.from_passes.split(",")] if a.from_passes else [a.pass_no - 1]
+        earlier = [r for p in src for r in sp.read_jsonl(out / f"pass{p}" / "seeds.all.jsonl")]
         kept = [r for r in earlier if r["id"] in keep]
         if not kept:
             raise SystemExit("no kept seeds from earlier passes to draw exemplars from (pass --verdicts)")
@@ -884,5 +914,104 @@ def main_variety(argv: list[str]) -> int:
     return 0
 
 
+def drift(out: Path, passes: Sequence[int], verdicts: dict[str, str],
+          exemplar_files: Optional[dict[int, Path]] = None) -> dict[str, Any]:
+    """Per pass (and per frame pool within it): chains, gate passes, filter keeps, copy rejections, median header
+    length, the share of passing listings that state a genre, the share of passing headers sharing a run of
+    ``COPY_RUN`` words with a shown exemplar, and the theatre-about-theatre share (``THEATRE_META`` in the header)."""
+    import statistics
+
+    rep: dict[str, Any] = {}
+    for p in passes:
+        rows = sp.read_jsonl(out / f"pass{p}" / "chains.jsonl")
+        src: dict[str, dict[str, Any]] = {}
+        if exemplar_files and p in exemplar_files:
+            src = {r["id"]: as_exemplar(r) for r in sp.read_jsonl(exemplar_files[p])}
+        elif p > 0:
+            src = {r["id"]: r for r in sp.read_jsonl(out / f"pass{p - 1}" / "seeds.all.jsonl")}
+        for pool in ["*"] + sorted({r.get("frame_pool", "") for r in rows}):
+            sub = [r for r in rows if pool == "*" or r.get("frame_pool", "") == pool]
+            ok = [r for r in sub if r["status"] == "pass"]
+            heads = [r["header"] for r in ok]
+            overlap = [bool(word_runs(r["header"]) & set().union(*(word_runs(render_listing(1, src[e]))
+                                                                   for e in r.get("exemplars", []) if e in src)))
+                       for r in ok]
+            judged = [verdicts[r["id"]] for r in ok if r["id"] in verdicts]
+            rep[f"pass{p}" + ("" if pool == "*" else f"/{pool}")] = {
+                "chains": len(sub), "gate_pass": len(ok),
+                "copy_rejected": sum("copy" in r.get("rejections", {}).get("page", []) for r in sub),
+                "filter_keep": sum(v == "keep" for v in judged), "filter_judged": len(judged),
+                "keep_rate_end_to_end": round(sum(v == "keep" for v in judged) / len(sub), 3) if sub else None,
+                "median_header_chars": statistics.median(len(h) for h in heads) if heads else None,
+                "genre_stated_share": round(sum(r.get("genre", "none") != "none" for r in ok) / len(ok), 3)
+                if ok else None,
+                "six_gram_overlap_share": round(sum(overlap) / len(overlap), 3) if overlap else None,
+                "theatre_meta_share": round(sum(bool(THEATRE_META.search(h)) for h in heads) / len(heads), 3)
+                if heads else None}
+    return rep
+
+
+def boot_pick(out: Path, passes: Sequence[int], verdicts: dict[str, str], nll_cut: float = 0.05,
+              cast_share: float = 0.3, seed: int = 0) -> dict[str, Any]:
+    """Kept seeds of ``passes`` only, minus the worst ``nll_cut`` NLL tail, stratified by cast arm at
+    ``cast_share`` casts (the largest pick both cells can fill); writes ``<out>/seeds.jsonl`` and
+    ``<out>/pick.stats.json``."""
+    rows = [r for p in passes for r in sp.read_jsonl(out / f"pass{p}" / "seeds.all.jsonl")
+            if verdicts.get(r["id"]) == "keep"]
+    nlls = sorted(r["nll"] for r in rows if r.get("nll") is not None)
+    cut = nlls[max(0, math.ceil(len(nlls) * (1 - nll_cut)) - 1)] if nlls and nll_cut > 0 else None
+    rows = [r for r in rows if cut is None or r.get("nll") is None or r["nll"] <= cut]
+    cells = {a: [r for r in rows if r["cast_arm"] == a] for a in ("pair", "cast")}
+    shares = {"pair": 1 - cast_share, "cast": cast_share}
+    total = min(len(cells[a]) / shares[a] for a in cells) if all(cells.values()) else 0
+    rng = random.Random(seed)
+    picked = []
+    for a, rs in cells.items():
+        rs = rs[:]
+        rng.shuffle(rs)
+        picked += rs[:math.floor(total * shares[a])]
+    sp.write_jsonl(out / "seeds.jsonl", picked)
+    stats = {"passes": list(passes), "kept": len(rows), "nll_cut_value": cut,
+             "available": {a: len(v) for a, v in cells.items()},
+             "picked": dict(collections.Counter(r["cast_arm"] for r in picked)), "total": len(picked),
+             "by_pass": dict(collections.Counter(r["pass"] for r in picked)),
+             "by_frame_pool": dict(collections.Counter(r.get("frame_pool", "") for r in picked))}
+    (out / "pick.stats.json").write_text(json.dumps(stats, indent=1))
+    return stats
+
+
+def _verdict_map(files: Sequence[str]) -> dict[str, str]:
+    """{id: verdict}, the last row per id winning (a rerun appends)."""
+    return {v["id"]: v["verdict"] for f in files for v in sp.read_jsonl(Path(f))}
+
+
+def main_drift(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description="per-pass drift (python -m kotodama.posttrain.seeds boot-drift)")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--passes", default="0,1,2")
+    ap.add_argument("--verdicts", action="append", default=[])
+    ap.add_argument("--exemplar_file", action="append", default=[], help="PASS=FILE: that pass's exemplar source")
+    a = ap.parse_args(argv)
+    ex = {int(k): Path(v) for k, v in (x.split("=", 1) for x in a.exemplar_file)}
+    rep = drift(Path(a.out), [int(x) for x in a.passes.split(",")], _verdict_map(a.verdicts), ex)
+    (Path(a.out) / "drift.json").write_text(json.dumps(rep, indent=1))
+    print(json.dumps(rep, indent=1))
+    return 0
+
+
+def main_pick(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description="stratified pick over chosen passes (python -m kotodama.posttrain.seeds "
+                                             "boot-pick)")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--passes", default="1,2")
+    ap.add_argument("--verdicts", action="append", default=[])
+    ap.add_argument("--nll_cut", type=float, default=0.05)
+    a = ap.parse_args(argv)
+    print(json.dumps(boot_pick(Path(a.out), [int(x) for x in a.passes.split(",")], _verdict_map(a.verdicts),
+                               a.nll_cut), indent=1))
+    return 0
+
+
 COMMANDS = {"boot-frames": main_frames, "boot-frames-pick": main_frames_pick, "boot-organon": main_organon,
-            "boot": main_boot, "boot-fan": main_fan, "boot-variety": main_variety}
+            "boot": main_boot, "boot-fan": main_fan, "boot-variety": main_variety, "boot-drift": main_drift,
+            "boot-pick": main_pick}
