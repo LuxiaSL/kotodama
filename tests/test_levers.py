@@ -677,3 +677,11 @@ def test_rows_of_different_laws_share_a_batch(model: KotodamaModel) -> None:
         want = [solo.admit(list(range(ROWS)), logits, law, seeds=[100 + r] * ROWS)]
         want += [solo.step(law).view(-1).tolist() for _ in range(6)]
         assert [g[r] for g in got] == [w[0] for w in want], r
+
+
+def test_the_chunked_exclusive_cumsum_is_the_cumsum() -> None:
+    g = torch.Generator().manual_seed(0)
+    for V in (49152, 1000, 256, 7):
+        p = torch.rand((5, V), generator=g, dtype=torch.float64)
+        want = p.cumsum(-1) - p
+        torch.testing.assert_close(MultiSampleDecoder._exclusive_cumsum(p), want, rtol=1e-12, atol=1e-9)

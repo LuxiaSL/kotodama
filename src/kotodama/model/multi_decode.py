@@ -277,6 +277,24 @@ class MultiSampleDecoder(nn.Module):
         self._advance_step()
         return logits[:, -1]
 
+    # Scan length of each chunk of _exclusive_cumsum: a row's cumsum over the whole vocabulary is a scan long enough
+    # for inductor to split it across blocks, and its split-scan codegen fails at batched decode shapes; two scans of
+    # at most a few hundred elements compile as plain reductions.
+    _SCAN_CHUNK = 256
+
+    @classmethod
+    def _exclusive_cumsum(cls, p: torch.Tensor) -> torch.Tensor:
+        """Per row, the sum of the entries before each one ((B, V) -> (B, V)): a cumsum within chunks plus the
+        running total of the chunks before."""
+        B, V = p.shape
+        C = cls._SCAN_CHUNK
+        pad = (-V) % C
+        x = F.pad(p, (0, pad)).view(B, -1, C)
+        inner = x.cumsum(dim=-1)
+        totals = inner[..., -1]
+        before = totals.cumsum(dim=-1) - totals
+        return (inner - x + before.unsqueeze(-1)).view(B, -1)[:, :V]
+
     @staticmethod
     def _truncate(scaled: torch.Tensor, top_p: torch.Tensor, log_min_p: torch.Tensor) -> torch.Tensor:
         """Top-p over the temperature-scaled logits (the smallest prefix of the sorted distribution whose exclusive
@@ -284,7 +302,7 @@ class MultiSampleDecoder(nn.Module):
         token whose probability is below min_p times the top token's). Per row; off values are no-ops."""
         sorted_logits, sorted_idx = torch.sort(scaled, dim=-1, descending=True)
         probs = sorted_logits.softmax(dim=-1)
-        cut = probs.cumsum(dim=-1) - probs >= top_p
+        cut = MultiSampleDecoder._exclusive_cumsum(probs) >= top_p
         sorted_logits = torch.where(cut, torch.full_like(sorted_logits, float("-inf")), sorted_logits)
         floor = sorted_logits[:, :1] + log_min_p  # log(min_p * p_max) relative to the shared normaliser
         sorted_logits = torch.where(sorted_logits < floor, torch.full_like(sorted_logits, float("-inf")),
