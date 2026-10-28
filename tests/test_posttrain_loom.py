@@ -354,6 +354,13 @@ def test_length_residuals() -> None:
     assert res[0] > res[1] and res[2] > res[3]
 
 
+def test_shrunk_shares() -> None:
+    got = loom.shrunk_shares([(1, 1), (0, 1), (5, 10)], 4.0)  # pooled share 6/12 = .5
+    assert [round(x, 6) for x in got] == [0.6, 0.4, 0.5]  # one-word turns pulled toward .5, not 1 or 0
+    assert loom.shrunk_shares([(1, 1), (0, 1)], 0.0) == [1.0, 0.0]  # no prior: the raw shares
+    assert loom.shrunk_shares([(0, 0), (0, 0)], 4.0) == [0.0, 0.0]
+
+
 def test_novelty_norm_length_stops_selection_tracking_length() -> None:
     """Long candidates are all-new, short ones half-new: raw novelty picks the long ones every time, while the
     length-normalised choice has nothing left to prefer and picks either."""

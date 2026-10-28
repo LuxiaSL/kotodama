@@ -17,9 +17,9 @@ exp(λ·z), z = its engagement standardised among the node's survivors, where en
 replies of log p(reply | context + this turn) − log p(reply | context) for the next speaker — how much the turn hands
 the other speaker something to answer. λ > 0 leans toward engaging turns (questions, challenges), λ < 0 toward
 self-contained ones (narration, scene-setting, monologue); nothing is vetoed by it. ``novel`` weights each survivor
-by exp(λ·z) on its share of content words the last 30 turns did not use; ``--novelty_norm length`` first removes the
-part of that share a fit on log(1 + words) explains across the node's survivors, so the choice does not follow turn
-length. ``--overlong keep`` lets a turn that reaches the token cap live (flagged) instead of vetoing it.
+by exp(λ·z) on its share of content words the last 30 turns did not use; ``--novelty_norm length`` first shrinks each
+share toward the siblings' pooled rate (``--novelty_prior`` content words) and removes the part a fit on
+log(1 + words) explains across the node's survivors, so the choice follows turn length in neither direction. ``--overlong keep`` lets a turn that reaches the token cap live (flagged) instead of vetoing it.
 ``--rerolls N`` draws K fresh candidates (up to N times) when all K were vetoed, instead of ending the branch at once;
 ``--deep_children C`` caps children at C from ``--deep_after`` on (branch in the opening, then one path per branch).
 
@@ -71,8 +71,8 @@ from typing import Any, Awaitable, Callable, Optional
 
 from kotodama.posttrain import compliance
 from kotodama.posttrain.selfplay import (Complete, PromptTooLong, SeedSpec, SelfPlayConfig, evaluate, next_speaker,
-                                         novelty, oai_completer, parse_seed, parse_steer, speech_key, split_completion,
-                                         spoken_text)
+                                         novelty_counts, oai_completer, parse_seed, parse_steer, speech_key,
+                                         split_completion, spoken_text)
 from kotodama.posttrain.transcript import Transcript, Turn, render_prompt, stop_sequences, to_row
 from kotodama.serve.laws import law
 
@@ -94,9 +94,11 @@ class LoomConfig:
     select: str = "uniform"  # uniform | engage | novel
     select_lambda: float = 0.0
     novelty_speech_only: bool = False  # novel: narration paragraphs earn no novelty
-    # novel: "length" scores each survivor by its novelty's residual after a least-squares fit on log(1 + its words)
-    # across the node's survivors, so the choice does not lean toward longer (or shorter) turns; "none" = raw novelty
+    # novel: "length" scores each survivor by its shrunk novelty share (shrunk_shares) minus a least-squares fit on
+    # log(1 + its words) across the node's survivors, so the choice leans neither to long turns (whose share runs
+    # higher) nor to short ones (whose share is noisy, and noise wins under exp weighting); "none" = the raw share
     novelty_norm: str = "none"
+    novelty_prior: float = 4.0  # novelty_norm length: pseudo-count of content words in the shrunk share
     deep_children: int = 0  # > 0: nodes at depth >= deep_after keep at most this many children (branch early only)
     rerolls: int = 0  # a node whose K candidates are all vetoed draws K more, up to this many times, before degrading
     engage_replies: int = 2
@@ -146,6 +148,14 @@ async def engagement(turns: tuple[Turn, ...], header: str, cast: list[str], cand
     texts = [t for t in texts if t] or ["..."]
     lps = await score([(p, " " + t) for t in texts for p in (with_c, without)])
     return sum(lps[2 * i] - lps[2 * i + 1] for i in range(len(texts))) / len(texts)
+
+
+def shrunk_shares(counts: list[tuple[int, int]], prior: float) -> list[float]:
+    """Each (new, total) content-word count as (new + prior·p) / (total + prior), p = the pooled share Σnew / Σtotal:
+    a turn with few content words is pulled toward the siblings' rate instead of scoring 0 or 1 by chance."""
+    tot = sum(t for _, t in counts)
+    p = sum(n for n, _ in counts) / tot if tot else 0.0
+    return [(n + prior * p) / (t + prior) if t + prior > 0 else p for n, t in counts]
 
 
 def length_residuals(values: list[float], lengths: list[int]) -> list[float]:
@@ -240,15 +250,18 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
         nov: dict[int, float] = {}
         n_words: dict[int, int] = {}
         if cfg.select == "novel" and len(survivors) > n_children:
-            nov = {i: novelty(cands[i].text, list(seen), speech_only=cfg.novelty_speech_only, cast=seed.cast)
-                   for i in survivors}
+            counts = {i: novelty_counts(cands[i].text, list(seen), speech_only=cfg.novelty_speech_only,
+                                        cast=seed.cast) for i in survivors}
+            nov = {i: (new / tot if tot else 0.0) for i, (new, tot) in counts.items()}
             n_words = {i: len(speech_key(spoken_text(cands[i].text, seed.cast) if cfg.novelty_speech_only
                                          else cands[i].text).split()) for i in survivors}
             vals = [nov[i] for i in survivors]
             if cfg.novelty_norm == "length":
-                vals = length_residuals(vals, [n_words[i] for i in survivors])
+                vals = length_residuals(shrunk_shares([counts[i] for i in survivors], cfg.novelty_prior),
+                                        [n_words[i] for i in survivors])
             mu = sum(vals) / len(vals)
-            sd = (sum((v - mu) ** 2 for v in vals) / len(vals)) ** 0.5 or 1.0
+            sd = (sum((v - mu) ** 2 for v in vals) / len(vals)) ** 0.5
+            sd = sd if sd > 1e-9 else math.inf  # equal scores (up to float residue from the fit): a uniform choice
             w = [math.exp(cfg.select_lambda * (v - mu) / sd) for v in vals]
             chosen = {survivors[j] for j in weighted_choice(rng, w, n_children)}
         elif eng:
@@ -665,8 +678,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--novelty_speech_only", action="store_true",
                     help="novel: count only speech (narration paragraphs and stage directions earn no novelty)")
     ap.add_argument("--novelty_norm", choices=["none", "length"], default="none",
-                    help="novel: length = choose on novelty's residual after a fit on log(1 + words) across the "
-                         "node's survivors, so selection does not track turn length")
+                    help="novel: length = choose on the shrunk novelty share's residual after a fit on log(1 + words) "
+                         "across the node's survivors, so selection does not track turn length")
+    ap.add_argument("--novelty_prior", type=float, default=4.0,
+                    help="novelty_norm length: pseudo-count (content words) shrinking each share toward the siblings'")
     ap.add_argument("--deep_children", type=int, default=0,
                     help="> 0: nodes at depth >= --deep_after keep at most this many children (e.g. --children 2 "
                          "--deep_after 6 --deep_children 1: branch in the opening, then grow each branch as one path)")
@@ -711,7 +726,7 @@ def main(argv: list[str] | None = None) -> int:
                      window_chars=a.window_chars, deep_after=a.deep_after, deep_width=a.deep_width,
                      select=a.select, select_lambda=a.select_lambda, engage_replies=a.engage_replies,
                      overlong=a.overlong, novelty_speech_only=a.novelty_speech_only, novelty_norm=a.novelty_norm,
-                     deep_children=a.deep_children, rerolls=a.rerolls)
+                     novelty_prior=a.novelty_prior, deep_children=a.deep_children, rerolls=a.rerolls)
     sp = SelfPlayConfig(candidates=a.candidates, max_tokens=a.max_tokens, min_turns=a.min_turns,
                         cycle_window=a.cycle_window, template_window=a.template_window, template_max=a.template_max)
     complete, close = oai_completer(a.endpoint, sampling, a.max_tokens, steer=parse_steer(a.steer) or None,

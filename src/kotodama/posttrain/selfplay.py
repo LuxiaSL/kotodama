@@ -225,12 +225,22 @@ def novelty(text: str, prior: list[Turn], window: int = 30, speech_only: bool = 
     used; 0 for a turn without content words. ``speech_only``: narration paragraphs earn nothing (prose is word-rich,
     so counting it rewards narration over speech). ``count``: the number of such new words instead of their share
     (new state per turn, which a share hides: a one-word turn with one new word scores 1.0 as a share)."""
+    new, total = novelty_counts(text, prior, window, speech_only, cast)
+    if not total:
+        return 0.0
+    return float(new) if count else new / total
+
+
+def novelty_counts(text: str, prior: list[Turn], window: int = 30, speech_only: bool = False,
+                   cast: Optional[list[str]] = None) -> tuple[int, int]:
+    """(new, total): the candidate's distinct content words that none of the last ``window`` turns used, and all of
+    its distinct content words (``novelty`` is their ratio, or ``new`` with ``count``)."""
     words = {w for w in speech_key(spoken_text(text, cast) if speech_only else text).split()
              if len(w) >= 3 and w not in _STOP}
     if not words:
-        return 0.0
+        return 0, 0
     seen = {w for t in prior[-window:] for w in speech_key(t.text).split()}
-    return float(len(words - seen)) if count else len(words - seen) / len(words)
+    return len(words - seen), len(words)
 
 
 def own_opening_repeat(text: str, speaker: str, prior: list[Turn], back: int = 3) -> bool:
