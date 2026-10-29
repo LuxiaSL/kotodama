@@ -1,0 +1,17 @@
+# The 1B kotodama-standard trunk: the 1b rung's shape (d2048 x 28, ~1.42B, no looped depth) on the kotodama-tsumugi
+# recipe (Muon 0.04, 2M-token batch, 4K ctx, rdlg2 at ~0.67%, constant LR, anchors every 10B), with AttnRes boundaries
+# fitted to this shape (presets.STANDARD_FIT). Everything not set here comes from tsumugi-1b.yaml, so the two runs
+# differ only in shape, boundaries and AttnRes numerics.
+#
+# Launch (8 GPUs; pass --global_batch_tokens on the CLI too so the scheduler telemetry derives the tokens axis):
+#   tools/run_train.sh --config configs/standard-1b.yaml --global_batch_tokens 2097152 \
+#     --data_path <train.bin> --mix_data_path <rdlg2.bin> --checkpoint_dir <dir> [--seed N]
+# The trunk never decays; cooldowns are branches forked from the anchors (see tsumugi-1b.yaml).
+
+extends: tsumugi-1b.yaml
+
+model_size: 1b-standard
+attn_res_boundaries: "0,1,4,10,12,20,23"
+# A new lineage: AttnRes routing in the kernels' own precision (tsumugi keeps fp64 routing for its lineage).
+attnres_eps_fp64_compat: false
+checkpoint_shm_dir: /dev/shm/kotodama-standard

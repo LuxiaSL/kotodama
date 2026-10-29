@@ -63,6 +63,10 @@ SHAPES: dict[str, dict[str, Any]] = {
                   vocab_size=1024, max_position_embeddings=2048),
 }
 
+# kotodama-standard (configs/standard-1b.yaml): the 1b rung's shape trained on the tsumugi recipe, with its own
+# boundary fit (STANDARD_FIT). The same dict as "1b": one shape, two boundary sets.
+SHAPES["1b-standard"] = SHAPES["1b"]
+
 # Older names still found in configs and scripts, and public model names for their shapes.
 # "1b-moonshot-loop" is kotodama-tsumugi's pre-release name; checkpoints, published config.json files and older scripts carry it.
 ALIASES: dict[str, str] = {"full": "3b", "model": "3b", "8b": "7b", "1b-moonshot-loop": "1b-tsumugi"}
@@ -75,10 +79,15 @@ DD3B_DEEP52: tuple[int, ...] = (0, 2, 6, 13, 28, 35, 45)
 CF52_FIT: tuple[int, ...] = (0, 1, 7, 9, 17, 19, 39)
 # Shape A's effective-position boundaries: CF52_FIT's prelude cuts + a block at every loop pass (19, 39) + the coda (59).
 TSUMUGI_LOOP: tuple[int, ...] = (0, 1, 7, 9, 17, 19, 39, 59)
+# 1b-standard's boundaries: scripts/eval/fit_boundaries.py on a no-AttnRes, no-decay counterfactual of the shape to
+# 10B tokens (rules_true, settled from 8.5B): the cuts present in >= 90% of the second-half fits (0, 1, 4), the two
+# strongest late cuts (20, 23), and the one middle pair that keeps layer 14 in a block of >= 8 layers (10, 12).
+STANDARD_FIT: tuple[int, ...] = (0, 1, 4, 10, 12, 20, 23)
 DEFAULT_BOUNDARIES: dict[str, tuple[int, ...]] = {"3b": DD3B, "proxy": DDV1,
                                                   "1b": DD3B, "1b-deep": DD3B_DEEP52,
                                                   "1b-deep-loop": DD3B_DEEP52,  # same effective geometry as deep
-                                                  "1b-deep-loopfit": CF52_FIT, "1b-tsumugi": TSUMUGI_LOOP}
+                                                  "1b-deep-loopfit": CF52_FIT, "1b-tsumugi": TSUMUGI_LOOP,
+                                                  "1b-standard": STANDARD_FIT}
 # an alias reads the same boundaries as its shape (callers index this table by the name they were given)
 DEFAULT_BOUNDARIES.update({a: DEFAULT_BOUNDARIES[k] for a, k in ALIASES.items() if k in DEFAULT_BOUNDARIES})
 

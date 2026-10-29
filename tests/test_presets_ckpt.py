@@ -153,3 +153,35 @@ def test_serve_knows_1b_deep():
     assert all(cfg[k] == v for k, v in presets.shape("1b-deep").items())
     assert list(cfg["attn_res_boundaries"]) == list(presets.DEFAULT_BOUNDARIES["1b-deep"])
     assert cfg["attn_res"] is True
+
+
+def test_preset_1b_standard():
+    """1b-standard: the 1b shape, its own fitted boundaries (seven block starts, ascending, inside 28 layers, layer 14 in a
+    block of >= 8 layers), and configs/standard-1b.yaml differs from tsumugi-1b.yaml only in shape, boundaries, AttnRes
+    numerics and its shm dir."""
+    import sys
+
+    from kotodama.training import train
+
+    assert presets.shape("1b-standard") == presets.shape("1b")
+    b = presets.DEFAULT_BOUNDARIES["1b-standard"]
+    assert b == presets.STANDARD_FIT == (0, 1, 4, 10, 12, 20, 23)
+    n = presets.shape("1b-standard")["num_layers"]
+    assert b[0] == 0 and list(b) == sorted(set(b)) and b[-1] < n
+    ends = list(b[1:]) + [n]
+    start, end = next((s, e) for s, e in zip(b, ends) if s <= 14 < e)
+    assert end - start >= 8
+
+    def parsed(config: str):
+        old = sys.argv
+        try:
+            sys.argv = ["train.py", "--config", config]
+            return vars(train.parse_args())
+        finally:
+            sys.argv = old
+
+    std, tsu = parsed("configs/standard-1b.yaml"), parsed("configs/tsumugi-1b.yaml")
+    assert std["model_size"] == "1b-standard" and std["attn_res_boundaries"] == "0,1,4,10,12,20,23"
+    assert std["attnres_eps_fp64_compat"] is False and tsu["attnres_eps_fp64_compat"] is True
+    differ = {k for k in std if std[k] != tsu.get(k)}
+    assert differ <= {"model_size", "attn_res_boundaries", "attnres_eps_fp64_compat", "checkpoint_shm_dir", "config", "_config_file"}, differ
