@@ -32,6 +32,9 @@ levers: 64
 # A request's `seed` reproduces its candidates whatever shares their batch (seeded requests prefill cold and
 # decode on the widest bucket).
 seeded_rows: true
+# Compiled decode regions round intermediates as eager does, so a signing decoder decodes the tokens an unsigned one
+# does (with the fleet's --kernel_pins table): signed and unsigned servers and requests stay token-comparable.
+emulate_casts: true
 
 # No KOTODAMA_ATTNRES_EPS_FP64_COMPAT: the decode engine routes AttnRes with its own math in fp32, which that variable
 # does not reach, and post-training trains on the numerics the model is served with.
