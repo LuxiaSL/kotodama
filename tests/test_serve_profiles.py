@@ -1,6 +1,7 @@
 """Serve profiles (kotodama.serve.profiles): every profile in configs/serve names only server flags and parses to a
 complete command line; a flag given on the command line overrides the profile; the profile's environment never
-overrides one already set; a key that is not a server flag is refused."""
+overrides one already set; a key that is not a server flag is refused. /info's AttnRes routing reports the eps choice
+the forward ops run, which a profile's env applied after their import does not change."""
 
 from __future__ import annotations
 
@@ -87,3 +88,14 @@ def test_narrow_row_buckets_skip_kernel_benchmarking(monkeypatch) -> None:
     monkeypatch.setattr(server, "_autotune_min_rows", 0)
     monkeypatch.setattr(server, "_compile_mode", "max-autotune")
     assert server._row_compile_mode(16) == "max-autotune"
+
+
+def test_attnres_routing_reports_what_the_ops_run(monkeypatch) -> None:
+    from kotodama.model.flash_attn_res.ops import phase_1 as p1ops
+    from kotodama.model.flash_attn_res.ops import phase_2 as p2ops
+    from kotodama.serve.server import attnres_routing
+
+    monkeypatch.setattr(p1ops, "EPS_FP64_COMPAT", False)
+    monkeypatch.setattr(p2ops, "EPS_FP64_COMPAT", False)
+    monkeypatch.setenv("KOTODAMA_ATTNRES_EPS_FP64_COMPAT", "1")  # a profile's env, applied after the import
+    assert attnres_routing() == {"eps_fp64_compat": False, "env": "1"}

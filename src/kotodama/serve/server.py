@@ -1564,11 +1564,22 @@ _sign_rows_arg = 128
 _sign_groups_arg = 16
 
 
+def attnres_routing() -> dict[str, Any]:
+    """The AttnRes forward ops' eps choice as they run it (bound when they were imported) beside the environment
+    variable that names it: a serve profile's env applies after the import, so the two can differ."""
+    from kotodama.model.flash_attn_res.ops import phase_1 as p1ops
+    from kotodama.model.flash_attn_res.ops import phase_2 as p2ops
+
+    return {"eps_fp64_compat": bool(p1ops.EPS_FP64_COMPAT and p2ops.EPS_FP64_COMPAT),
+            "env": os.environ.get("KOTODAMA_ATTNRES_EPS_FP64_COMPAT")}
+
+
 def _record_startup() -> None:
     """Seconds from process start to ready, against --startup_budget_s (a start over budget is logged loudly)."""
     global _startup_info
     seconds = time.time() - _PROCESS_T0
     _startup_info = {"seconds": round(seconds, 1), "budget_s": _startup_budget_s_arg, "regional": _regional,
+                     "attnres_routing": attnres_routing(),
                      "compile_mode": _compile_mode, "autotune_min_rows": _autotune_min_rows,
                      "compile_store": _compile_store_state}
     if _startup_budget_s_arg and seconds > _startup_budget_s_arg:
