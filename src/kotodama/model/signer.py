@@ -265,10 +265,12 @@ class RecordSigner:
         return cls(dec, reducer, compile_mode=compile_mode, **kw)
 
     @torch.inference_mode()
-    def warm(self, prompt_len: Optional[int] = None, span: int = 8) -> None:
-        """Run one batch of filler through the scoring step (no reducer): compiles and, with kernel pins recording,
-        records the kernels a signed batch launches. The default prompt is as long as the prefill's block buckets
-        together, so its prefill runs every bucket (a long prompt's chunks launch kernels a short one does not)."""
+    def warm(self, prompt_len: Optional[int] = None, span: int = 8, reduce: bool = False) -> None:
+        """Run one batch of filler through the scoring step: compiles and, with kernel pins recording, records the
+        kernels a signed batch launches. The default prompt is as long as the prefill's block buckets together, so its
+        prefill runs every bucket (a long prompt's chunks launch kernels a short one does not). ``reduce``: also hand
+        the batch's rows to the reducer once, its output discarded (a reducer's first batch compiles and allocates
+        what later batches reuse); a reducer that fails here is logged, not raised."""
         from kotodama.model.decode_engine import SamplingParams
 
         dec, eng = self.dec, self.dec.engine
@@ -280,7 +282,19 @@ class RecordSigner:
         dec.release(range(dec.rows))
         dec.admit(list(range(dec.rows)), eng.prefill(prompt), SamplingParams(temperature=1.0, repetition_penalty=1.0),
                   seeds=[0] * dec.rows)
-        dec.score(torch.randint(3, eng.config.vocab_size, (1, span), generator=g).to(eng.device))
+        tokens = torch.randint(3, eng.config.vocab_size, (1, span), generator=g)
+        dec.score(tokens.to(eng.device))
+        if reduce:
+            rows = [dec.signed(r, device=eng.device) for r in range(dec.rows)]
+            ids = tuple(prompt[0].tolist()) + tuple(tokens[0].tolist())
+            t0 = time.perf_counter()
+            try:
+                with deterministic_algorithms():
+                    self.reducer.reduce(rows, engine=self.identity, token_ids=[ids] * len(rows))
+                logger.info("sign: reducer warmed on a %d-row batch in %.2fs", len(rows), time.perf_counter() - t0)
+            except Exception as exc:  # noqa: BLE001 - a warm-up must not keep a server or drain from starting
+                logger.warning("sign: the reducer's warm-up batch failed (%s: %s)", type(exc).__name__, exc)
+            del rows
         dec.release(range(dec.rows))
 
     def why_not(self, rec: SignRecord) -> Optional[str]:

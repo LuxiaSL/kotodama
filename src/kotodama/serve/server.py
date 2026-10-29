@@ -255,6 +255,7 @@ _sign_pending: list[tuple[Any, Any, Any]] = []
 _sign_unwritten: list[tuple[list, list]] = []  # reduced batches (results, plans) the spool's drain lock held off
 _sign_pending_lock = threading.Lock()
 _sign_reducing = 0  # rows taken from _sign_pending and not yet reduced
+_sign_timing: dict[str, float] = {"reduce_s": 0.0, "write_s": 0.0}  # in-flight batches, seconds in each part
 # Kernel pins (--kernel_pins, kotodama.model.kernel_pins): the pin session, recording or replaying.
 _pins: Any = None
 # Startup: when this process started, how long it took to be ready (and against what budget), for /info.
@@ -1731,7 +1732,7 @@ def build_inflight_signer(reducer: "Any" = None) -> "RecordSigner":
                     dec.step(law)
         torch.cuda.synchronize(_engine.device)
     signer = RecordSigner(dec, reducer, compile_mode=mode, pins=_pins, audit_every=_sign_audit_every_arg)
-    signer.warm()
+    signer.warm(reduce=True)
     dec.release(range(dec.rows))
     _engine.reset()
     return signer
@@ -2212,15 +2213,19 @@ def _sign_reduce_batch(take: list) -> None:
     t0 = time.perf_counter()
     results = _signer.sign_captured([rec for rec, _, _ in take], [row for _, row, _ in take])
     del take
+    t1 = time.perf_counter()
     summary = _sign_spool.add_signed(_sign_writer, results, _signer.identity, plans=plans or None)
+    t2 = time.perf_counter()
+    _sign_timing["reduce_s"] += t1 - t0
+    _sign_timing["write_s"] += t2 - t1
     if summary is None:
         _sign_unwritten.append((results, plans or None))
         logger.info("sign: in-flight batch of %d rows reduced; the spool's drain lock is held, written later",
                     len(results))
         return
     _sign_count(summary)
-    logger.info("sign: in-flight batch %s: %d signed, %d skipped in %.2fs", summary.get("batch"),
-                summary.get("signed", 0), summary.get("skipped", 0), time.perf_counter() - t0)
+    logger.info("sign: in-flight batch %s: %d signed, %d skipped in %.2fs (reduce %.2fs, write %.2fs)",
+                summary.get("batch"), summary.get("signed", 0), summary.get("skipped", 0), t2 - t0, t1 - t0, t2 - t1)
 
 
 def _sign_count(summary: dict) -> None:
@@ -2238,7 +2243,10 @@ def _sign_info() -> dict | None:
             # rows captured and not yet in a written signed batch (waiting, being reduced, or held off by a drain)
             "pending_inflight": len(_sign_pending) + _sign_reducing + sum(len(r) for r, _ in _sign_unwritten),
             "reducer": getattr(_signer.reducer, "reducer_identity", None) if _signer is not None else None,
-            "stats": dict(_sign_stats)}
+            "stats": dict(_sign_stats),
+            "inflight_timing": {**{k: round(v, 3) for k, v in _sign_timing.items()},
+                                **({k: round(_xbatch.runner.stats[k], 3) for k in ("signed_rows", "export_s")}
+                                   if _xbatch is not None else {})} if _sign_inflight_arg else None}
 
 
 # A replica signs its spool when it has been idle this long (no request holds the engine, nothing queued).

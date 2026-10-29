@@ -309,6 +309,8 @@ def test_server_signs_in_flight(monkeypatch, model: KotodamaModel, tmp_path) -> 
     with torch.inference_mode():
         server._sign_flush()
     assert server._sign_pending == [] and server._sign_stats["inflight_batches"] == 1
+    timing = server._sign_info()["inflight_timing"]
+    assert timing["reduce_s"] > 0 and timing["signed_rows"] >= 2 and "write_s" in timing and "export_s" in timing
     index = [json.loads(x) for x in open(tmp_path / "spool" / "index.jsonl")]
     batch = tmp_path / "spool" / "signed" / index[-1]["batch"]
     rows = [json.loads(x) for x in open(batch / "rows.jsonl")]
@@ -329,3 +331,21 @@ def test_server_signs_in_flight(monkeypatch, model: KotodamaModel, tmp_path) -> 
     assert sum("file" in row for row in rows) >= 2
     # in flight, a signed request the batcher cannot take is refused
     assert client.post("/v1/completions", json={**body, "temperature": 0}).status_code == 400
+
+
+@torch.inference_mode()
+def test_warm_hands_the_reducer_one_batch(model: KotodamaModel) -> None:
+    eng = DecodeEngine(model, max_seq_len=MAX_SEQ, dtype=torch.float32, prefill_backends=[SDPBackend.MATH], levers=2)
+    _, signer = _decoders(eng)
+    keep = _Keep()
+    RecordSigner(signer, keep, compile_mode="aot_eager").warm(prompt_len=8, span=4, reduce=True)
+    assert len(keep.rows) == 1  # one batch of identical filler rows
+    assert next(iter(keep.rows.values())).positions == 3
+
+    class Broken:
+        reducer_identity = "broken"
+
+        def reduce(self, rows, *, token_ids, engine):
+            raise RuntimeError("no")
+
+    RecordSigner(signer, Broken(), compile_mode="aot_eager").warm(prompt_len=8, span=4, reduce=True)  # logged

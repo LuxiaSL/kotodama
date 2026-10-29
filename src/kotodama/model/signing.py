@@ -228,6 +228,17 @@ class SignedRow:
         return self.kept == self.positions
 
 
+_LAYER_INDEX: dict[tuple, torch.Tensor] = {}
+
+
+def _layer_index(layers: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """``layers`` as a long tensor on ``device``, made once per (layers, device)."""
+    key = (layers, str(device))
+    if key not in _LAYER_INDEX:
+        _LAYER_INDEX[key] = torch.tensor(layers, dtype=torch.long, device=device)
+    return _LAYER_INDEX[key]
+
+
 def export(spec: SignSpec, bufs: dict[str, torch.Tensor], row: int, *, start: int, pos: int, lever_slot: int,
            steered: bool, signatures: Sequence[tuple[int, bool]], n_heads: int, n_kv_heads: int,
            head_dim: int, weights: str = "", device: Optional[torch.device] = None) -> SignedRow:
@@ -253,7 +264,9 @@ def export(spec: SignSpec, bufs: dict[str, torch.Tensor], row: int, *, start: in
             x = x.view(kept, n, 3, n_heads)
         surf[name] = x
     if spec.depth:
-        surf["hidden"] = surf["depth"][:, list(spec.layers)]
+        # an index already on the device: indexing with a list copies it from pageable host memory, which waits
+        # for the work queued on the stream (an export while the next decode step runs would stall on it)
+        surf["hidden"] = surf["depth"].index_select(1, _layer_index(spec.layers, surf["depth"].device))
         # a block's output is its last layer's partial; layer li ends a block when li + 1 opens one
         ends = [li - 1 for li, (_, boundary) in enumerate(signatures) if boundary and li > 0]
         surf["committed"] = [surf["embed"]] + [surf["depth"][:, li] for li in ends]
