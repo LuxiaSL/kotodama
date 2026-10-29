@@ -191,6 +191,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--once", action="store_true", help="drain what is pending and exit (default: keep polling)")
     ap.add_argument("--poll_s", type=float, default=30.0)
     a = ap.parse_args(argv)
+    # the reducers' deterministic algorithms need cuBLAS's fixed workspace, set before CUDA starts
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     import torch

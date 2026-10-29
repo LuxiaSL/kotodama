@@ -7,7 +7,8 @@ engine, refill (continuous batching), steering installed for the batch and clear
 requests go through the batcher, anything else falls back to the existing paths; a signed request leaves one sign
 record per candidate in the spool (its generated ids ending with the stop token that ended it, its sign_meta kept),
 each choice carries its sign_id, the records sign through a signing decoder, and signed requests the sign path cannot
-take are refused.
+take are refused. A seeded job's prompt is prefilled cold (never through a prefix cache), so its draws do not depend
+on what the cache held.
 """
 
 from __future__ import annotations
@@ -496,3 +497,36 @@ def test_signed_requests_leave_records_in_the_spool(monkeypatch, model: Kotodama
     monkeypatch.setattr(server, "_sign_spool", None)
     r = client.post("/v1/completions", json=body)
     assert r.status_code == 400 and "--sign_spool" in r.text
+
+
+@torch.inference_mode()
+def test_seeded_jobs_prefill_cold(monkeypatch, model: KotodamaModel) -> None:
+    from kotodama.serve import server
+
+    eng = _engine(model)
+    calls: list[dict] = []
+
+    def prefill(ids, **kw):
+        calls.append(kw)
+        return eng.prefill_reference(ids), None
+
+    wide = MultiSampleDecoder(eng, 4, seeded=True)
+    runner = XBatchRunner({4: wide}, prefill=prefill, set_steer=eng.set_steer, decode=lambda ids: "",
+                          stop_ids=frozenset(), max_seq_len=MAX_SEQ, device=torch.device("cpu"))
+    rec = _Rec()
+    seeded = rec.job("s", _ids(8, 1), 2, params=SamplingParams(temperature=0.9, repetition_penalty=1.2))
+    seeded.seed = 11
+    runner.queue.put(seeded)
+    runner.queue.put(rec.job("u", _ids(8, 1), 2))
+    runner.run_batch()
+    assert calls == [{"fresh": True}, {}]
+    # the server's router: fresh skips the prefix cache even when it is on
+    used: list[str] = []
+    monkeypatch.setattr(server, "_engine", eng)
+    monkeypatch.setattr(server, "_prefix_pool", None)
+    monkeypatch.setattr(server, "_prefix_cache", True)
+    monkeypatch.setattr(eng, "prefill", lambda ids, slot=0: used.append("cold") or eng.prefill_reference(ids))
+    monkeypatch.setattr(eng, "prefill_cached", lambda ids, slot=0: used.append("cached") or (None, {}))
+    server._engine_prefill(torch.tensor([_ids(8, 1)]), fresh=True)
+    server._engine_prefill(torch.tensor([_ids(8, 1)]))
+    assert used == ["cold", "cached"]

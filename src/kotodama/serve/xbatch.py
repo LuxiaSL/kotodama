@@ -214,11 +214,13 @@ class XBatchRunner:
         slot = 0
         try:
             ids = torch.tensor([job.prompt_ids], dtype=torch.long, device=self.device)
+            # a seeded job's prompt is prefilled cold: its draws must not depend on what a prefix cache held
+            fresh = {"fresh": True} if job.seed is not None else {}
             if self.levers is not None:
                 slot = self.levers.bind(job.lever) if job.lever is not None else 0
-                logits, info = self.prefill(ids, slot)
+                logits, info = self.prefill(ids, slot, **fresh)
             else:
-                logits, info = self.prefill(ids)
+                logits, info = self.prefill(ids, **fresh)
             m = min(job.n, len(free), dec.admit_capacity())
             rows = free[:m]
             kw: dict[str, Any] = {}

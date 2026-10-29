@@ -79,7 +79,7 @@ def _solo_greedy(eng: DecodeEngine, prompt: list[int], plan: LeverPlan | None, n
 def _runner(eng: DecodeEngine, width: int = 6, seeded: bool = False) -> XBatchRunner:
     dec = MultiSampleDecoder(eng, width, seeded=seeded)
 
-    def prefill(ids, slot=0):
+    def prefill(ids, slot=0, fresh=False):
         return eng.prefill(ids, slot=slot), None
 
     return XBatchRunner({width: dec}, prefill=prefill, set_steer=eng.set_steer, decode=lambda ids: "",

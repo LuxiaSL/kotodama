@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+from contextlib import contextmanager
 import json
 import time
 import logging
@@ -174,6 +175,19 @@ def audited(request_id: str, every: int) -> bool:
     if every <= 0:
         return False
     return int(hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:8], 16) % every == 0
+
+
+@contextmanager
+def deterministic_algorithms() -> Iterator[None]:
+    """torch's deterministic algorithms on for the block, then the previous setting back. Reducers run under it (a
+    signature lane's reductions refuse to run without it); the capture does not, since the setting is process-wide
+    and can swap the kernels a decoder's pinned arithmetic was recorded with."""
+    was, warn_only = torch.are_deterministic_algorithms_enabled(), torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(was, warn_only=warn_only)
 
 
 def _canonical(x: Any) -> Any:
@@ -411,8 +425,9 @@ class RecordSigner:
                 signed: list[signing.SignedRow]) -> None:
         """Reduce a batch's rows together; if the reducer refuses the batch, row by row."""
         def call(ix: list[int], rows: list[signing.SignedRow]) -> list[signing.ReducedRow]:
-            out = self.reducer.reduce(rows, token_ids=[records[i].prompt_ids + records[i].generated_ids for i in ix],
-                                      engine=self.identity)
+            with deterministic_algorithms():
+                out = self.reducer.reduce(rows, engine=self.identity,
+                                          token_ids=[records[i].prompt_ids + records[i].generated_ids for i in ix])
             if len(out) != len(rows):
                 raise RuntimeError(f"the reducer returned {len(out)} rows for {len(rows)}")
             return out

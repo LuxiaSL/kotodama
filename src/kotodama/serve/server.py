@@ -276,15 +276,22 @@ def _engine_lock_contended() -> bool:
     return bool(getattr(_engine_lock, "_waiters", None))
 
 
-def _engine_prefill(input_ids: "torch.Tensor", slot: int = 0) -> tuple["torch.Tensor", dict | None]:
+def _engine_prefill(input_ids: "torch.Tensor", slot: int = 0,
+                    fresh: bool = False) -> tuple["torch.Tensor", dict | None]:
     """Engine prefill, via the prefix cache when enabled.
 
     ``slot``: the request's lever slot (--levers). A uniform lever's prompt KV is steered, so it bypasses the pool
     (keyed by tokens alone); the engine's own cached prefix is reused only under the same lever.
 
+    ``fresh``: a cold prefill whatever the caches hold. Seeded requests take it: a prefix hit forwards only the
+    suffix, through other kernels than a cold prefill, so the prompt's logits (and a seeded candidate's draws) would
+    otherwise depend on what the cache held when the request arrived.
+
     Returns (last-position logits, prefix-cache info dict or None).
     """
     assert _engine is not None
+    if fresh:
+        return _engine.prefill(input_ids, slot=slot), None
     uniform = bool(slot) and _engine.levers is not None and _engine.levers.span(slot) == "uniform"
     if _prefix_pool is not None and not uniform:
         out = _prefix_pool.prefill(input_ids)
@@ -1891,7 +1898,7 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
 
     t0 = time.perf_counter()
     with _steering(request, timing) as slot:
-        prefill_logits, pc_info = _engine_prefill(input_ids, slot)
+        prefill_logits, pc_info = _engine_prefill(input_ids, slot, fresh=request.seed is not None)
         timing["prefill_ms"] = (time.perf_counter() - t0) * 1000
         if pc_info is not None:
             timing["prefix_cache_hit"] = pc_info["prefix_hit"]
@@ -2621,6 +2628,9 @@ if __name__ == "__main__":
         parser.error(f"--sign_layers / --sign_reducer_kwargs: {exc}")
     if args.sign_reducer and not _sign_layers_arg:
         parser.error("--sign_reducer needs --sign_layers")
+    if args.sign_reducer:
+        # the reducer runs under deterministic algorithms, which need cuBLAS's fixed workspace before CUDA starts
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
     _sign_spool_arg = args.sign_spool
     _sign_reducer_arg = args.sign_reducer
     _sign_reducer_kwargs_arg = args.sign_reducer_kwargs
