@@ -118,7 +118,8 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
     tuple); the arithmetic of everything it returns is the same as without. With ``stats`` (1: every layer's statistics, 2: a sampled layer's too) the layer
     writes its attention statistics through kotodama.model.signing.stats_write from ``probs(q, kv, state)`` (the
     attention's probabilities in absolute column order; ``stats_args``: its stats tuple), or with ``stats_fn`` through
-    ``stats_fn(stats_args, q, kv, state, sampled)``, which writes the same statistics itself (a fused kernel). The function gets a code
+    ``stats_fn(stats_args, q, kv, state, sampled, lse)``, which writes the same statistics itself (a fused kernel)
+    given the attention's per-row log-normalisers (``attend(..., lse=True)`` returns them beside its output). The function gets a code
     object of its own named ``name``, so its compiled graphs are cached apart from every other signature's."""
     q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
 
@@ -149,10 +150,12 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
         q_pre, k_pre = q, k
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        attended = attend(q, k, v, kv, state)
         if stats and stats_fn is not None:
-            stats_fn(stats_args, q, kv, state, stats == 2)
-        elif stats:
+            attended, lse = attend(q, k, v, kv, state, lse=True)
+            stats_fn(stats_args, q, kv, state, stats == 2, lse)
+        else:
+            attended = attend(q, k, v, kv, state)
+        if stats and stats_fn is None:
             stats_write(stats_args, probs(q, kv, state), stats == 2)
         attn_out = linear(attended, w_o)
         if levers:

@@ -7,6 +7,8 @@ What is pinned here:
     the decoded sequence) at the same positions, for the eager step and the regional step, for both row decoders;
   * so do the attention statistics (per-head and head-mean entropy at every layer; per-head prompt, recency and sink
     mass and the head-mean rows at the sampled layers), computed from the replay's attention weights;
+  * the cascade decoder's stats function hook (the fused kernel's, on CUDA) gets each row's log-normaliser from the
+    attention, and what it writes is what the row exports;
   * signing does not change generation: a signed and an unsigned regional decoder give the same tokens and readouts,
     bit for bit;
   * replay through the engine: scoring a generated row's own tokens from the same prompt signs it bit for bit as its
@@ -204,6 +206,54 @@ def test_attention_statistics_match_the_replay_weights(model: KotodamaModel, cls
         rows = torch.zeros(STEPS, len(LAYERS), width)
         rows[..., :S] = ps.mean(2)
         torch.testing.assert_close(row.surfaces["mean_rows"], rows, **TOL)
+
+
+def _cascade_lse(q: torch.Tensor, kv: tuple, state: tuple) -> torch.Tensor:
+    """Each row's log-normaliser over its group's prompt keys and its own tail keys, from the scores, (B, heads)."""
+    tail_k, _, prompt_k, _ = kv
+    tail_pos, members, row_slot, prompt_lens, _ = state
+    B, H, _, D = q.shape
+    r = H // tail_k.shape[2]
+    out = torch.empty(B, H)
+    for b in range(B):
+        g = int(row_slot[b]) // members.shape[1]
+        keys = torch.cat([prompt_k[g, :int(prompt_lens[g])], tail_k[b, :int(tail_pos[b]) + 1]], dim=0)
+        s = torch.einsum("hd,shd->hs", q[b, :, 0].float(), keys.float().repeat_interleave(r, dim=1)) / D ** 0.5
+        out[b] = torch.logsumexp(s, dim=-1)
+    return out
+
+
+@pytest.mark.parametrize("regional", [False, True])
+@torch.inference_mode()
+def test_a_stats_function_reads_the_attentions_log_normalisers(model: KotodamaModel, regional: bool) -> None:
+    """The cascade decoder's ``_stats_fn`` hook (the fused kernel's, on CUDA) gets each row's log-normaliser from the
+    attention (eager step: checked against the scores), and what it writes is what the row exports: a stand-in that
+    writes the reference statistics signs every row as the reference path does, bit for bit."""
+    from kotodama.model.multi_decode import _cascade_probs
+    from kotodama.model.signing import stats_write
+
+    eng = _engine(model)
+    spec = SignSpec(LAYERS, tail=16, attn=True, width=40)
+    seen: list[float] = []
+
+    def stand_in(st, q, kv, state, sampled, lse):
+        if not regional:
+            seen.append(float((lse - _cascade_lse(q, kv, state)).abs().max()))
+        stats_write(st, _cascade_probs(q, kv, state), sampled)
+
+    ref, hooked = _dec(CascadeDecoder, eng, spec), _dec(CascadeDecoder, eng, spec)
+    hooked._stats_fn = stand_in
+    if regional:
+        for dec in (ref, hooked):
+            dec.compile_step(regional=True, backend="aot_eager")
+    prompt = _ids(11, 7)
+    assert _decode(eng, ref, prompt) == _decode(eng, hooked, prompt)
+    for r in range(ROWS):
+        a, b = ref.signed(r), hooked.signed(r)
+        for name in ("head_entropy", "mean_entropy", "head_scalars", "mean_rows"):
+            assert torch.equal(a.surfaces[name], b.surfaces[name]), name
+    if not regional:
+        assert len(seen) == CFG["num_layers"] * STEPS and max(seen) < 1e-5
 
 
 @pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])

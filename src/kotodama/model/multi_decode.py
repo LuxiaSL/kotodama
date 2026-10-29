@@ -113,10 +113,11 @@ def _cascade_probs(q: torch.Tensor, kv: tuple[torch.Tensor, ...], state: tuple[t
 
 def _cascade_attend_with(attend_fn: Callable) -> Callable:
     """CascadeDecoder._attend on passed tensors, over the part kernel ``attend_fn``: kv = (tail_k, tail_v, prompt_k,
-    prompt_v), state = (tail_pos, members, row_slot, prompt_lens, row_ids)."""
+    prompt_v), state = (tail_pos, members, row_slot, prompt_lens, row_ids). With ``lse`` it also returns each row's
+    log-normaliser over its prompt and tail, (B, heads) fp32, the merge's two parts' added in log space."""
 
     def cascade_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[torch.Tensor, ...],
-                       state: tuple[torch.Tensor, ...]) -> torch.Tensor:
+                       state: tuple[torch.Tensor, ...], lse: bool = False):
         B, H, _, D = q.shape
         tail_k, tail_v, prompt_k, prompt_v = kv
         tail_pos, members, row_slot, prompt_lens, row_ids = state
@@ -128,7 +129,8 @@ def _cascade_attend_with(attend_fn: Callable) -> Callable:
         o1, l1 = unpack_group_outputs(o1, l1, members.shape[1])
         o1, l1 = o1[row_slot], l1[row_slot]
         o2, l2 = attend_fn(q_rows.unsqueeze(1), tail_k, tail_v, (tail_pos + 1).to(torch.int32))
-        return merge(o1, l1, o2[:, 0], l2[:, :, 0]).reshape(B, 1, H * D)
+        out = merge(o1, l1, o2[:, 0], l2[:, :, 0]).reshape(B, 1, H * D)
+        return (out, torch.logaddexp(l1, l2[:, :, 0])) if lse else out
 
     return cascade_attend
 
@@ -328,13 +330,15 @@ class MultiSampleDecoder(nn.Module):
         sin = eng.rope_sin_t.index_select(0, self.pos).unsqueeze(1)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        out = self._attend(layer_idx, q, k, v)  # (B, 1, n_heads * head_dim)
-        if stats:
+        if stats and self._stats_fn is not None:  # the fused statistics read the attention's log-normalisers
+            attend, kvs, state = self._regional_attend()
+            out, lse = attend(q, k, v, kvs[layer_idx], state, lse=True)
+            self._stats_fn(self._stats_args(layer_idx), q, kvs[layer_idx], state, stats == 2, lse)
+        else:
+            out = self._attend(layer_idx, q, k, v)  # (B, 1, n_heads * head_dim)
+        if stats and self._stats_fn is None:
             _, kvs, state = self._regional_attend()
-            if self._stats_fn is not None:
-                self._stats_fn(self._stats_args(layer_idx), q, kvs[layer_idx], state, stats == 2)
-            else:
-                signing.stats_write(self._stats_args(layer_idx), self._probs(q, kvs[layer_idx], state), stats == 2)
+            signing.stats_write(self._stats_args(layer_idx), self._probs(q, kvs[layer_idx], state), stats == 2)
         return F.linear(out, attn.o_proj.weight)
 
     def _attend(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -543,8 +547,9 @@ class MultiSampleDecoder(nn.Module):
 
     # The attention probabilities of this decoder's attention (signing statistics), on the regional attend's tensors.
     _probs = staticmethod(_slot_probs)
-    # A function that writes a layer's attention statistics itself (stats_tuple, q, kv, state, sampled), in place of
-    # ``_probs`` + signing.stats_write; None: the reference.
+    # A function that writes a layer's attention statistics itself (stats_tuple, q, kv, state, sampled, lse), in place
+    # of ``_probs`` + signing.stats_write, given the attention's log-normalisers (its regional attend's ``lse=True``);
+    # None: the reference.
     _stats_fn: Optional[Callable] = None
 
     # ── signing (kotodama.model.signing) ────────────────────────────────────
