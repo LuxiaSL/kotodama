@@ -155,19 +155,54 @@ class SignSpool:
             signer.plans.update(self.plans())
             t0 = time.perf_counter()
             results = signer.sign(records) if records else []
-            name = f"{time.time_ns():020d}-{os.getpid()}"  # sorts in drain order
-            tmp = self.signed_dir / f".{name}"
-            summary = write_results(tmp, results)
-            (tmp / "engine.json").write_text(json.dumps(signer.identity, sort_keys=True, default=str))
-            final = self.signed_dir / name
-            os.replace(tmp, final)
-            with open(self.root / "index.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps({"batch": name, "dir": str(final.resolve()), "host": socket.gethostname(),
-                                    "signed": summary["signed"], "skipped": summary["skipped"]}) + "\n")
+            summary = self._write_batch(results, signer.identity)
             self._save_state(state)
-            summary.update(batch=name, seconds=round(time.perf_counter() - t0, 2),
+            summary.update(seconds=round(time.perf_counter() - t0, 2),
                            signer_timing={k: round(v, 3) for k, v in signer.timing.items()})
             logger.info("sign spool: %s", summary)
+            return summary
+
+    def _write_batch(self, results: list, identity: Any, inflight: bool = False) -> dict[str, Any]:
+        """One signed batch into the signed dir (a temporary directory, then renamed) and its index line."""
+        name = f"{time.time_ns():020d}-{os.getpid()}"  # sorts in drain order
+        tmp = self.signed_dir / f".{name}"
+        summary = write_results(tmp, results)
+        (tmp / "engine.json").write_text(json.dumps(identity, sort_keys=True, default=str))
+        final = self.signed_dir / name
+        os.replace(tmp, final)
+        line = {"batch": name, "dir": str(final.resolve()), "host": socket.gethostname(),
+                "signed": summary["signed"], "skipped": summary["skipped"]}
+        if inflight:
+            line["inflight"] = True
+        with open(self.root / "index.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(line) + "\n")
+        summary["batch"] = name
+        return summary
+
+    def add_signed(self, writer: str, results: list, identity: Any,
+                   plans: Optional[list[LeverPlan]] = None) -> Optional[dict[str, Any]]:
+        """Records signed as they were generated (in-flight signing; ``results``: kotodama.model.signer.SignResult,
+        each holding its record): appends the records to ``<writer>.inflight.jsonl`` and writes their signed batch,
+        then moves that file's signed offset past them, all under the drain lock, so a drain never signs them again.
+        Returns the batch's summary, or None when another drain holds the spool (nothing was written; call again)."""
+        with self._drain_lock() as mine:
+            if not mine:
+                return None
+            if not results:
+                return {"signed": 0, "skipped": 0, "batch": None}
+            path = self.root / "records" / f"{writer}.inflight.jsonl"
+            before = path.stat().st_size if path.exists() else 0
+            # a failure between the append and the state below leaves the records past the signed offset: a drain
+            # then signs them (the records file stays the one account of what was generated)
+            self.add(writer + ".inflight", [r.record for r in results], plans=plans)
+            summary = self._write_batch(results, identity, inflight=True)
+            state = self._state()
+            if state.get(path.name, 0) == before:
+                state[path.name] = path.stat().st_size
+                self._save_state(state)
+            else:
+                logger.warning("sign spool: %s holds records an earlier batch left unsigned; a drain signs them "
+                               "(and these again)", path.name)
             return summary
 
 
@@ -236,6 +271,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--rows", type=int, default=128, help="the signing decoder's width (the lane's canonical 128)")
     ap.add_argument("--groups", type=int, default=16)
     ap.add_argument("--group_rows", type=int, default=32)
+    ap.add_argument("--tail_tokens", type=int, default=0,
+                    help="the signing decoder's per-row tail (0: the sign tail + 2); a server's in-flight signer "
+                         "has its widest bucket's geometry (--groups, --group_rows, --tail_tokens = the server's "
+                         "--cascade_tail_tokens)")
     ap.add_argument("--max_seq_len", type=int, default=4096)
     ap.add_argument("--levers", type=int, default=4, help="lever slots (records' levers bind them per batch)")
     ap.add_argument("--compile_mode", default="default")
@@ -273,7 +312,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     reducer = load_reducer(a.reducer, **json.loads(a.reducer_kwargs))
     signer = RecordSigner.build(eng, reducer, layers=[int(x) for x in a.layers.split(",")], tail=a.tail,
                                 width=a.width or a.max_seq_len, rows=a.rows, groups=a.groups,
-                                group_rows=a.group_rows, compile_mode=a.compile_mode, pins=pins,
+                                group_rows=a.group_rows, tail_tokens=a.tail_tokens, compile_mode=a.compile_mode,
+                                pins=pins,
                                 audit_every=a.audit_every)
     if pins is not None and pins.mode == "record":
         signer.warm()

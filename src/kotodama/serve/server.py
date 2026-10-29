@@ -40,6 +40,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -246,6 +247,14 @@ _signer: "RecordSigner | None" = None
 _sign_writer: str = ""
 _sign_weights: str = ""
 _sign_stats: dict[str, Any] = {"records": 0, "batches": 0, "signed": 0, "skipped": 0, "errors": 0}
+# In-flight signing (--sign_inflight): signed requests decode on the signer's decoder (the widest bucket's geometry,
+# so their tokens are the unsigned ones'), each candidate's span is exported as it ends, and the rows are reduced on
+# the generation thread in batches of the signer's width (between steps once that many wait, else when idle) and
+# written to the spool as signed batches. (record, captured span or None, lever plan or None) per candidate:
+_sign_pending: list[tuple[Any, Any, Any]] = []
+_sign_unwritten: list[tuple[list, list]] = []  # reduced batches (results, plans) the spool's drain lock held off
+_sign_pending_lock = threading.Lock()
+_sign_reducing = 0  # rows taken from _sign_pending and not yet reduced
 # Kernel pins (--kernel_pins, kotodama.model.kernel_pins): the pin session, recording or replaying.
 _pins: Any = None
 # Startup: when this process started, how long it took to be ready (and against what budget), for /info.
@@ -1565,6 +1574,8 @@ _sign_tail_arg = 256
 _sign_width_arg = 0
 _sign_rows_arg = 128
 _sign_groups_arg = 16
+_sign_inflight_arg = False
+_sign_audit_every_arg = 100
 
 
 def attnres_routing() -> dict[str, Any]:
@@ -1670,14 +1681,60 @@ def _start_signing() -> "asyncio.Task | None":
         signer = RecordSigner.build(_engine, reducer, layers=_sign_layers_arg, tail=_sign_tail_arg,
                                     width=_sign_width_arg or _max_seq_len, rows=_sign_rows_arg,
                                     groups=_sign_groups_arg, compile_mode=_without_autotune(_compile_mode),
-                                    pins=_pins)
+                                    pins=_pins, audit_every=_sign_audit_every_arg)
         signer.warm()
         return signer
 
-    _signer = _generate_executor.submit(build).result()
-    logger.info("sign: draining %s when idle (%d-row signing decoder, reducer %s)", _sign_spool.root,
-                _signer.dec.rows, getattr(reducer, "reducer_identity", "?"))
+    _signer = _generate_executor.submit(
+        functools.partial(build_inflight_signer, reducer) if _sign_inflight_arg else build).result()
+    if _sign_inflight_arg:
+        assert _xbatch is not None
+        _xbatch.runner.sign_decoder = _signer.dec
+        _xbatch.runner.between_steps = _sign_between_steps
+    logger.info("sign: %sdraining %s when idle (%d-row signing decoder, %d groups, %d-token tails, reducer %s)",
+                "signing in flight and " if _sign_inflight_arg else "", _sign_spool.root, _signer.dec.rows,
+                _signer.dec.groups, _signer.dec.tail_tokens, getattr(reducer, "reducer_identity", "?"))
     return asyncio.get_running_loop().create_task(_sign_when_idle())
+
+
+def build_inflight_signer(reducer: "Any" = None) -> "RecordSigner":
+    """The in-flight signer (--sign_inflight; call on the generation thread): a signing CascadeDecoder with the
+    widest xbatch bucket's geometry and compile mode, viewing its KV storage (one decoder holds live rows at a time),
+    so a signed request decodes the tokens the unsigned bucket would (one kernel pin table, --emulate_casts). Its
+    generation and scoring steps are warmed (and, with kernel pins recording, recorded); the idle drain signs records
+    on it too, so a drained record and an in-flight row sign alike."""
+    from kotodama.model.signer import RecordSigner
+    from kotodama.model.signing import SignSpec, load_reducer
+
+    if reducer is None:
+        reducer = load_reducer(_sign_reducer_arg, **json.loads(_sign_reducer_kwargs_arg or "{}"))
+    if _sign_rows_arg != 128 or _sign_groups_arg != 16:
+        logger.info("sign: --sign_rows / --sign_groups do not apply in flight (the signer takes the widest bucket's "
+                    "geometry)")
+    assert _xbatch is not None and _engine is not None
+    widest = _xbatch.runner.decoders[_xbatch.runner.max_rows]
+    if not isinstance(widest, CascadeDecoder):
+        raise RuntimeError("--sign_inflight needs --cascade_attn (the signing decoder is a CascadeDecoder)")
+    spec = SignSpec(_sign_layers_arg, tail=_sign_tail_arg, depth=True, attn=True, width=_sign_width_arg or _max_seq_len)
+    dec = CascadeDecoder(_engine, widest.rows, groups=widest.groups, group_rows=widest.group_rows,
+                         tail_tokens=widest.tail_tokens, kv_from=widest, seeded=_seeded_rows, sign=spec)
+    mode = _row_compile_mode(widest.rows)
+    dec.compile_step(mode=mode, regional=_regional)
+    with torch.inference_mode():  # the generation step variants, as build_and_warm_row_decoder warms a bucket's
+        params = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2)
+        trunc = EngineSamplingParams(temperature=0.9, repetition_penalty=1.2, top_p=0.9, min_p=0.05)
+        for plen in sorted({min(plen, _engine.max_seq_len - 8) for plen in [16, 256]}):
+            logits = _engine.prefill(torch.randint(4, _engine.config.vocab_size, (1, plen), device=_engine.device))
+            for law in (params, trunc) if _warm_truncated else (params,):
+                dec.start(logits, law)
+                for _ in range(4):
+                    dec.step(law)
+        torch.cuda.synchronize(_engine.device)
+    signer = RecordSigner(dec, reducer, compile_mode=mode, pins=_pins, audit_every=_sign_audit_every_arg)
+    signer.warm()
+    dec.release(range(dec.rows))
+    _engine.reset()
+    return signer
 
 
 def _model_name() -> str:
@@ -2013,9 +2070,12 @@ def _xbatch_key(request: GenerateRequest, steered: bool) -> tuple:
     return (steer,)
 
 
-async def engine_generate_xbatch(request: GenerateRequest, n: int) -> list[GenerateResponse]:
+async def engine_generate_xbatch(request: GenerateRequest, n: int,
+                                 signed_out: list | None = None) -> list[GenerateResponse]:
     """n candidates of one prompt through the cross-request batcher: same tokenization, steering, stop and capacity
-    rules as engine_generate per candidate. Bad prompts and steering stacks 400 before the request queues."""
+    rules as engine_generate per candidate. Bad prompts and steering stacks 400 before the request queues.
+    ``signed_out`` (in-flight signing): the job decodes on the signing decoder and the list receives each
+    candidate's captured span."""
     assert _xbatch is not None and _tokenizer is not None
     t0 = time.perf_counter()
     prompt_ids = _prompt_ids(request, _tokenizer)
@@ -2030,8 +2090,10 @@ async def engine_generate_xbatch(request: GenerateRequest, n: int) -> list[Gener
     job = XBatchJob(key=_xbatch_key(request, steered), prompt_ids=prompt_ids, n=n,
                     max_new_tokens=request.max_new_tokens, params=params, done=lambda _outcome: None,
                     stop_strings=tuple(request.stop_strings), steer_writes=steer_writes, steer_kwargs=steer_kwargs,
-                    lever=lever, seed=request.seed)
+                    lever=lever, seed=request.seed, sign=signed_out is not None)
     result = await _xbatch.submit(job)
+    if signed_out is not None:
+        signed_out.extend(result.signed)
     elapsed = time.perf_counter() - t0
     timing = dict(result.timing)
     if steered:
@@ -2057,10 +2119,19 @@ def _check_sign(request: GenerateRequest) -> None:
 
 def _spool_records(request: GenerateRequest, responses: list[GenerateResponse]) -> None:
     """One sign record per candidate (kotodama.model.signer.SignRecord) into the spool; each response gets its
-    sign_id. The generated ids end with the stop token that ended the candidate, if one did: its position was fed."""
+    sign_id."""
+    assert _sign_spool is not None
+    records, plan = _sign_records(request, responses)
+    _sign_spool.add(_sign_writer, records, plans=[plan] if plan is not None else None)
+    _sign_stats["records"] += len(records)
+
+
+def _sign_records(request: GenerateRequest, responses: list[GenerateResponse]) -> tuple[list, "Any"]:
+    """One sign record per candidate (kotodama.model.signer.SignRecord), and the request's lever plan (None:
+    unsteered); each response gets its sign_id. The generated ids end with the stop token that ended the candidate,
+    if one did: its position was fed."""
     from kotodama.model.signer import SignRecord
 
-    assert _sign_spool is not None
     plan = _request_lever(request) if _levers and _request_wants_steering(request) else None
     base = uuid.uuid4().hex[:16]
     law = {"temperature": request.temperature, "repetition_penalty": request.repetition_penalty,
@@ -2074,15 +2145,98 @@ def _spool_records(request: GenerateRequest, responses: list[GenerateResponse]) 
                                   lever=plan.digest() if plan is not None else None,
                                   meta={**(request.sign_meta or {}), "candidate": i, "seed": request.seed,
                                         "law": law, "served_by": _sign_writer}))
-    _sign_spool.add(_sign_writer, records, plans=[plan] if plan is not None else None)
+    return records, plan
+
+
+def _sign_add_inflight(request: GenerateRequest, responses: list[GenerateResponse], signed: list) -> None:
+    """A signed request's records (as _spool_records names them) and its candidates' captured spans, queued for
+    the in-flight reduce."""
+    records, plan = _sign_records(request, responses)
+    if len(signed) != len(records):
+        signed = [None] * len(records)
+    with _sign_pending_lock:
+        _sign_pending.extend((rec, row, plan) for rec, row in zip(records, signed))
     _sign_stats["records"] += len(records)
+
+
+def _sign_between_steps() -> None:
+    """The xbatch runner's hook (generation thread): reduce the pending in-flight rows once a signer's batch of them
+    waits."""
+    if len(_sign_pending) >= _signer.dec.rows or _sign_unwritten:
+        _sign_flush(full_only=True)
+
+
+def _sign_flush(full_only: bool = False) -> None:
+    """Reduce pending in-flight rows, a signer's batch at a time (``full_only``: only full batches), and write each
+    reduced batch to the spool (a batch the drain lock holds off waits for the next call). A record whose span was not
+    captured but which a drain can sign (a span as long as the sign tail) goes to the spool's records instead, so the
+    drain signs it. Generation thread only."""
+    global _sign_reducing
+    assert _signer is not None and _sign_spool is not None
+    while _sign_unwritten:
+        results, plans = _sign_unwritten[0]
+        summary = _sign_spool.add_signed(_sign_writer, results, _signer.identity, plans=plans)
+        if summary is None:
+            return
+        _sign_unwritten.pop(0)
+        _sign_count(summary)
+    width = _signer.dec.rows
+    while True:
+        with _sign_pending_lock:
+            if not _sign_pending or (full_only and len(_sign_pending) < width):
+                return
+            take = _sign_pending[:width]
+            del _sign_pending[:width]
+            _sign_reducing = len(take)
+        try:
+            _sign_reduce_batch(take)
+        finally:
+            _sign_reducing = 0
+        if _sign_unwritten:
+            return
+
+
+def _sign_reduce_batch(take: list) -> None:
+    """One batch of pending in-flight rows (see _sign_flush): reduced and written, or queued in _sign_unwritten
+    while another drain holds the spool."""
+    drainable = [row is None and _signer.why_not(rec) is None for rec, row, _ in take]
+    to_drain = [(rec, plan) for (rec, _, plan), d in zip(take, drainable) if d]
+    if to_drain:
+        _sign_spool.add(_sign_writer, [rec for rec, _ in to_drain],
+                        plans=list({p.digest(): p for _, p in to_drain if p is not None}.values()) or None)
+    take = [t for t, d in zip(take, drainable) if not d]
+    if not take:
+        return
+    plans = list({p.digest(): p for _, _, p in take if p is not None}.values())
+    _signer.plans.update({p.digest(): p for p in plans})
+    t0 = time.perf_counter()
+    results = _signer.sign_captured([rec for rec, _, _ in take], [row for _, row, _ in take])
+    del take
+    summary = _sign_spool.add_signed(_sign_writer, results, _signer.identity, plans=plans or None)
+    if summary is None:
+        _sign_unwritten.append((results, plans or None))
+        logger.info("sign: in-flight batch of %d rows reduced; the spool's drain lock is held, written later",
+                    len(results))
+        return
+    _sign_count(summary)
+    logger.info("sign: in-flight batch %s: %d signed, %d skipped in %.2fs", summary.get("batch"),
+                summary.get("signed", 0), summary.get("skipped", 0), time.perf_counter() - t0)
+
+
+def _sign_count(summary: dict) -> None:
+    _sign_stats["batches"] += 1
+    _sign_stats["signed"] += summary.get("signed", 0)
+    _sign_stats["skipped"] += summary.get("skipped", 0)
+    _sign_stats["inflight_batches"] = _sign_stats.get("inflight_batches", 0) + 1
 
 
 def _sign_info() -> dict | None:
     if _sign_spool is None:
         return None
     return {"spool": str(_sign_spool.root), "writer": _sign_writer, "weights": _sign_weights,
-            "drains_when_idle": _signer is not None,
+            "drains_when_idle": _signer is not None, "inflight": _sign_inflight_arg,
+            # rows captured and not yet in a written signed batch (waiting, being reduced, or held off by a drain)
+            "pending_inflight": len(_sign_pending) + _sign_reducing + sum(len(r) for r, _ in _sign_unwritten),
             "reducer": getattr(_signer.reducer, "reducer_identity", None) if _signer is not None else None,
             "stats": dict(_sign_stats)}
 
@@ -2105,6 +2259,10 @@ async def _sign_when_idle() -> None:
         if time.monotonic() - idle_since < _SIGN_IDLE_S:
             continue
         try:
+            if _sign_pending or _sign_unwritten:
+                async with _engine_lock:
+                    await _run_generation(_sign_flush)
+                continue
             if not await asyncio.to_thread(_sign_spool.has_pending):
                 continue
             async with _engine_lock:
@@ -2127,6 +2285,15 @@ async def _batched_candidates(request: GenerateRequest, n: int) -> list[Generate
     batched paths only, and its candidates' records go to the sign spool."""
     if request.sign:
         _check_sign(request)
+        if _sign_inflight_arg:
+            if not _xbatch_compatible(request, n):
+                raise HTTPException(400, "'sign' (in flight) needs the cross-request batcher: a pure-temperature law "
+                                         "(temperature > 0, no top-k/top-p), n within the widest bucket and "
+                                         "max_tokens within the row cap")
+            signed: list = []
+            out = await engine_generate_xbatch(request, n, signed_out=signed)
+            _sign_add_inflight(request, out, signed)
+            return out
         out = await _batched_candidates(request.model_copy(update={"sign": False}), n)
         if not out:
             raise HTTPException(400, "'sign' needs the batched decoders (--xbatch_rows or --multi_rows) and a "
@@ -2550,6 +2717,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="With --sign_reducer: the signing decoder's width (the lane's canonical 128)")
     parser.add_argument("--sign_groups", type=int, default=16,
                         help="With --sign_reducer: prompts one signing batch holds")
+    parser.add_argument("--sign_inflight", action=argparse.BooleanOptionalAction, default=False,
+                        help="With --sign_reducer and --xbatch_rows (cascade): sign requests as they generate. A "
+                             "signed request decodes on a signing decoder with the widest bucket's geometry (the "
+                             "tokens the unsigned bucket decodes), each candidate's span is captured as it ends and "
+                             "reduced in this process, and its signatures land in the spool as signed batches (the "
+                             "records too); the idle drain signs on the same decoder")
+    parser.add_argument("--sign_audit_every", type=int, default=100,
+                        help="With --sign_reducer: keep the raw signed surfaces of 1 row in N (0: none)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     parser.add_argument("--profile", default=None,
@@ -2652,6 +2827,17 @@ if __name__ == "__main__":
         parser.error(f"--sign_layers / --sign_reducer_kwargs: {exc}")
     if args.sign_reducer and not _sign_layers_arg:
         parser.error("--sign_reducer needs --sign_layers")
+    if args.sign_inflight and not (args.sign_reducer and _xbatch_rows_arg and args.cascade_attn):
+        parser.error("--sign_inflight needs --sign_reducer, --xbatch_rows and --cascade_attn")
+    if args.sign_inflight and _autotune_min_rows_arg <= max(_xbatch_rows_arg) and _compile_mode_arg.startswith(
+            "max-autotune"):
+        # Kernel benchmarking chooses each kernel's config per graph by timing: the signing decoder's fused kernels
+        # differ in source from the unsigned bucket's (they store the signed surfaces), so they would time and keep
+        # their own configs (a reduction's block size sets its summation order), and a signed request would decode
+        # other tokens. Without it every graph takes the configs its sizes give, the same in both.
+        print(f"--sign_inflight: the row buckets compile without kernel benchmarking (--autotune_min_rows "
+              f"{max(_xbatch_rows_arg) + 1}), so signed and unsigned requests decode the same tokens")
+        _autotune_min_rows_arg = max(_xbatch_rows_arg) + 1
     if args.sign_reducer:
         # the reducer runs under deterministic algorithms, which need cuBLAS's fixed workspace before CUDA starts
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
@@ -2662,6 +2848,8 @@ if __name__ == "__main__":
     _sign_width_arg = args.sign_width
     _sign_rows_arg = args.sign_rows
     _sign_groups_arg = args.sign_groups
+    _sign_inflight_arg = args.sign_inflight
+    _sign_audit_every_arg = args.sign_audit_every
 
     import uvicorn
 

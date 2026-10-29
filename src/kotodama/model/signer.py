@@ -425,6 +425,45 @@ class RecordSigner:
         dec.release(range(dec.rows))
         return results
 
+    @torch.inference_mode()
+    def sign_captured(self, records: Sequence[SignRecord],
+                      rows: Sequence[Optional[signing.SignedRow]]) -> list[SignResult]:
+        """Reduce rows the signing decoder captured as it generated them (in-flight signing: ``rows[i]`` is
+        ``records[i]``'s span, exported when its generation ended; None: not exported). One result per record, in
+        order; a record is skipped for the reasons ``sign`` skips it, or when its span was not exported. Rows reduce
+        in batches of the decoder's width, as ``sign`` reduces them; their signatures are the ones ``sign`` gives the
+        same records on this signer (same decoder, scoring instead of sampling)."""
+        if len(rows) != len(records):
+            raise ValueError(f"{len(rows)} captured rows for {len(records)} records")
+        results = [SignResult(record=r) for r in records]
+        ok: list[int] = []
+        for i, (rec, row) in enumerate(zip(records, rows)):
+            reason = self.why_not(rec)
+            if reason is None and row is None:
+                reason = "its span was not captured (fewer than two generated ids, or as long as the sign tail)"
+            if reason is None and row.positions != len(rec.generated_ids) - 1:
+                reason = f"its captured span has {row.positions} positions, its record {len(rec.generated_ids) - 1}"
+            if reason is not None:
+                results[i].skipped = reason
+                logger.warning("sign: skipped %s: %s", rec.request_id, reason)
+                continue
+            results[i].same_engine = True
+            ok.append(i)
+        dev = self.dec.engine.device
+        for k in range(0, len(ok), self.dec.rows):
+            order = ok[k:k + self.dec.rows]
+            signed = [rows[i] for i in order]
+            for i, row in zip(order, signed):
+                if audited(records[i].request_id, self.audit_every):
+                    results[i].raw = _to_cpu(row)
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+            t0 = time.perf_counter()
+            self._reduce(records, results, order, signed)
+            self.timing["reduce_s"] += time.perf_counter() - t0
+            self.timing["rows"] += len(order)
+        return results
+
     def _reduce(self, records: Sequence[SignRecord], results: list[SignResult], order: list[int],
                 signed: list[signing.SignedRow]) -> None:
         """Reduce a batch's rows together; if the reducer refuses the batch, row by row."""

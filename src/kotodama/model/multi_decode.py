@@ -584,12 +584,17 @@ class MultiSampleDecoder(nn.Module):
         buf = self.sign_depth if self.sign.depth else self.sign_hidden
         return buf, self._sign_partial_cols, self.row_ids, self.sign_slot
 
-    def signed(self, row: int, device: Optional[torch.device] = None) -> signing.SignedRow:
-        """Row ``row``'s captured span since its admission (copies; default on the CPU)."""
+    def signed(self, row: int, device: Optional[torch.device] = None,
+               lever_slot: Optional[int] = None) -> signing.SignedRow:
+        """Row ``row``'s captured span since its admission (copies; default on the CPU). ``lever_slot``: the row's
+        lever slot, when the caller knows it (else it is read back from the device, a sync)."""
         if self.sign is None:
             raise RuntimeError("this decoder was built without signing (sign=None)")
         eng = self.engine
-        lever = int(self.row_slots[row]) if eng.levers is not None else 0
+        if lever_slot is not None:
+            lever = int(lever_slot) if eng.levers is not None else 0
+        else:
+            lever = int(self.row_slots[row]) if eng.levers is not None else 0
         bufs = {n: getattr(self, f"sign_{n}") for n in self.sign_names}
         return signing.export(self.sign, bufs, row, start=self._sign_start_host[row], pos=self._pos_host[row],
                               lever_slot=lever, steered=bool(eng.steer_enabled),

@@ -29,6 +29,12 @@ plan, binds a slot of the tables when it is admitted (a job finds no room while 
 ``admit_capacity``), prefills and decodes its rows on that slot, and releases it when its last row ends, so the batch
 key need not include steering at all.
 
+With a signing decoder (``sign_decoder``: a ``CascadeDecoder`` built with ``sign=``, as wide as the widest bucket and
+decoding the tokens it does), a job that sets ``sign`` decodes there: a batch holding one runs on the signing decoder
+(other jobs of the batch decode on it too, unsigned), and a signed job waits while another decoder runs. When a signed
+candidate ends, its row's span is exported (``MultiSampleDecoder.signed``, trimmed to the positions its generated ids
+fed) into ``XBatchResult.signed``, before the row can start anything else.
+
 The runner knows nothing about HTTP: prompts arrive tokenized and validated, steering arrives as the engine's
 ``set_steer`` arguments or as a lever plan, and stop strings are checked through a ``decode`` callable (the
 tokenizer's).
@@ -59,6 +65,9 @@ class XBatchResult:
     rows: list[list[int]]
     timing: dict[str, float]
     stops: list[Optional[int]] = field(default_factory=list)
+    # signed jobs: candidate i's signed span (kotodama.model.signing.SignedRow, on the decoder's device), or None when
+    # it fed fewer than one position or its span does not fit the sign tail
+    signed: list[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -82,6 +91,7 @@ class XBatchJob:
     lever: Any = None  # a kotodama.model.levers.LeverPlan (runner built with levers), None: unsteered
     # seeded decoders: candidate i draws with candidate_seed(seed, i), in any batch (always on the widest bucket)
     seed: Optional[int] = None
+    sign: bool = False  # decode on the signing decoder and export each candidate's signed span
     t_enqueue: float = field(default_factory=time.perf_counter)
 
 
@@ -154,6 +164,7 @@ class _Live:
     home: frozenset[int] = frozenset()  # the rows admitted from this job's prompt: only they can restart it
     slot: int = 0  # the job's lever slot (0: none)
     stops: dict[int, int] = field(default_factory=dict)  # candidate -> the stop token that ended it
+    signed: dict[int, Any] = field(default_factory=dict)  # candidate -> its exported span (signed jobs)
 
     @property
     def done(self) -> bool:
@@ -176,7 +187,9 @@ class XBatchRunner:
     def __init__(self, decoders: dict[int, MultiSampleDecoder], prefill: Callable[..., tuple],
                  set_steer: Callable[..., None], decode: Callable[[list[int]], str], stop_ids: frozenset[int],
                  max_seq_len: int, device: torch.device, refill: bool = False,
-                 should_yield: Optional[Callable[[], bool]] = None, levers: Any = None) -> None:
+                 should_yield: Optional[Callable[[], bool]] = None, levers: Any = None,
+                 sign_decoder: Optional[MultiSampleDecoder] = None,
+                 between_steps: Optional[Callable[[], None]] = None) -> None:
         if not decoders:
             raise ValueError("XBatchRunner needs at least one decoder bucket")
         self.decoders = dict(sorted(decoders.items()))
@@ -191,10 +204,18 @@ class XBatchRunner:
         self.should_yield = should_yield or (lambda: False)
         # the engine's LeverTables: per-job levers, ``prefill(ids, slot)``; None: ``prefill(ids)``, set_steer
         self.levers = levers
+        # signed jobs decode here (see the module docstring); as wide as the widest bucket
+        if sign_decoder is not None and (getattr(sign_decoder, "sign", None) is None
+                                         or sign_decoder.rows != self.max_rows):
+            raise ValueError("sign_decoder must be a signing decoder as wide as the widest bucket")
+        self.sign_decoder = sign_decoder
+        # polled on the generation thread between steps and after each batch (the server reduces signed rows there)
+        self.between_steps = between_steps or (lambda: None)
+        self._dec: Optional[MultiSampleDecoder] = None  # the decoder of the running batch
         self.queue = XBatchQueue()
         self.stats: dict[str, float] = {"batches": 0, "steps": 0, "row_steps": 0, "useful_row_steps": 0,
                                         "admitted": 0, "refilled": 0, "restarts": 0, "prefill_s": 0.0,
-                                        "step_s": 0.0, "host_s": 0.0}
+                                        "step_s": 0.0, "host_s": 0.0, "signed_rows": 0, "export_s": 0.0}
 
     def bucket_for(self, rows: int) -> MultiSampleDecoder:
         """The narrowest decoder that holds ``rows`` rows (the widest when none does)."""
@@ -279,18 +300,39 @@ class XBatchRunner:
         cand = lv.running[row]
         if tok in self.stop_ids:
             lv.stops[cand] = tok
-            del lv.running[row]
+            self._end(lv, row)
             return
         out = lv.out[cand]
         out.append(tok)
         self.stats["useful_row_steps"] += 1
         stops = lv.job.stop_strings
         if len(out) >= lv.budget:
-            del lv.running[row]
+            self._end(lv, row)
         elif stops:
             tail = self.decode(out[-lv.stop_window:])
             if any(s in tail for s in stops):
-                del lv.running[row]
+                self._end(lv, row)
+
+    def _end(self, lv: _Live, row: int) -> None:
+        """End the candidate in ``row``; a signed job's candidate first exports its span. Runs before the row can
+        restart or take another job, and before the next step launches: the span's last fed position is the
+        candidate's next-to-last generated id (the step in flight feeds its last id one slot further, which the
+        trim drops; a span of the sign tail or more is not exported, since that step would overwrite its last
+        slot)."""
+        cand = lv.running.pop(row)
+        dec = self._dec
+        if not lv.job.sign or dec is None or getattr(dec, "sign", None) is None:
+            return
+        from kotodama.model.signer import trim
+
+        n = len(lv.out[cand]) + (cand in lv.stops)  # generated ids, the stop token included
+        if n < 2 or n > dec.sign.tail:
+            lv.signed[cand] = None
+            return
+        t0 = time.perf_counter()
+        lv.signed[cand] = trim(dec.signed(row, device=dec.cur_tokens.device, lever_slot=lv.slot), n - 1)
+        self.stats["signed_rows"] += 1
+        self.stats["export_s"] += time.perf_counter() - t0
 
     def _room_for(self, job: XBatchJob) -> bool:
         """Whether ``job`` can bind its lever now (always, for an unsteered job or a runner without levers)."""
@@ -305,8 +347,9 @@ class XBatchRunner:
         self._release_lever(lv)
         lv.timing["decode_ms"] = round((time.perf_counter() - lv.t_admit) * 1000 - lv.timing["prefill_ms"], 2)
         lv.timing["total_ms"] = round((time.perf_counter() - lv.job.t_enqueue) * 1000, 2)
+        signed = [lv.signed.get(c) for c in range(lv.job.n)] if lv.job.sign else []
         self._deliver(lv.job, XBatchResult(rows=lv.out, timing=lv.timing,
-                                           stops=[lv.stops.get(c) for c in range(lv.job.n)]))
+                                           stops=[lv.stops.get(c) for c in range(lv.job.n)], signed=signed))
 
     def _fill(self, dec: MultiSampleDecoder, active: list[_Live], free: list[int], head: XBatchJob) -> int:
         """Hand free rows out: a job's unstarted candidates restart in the job's own free rows (the only rows that
@@ -347,6 +390,9 @@ class XBatchRunner:
             if job.seed is not None and dec.rows != self.max_rows:  # seeded jobs run on the widest bucket only
                 self.queue.requeue([job])
                 return taken
+            if job.sign and dec is not self.sign_decoder:  # signed jobs run on the signing decoder only
+                self.queue.requeue([job])
+                return taken
             taken += 1
             self.stats["refilled"] += 1
             lv = self._admit(dec, job, free)
@@ -363,7 +409,15 @@ class XBatchRunner:
         # A batch holding a seeded job runs the widest bucket: rows decode bit for bit whatever shares a decoder of
         # one width, but decoders of different widths round the logits differently, which can flip a seeded draw.
         seeded = any(j.seed is not None for j in jobs)
-        dec = self.decoders[self.max_rows] if seeded else self.bucket_for(sum(j.n for j in jobs))
+        if any(j.sign for j in jobs):
+            if self.sign_decoder is None:
+                for job in jobs:
+                    self._deliver(job, RuntimeError("a signed job needs a runner with a signing decoder"))
+                return len(jobs)
+            dec = self.sign_decoder
+        else:
+            dec = self.decoders[self.max_rows] if seeded else self.bucket_for(sum(j.n for j in jobs))
+        self._dec = dec
         free = list(range(dec.rows))
         dec.release(free)  # whatever the decoder's rows held belongs to an earlier batch
         active: list[_Live] = []
@@ -395,6 +449,7 @@ class XBatchRunner:
                 served += self._fill(dec, active, free, head)
                 if not active and pending is None:
                     break
+                self.between_steps()
                 t0 = time.perf_counter()
                 launched = None
                 if active:
@@ -429,6 +484,8 @@ class XBatchRunner:
                 self._release_lever(lv)
             active.clear()
             self.set_steer(None)  # steering state never outlives the batch
+            self._dec = None
+        self.between_steps()
         return served
 
 
