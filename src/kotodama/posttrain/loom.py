@@ -108,6 +108,8 @@ class LoomConfig:
     overlong: str = "veto"  # veto | keep
     speaker: str = "rotate"  # rotate (round-robin over the cast) | model (the model names the next speaker)
     unsigned_utility: bool = False  # utility draws (speaker tags, engagement replies) send sign: false
+    switch_model: str = ""  # non-empty: from turn switch_after on, every draw at a node asks for this model instead
+    switch_after: int = 0
 
 
 @dataclass
@@ -213,9 +215,16 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
     def visible(turns: tuple[Turn, ...]) -> tuple[Turn, ...]:
         return window_turns(turns, seed.header, n_seed, cfg.window_chars)
 
-    utility = {"sign": False} if cfg.unsigned_utility else None
+    def fields_at(node: Node, base: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Per-request fields for draws at ``node``: the second model once the scene has switch_after turns."""
+        out = dict(base or {})
+        if cfg.switch_model and node.depth >= cfg.switch_after:
+            out["model"] = cfg.switch_model
+        return out
 
     async def expand(node: Node) -> list[Node]:
+        utility = fields_at(node, {"sign": False} if cfg.unsigned_utility else None) or None
+        turn_fields = fields_at(node)
         seen = visible(node.turns)
         if cfg.speaker == "model":
             speaker, chose = await model_speaker(seed.cast, list(seen), seed.header, complete, fields=utility)
@@ -231,7 +240,7 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
         cands = []
         for draw in range(cfg.rerolls + 1):  # a reroll draws K fresh candidates when every one so far was vetoed
             try:
-                raw = await complete(prompt, cfg.candidates, stops)
+                raw = await complete(prompt, cfg.candidates, stops, **turn_fields)
             except PromptTooLong:  # the character window can still exceed the context in tokens: end this branch only
                 end(node, "length_cap")
                 return []
@@ -764,6 +773,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--template_max", type=int, default=3)
     ap.add_argument("--engage_replies", type=int, default=2)
     ap.add_argument("--overlong", choices=["veto", "keep"], default="veto")
+    ap.add_argument("--switch_model", default="",
+                    help="from turn --switch_after on, every draw asks for this model (the OpenAI model field: a gateway "
+                         "pool) instead of --model, e.g. one model opens a scene and another carries it")
+    ap.add_argument("--switch_after", type=int, default=0, help="turns written by --model before --switch_model takes over")
     ap.add_argument("--unsigned_utility", action="store_true",
                     help="utility draws (speaker tags, engagement replies) send sign: false, so a server that signs by "
                          "default spends its signing on the scene's own turns (needs a server that knows the field)")
@@ -804,7 +817,8 @@ def main(argv: list[str] | None = None) -> int:
                      select=a.select, select_lambda=a.select_lambda, engage_replies=a.engage_replies,
                      overlong=a.overlong, novelty_speech_only=a.novelty_speech_only, novelty_norm=a.novelty_norm,
                      novelty_prior=a.novelty_prior, deep_children=a.deep_children, rerolls=a.rerolls,
-                     speaker=a.speaker, unsigned_utility=a.unsigned_utility)
+                     speaker=a.speaker, unsigned_utility=a.unsigned_utility,
+                     switch_model=a.switch_model, switch_after=a.switch_after)
     sp = SelfPlayConfig(candidates=a.candidates, max_tokens=a.max_tokens, min_turns=a.min_turns,
                         cycle_window=a.cycle_window, template_window=a.template_window, template_max=a.template_max)
     complete, close = oai_completer(a.endpoint, sampling, a.max_tokens, model=a.model,

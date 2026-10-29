@@ -530,3 +530,19 @@ def test_unsigned_utility_marks_only_the_tag_draws() -> None:
     asyncio.run(loom.grow(seed, "t4", complete, cfg, SelfPlayConfig(min_turns=2), "x", lambda k, r: None))
     assert seen["tag"] and all(v is False for v in seen["tag"])  # utility draws opt out of signing
     assert seen["turn"] and all(v is None for v in seen["turn"])  # the scene's own turns stay signed (field unset)
+
+
+def test_switch_model_hands_the_scene_over_after_n_turns() -> None:
+    asked = []
+
+    async def complete(prompt: str, n: int, stops: list[str], **kw):
+        asked.append((prompt.count("\n\n"), kw.get("model")))
+        return [(f"line {prompt.count(chr(10))}-{i}{stops[0]}", "stop", False) for i in range(n)]
+
+    cfg = loom.LoomConfig(candidates=2, children=1, width=1, max_depth=6, min_turns=2, switch_model="carry",
+                          switch_after=3)
+    st, recs = grow(cfg, complete)
+    path = max(recs["path"], key=lambda p: p["depth"])
+    assert path["depth"] == 6
+    by_turn = [m for _, m in sorted(asked)]  # one draw per node: turn index = number of turn breaks in the prompt - 1
+    assert by_turn[:3] == [None, None, None] and set(by_turn[3:]) == {"carry"}
