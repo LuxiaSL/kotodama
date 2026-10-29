@@ -61,19 +61,14 @@ def _route(sources: list[torch.Tensor], query: torch.Tensor, norm_weight: torch.
     return route_weights(sources, query, norm_weight, eps)[0]
 
 
-def sign_write(sign: tuple[torch.Tensor, ...], q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor,
-               w_attn: Optional[torch.Tensor], w_mlp: torch.Tensor) -> None:
-    """A sampled layer's surfaces at its last position into the sign buffers (kotodama.model.signing):
-    sign = (q, k, v, gate, route buffers, row ids, each row's slot, the layer's column (0-d)). q / k / v are
-    (B, heads, S, head_dim) before RoPE, gate (B, S, intermediate), the routing weights (n, B, S) (``w_attn`` None: the
-    attention input reads no routing)."""
-    q_buf, k_buf, v_buf, gate_buf, route_buf, row_ids, slot, col = sign
-    B = q.shape[0]
-    idx = (row_ids, slot, col.expand(B))
-    q_buf.index_put_(idx, q[:, :, -1].reshape(B, -1))
-    k_buf.index_put_(idx, k[:, :, -1].reshape(B, -1))
-    v_buf.index_put_(idx, v[:, :, -1].reshape(B, -1))
-    gate_buf.index_put_(idx, gate[:, -1])
+def sign_write(sign: tuple, q: Optional[torch.Tensor], k: Optional[torch.Tensor], v: Optional[torch.Tensor],
+               gate: Optional[torch.Tensor], w_attn: Optional[torch.Tensor], w_mlp: torch.Tensor) -> None:
+    """A signing layer's last position into the sign buffers (kotodama.model.signing): sign = (route buffer, row ids,
+    each row's slot, the layer's column (0-d), then the q, k, v, gate buffers and the sampled column, or Nones for a
+    layer that writes its routing only). q / k / v are (B, heads, S, head_dim) before RoPE, gate (B, S, intermediate),
+    the routing weights (n, B, S) (``w_attn`` None: the attention input reads no routing)."""
+    route_buf, row_ids, slot, layer_col, q_buf, k_buf, v_buf, gate_buf, sampled_col = sign
+    B = w_mlp.shape[1]
     width = route_buf.shape[-1] // 2
     halves = []
     for w in (w_attn, w_mlp):
@@ -82,7 +77,14 @@ def sign_write(sign: tuple[torch.Tensor, ...], q: torch.Tensor, k: torch.Tensor,
             halves.append(w[:, :, -1].transpose(0, 1).to(route_buf.dtype))
         if n < width:
             halves.append(route_buf.new_zeros((B, width - n)))
-    route_buf.index_put_(idx, torch.cat(halves, dim=-1))
+    route_buf.index_put_((row_ids, slot, layer_col.expand(B)), torch.cat(halves, dim=-1))
+    if q_buf is None:
+        return
+    idx = (row_ids, slot, sampled_col.expand(B))
+    q_buf.index_put_(idx, q[:, :, -1].reshape(B, -1))
+    k_buf.index_put_(idx, k[:, :, -1].reshape(B, -1))
+    v_buf.index_put_(idx, v[:, :, -1].reshape(B, -1))
+    gate_buf.index_put_(idx, gate[:, -1])
 
 
 def cache_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[torch.Tensor, ...],
@@ -101,7 +103,7 @@ def cache_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[to
 
 def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_heads: int, n_kv_heads: int,
                        head_dim: int, intermediate: int, qk_norm: bool, levers: bool, steer: bool,
-                       attend: Callable, linear: Callable = F.linear, sign: bool = False, stats: int = 0,
+                       attend: Callable, linear: Callable = F.linear, sign: int = 0, stats: int = 0,
                        probs: Optional[Callable] = None) -> Callable:
     """One layer as a function of tensors, mirroring the loop body of MultiSampleDecoder._forward_step and of
     DecodeEngine's step and block forwards: pre-attention routing over ``committed + [partial]``, the attention
@@ -112,8 +114,8 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
     projection (the engine's GEMV dispatch).
 
     Returns the layer's output partial, and with ``capture`` also the MLP input (B, S, D). With ``sign`` the layer
-    writes its surfaces through ``sign_write`` (``sign_args``: its sign tuple); the arithmetic of everything it
-    returns is the same as without. With ``stats`` (1: every layer's statistics, 2: a sampled layer's too) the layer
+    writes its routing (1) and a sampled layer's surfaces too (2) through ``sign_write`` (``sign_args``: its sign
+    tuple); the arithmetic of everything it returns is the same as without. With ``stats`` (1: every layer's statistics, 2: a sampled layer's too) the layer
     writes its attention statistics through kotodama.model.signing.stats_write from ``probs(q, kv, state)`` (the
     attention's probabilities in absolute column order; ``stats_args``: its stats tuple). The function gets a code
     object of its own named ``name``, so its compiled graphs are cached apart from every other signature's."""
@@ -176,6 +178,17 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
                               decode_layer.__closure__)
 
 
+def own_code(fn: Callable, name: str) -> Callable:
+    """``fn`` behind a function with a code object of its own named ``name``: torch.compile caches graphs per code
+    object, so a bound method compiled for many instances (each decoder's sampler and tail) would otherwise pile one
+    cache entry per instance onto one code object."""
+    def call(*args):
+        return fn(*args)
+
+    code = call.__code__.replace(co_name=name, co_qualname=name)
+    return types.FunctionType(code, call.__globals__, name, None, call.__closure__)
+
+
 # The region mode for each whole-step mode: the same autotuning, without CUDA graphs (the whole step is captured as
 # one graph around the regions instead).
 REGION_MODES = {"reduce-overhead": "default", "max-autotune": "max-autotune-no-cudagraphs"}
@@ -235,7 +248,7 @@ def check_norms(model, eps: float) -> None:
 Region = tuple[Callable, bool, int, tuple, tuple, Optional[tuple], Optional[tuple]]
 
 
-def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, bool, int]],
+def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, int, int]],
                   kvs: Sequence[tuple[torch.Tensor, ...]], prefix: str, *, attend: Callable, steer: bool,
                   linear: Callable = F.linear, capture_col: Optional[Callable[[int], int]] = None,
                   sign_args: Optional[Callable[[int], tuple]] = None, probs: Optional[Callable] = None,
@@ -243,7 +256,7 @@ def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, bool, int]],
     """One compiled layer per distinct signature (committed sources, boundary, capture, sign, stats) over a
     DecodeEngine's weights, and each effective layer's (compiled layer, boundary, capture column or -1, its tensors,
     its KV buffers, its sign tuple or None, its stats tuple or None). The compiled functions are named
-    ``{prefix}_c{committed}[_boundary][_capture][_sign][_stats{level}]``. ``opts`` go to torch.compile.
+    ``{prefix}_c{committed}[_boundary][_capture][_sign{level}][_stats{level}]``. ``opts`` go to torch.compile.
     ``capture_col(layer)``: a captured layer's column in the caller's capture buffer; ``sign_args(layer)``: a signing
     layer's sign tuple (``sign_write``); ``probs`` / ``stats_args(layer)``: the attention probabilities and a layer's
     stats tuple (``make_layer``). Returns (regions, number of distinct signatures)."""
@@ -257,7 +270,7 @@ def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, bool, int]],
         c, boundary, capture, sign, stats = sig
         if sig not in fns:
             name = (f"{prefix}_c{c}{'_boundary' if boundary else ''}{'_capture' if capture else ''}"
-                    f"{'_sign' if sign else ''}{f'_stats{stats}' if stats else ''}")
+                    f"{f'_sign{sign}' if sign else ''}{f'_stats{stats}' if stats else ''}")
             fns[sig] = torch.compile(make_layer(name, is_boundary=boundary, capture=capture, sign=sign, stats=stats,
                                                 probs=probs, **static), **opts)
         layer = model.layers[li]

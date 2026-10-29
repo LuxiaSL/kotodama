@@ -21,12 +21,13 @@ way the server compiles it today (``compile_step(mode)``). Reports:
     against the same decoder uneager: per-step KL and top-1 of the forced continuation, the largest score
     difference, and whether the greedy rows agree;
   * ``sign`` (``--sections sign``): decode signing (kotodama.model.signing) on a cascade decoder of ``--sign_rows``
-    rows, regional and captured: (1) signing on vs off, mixed laws and a decode-span lever on half the rows, tokens
-    and per-step readouts compared bit for bit, and the step time of each; (2) the signed surfaces of two rows
-    against the replay capture (kotodama.model.capture.cached_forward over the decoded sequence), relative L2 per
-    surface; (3) batchmate independence at a fixed width: target rows decoded beside their own prompt's rows and
-    beside another prompt's rows (another cascade grouping), differing coordinates per surface; (4) the cross-width
-    floor: the same rows decoded at narrower decoder widths, relative L2 per surface against the widest.
+    rows, regional and captured, a decode-span lever on half the rows: (1) signing on vs off, sampled (tokens and
+    per-step readouts bit for bit, the step time of each) and fed the same tokens in lockstep (the logprob gap of
+    on vs off beside that of two unsigned decoders); (2) the fed rows' signed surfaces against the replay capture
+    (kotodama.model.capture.cached_forward over the same sequence), relative L2 per surface; (3) batchmate
+    independence at a fixed width: target rows decoded beside their own prompt's rows and beside another prompt's
+    rows (another cascade grouping), differing coordinates per surface; (4) the cross-width floor: the same rows fed
+    the same tokens at narrower decoder widths, relative L2 per surface against the widest.
 
 Usage (node, GPU):
   tools/run_py.sh scripts/benchmark/check_regional_engine.py --checkpoint <model.pt> --model_size 1b-tsumugi \\
@@ -266,50 +267,76 @@ def sign_check(a, eng: DecodeEngine, tok, slot: int) -> dict:
                 t_steady += time.perf_counter() - t0
         return toks, reads, t_steady / max(1, steps - 8) * 1000, firsts
 
-    out: dict = {"rows": B, "steps": steps, "layers": list(spec.layers), "depth": spec.depth}
-    # (1) on vs off
+    def lockstep(decs, fed: torch.Tensor) -> list[dict]:
+        """Every decoder admitted as in ``run`` (law 0) and fed the same tokens ``fed`` (rows, steps) through its
+        regional forward; per later decoder against the first, over every step: the largest |logprob| difference,
+        the largest per-row KL, and the steps x rows whose argmax differs."""
+        for dec in decs:
+            dec.release(range(dec.rows))
+            dec.admit(list(range(dec.rows)), eng.prefill(prompts[0]), laws[0], slots=slots[:dec.rows],
+                      seeds=seeds[:dec.rows])
+        cmp = [{"max_abs_logprob": 0.0, "kl_max": 0.0, "argmax_differ": 0} for _ in decs[1:]]
+        for t in range(fed.shape[1]):
+            outs = []
+            for dec in decs:
+                outs.append(F.log_softmax(dec._regional_forward(fed[:dec.rows, t:t + 1].clone()).float(), -1))
+                dec._advance_host()
+            ref = outs[0]
+            for c, o in zip(cmp, outs[1:]):
+                n = o.shape[0]
+                c["max_abs_logprob"] = max(c["max_abs_logprob"], float((o - ref[:n]).abs().max()))
+                c["kl_max"] = max(c["kl_max"], float((ref[:n].exp() * (ref[:n] - o)).sum(-1).max()))
+                c["argmax_differ"] += int((o.argmax(-1) != ref[:n].argmax(-1)).sum())
+        return cmp
+
+    def surfaces(dec, rows) -> dict:
+        return {r: {k: v for k, v in dec.signed(r, device=torch.device("cuda")).surfaces.items()
+                    if isinstance(v, torch.Tensor)} for r in rows}
+
+    out: dict = {"rows": B, "steps": steps, "layers": list(spec.layers), "depth": spec.depth, "attn": spec.attn}
+    # (1) on vs off: sampled (tokens, readouts, step time), then forced in lockstep (off, a second off, on)
     base = [0] * B
+    off = make(B, None)
+    rec_off = [run(off, law, base) for law in laws]
+    toks0, _, _, firsts0 = rec_off[0]
+    fed = torch.cat([torch.tensor([firsts0[r] for r in range(B)], device="cuda").view(B, 1),
+                     torch.stack(toks0, dim=1)[:, :-1]], dim=1)  # the tokens law 0's rows were fed
+    on = make(B, spec)
+    out["sign_mb"] = round(sum(getattr(on, f"sign_{n}").numel() * getattr(on, f"sign_{n}").element_size()
+                               for n in on.sign_names) / 1e6, 1)
+    rec_on = [run(on, law, base) for law in laws]
     ident = {}
-    records = {}
-    for name, sign in (("off", None), ("on", spec)):
-        dec = make(B, sign)
-        if sign is not None:
-            out["sign_mb"] = round(sum(getattr(dec, f"sign_{n}").numel() * getattr(dec, f"sign_{n}").element_size()
-                                       for n in dec.sign_names) / 1e6, 1)
-        per_law = []
-        for law in laws:
-            per_law.append(run(dec, law, base))
-        records[name] = per_law
-        if sign is not None:
-            signed_dec = dec
-        else:
-            del dec
-            torch.cuda.empty_cache()
     for li, law in enumerate(("plain", "truncated")):
-        (t0, r0, ms0, _), (t1, r1, ms1, _) = records["off"][li], records["on"][li]
-        first_tok = next((i for i, (x, y) in enumerate(zip(t0, t1)) if not torch.equal(x, y)), None)
+        (t0, r0, ms0, _), (t1, r1, ms1, _) = rec_off[li], rec_on[li]
+        rows_diff = [int((x != y).sum()) for x, y in zip(t0, t1)]
+        first_tok = next((i for i, n in enumerate(rows_diff) if n), None)
         first_read = next((i for i, (x, y) in enumerate(zip(r0, r1)) if not all(torch.equal(p, q)
                                                                               for p, q in zip(x, y))), None)
         ident[law] = {"tokens_bitwise": first_tok is None, "first_token_diff_step": first_tok,
+                      "rows_differing_at_first_diff": rows_diff[first_tok] if first_tok is not None else 0,
                       "readouts_bitwise": first_read is None, "first_readout_diff_step": first_read,
+                      "step0_max_abs_logprob": float((r0[0][0] - r1[0][0]).abs().max()),
                       "ms_off": round(ms0, 3), "ms_on": round(ms1, 3), "overhead": round(ms1 / ms0 - 1, 4)}
+    off2 = make(B, None)
+    cmp = lockstep([off, off2, on], fed)
+    ident["forced"] = {"off_vs_off2": cmp[0], "on_vs_off": cmp[1]}
     out["on_off"] = ident
     logger.info("sign on/off: %s", json.dumps(ident))
-    # (2) the last law's signed rows vs the replay capture (rows 0 and 1: no lever and the lever)
+    del off, off2
+    torch.cuda.empty_cache()
+    # (2) the forced rows' signatures vs the replay capture over the same sequences (row 0: no lever; row 1: lever)
     model = eng.model
-    toks = torch.stack(records["on"][-1][0], dim=1)  # (B, steps)
-    firsts = records["on"][-1][3]
+    targets = list(range(8))
+    ref = surfaces(on, targets)
     P = prompts[0].shape[1]
     replay = {}
     for r in (0, 1):
-        row = signed_dec.signed(r, device=torch.device("cuda"))
+        row = on.signed(r, device=torch.device("cuda"))
         if slots[r]:
             replay[str(r)] = {"lever_slot": row.lever_slot, "skipped": "the replay forward runs no levers"}
             continue
-        # the sequence: the prompt, the first token (sampled at admission), then every step's token but the last
-        # (sampled, never fed)
         replay[str(r)] = {"positions": row.positions}
-        seq = torch.cat([prompts[0][0], torch.tensor([firsts[r]], device="cuda"), toks[r, :-1]]).view(1, -1)
+        seq = torch.cat([prompts[0][0], fed[r]]).view(1, -1)
         _, cap, _ = cached_forward(model, seq, past=None, position_offset=0, light=False, capture_hidden=True)
         hid = hidden_rows(cap, model.config.num_layers)
         span = slice(P, P + row.positions)
@@ -331,32 +358,22 @@ def sign_check(a, eng: DecodeEngine, tok, slot: int) -> dict:
         del cap
     out["vs_replay"] = replay
     logger.info("sign vs replay: %s", json.dumps(replay))
-
-    def surfaces(dec, rows) -> dict:
-        return {r: dec.signed(r, device=torch.device("cuda")).surfaces for r in rows}
-
-    # (3) batchmate independence at the fixed width: targets beside their own prompt vs beside another prompt
-    targets = list(range(8))
-    run(signed_dec, laws[0], base)
-    ref = surfaces(signed_dec, targets)
-    mixed = [0 if r < 8 else 1 for r in range(B)]
-    run(signed_dec, laws[0], mixed)
-    got = surfaces(signed_dec, targets)
-    bm = {}
-    for name in ref[0]:
-        differ = sum(int((ref[r][name] != got[r][name]).sum()) for r in targets)
-        bm[name] = {"coords": sum(ref[r][name].numel() for r in targets), "differ": differ}
-    out["batchmates_fixed_width"] = bm
-    logger.info("sign batchmates: %s", json.dumps(bm))
-    del signed_dec
-    torch.cuda.empty_cache()
-    # (4) the cross-width floor: the same rows at narrower widths against the widest
+    # (3) batchmate independence at the fixed width (sampled): targets beside their own prompt vs another prompt's
+    run(on, laws[0], base)
+    alone = surfaces(on, targets)
+    run(on, laws[0], [0 if r < 8 else 1 for r in range(B)])
+    got = surfaces(on, targets)
+    out["batchmates_fixed_width"] = {name: {"coords": sum(alone[r][name].numel() for r in targets),
+                                            "differ": sum(int((alone[r][name] != got[r][name]).sum())
+                                                          for r in targets)} for name in alone[0]}
+    logger.info("sign batchmates: %s", json.dumps(out["batchmates_fixed_width"]))
+    # (4) the cross-width floor: the same rows fed the same tokens at narrower widths, against the widest
     floor = {}
     for w in (16, 32, 64):
         if w >= B:
             continue
         dec = make(w, spec)
-        run(dec, laws[0], [0] * w)
+        lockstep([dec], fed)
         sub = surfaces(dec, targets)
         floor[str(w)] = {name: {"differ_frac": round(sum(int((ref[r][name] != sub[r][name]).sum()) for r in targets)
                                                     / sum(ref[r][name].numel() for r in targets), 4),

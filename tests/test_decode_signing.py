@@ -2,7 +2,8 @@
 
 What is pinned here:
   * every surface a signed row decoder captures over a row's generated span (hidden, pre-RoPE q / k, v, pre-SiLU
-    gate, both routings, and the depth path) equals the replay capture's (kotodama.model.capture.cached_forward over
+    gate; both routings at every layer and the final routing; the embedding and the committed blocks; the depth
+    path; the next-token logit statistics against the chosen token) equals the replay capture's (kotodama.model.capture.cached_forward over
     the decoded sequence) at the same positions, for the eager step and the regional step, for both row decoders;
   * so do the attention statistics (per-head and head-mean entropy at every layer; per-head prompt, recency and sink
     mass and the head-mean rows at the sampled layers), computed from the replay's attention weights;
@@ -10,7 +11,7 @@ What is pinned here:
     bit for bit;
   * the span bookkeeping: a row's span starts at its admission, a re-admitted row starts over, a row past the tail
     is reported incomplete, and the row's lever slot and steering are recorded;
-  * signing compiles only the sampled layers' signatures on top of the unsigned ones.
+  * signing compiles at most the sampled layers' signatures on top of the unsigned ones' count.
 """
 
 from __future__ import annotations
@@ -86,10 +87,22 @@ def _decode(eng: DecodeEngine, dec: MultiSampleDecoder, prompt: torch.Tensor, st
     return seqs
 
 
-def _oracle(model: KotodamaModel, seq: list[int], P: int, n: int) -> dict[str, torch.Tensor]:
+def _logit_stats(logits: torch.Tensor, chosen: torch.Tensor) -> torch.Tensor:
+    """entropy, top-1, top-5 mass, rank, chosen prob, logprob of each row (n, V) at its chosen token (n,), fp64."""
+    x = logits.double()
+    x = x - x.max(-1, keepdim=True).values
+    p = torch.softmax(x, -1)
+    lp = torch.log_softmax(x, -1)
+    xc = x.gather(1, chosen.view(-1, 1))
+    return torch.cat([-(p * lp).sum(-1, keepdim=True), p.max(-1, keepdim=True).values,
+                      p.topk(5, -1).values.sum(-1, keepdim=True), (x > xc).sum(-1, keepdim=True).double(),
+                      p.gather(1, chosen.view(-1, 1)), lp.gather(1, chosen.view(-1, 1))], dim=-1)
+
+
+def _oracle(model: KotodamaModel, seq: list[int], P: int, n: int) -> dict:
     """The replay capture's surfaces at span positions P..P+n-1, per layer, in the export's layouts."""
-    _, cap, _ = cached_forward(model, torch.tensor([seq]), past=None, position_offset=0, light=False,
-                               capture_hidden=True)
+    logits, cap, _ = cached_forward(model, torch.tensor([seq]), past=None, position_offset=0, light=False,
+                                    capture_hidden=True)
     hid = hidden_rows(cap, CFG["num_layers"])
     span = slice(P, P + n)
     pre_attn = {i: w for kind, i, w in cap["routing"] if kind == "pre_attn"}
@@ -97,31 +110,47 @@ def _oracle(model: KotodamaModel, seq: list[int], P: int, n: int) -> dict[str, t
     out: dict[str, list] = {k: [] for k in ("hidden", "depth", "q", "k", "v", "gate", "route_attn", "route_mlp")}
     for li in range(CFG["num_layers"]):
         out["depth"].append(hid[li + 1][0, span])
+        w = pre_attn.get(li)
+        out["route_attn"].append(None if w is None else w[:, 0, span].transpose(0, 1))  # (n, sources)
+        out["route_mlp"].append(pre_mlp[li][:, 0, span].transpose(0, 1))
     for li in LAYERS:
         out["hidden"].append(hid[li + 1][0, span])
         for name, key in (("q", "queries"), ("k", "keys"), ("v", "values")):
             out[name].append(cap[key][li][0, :, span].transpose(0, 1))  # (n, heads, head_dim)
         out["gate"].append(cap["gate"][li][0, span])
-        w = pre_attn.get(li)
-        out["route_attn"].append(None if w is None else w[:, 0, span].transpose(0, 1))  # (n, sources)
-        out["route_mlp"].append(pre_mlp[li][:, 0, span].transpose(0, 1))
-    return {k: (v if k.startswith("route") else torch.stack(v, dim=1)) for k, v in out.items()}
+    res = {k: (v if k.startswith("route") else torch.stack(v, dim=1)) for k, v in out.items()}
+    final = [w for kind, _, w in cap["routing"] if kind == "final"][0]
+    res["route_final"] = final[:, 0, span].transpose(0, 1)
+    res["committed"] = [c[0, span] for c in cap["committed"]]
+    res["embed"] = res["committed"][0]
+    res["logit_stats"] = _logit_stats(logits[0, span], torch.tensor(seq[P + 1:P + 1 + n]))
+    return res
 
 
 def _check_row(model: KotodamaModel, signed, seq: list[int], P: int, depth: bool) -> None:
     assert signed.start == P and signed.positions == STEPS and signed.complete
     want = _oracle(model, seq, P, STEPS)
     s = signed.surfaces
-    for name in ("hidden", "q", "k", "v", "gate") + (("depth",) if depth else ()):
+    for name in ("hidden", "q", "k", "v", "gate", "embed") + (("depth",) if depth else ()):
         torch.testing.assert_close(s[name], want[name], **TOL, msg=name)
-    for j, li in enumerate(LAYERS):
-        n_attn, n_mlp = signed.route_sources[j]
-        wa = want["route_attn"][j]
+    for li in range(CFG["num_layers"]):
+        n_attn, n_mlp = signed.route_sources[li]
+        wa = want["route_attn"][li]
         assert n_attn == (0 if wa is None else wa.shape[1]), li
         if wa is not None:
-            torch.testing.assert_close(s["route"][:, j, 0, :n_attn], wa, **TOL)
-        torch.testing.assert_close(s["route"][:, j, 0, n_attn:], torch.zeros_like(s["route"][:, j, 0, n_attn:]))
-        torch.testing.assert_close(s["route"][:, j, 1, :n_mlp], want["route_mlp"][j], **TOL)
+            torch.testing.assert_close(s["route"][:, li, 0, :n_attn], wa, **TOL)
+        torch.testing.assert_close(s["route"][:, li, 0, n_attn:], torch.zeros_like(s["route"][:, li, 0, n_attn:]))
+        torch.testing.assert_close(s["route"][:, li, 1, :n_mlp], want["route_mlp"][li], **TOL)
+    nf = signed.final_sources
+    assert nf == want["route_final"].shape[1]
+    torch.testing.assert_close(s["route_final"][:, :nf], want["route_final"], **TOL)
+    got, ref = s["logit_stats"], want["logit_stats"]
+    assert torch.equal(got[:, 3], ref[:, 3])  # the chosen token's rank
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+    if depth:
+        assert len(s["committed"]) == len(want["committed"]) == len(CFG["attn_res_boundaries"])
+        for a, b in zip(s["committed"], want["committed"]):
+            torch.testing.assert_close(a, b, **TOL)
 
 
 @pytest.mark.parametrize("depth", [False, True])
@@ -225,7 +254,8 @@ def test_span_bookkeeping(model: KotodamaModel) -> None:
     row = dec.signed(2)
     assert (row.start, row.positions, row.kept, row.complete) == (10, 3, 3, True)
     assert row.surfaces["hidden"].shape == (3, len(LAYERS), CFG["hidden_size"])
-    assert row.surfaces["q"].shape == (3, len(LAYERS), 4, 16) and row.surfaces["route"].shape[:3] == (3, 5, 2)
+    assert row.surfaces["q"].shape == (3, len(LAYERS), 4, 16) and row.surfaces["route"].shape[:3] == (3, 11, 2)
+    assert row.surfaces["logit_stats"].shape == (3, 6) and row.surfaces["logit_stats"].dtype == torch.float64
     _decode(eng, dec, _ids(7, 5), steps=6)  # re-admitted from a shorter prompt, past the tail
     row = dec.signed(2)
     assert (row.start, row.positions, row.kept, row.complete) == (7, 6, 4, False)
@@ -239,24 +269,28 @@ def test_span_bookkeeping(model: KotodamaModel) -> None:
     sized = sign_bytes(spec, ROWS, hidden=64, n_heads=4, n_kv_heads=2, head_dim=16, intermediate=128,
                        n_layers=11, route=dec._sign_route, dtype=torch.float32)
     built = _dec(MultiSampleDecoder, eng, spec)
-    assert sized == sum(getattr(built, f"sign_{n}").numel() * 4 for n in built.sign_names)
+    assert sized == sum(getattr(built, f"sign_{n}").numel() * getattr(built, f"sign_{n}").element_size()
+                        for n in built.sign_names)
     with pytest.raises(ValueError, match="width"):
         SignSpec(LAYERS, tail=4, attn=True)
 
 
 @torch.inference_mode()
-def test_signing_compiles_only_the_sampled_signatures(model: KotodamaModel) -> None:
+def test_signing_compiles_a_bounded_number_of_signatures(model: KotodamaModel) -> None:
     eng = _engine(model)
     plain = _dec(MultiSampleDecoder, eng, None)
     signed = _dec(MultiSampleDecoder, eng, SignSpec(LAYERS, tail=8))
     base = len(set(plain.regional_signatures()))
-    extra = len({s for s in signed.regional_signatures() if s[3]})
-    assert extra == len({s[:3] for s, li in zip(signed.regional_signatures(), range(11)) if li in LAYERS})
+    sigs = signed.regional_signatures()
+    assert {s[3] for li, s in enumerate(sigs) if li in LAYERS} == {2}
+    assert {s[3] for li, s in enumerate(sigs) if li not in LAYERS} == {1}
+    # every unsigned signature becomes one routing-only signature; the sampled layers add theirs
+    extra = len({s for s in sigs if s[3] == 2})
     counter = CompileCounterWithBackend("aot_eager")
     signed.compile_step(regional=True, backend=counter)
-    assert signed.regional_variants == len(set(signed.regional_signatures()))
-    unsigned_left = {s for li, s in enumerate(signed.regional_signatures()) if li not in LAYERS}
-    assert signed.regional_variants == len(unsigned_left) + extra <= base + extra
+    assert signed.regional_variants == len(set(sigs))
+    assert signed.regional_variants == len({s for li, s in enumerate(sigs) if li not in LAYERS}) + extra
+    assert signed.regional_variants <= base + extra
     signed.admit(list(range(ROWS)), eng.prefill(_ids(8, 6)), PARAMS)
     signed.step(PARAMS)
     assert counter.frame_count == signed.regional_variants + 2  # the signatures, the tail and the sampler
