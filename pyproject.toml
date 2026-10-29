@@ -45,6 +45,12 @@ nca = [
     "einops",
 ]
 
+# Tests: the CPU suite runs across all cores (pytest-xdist; `-n 0` runs it serially)
+dev = [
+    "pytest",
+    "pytest-xdist>=3.5",
+]
+
 # Everything
 all = [
     "kotodama[training,eval,nca]",
@@ -65,3 +71,4 @@ kotodama = ["anamnesis_models.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-n auto"

@@ -152,7 +152,7 @@ A change merges when these pass. Each is a command you can run from the reposito
 
 | gate | what it checks | command |
 |---|---|---|
-| tests | the CPU suite | `.venv/bin/python -m pytest tests/` |
+| tests | the CPU suite, across all cores (pytest-xdist, from the `dev` extra; `-n 0` runs it serially) | `.venv/bin/python -m pytest tests/` |
 | G2 test retention | a change that shrinks the suite shrinks the code by at least as many lines | `python -m tools.check_test_retention --base origin/main` |
 | G3 documentation | the two rules above | `python -m tools.check_timelessness --root src/kotodama scripts tools tests` and `python -m tools.check_referents --root src/kotodama scripts tools tests` |
 | G4 import closure | every module reachable from a script, a tool or a test; no orphans | `python -m tools.check_import_closure --package src/kotodama --roots scripts tests tools` |
