@@ -579,10 +579,11 @@ def write_results(out_dir: str | Path, results: Sequence[SignResult]) -> dict[st
 
 
 def skip_reasons(results: Sequence[SignResult]) -> dict[str, int]:
-    """The skipped results counted by reason, numbers in a reason replaced by N (so one cause is one key)."""
+    """The skipped results counted by reason, digests in a reason replaced by H and other numbers by N (so one cause
+    is one key)."""
     out: dict[str, int] = {}
     for res in results:
         if res.reduced is None:
-            key = re.sub(r"\d+", "N", res.skipped or "not signed")
+            key = re.sub(r"\d+", "N", re.sub(r"\b[0-9a-f]{12,}\b", "H", res.skipped or "not signed"))
             out[key] = out.get(key, 0) + 1
     return out

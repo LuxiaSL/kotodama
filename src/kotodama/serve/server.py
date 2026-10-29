@@ -2976,8 +2976,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "opts out and is counted); /logprobs and /score_tokens are never signed. A server that "
                              "signs (this, or --sign_inflight) takes the site's signer where its flags leave it unset: "
                              "$KOTODAMA_SIGN_SPOOL, $KOTODAMA_SIGN_REDUCER, $KOTODAMA_SIGN_REDUCER_KWARGS, and "
-                             "$KOTODAMA_SIGN_PYTHONPATH (where the reducer's package lives, put on sys.path); one that "
-                             "signs by default refuses to start without a spool, a reducer and --sign_layers")
+                             "$KOTODAMA_SIGN_PYTHONPATH (where the reducer's package lives, put on sys.path) and "
+                             "$KOTODAMA_KERNEL_PINS (the fleet's kernel pin table); one that signs by default refuses "
+                             "to start without a spool, a reducer, --sign_layers and an existing pin table (replayed, "
+                             "never recorded: every replica's rows are then one lane)")
     parser.add_argument("--sign_audit_every", type=int, default=100,
                         help="With --sign_reducer: keep the raw signed surfaces of 1 row in N (0: none)")
     parser.add_argument("--host", default="0.0.0.0")
@@ -3072,6 +3074,7 @@ if __name__ == "__main__":
     _emulate_casts_arg = args.emulate_casts
     _kernel_pins_arg = args.kernel_pins
     if args.sign_default or args.sign_inflight:  # the site's signer, where the flags leave it unset
+        args.kernel_pins = args.kernel_pins or os.environ.get("KOTODAMA_KERNEL_PINS") or None
         args.sign_spool = args.sign_spool or os.environ.get("KOTODAMA_SIGN_SPOOL") or None
         args.sign_reducer = args.sign_reducer or os.environ.get("KOTODAMA_SIGN_REDUCER") or None
         if args.sign_reducer_kwargs is None:
@@ -3085,6 +3088,14 @@ if __name__ == "__main__":
                      f"{'sign spool' if not args.sign_spool else 'reducer' if not args.sign_reducer else 'sign layers'}"
                      ": set KOTODAMA_SIGN_SPOOL, KOTODAMA_SIGN_REDUCER and KOTODAMA_SIGN_REDUCER_KWARGS (site.env), or "
                      "pass --no-sign_default to serve without signatures")
+    if args.sign_default and not (args.kernel_pins and Path(args.kernel_pins).is_file()):
+        # every replica of a fleet replays one table, so their rows are one lane; a missing table would be recorded
+        # here, and this server would sign a lane of its own
+        parser.error("this server signs every request (--sign_default) but has "
+                     f"{'no kernel pin table' if not args.kernel_pins else f'no pin table at {args.kernel_pins}'}: "
+                     "set KOTODAMA_KERNEL_PINS (site.env) to the fleet's canonical replay-only table, or pass "
+                     "--no-sign_default to serve without signatures")
+    _kernel_pins_arg = args.kernel_pins  # with the site's table filled in above
     if args.sign_reducer and not args.sign_spool:
         parser.error("--sign_reducer needs --sign_spool")
     if args.sign_spool and _engine_arg != "fast":

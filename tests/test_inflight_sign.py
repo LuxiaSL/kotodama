@@ -441,8 +441,16 @@ def test_a_signing_profile_refuses_to_start_unconfigured(tmp_path) -> None:
 
     from pathlib import Path
 
-    env = {k: v for k, v in os.environ.items() if not k.startswith("KOTODAMA_SIGN_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KOTODAMA_SIGN_") and k != "KOTODAMA_KERNEL_PINS"}
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
     cmd = [sys.executable, "-m", "kotodama.serve.server", "--profile", "tsumugi-1b", "--port", "1"]
     out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
     assert out.returncode == 2 and "KOTODAMA_SIGN_SPOOL" in out.stderr and "--no-sign_default" in out.stderr
+    # a site with a signer but no pin table (or a table path that does not exist): refused, so no replica records
+    # a table of its own and signs a lane of its own
+    site = {**env, "KOTODAMA_SIGN_SPOOL": str(tmp_path / "spool"), "KOTODAMA_SIGN_REDUCER": "x.y:Z"}
+    out = subprocess.run(cmd, env=site, capture_output=True, text=True, timeout=300)
+    assert out.returncode == 2 and "KOTODAMA_KERNEL_PINS" in out.stderr
+    out = subprocess.run(cmd, env={**site, "KOTODAMA_KERNEL_PINS": str(tmp_path / "absent.json")},
+                         capture_output=True, text=True, timeout=300)
+    assert out.returncode == 2 and "no pin table at" in out.stderr
