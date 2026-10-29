@@ -1904,9 +1904,9 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
             timing["prefix_cache_hit"] = pc_info["prefix_hit"]
             timing["prefix_common_tokens"] = pc_info["common_prefix"]
         budget = min(request.max_new_tokens, _max_seq_len - prompt_len)
-        stops: list[int | None] = [None] * n
+        ended_on: list[int | None] = [None] * n
         rows = decode_rows(dec, prefill_logits, params, n, budget, _stop_token_ids, stop_check,
-                           slots=slot if _levers else None, seed=request.seed, stops=stops)
+                           slots=slot if _levers else None, seed=request.seed, stops=ended_on)
     elapsed = time.perf_counter() - t0
     timing["total_ms"] = round(elapsed * 1000, 2)
     timing["batched_rows"] = float(dec.rows)
@@ -1916,7 +1916,7 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
     return [GenerateResponse(text=_tokenizer.decode(r, skip_special_tokens=True), prompt_tokens=prompt_len,
                              completion_tokens=len(r), tokens_per_second=tps, timing=dict(timing),
                              prompt_ids=prompt_ids, completion_ids=list(r), stop_id=stop)
-            for r, stop in zip(rows, stops)]
+            for r, stop in zip(rows, ended_on)]
 
 
 def _multi_bucket(n: int) -> "MultiSampleDecoder | None":
