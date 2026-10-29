@@ -5,19 +5,18 @@ request that sets ``sign``; with a reducer configured it also signs the spool it
 do, one batch at a time. The same drain runs as a job of its own (this module's command line), for a spool whose
 server never idles or was started without a reducer. Layout:
 
-    records/<writer>.jsonl   one record per line, appended by each writer (a server process)
-    plans/<digest>.npz       the lever plans records name (kotodama.model.signer.save_plans)
-    signed/<batch>/          per signed batch (kotodama.model.signer.write_results: rows.jsonl, one features file
-                             per feature layout, names.json, raw/ audit samples) + engine.json (the identity it was
-                             signed under), named so they sort in drain order
-    index.jsonl              one line per signed batch: its name, directory, host, and row counts
-    state.json               per records file, the byte offset signed (or skipped) up to
+    <spool>/records/<writer>.jsonl   one record per line, appended by each writer (a server process)
+    <spool>/plans/<digest>.npz       the lever plans records name (kotodama.model.signer.save_plans)
+    <spool>/signed/<batch>/          per signed batch: kotodama.model.signer.write_results's files and the engine
+                                     identity it was signed under (<batch>/engine.json); batches sort in drain order
+    <spool>/index.jsonl              one line per signed batch: its name, directory, host, and row counts
+    <spool>/state.json               per records file, the byte offset signed (or skipped) up to
 
 Records are small and belong with the run; signed batches are bulk (~19 KB per row on the 1B), so a drain can write
 them elsewhere (``signed_dir``, e.g. node-local storage) and the index says where each batch went.
 
-A drain holds ``drain.lock`` (an exclusive flock) while it signs a batch, so a server and a job can drain one spool
-together. A batch is written (into a temporary directory, then renamed) before ``state.json`` moves past it, so a
+A drain holds an exclusive flock on ``<spool>/drain.lock`` while it signs a batch, so a server and a job can drain one
+spool together. A batch is written (into a temporary directory, then renamed) before the state moves past it, so a
 crash re-signs at most the batch in flight, under the same request ids.
 
     tools/run_py.sh -m kotodama.serve.sign --spool <dir> --checkpoint <ckpt> --model_size 1b-tsumugi \\

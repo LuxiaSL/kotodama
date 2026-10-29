@@ -132,7 +132,7 @@ def save_plans(path: str | Path, plans: Iterable[LeverPlan]) -> list[str]:
 
 
 def load_plans(path: str | Path) -> dict[str, LeverPlan]:
-    """The plans ``save_plans`` wrote, by digest; a plan whose content no longer hashes to its key raises."""
+    """The plans ``save_plans`` wrote, by digest; a plan whose content does not hash to its key raises."""
     rows: dict[str, dict[str, Any]] = {}
     with np.load(path, allow_pickle=False) as z:
         for key in z.files:
@@ -439,13 +439,13 @@ def _to_cpu(row: signing.SignedRow) -> signing.SignedRow:
 
 def write_results(out_dir: str | Path, results: Sequence[SignResult]) -> dict[str, Any]:
     """Results into ``out_dir``:
-      * ``rows.jsonl``: per record, in order: sign_id, steps (positions signed), weights, lever, same_engine, the
-        record's meta, and either the skip reason or lane_id, names_digest, the features file and row index, and the
-        reducer's meta (feature names left out);
-      * ``features-<names digest>.npy``: the reduced rows of one feature layout stacked, fp32 (rows with few steps
-        have fewer features, so each layout has its own file);
-      * ``names.json``: each layout's feature names (from the reducer's meta), once;
-      * ``raw/<sign_id>.pt``: the raw signed surfaces of the rows the audit sink sampled.
+      * ``<out_dir>/rows.jsonl``: per record, in order: sign_id, steps (positions signed), weights, lever,
+        same_engine, the record's meta, and either the skip reason or lane_id, names_digest, the features file and
+        row index, and the reducer's meta (feature names left out);
+      * ``<out_dir>/features-<names digest>.npy``: the reduced rows of one feature layout stacked, fp32 (rows with
+        few steps have fewer features, so each layout has its own file);
+      * ``<out_dir>/names.json``: each layout's feature names (from the reducer's meta), once;
+      * ``<out_dir>/raw/<sign_id>.pt``: the raw signed surfaces of the rows the audit sink sampled.
     Returns a summary."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
