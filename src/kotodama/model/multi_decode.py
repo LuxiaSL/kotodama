@@ -220,6 +220,11 @@ class MultiSampleDecoder(nn.Module):
         self._sign_start_host = [0] * self.rows
         if sign is not None:
             sign.check(self.n_layers)
+            # the computor the rows describe; a lane that declares its weights refuses any other model
+            self._sign_weights = signing.weights_digest(engine.model)
+            if sign.weights is not None and sign.weights != self._sign_weights:
+                raise ValueError(f"the signing lane declares weights {sign.weights[:12]}..., the engine's model is "
+                                 f"{self._sign_weights[:12]}...")
             sigs = layer_signatures(engine.model._attn_res_boundary_set, self.n_layers)
             self._sign_route = signing.route_width(sigs)
             bufs = signing.allocate(sign, self.rows, hidden=engine.hidden, n_heads=engine.n_heads,
@@ -557,7 +562,8 @@ class MultiSampleDecoder(nn.Module):
         return signing.export(self.sign, bufs, row, start=self._sign_start_host[row], pos=self._pos_host[row],
                               lever_slot=lever, steered=bool(eng.steer_enabled),
                               signatures=layer_signatures(eng.model._attn_res_boundary_set, self.n_layers),
-                              n_heads=eng.n_heads, n_kv_heads=eng.n_kv_heads, head_dim=eng.head_dim, device=device)
+                              n_heads=eng.n_heads, n_kv_heads=eng.n_kv_heads, head_dim=eng.head_dim,
+                              weights=self._sign_weights, device=device)
 
     def _build_regions(self, **opts) -> None:
         """One compiled decode layer per distinct signature, and each layer's tensors in the order the layer takes."""

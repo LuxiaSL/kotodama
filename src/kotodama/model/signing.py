@@ -39,6 +39,7 @@ says so).
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -57,13 +58,15 @@ STATS = ("head_entropy", "mean_entropy", "head_scalars", "mean_rows")
 class SignSpec:
     """What a decoder signs. ``layers``: the sampled effective layers (sorted, distinct); ``tail``: positions kept per
     row; ``depth``: also the post-MLP partial at every effective layer; ``attn``: attention statistics at every layer,
-    with head-mean rows over ``width`` absolute columns at the sampled layers."""
+    with head-mean rows over ``width`` absolute columns at the sampled layers; ``weights``: the weights digest the
+    lane declares (``weights_digest``), checked when the decoder is built (None: not checked)."""
 
     layers: tuple[int, ...]
     tail: int
     depth: bool = False
     attn: bool = False
     width: int = 0
+    weights: Optional[str] = None
 
     def __post_init__(self) -> None:
         layers = tuple(int(x) for x in self.layers)
@@ -80,6 +83,20 @@ class SignSpec:
     def check(self, n_layers: int) -> None:
         if self.layers[0] < 0 or self.layers[-1] >= n_layers:
             raise ValueError(f"sign layers {self.layers} outside [0, {n_layers})")
+
+
+def weights_digest(model: torch.nn.Module) -> str:
+    """sha256 of a model's weights as loaded: every ``state_dict()`` entry in sorted key order, each as its utf-8
+    name, NUL, its dtype, NUL, its shape (comma-joined), NUL, then its raw bytes in the loaded dtype. Tied or aliased
+    tensors are hashed under each key. This is anamnesis's lane weights rule (v1), byte for byte, so a signature row
+    names the computor it was captured from."""
+    h = hashlib.sha256()
+    for name, t in sorted(model.state_dict().items()):
+        x = t.detach().contiguous().cpu()
+        h.update(name.encode("utf-8") + b"\0" + str(x.dtype).encode("utf-8") + b"\0"
+                 + ",".join(str(int(d)) for d in x.shape).encode("utf-8") + b"\0")
+        h.update(x.view(torch.uint8).numpy().tobytes() if x.numel() else b"")
+    return h.hexdigest()
 
 
 def route_width(signatures: Sequence[tuple[int, bool]]) -> int:
@@ -179,6 +196,7 @@ def stats_write(st: tuple, p: torch.Tensor, sampled: bool) -> None:
 class SignedRow:
     """One row's captured span. ``positions``: span length (steps decoded since admission); ``kept``: positions
     held (``min(positions, tail)``; when they differ the last slot was overwritten and the span is incomplete);
+    ``weights``: the decoder's weights digest (``weights_digest``);
     ``start``: the row's position at admission (its prompt length); ``lever_slot``: the row's lever slot (0: none
     bound); ``steered``: broadcast steering was engaged. ``surfaces``: name -> tensor [kept, layers, ...] with
     q (heads, head_dim), k / v (kv heads, head_dim), gate, route (2, route width), hidden, depth (every layer).
@@ -197,6 +215,7 @@ class SignedRow:
     layers: tuple[int, ...]
     route_sources: tuple[tuple[int, int], ...]
     final_sources: int = 0
+    weights: str = ""
     surfaces: dict[str, object] = field(default_factory=dict)
 
     @property
@@ -206,7 +225,7 @@ class SignedRow:
 
 def export(spec: SignSpec, bufs: dict[str, torch.Tensor], row: int, *, start: int, pos: int, lever_slot: int,
            steered: bool, signatures: Sequence[tuple[int, bool]], n_heads: int, n_kv_heads: int,
-           head_dim: int, device: Optional[torch.device] = None) -> SignedRow:
+           head_dim: int, weights: str = "", device: Optional[torch.device] = None) -> SignedRow:
     """Row ``row``'s span from the buffers (copies, on ``device``: default the CPU)."""
     positions = max(0, int(pos) - int(start))
     kept = min(positions, spec.tail)
@@ -236,4 +255,4 @@ def export(spec: SignSpec, bufs: dict[str, torch.Tensor], row: int, *, start: in
     return SignedRow(positions=positions, kept=kept, start=int(start), lever_slot=int(lever_slot),
                      steered=bool(steered), layers=spec.layers,
                      route_sources=tuple(route_sources(c, b) for c, b in signatures),
-                     final_sources=committed_sources(signatures), surfaces=surf)
+                     final_sources=committed_sources(signatures), weights=weights, surfaces=surf)

@@ -32,7 +32,7 @@ from kotodama.model.decode_engine import DecodeEngine, SamplingParams
 from kotodama.model.levers import LeverPlan
 from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.model.multi_decode import CascadeDecoder, MultiSampleDecoder
-from kotodama.model.signing import SignSpec, sign_bytes
+from kotodama.model.signing import SignSpec, sign_bytes, weights_digest
 
 CFG = dict(hidden_size=64, num_layers=11, num_attention_heads=4, num_kv_heads=2, head_dim=16,
            intermediate_size=128, vocab_size=211, max_position_embeddings=128, rope_theta=10000.0,
@@ -294,3 +294,43 @@ def test_signing_compiles_a_bounded_number_of_signatures(model: KotodamaModel) -
     signed.admit(list(range(ROWS)), eng.prefill(_ids(8, 6)), PARAMS)
     signed.step(PARAMS)
     assert counter.frame_count == signed.regional_variants + 2  # the signatures, the tail and the sampler
+
+
+def _digest_by_rule(model: torch.nn.Module) -> str:
+    """anamnesis's lane weights rule (v1) written out independently: sorted state_dict keys; name, dtype, shape,
+    raw loaded bytes."""
+    import hashlib
+
+    h = hashlib.sha256()
+    for name in sorted(model.state_dict()):
+        t = model.state_dict()[name].detach().contiguous().cpu()
+        h.update(f"{name}\0{t.dtype}\0{','.join(map(str, t.shape))}\0".encode())
+        h.update(t.view(torch.uint8).numpy().tobytes())
+    return h.hexdigest()
+
+
+@torch.inference_mode()
+def test_signed_rows_name_their_weights(model: KotodamaModel) -> None:
+    digest = weights_digest(model)
+    assert digest == _digest_by_rule(model)
+    eng = _engine(model)
+    dec = _dec(MultiSampleDecoder, eng, SignSpec(LAYERS, tail=4, weights=digest))
+    _decode(eng, dec, _ids(6, 8), steps=2)
+    assert dec.signed(0).weights == digest
+    with pytest.raises(ValueError, match="declares weights"):
+        _dec(MultiSampleDecoder, eng, SignSpec(LAYERS, tail=4, weights="0" * 64))
+    other = KotodamaModel(KotodamaModelConfig(**CFG)).eval()
+    assert weights_digest(other) != digest
+    bf16 = KotodamaModel(KotodamaModelConfig(**CFG)).eval()
+    bf16.load_state_dict(model.state_dict())
+    assert weights_digest(bf16) == digest and weights_digest(bf16.to(torch.bfloat16)) != digest  # loaded dtype
+
+
+def test_weights_digest_matches_anamnesis() -> None:
+    """The same rule as anamnesis's own ``weights_digest``, where anamnesis is installed."""
+    anamnesis_lane = pytest.importorskip("anamnesis.lane_weights", reason="anamnesis with weights_digest not installed")
+    torch.manual_seed(3)
+    tiny = KotodamaModel(KotodamaModelConfig(**dict(CFG, num_layers=4, loop_start=1, loop_len=2,
+                                                    loop_times=1, attn_res_boundaries=[0, 2])))
+    assert weights_digest(tiny) == anamnesis_lane.weights_digest(tiny)
+
