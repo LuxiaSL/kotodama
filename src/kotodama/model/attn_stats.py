@@ -3,10 +3,11 @@ own log-normalisers (each row's lse over its prompt and tail, which the cascade 
 in one pass over the keys, in two Triton launches that read keys the way the attention does and write the stats
 buffers in place.
 
-- Prompt part: program (g, j) takes group g's prompt column tiles j, j + splits, ..., and per key head scores the
-  group's stacked queries (every member row's query heads on that key head) against the tile in one dot, so a prompt
-  key is read once per group, not once per row. It leaves partial sums per group slot and split, and writes the
-  head-mean row's prompt columns.
+- Prompt part: program (g, j, u) takes group g's prompt column tiles j, j + splits, ... for the u-th block of
+  ``sub`` member slots, and per key head scores those slots' stacked queries (each member row's query heads on that
+  key head) against the tile in one dot, so a prompt key is read once per block of rows, not once per row. A block
+  with no slot a row reads from (only the entries repeating a member, which fill a group past its rows) exits at
+  once. It leaves partial sums per group slot and split, and writes the head-mean row's prompt columns.
 - Row part: program b scores row b's own tail keys, adds its prompt slot's partials (in split order) and then its
   tail's, and writes the row's statistics, the head-mean row's tail columns and zeros past them.
 
@@ -34,8 +35,9 @@ except ImportError:  # CPU-only installs: the reference path computes the statis
 
 # The launch geometry. Part of the arithmetic (the partial sums' grouping), so fixed rather than tuned per batch.
 BLOCK = 32  # columns per tile
-SPLITS = 16  # prompt-part programs per group
-WARPS = 8
+SPLITS = 16  # prompt-part programs per group and block of slots
+SUB = 8  # member slots per prompt-part program (x the query heads per key head = the dot's rows, >= 16)
+WARPS = 4
 STAGES = 1  # the prompt part's tile-loop pipelining
 
 
@@ -57,13 +59,22 @@ if _TRITON:
         HKP: tl.constexpr, D: tl.constexpr, BN: tl.constexpr, NS: tl.constexpr, WIDTH: tl.constexpr,
         SAMPLED: tl.constexpr, STAGES: tl.constexpr,
     ):
-        """Program (g, j): partial sums per group slot (g * M + i) and head over group g's prompt tiles j, j + NS, ...
-        Query index x = i * RP + c is slot i's query head hk * R + c on key head hk."""
+        """Program (g, j, u): partial sums per group slot (g * M + i) and head over group g's prompt tiles j, j + NS,
+        ... for slots i in [u * MP, (u + 1) * MP). Query index x = (i - u * MP) * RP + c is slot i's query head
+        hk * R + c on key head hk."""
         g = tl.program_id(0)
         j = tl.program_id(1)
+        u = tl.program_id(2)
+        slots = u * MP + tl.arange(0, MP)
+        # the head-mean row is written only by the slot a row reads its prompt part from (row_slot), not by an
+        # unused entry repeating it; a block with no such slot has nothing anyone reads
+        rows = tl.load(mem_ptr + g * M + slots, mask=slots < M, other=0)
+        own = (slots < M) & (tl.load(rslot_ptr + rows, mask=slots < M, other=-1) == g * M + slots)
+        if tl.max(own.to(tl.int32), axis=0) == 0:
+            return
         plen = tl.load(plen_ptr + g).to(tl.int32)
         xs = tl.arange(0, MP * RP)
-        slot = xs // RP
+        slot = u * MP + xs // RP
         c = xs % RP
         xmask = (slot < M) & (c < R)
         row = tl.load(mem_ptr + g * M + slot, mask=slot < M, other=0)
@@ -77,11 +88,6 @@ if _TRITON:
         rec = tl.zeros([HKP, MP * RP], dtype=tl.float32)
         sink = tl.zeros([HKP, MP * RP], dtype=tl.float32)
         ment = tl.zeros([MP], dtype=tl.float32)
-        slots = tl.arange(0, MP)
-        # the head-mean row is written only by the slot a row reads its prompt part from (row_slot), not by an
-        # unused entry repeating it
-        rows = tl.load(mem_ptr + g * M + slots, mask=slots < M, other=0)
-        own = (slots < M) & (tl.load(rslot_ptr + rows, mask=slots < M, other=-1) == g * M + slots)
         mrow_base = (tl.load(rid_ptr + rows, mask=own, other=0) * stride_mr0
                      + tl.load(slot_ptr + rows, mask=own, other=0) * stride_mr1 + tl.load(scol_ptr) * stride_mr2)
         # each tile reads every key head's stacked queries again (from cache): pipelining them would buffer
@@ -205,7 +211,7 @@ if _TRITON:
 
 def cascade_stats(st: tuple, q: torch.Tensor, kv: tuple[torch.Tensor, ...], state: tuple[torch.Tensor, ...],
                   sampled: bool, lse: torch.Tensor, block: int = BLOCK, splits: int = SPLITS,
-                  warps: int = WARPS, stages: int = STAGES) -> None:
+                  warps: int = WARPS, stages: int = STAGES, sub: int = SUB) -> None:
     """One layer's attention statistics into the stats buffers, as ``stats_write(st, _cascade_probs(q, kv, state),
     sampled)`` writes them: q (B, heads, 1, head_dim) after the attention's KV write, kv = (tail_k, tail_v,
     prompt_k, prompt_v), state = (tail_pos, members, row_slot, prompt_lens, row_ids), st the stats tuple, lse
@@ -226,12 +232,12 @@ def cascade_stats(st: tuple, q: torch.Tensor, kv: tuple[torch.Tensor, ...], stat
                   SAMPLED=bool(sampled))
     pp = [torch.empty((G * M, splits, H), **f32) for _ in range(4)]
     pment = torch.empty((G * M, splits), **f32)
-    _prompt_stats_kernel[(G, splits)](
+    _prompt_stats_kernel[(G, splits, triton.cdiv(M, sub))](
         qr, prompt_k, prompt_lens, members, row_slot, start, pos, lse, *pp, pment,
         mean_rows, row_ids, slot, scol,
         qr.stride(0), qr.stride(1), prompt_k.stride(0), prompt_k.stride(1), prompt_k.stride(2),
         mean_rows.stride(0), mean_rows.stride(1), mean_rows.stride(2),
-        M=M, MP=triton.next_power_of_2(M), RP=triton.next_power_of_2(H // hk), HKP=triton.next_power_of_2(hk),
+        M=M, MP=sub, RP=triton.next_power_of_2(H // hk), HKP=triton.next_power_of_2(hk),
         STAGES=stages, num_warps=warps, **common)
     _row_stats_kernel[(B,)](
         qr, tail_k, prompt_lens, row_slot, tail_pos, start, pos, lse, *pp, pment,
