@@ -7,7 +7,9 @@ can keep different configs. For a reduction the block size sets the summation or
 in the low bits, and a signature lane (kotodama.model.signing) captured on one is not byte-reproducible on the other.
 
 ``install(table_path, mode)`` patches inductor's runtime autotuner for the process:
-  * ``record``: autotune as usual and record each kernel's choice; ``PinSession.save()`` writes the table;
+  * ``record``: autotune as usual and record each kernel's choice; a later instance of a recorded kernel (same
+    source and size hints) takes the recorded config instead of timing again, so the process runs exactly the
+    arithmetic the table replays; ``PinSession.save()`` writes the table;
   * ``replay``: take each kernel's recorded config (exact match), no timing; a kernel missing from the table is
     refused (``KernelPinMiss``), or with ``allow_missing`` takes its first config and is recorded as a miss, which
     changes the table digest;
@@ -104,9 +106,9 @@ class PinSession:
     def _choose(self, key: str, options: Sequence[Any], name: Callable[[Any], str]) -> Optional[Any]:
         if self.mode == "first":
             return options[0]
-        if self.mode == "record":
-            return None
         want = self.table.get(key)
+        if self.mode == "record" and want is None:
+            return None
         if want is not None:
             for option in options:
                 if name(option) == want:
@@ -120,11 +122,15 @@ class PinSession:
         return options[0]
 
     def record(self, key: str, launcher: Any) -> None:
-        self.table[key] = config_key(launcher.config)
-        self.recorded += 1
+        self._record(key, config_key(launcher.config))
 
     def record_config(self, key: str, config: Any) -> None:
-        self.table[key] = triton_config_key(config)
+        self._record(key, triton_config_key(config))
+
+    def _record(self, key: str, config: str) -> None:
+        if key in self.table:  # the first instance's choice stands (later instances take it, see _choose)
+            return
+        self.table[key] = config
         self.recorded += 1
 
     @property

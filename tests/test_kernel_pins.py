@@ -4,7 +4,8 @@ inductor's runtime autotuner, without a GPU.
 What is pinned here:
   * replay keeps exactly the recorded config, refuses a kernel the table does not hold (or, allowed, takes its first
     config and records the miss, which changes the digest), and refuses a pinned config the kernel does not have;
-  * record mode leaves the choice to the autotuner and records it; first mode always takes the first config;
+  * record mode leaves the choice to the autotuner and records it, and a second instance of a recorded kernel takes
+    the recorded config (one config per kernel in the recording process); first mode always takes the first config;
   * the digest is a function of the table alone, and a saved table replays the same choices;
   * install patches CachingAutotuner.autotune_to_one_config so a kernel's launchers are cut to the pinned one;
   * install patches triton's Autotuner (the hand-written ``@triton.autotune`` kernels): record keeps the timed choice
@@ -43,6 +44,10 @@ def test_replay_keeps_the_recorded_config(tmp_path: Path) -> None:
     launchers = _launchers(128, 256, 512)
     assert rec.choose("k1", launchers) is None  # the autotuner decides
     rec.record("k1", launchers[1])
+    # a second instance of k1 in the recording process: no second timing, the recorded config
+    assert rec.choose("k1", _launchers(128, 256, 512)).config.kwargs == {"XBLOCK": 256}
+    rec.record("k1", launchers[2])
+    assert rec.table["k1"] == "XBLOCK=256|w4|s1" and rec.recorded == 1
     rec.save()
     import json
 
@@ -113,6 +118,10 @@ def test_install_pins_triton_autotune(tmp_path: Path) -> None:
         tuner.run(x, 100)
         tuner.run(x, 7)
         assert [b for _, b, _ in launched] == [64, 64, 64] and sess.recorded == 2
+        # another instance of the same kernel in the recording process, whose timings differ: the recorded config
+        other, launched2 = _autotuned({32: 0.1, 64: 5.0, 128: 5.0})
+        other.run(x, 100)
+        assert launched2 == [(100, 64, 8)] and sess.recorded == 2
         assert all(k.startswith("triton:kernel:") for k in sess.table)
         sess.save()
         # another process, whose timings would pick BLOCK 32: replay launches the recorded 64, timing nothing
