@@ -107,6 +107,7 @@ class LoomConfig:
     engage_replies: int = 2
     overlong: str = "veto"  # veto | keep
     speaker: str = "rotate"  # rotate (round-robin over the cast) | model (the model names the next speaker)
+    unsigned_utility: bool = False  # utility draws (speaker tags, engagement replies) send sign: false
 
 
 @dataclass
@@ -140,14 +141,14 @@ def weighted_choice(rng: random.Random, weights: list[float], k: int) -> list[in
 
 
 async def engagement(turns: tuple[Turn, ...], header: str, cast: list[str], cand: Turn, complete: Complete,
-                     score: Score, replies: int) -> float:
+                     score: Score, replies: int, fields: Optional[dict[str, Any]] = None) -> float:
     """Mean over sampled next-speaker replies of log p(reply | context + cand) − log p(reply | context)."""
     after = turns + (cand,)
     nxt = next_speaker(cast, list(after))
     stops = stop_sequences(cast)
     with_c = render_prompt(Transcript(after, header), nxt)
     without = render_prompt(Transcript(turns, header), nxt)
-    raw = await complete(with_c, replies, stops)
+    raw = await complete(with_c, replies, stops, **(fields or {}))
     texts = [split_completion(t, stops, fr, hit)[0].strip() for t, fr, hit in raw]
     texts = [t for t in texts if t] or ["..."]
     lps = await score([(p, " " + t) for t in texts for p in (with_c, without)])
@@ -212,10 +213,12 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
     def visible(turns: tuple[Turn, ...]) -> tuple[Turn, ...]:
         return window_turns(turns, seed.header, n_seed, cfg.window_chars)
 
+    utility = {"sign": False} if cfg.unsigned_utility else None
+
     async def expand(node: Node) -> list[Node]:
         seen = visible(node.turns)
         if cfg.speaker == "model":
-            speaker, chose = await model_speaker(seed.cast, list(seen), seed.header, complete)
+            speaker, chose = await model_speaker(seed.cast, list(seen), seed.header, complete, fields=utility)
             stats["requests"] += 1
             stats["speaker_model" if chose else "speaker_rotate"] = stats.get(
                 "speaker_model" if chose else "speaker_rotate", 0) + 1
@@ -252,7 +255,7 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
             try:
                 vals = await asyncio.gather(*(engagement(node.turns, seed.header, seed.cast,
                                                          Turn(speaker, cands[i].text), complete, score,
-                                                         cfg.engage_replies) for i in survivors))
+                                                         cfg.engage_replies, utility) for i in survivors))
                 eng = dict(zip(survivors, vals))
             except Exception as e:  # a failed scoring round costs this node its weighting, not the tree
                 logger.warning("node %s: engagement scoring failed (%s); choosing uniformly", node.id, e)
@@ -761,6 +764,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--template_max", type=int, default=3)
     ap.add_argument("--engage_replies", type=int, default=2)
     ap.add_argument("--overlong", choices=["veto", "keep"], default="veto")
+    ap.add_argument("--unsigned_utility", action="store_true",
+                    help="utility draws (speaker tags, engagement replies) send sign: false, so a server that signs by "
+                         "default spends its signing on the scene's own turns (needs a server that knows the field)")
     ap.add_argument("--speaker", choices=["rotate", "model"], default="rotate",
                     help="who speaks next: rotate = round-robin over the cast; model = the model writes the next "
                          "turn's name tag (first of 4 draws naming a cast member other than the last speaker; "
@@ -798,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
                      select=a.select, select_lambda=a.select_lambda, engage_replies=a.engage_replies,
                      overlong=a.overlong, novelty_speech_only=a.novelty_speech_only, novelty_norm=a.novelty_norm,
                      novelty_prior=a.novelty_prior, deep_children=a.deep_children, rerolls=a.rerolls,
-                     speaker=a.speaker)
+                     speaker=a.speaker, unsigned_utility=a.unsigned_utility)
     sp = SelfPlayConfig(candidates=a.candidates, max_tokens=a.max_tokens, min_turns=a.min_turns,
                         cycle_window=a.cycle_window, template_window=a.template_window, template_max=a.template_max)
     complete, close = oai_completer(a.endpoint, sampling, a.max_tokens, model=a.model,

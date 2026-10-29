@@ -368,3 +368,9 @@ def test_model_speaker_falls_back_to_rotation() -> None:
     assert asyncio.run(sp.model_speaker(cast, turns, "H", _tags("Ann", "Zed")[0])) == ("Scott", False)
     assert asyncio.run(sp.model_speaker(cast, turns, "H", _tags(fail=True)[0])) == ("Scott", False)
     assert asyncio.run(sp.model_speaker(["Solo"], [], "H", _tags("Solo")[0])) == ("Solo", False)
+
+
+def test_model_speaker_passes_extra_fields() -> None:
+    complete, calls = _tags("Bea")
+    asyncio.run(sp.model_speaker(["Ann", "Bea"], [Turn("Ann", "Hi.")], "H", complete, fields={"sign": False}))
+    assert calls[0][3] == {"max_tokens": 8, "sign": False}

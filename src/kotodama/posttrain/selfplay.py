@@ -285,17 +285,19 @@ def match_speaker(text: str, cast: list[str], exclude: Optional[str] = None) -> 
 
 
 async def model_speaker(cast: list[str], turns: list[Turn], header: str, complete: Complete, samples: int = 4,
-                        max_tokens: int = 8) -> tuple[str, bool]:
+                        max_tokens: int = 8, fields: Optional[dict[str, Any]] = None) -> tuple[str, bool]:
     """(next speaker, chosen by the model). The model writes the next turn's name tag: ``samples`` draws of a short
     continuation of the document up to the turn break, stopped at the colon. The first draw that names a cast member
     other than the last speaker is the choice, so the choice follows the model's own distribution over who speaks
-    next. Falls back to round-robin (False) when no draw names one, or when the request fails."""
+    next. Falls back to round-robin (False) when no draw names one, or when the request fails. ``fields`` are extra
+    request fields for the draw (e.g. ``{"sign": False}``: a utility call a signing server need not sign)."""
     rotate = next_speaker(cast, turns)
     if len(cast) < 2:
         return rotate, False
     last = turns[-1].speaker if turns else None
     try:
-        raw = await complete(speaker_tag_prompt(header, turns), samples, [":", "\n"], max_tokens=max_tokens)
+        raw = await complete(speaker_tag_prompt(header, turns), samples, [":", "\n"], max_tokens=max_tokens,
+                             **(fields or {}))
     except Exception as e:  # a failed tag draw costs this turn the model's choice, never the scene
         logger.warning("speaker tag draw failed (%s); rotating", e)
         return rotate, False

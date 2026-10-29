@@ -512,3 +512,21 @@ def test_model_speaker_mode_lets_the_model_name_the_next_speaker() -> None:
     speakers = [t["speaker"] for t in max(recs["path"], key=lambda p: p["depth"])["turns"]]
     assert speakers[:4] == ["Ines", "Mara", "Ines", "Mara"]  # never the strict rotation Mara, Teo, Ines
     assert st["speaker_model"] == len(tags) and st.get("speaker_rotate", 0) == 0
+
+
+def test_unsigned_utility_marks_only_the_tag_draws() -> None:
+    seed = SeedSpec("s4", ["Mara", "Teo", "Ines"], "Three on a ferry.", [])
+    seen = {"tag": [], "turn": []}
+
+    async def complete(prompt: str, n: int, stops: list[str], **kw):
+        if stops == [":", "\n"]:
+            seen["tag"].append(kw.get("sign"))
+            return [("Teo", "stop", False)] * n
+        seen["turn"].append(kw.get("sign"))
+        return [(f"line {prompt.count(chr(10))}-{i}{stops[0]}", "stop", False) for i in range(n)]
+
+    cfg = loom.LoomConfig(candidates=2, children=1, width=1, max_depth=3, min_turns=2, speaker="model",
+                          unsigned_utility=True)
+    asyncio.run(loom.grow(seed, "t4", complete, cfg, SelfPlayConfig(min_turns=2), "x", lambda k, r: None))
+    assert seen["tag"] and all(v is False for v in seen["tag"])  # utility draws opt out of signing
+    assert seen["turn"] and all(v is None for v in seen["turn"])  # the scene's own turns stay signed (field unset)
