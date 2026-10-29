@@ -244,6 +244,7 @@ class RecordSigner:
         digest = self._pins.digest if self._pins is not None else self._pins_digest
         return signing.engine_identity(
             compile_mode=self.compile_mode, width=dec.rows, weights=self.weights, pins_digest=digest,
+            device=dec.engine.device,
             extra={"decoder": {"class": type(dec).__name__, "rows": dec.rows, "groups": dec.groups,
                                "group_rows": dec.group_rows, "tail_tokens": dec.tail_tokens,
                                "max_seq_len": dec.max_seq_len, "seeded": dec.seeded},

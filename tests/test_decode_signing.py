@@ -21,11 +21,13 @@ What is pinned here:
 from __future__ import annotations
 
 import os
+import platform
 import shutil
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 
 import numpy as np
+
 import pytest
 import torch
 from torch._dynamo.testing import CompileCounterWithBackend
@@ -486,8 +488,10 @@ def test_reducer_protocol_and_engine_identity(model: KotodamaModel) -> None:
     eng = _engine(model)
     dec = _dec(MultiSampleDecoder, eng, SignSpec(LAYERS, tail=4))
     seqs = _decode(eng, dec, _ids(6, 9), steps=3)
-    ident = engine_identity(compile_mode="default", width=ROWS, weights=dec.signed(0).weights, pins_digest=None)
+    ident = engine_identity(compile_mode="default", width=ROWS, weights=dec.signed(0).weights, pins_digest=None,
+                            device=eng.device)
     assert ident["weights"] == weights_digest(model) and set(ident["source_sha256"]) >= {"regional.py", "signing.py"}
+    assert ident["device_arch"] == f"cpu-{platform.machine()}-{torch.backends.cpu.get_cpu_capability()}"  # the arch is part of the lane: bytes differ across it
     red = load_reducer(f"{__name__}:_EchoReducer", scale=2.0)
     assert isinstance(red, SignatureReducer)
     out = red.reduce([dec.signed(r) for r in range(ROWS)], token_ids=seqs, engine=ident)

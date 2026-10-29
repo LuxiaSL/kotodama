@@ -307,11 +307,25 @@ ENGINE_SOURCES = ("regional.py", "multi_decode.py", "decode_engine.py", "cascade
                   "kernel_pins.py", "attn_stats.py")
 
 
-def engine_identity(*, compile_mode: str, width: int, weights: str, pins_digest: Optional[str],
+def device_arch(device: Any) -> str:
+    """The architecture a device computes on, as lane ids name it: ``cuda-sm_<major><minor>`` for a CUDA device (its
+    kernels, and so the captured bytes, differ across architectures), ``cpu-<machine>-<ISA>`` otherwise (the vector
+    instruction set torch dispatches to, which picks the CPU kernels)."""
+    import platform
+
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        major, minor = torch.cuda.get_device_capability(dev)
+        return f"cuda-sm_{major}{minor}"
+    return f"{dev.type}-{platform.machine() or 'unknown'}-{torch.backends.cpu.get_cpu_capability()}"
+
+
+def engine_identity(*, compile_mode: str, width: int, weights: str, pins_digest: Optional[str], device: Any,
                     extra: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
     """What a decode-engine signature's arithmetic is made of, for its lane id: the engine sources' digests, torch and
-    triton versions, the regions' compile mode, the pinned kernel configs (kotodama.model.kernel_pins digest; None:
-    unpinned, so not restart-reproducible), the canonical decoder width and the weights digest."""
+    triton versions, the device architecture (``device_arch``), the regions' compile mode, the pinned kernel configs
+    (kotodama.model.kernel_pins digest; None: unpinned, so not restart-reproducible), the canonical decoder width and
+    the weights digest."""
     import torch as _torch
 
     here = Path(__file__).parent
@@ -324,7 +338,8 @@ def engine_identity(*, compile_mode: str, width: int, weights: str, pins_digest:
     ident: dict[str, Any] = {
         "producer": "kotodama.model.signing",
         "source_sha256": {name: hashlib.sha256((here / name).read_bytes()).hexdigest() for name in ENGINE_SOURCES},
-        "torch": _torch.__version__, "triton": triton_version, "compile_mode": compile_mode,
+        "torch": _torch.__version__, "triton": triton_version, "device_arch": device_arch(device),
+        "compile_mode": compile_mode,
         "kernel_pins": pins_digest, "width": int(width), "weights": weights,
     }
     if extra:
