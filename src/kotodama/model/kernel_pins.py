@@ -13,7 +13,15 @@ in the low bits, and a signature lane (kotodama.model.signing) captured on one i
     changes the table digest;
   * ``first``: every kernel takes its first config (deterministic, often slower).
 A kernel is keyed by the sha256 of its Triton source and its size hints; a config by its block sizes, warps and
-stages. The table digest (``PinSession.digest``) names the pins in a lane's identity.
+stages.
+
+Hand-written ``@triton.autotune`` kernels (the AttnRes kernels the eager forward runs) choose the same way: once per
+process per tuning key, by timing, so two processes can keep different warps and differ in a reduction's order. The
+same session pins them in the same table: each (kernel, tuning key) is keyed ``triton:<name>:<source sha256>:<tuning
+key>``, a config by every launch option it sets. In replay the pinned config is put in the autotuner's cache before
+its first launch, so nothing is timed, and a launch that ends on another config is refused.
+
+The table digest (``PinSession.digest``) names the pins in a lane's identity.
 """
 
 from __future__ import annotations
@@ -23,7 +31,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +47,32 @@ def config_key(config: Any) -> str:
     kwargs = getattr(config, "kwargs", {}) or {}
     items = ",".join(f"{k}={kwargs[k]}" for k in sorted(kwargs))
     return f"{items}|w{getattr(config, 'num_warps', '?')}|s{getattr(config, 'num_stages', '?')}"
+
+
+def triton_config_key(config: Any) -> str:
+    """A ``triton.Config``'s identity: every meta-parameter and launch option it sets (warps, stages, CTAs, ...)."""
+    opts = config.all_kwargs() if hasattr(config, "all_kwargs") else dict(getattr(config, "kwargs", {}) or {})
+    return ",".join(f"{k}={opts[k]}" for k in sorted(opts))
+
+
+def triton_tuning_key(autotuner: Any, args: Sequence[Any], kwargs: dict) -> Optional[tuple]:
+    """The key ``triton.runtime.autotuner.Autotuner.run`` caches its choice under: the ``key`` arguments' values,
+    then the dtype of every argument that has one (None: a single config, nothing is tuned)."""
+    if len(autotuner.configs) <= 1:
+        return None
+    named = {**dict(zip(autotuner.arg_names, args)), **kwargs}
+    named = {k: v for k, v in named.items() if k in autotuner.arg_names}
+    key = [named[k] for k in autotuner.keys if k in named]
+    key += [str(v.dtype) for v in named.values() if hasattr(v, "dtype")]
+    return tuple(key)
+
+
+def triton_kernel_key(autotuner: Any, tuning_key: tuple) -> str:
+    """An ``@triton.autotune`` kernel's pin key: its name, the sha256 of its source and the tuning key."""
+    fn = autotuner.base_fn
+    src = getattr(fn, "src", None) or getattr(fn, "__name__", "?")
+    sha = hashlib.sha256(src.encode("utf-8")).hexdigest()
+    return f"triton:{getattr(fn, '__name__', '?')}:{sha}:{tuning_key!r}"
 
 
 def kernel_key(source: str, size_hints: Any) -> str:
@@ -60,25 +94,37 @@ class PinSession:
 
     def choose(self, key: str, launchers: Sequence[Any]) -> Optional[Any]:
         """The launcher to keep for kernel ``key``, or None to autotune (record mode). Raises KernelPinMiss."""
+        return self._choose(key, launchers, lambda launcher: config_key(launcher.config))
+
+    def choose_config(self, key: str, configs: Sequence[Any]) -> Optional[Any]:
+        """The ``triton.Config`` to keep for an ``@triton.autotune`` kernel's tuning ``key``, or None to autotune
+        (record mode). Raises KernelPinMiss."""
+        return self._choose(key, configs, triton_config_key)
+
+    def _choose(self, key: str, options: Sequence[Any], name: Callable[[Any], str]) -> Optional[Any]:
         if self.mode == "first":
-            return launchers[0]
+            return options[0]
         if self.mode == "record":
             return None
         want = self.table.get(key)
         if want is not None:
-            for launcher in launchers:
-                if config_key(launcher.config) == want:
+            for option in options:
+                if name(option) == want:
                     self.hits += 1
-                    return launcher
-            raise KernelPinMiss(f"kernel {key[:12]}: pinned config {want} is not among its configs")
+                    return option
+            raise KernelPinMiss(f"kernel {key[:40]}: pinned config {want} is not among its configs")
         if not self.allow_missing:
-            raise KernelPinMiss(f"kernel {key[:12]} is not in the pin table {self.path}")
+            raise KernelPinMiss(f"kernel {key[:40]} is not in the pin table {self.path}")
         self.misses.append(key)
-        self.table[key] = config_key(launchers[0].config)
-        return launchers[0]
+        self.table[key] = name(options[0])
+        return options[0]
 
     def record(self, key: str, launcher: Any) -> None:
         self.table[key] = config_key(launcher.config)
+        self.recorded += 1
+
+    def record_config(self, key: str, config: Any) -> None:
+        self.table[key] = triton_config_key(config)
         self.recorded += 1
 
     @property
@@ -102,8 +148,8 @@ def session() -> Optional[PinSession]:
 
 
 def install(table_path: Optional[str | Path], mode: Mode, allow_missing: bool = False) -> PinSession:
-    """Patch inductor's runtime autotuner for this process (see the module docstring). ``table_path`` is read in
-    replay mode and is where ``save`` writes in record mode. Returns the session."""
+    """Patch inductor's runtime autotuner and triton's ``Autotuner`` for this process (see the module docstring).
+    ``table_path`` is read in replay mode and is where ``save`` writes in record mode. Returns the session."""
     global _session
     from torch._inductor.runtime import triton_heuristics as th
 
@@ -128,6 +174,54 @@ def install(table_path: Optional[str | Path], mode: Mode, allow_missing: bool = 
         self.launchers = [chosen]
 
     cls.autotune_to_one_config = autotune_to_one_config
+    _install_triton(sess)
     _session = sess
     logger.info("kernel pins: %s (%s, %d pinned kernels)", mode, path, len(table))
     return sess
+
+
+def uninstall() -> None:
+    """Undo ``install``: inductor's and triton's autotuners choose by timing again."""
+    global _session
+    from torch._inductor.runtime import triton_heuristics as th
+
+    cls = th.CachingAutotuner
+    if hasattr(cls, "_kotodama_unpinned_autotune"):
+        cls.autotune_to_one_config = cls._kotodama_unpinned_autotune
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:
+        Autotuner = None
+    if Autotuner is not None and hasattr(Autotuner, "_kotodama_unpinned_run"):
+        Autotuner.run = Autotuner._kotodama_unpinned_run
+    _session = None
+
+
+def _install_triton(sess: PinSession) -> None:
+    """Patch ``triton.runtime.autotuner.Autotuner.run`` for ``sess`` (no-op without triton)."""
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:
+        return
+    original = getattr(Autotuner, "_kotodama_unpinned_run", Autotuner.run)
+    Autotuner._kotodama_unpinned_run = original
+
+    def run(self, *args, **kwargs):
+        tuning = triton_tuning_key(self, args, kwargs)
+        if tuning is None:
+            return original(self, *args, **kwargs)
+        key = triton_kernel_key(self, tuning)
+        fresh = tuning not in self.cache
+        if fresh:
+            pinned = sess.choose_config(key, self.configs)
+            if pinned is not None:
+                self.cache[tuning] = pinned
+        out = original(self, *args, **kwargs)
+        chosen = triton_config_key(self.best_config)
+        if fresh and sess.mode == "record":
+            sess.record_config(key, self.best_config)
+        elif sess.mode == "replay" and sess.table.get(key) not in (None, chosen):
+            raise KernelPinMiss(f"kernel {key[:40]} ran {chosen}, its pin is {sess.table[key]}")
+        return out
+
+    Autotuner.run = run
