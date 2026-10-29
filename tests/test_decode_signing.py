@@ -400,6 +400,24 @@ class _Pinned(torch.nn.Module):
             self.emb.weight.copy_(torch.tensor([[0.25], [2.0]]))
 
 
+def test_logit_stats_top5_is_the_fp64_top5() -> None:
+    """The top-5 mass selects on the logits as given and sums e at those columns: the same bytes as summing e's own
+    top five, with exact ties, ties made by the fp64 shift, and a tiny value beside large ones."""
+    from kotodama.model.signing import logit_stats
+
+    g = torch.Generator().manual_seed(11)
+    logits = torch.randn(64, 503, generator=g) * 6
+    logits[:, 7] = logits[:, 9] = logits[:, 11] = logits.max(-1).values + 1  # exact ties in the top five
+    logits[::2, 20] = logits[::2, 7] - 1e-6  # within fp32 of the tie
+    logits[1::3, 30] = 1e-30
+    chosen = torch.randint(0, 503, (64, 1), generator=g)
+    x = logits.double()
+    x = x - x.max(dim=-1, keepdim=True).values
+    e = x.exp()
+    want = e.topk(5, dim=-1).values.sum(-1, keepdim=True) / e.sum(-1, keepdim=True)
+    assert torch.equal(logit_stats(logits, chosen)[:, 2:3], want)
+
+
 def test_weights_digest_matches_anamnesis() -> None:
     """The rule's pinned constant on anamnesis's own module, and anamnesis's implementation where it is installed."""
     assert weights_digest(_Pinned()) == _PINNED_DIGEST

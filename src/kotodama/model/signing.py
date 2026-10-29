@@ -165,7 +165,10 @@ def logit_stats(logits: torch.Tensor, chosen: torch.Tensor) -> torch.Tensor:
     log_z = z.log()
     xc = x.gather(1, chosen)
     entropy = log_z - (x * e).sum(-1, keepdim=True) / z
-    top5 = e.topk(min(5, e.shape[-1]), dim=-1).values.sum(-1, keepdim=True) / z
+    # the top five by the logits as given: x and e are monotone in them, so these are e's top five, in the same order
+    # (ties hold equal values), and the selection runs on half-width keys
+    top = logits.topk(min(5, e.shape[-1]), dim=-1).indices
+    top5 = e.gather(1, top).sum(-1, keepdim=True) / z
     rank = (x > xc).sum(-1, keepdim=True).double()
     return torch.cat([entropy, 1.0 / z, top5, rank, xc.exp() / z, xc - log_z], dim=-1)
 
