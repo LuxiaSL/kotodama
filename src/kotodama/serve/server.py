@@ -212,6 +212,7 @@ _prefix_pool: "PrefixKVCache | None" = None
 # median norms are keyed by LAYER. The engine receives a per-request WRITES
 # list [(site_layer, unit_vec, alpha * site_median_norm), ...] via set_steer.
 _steer_loaded: bool = False
+_adapter: dict | None = None  # the merged LoRA adapter's identity (kotodama.posttrain.lora.merge), or None
 _steer_bank: dict[str, tuple[int, "torch.Tensor"]] = {}
 _steer_meds: dict[int, float] = {}
 _steer_aliases: dict[str, tuple[str | None, float, str]] = {}
@@ -350,13 +351,16 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True, regional: bool = False, autotune_min_rows: int = 0) -> tuple[KotodamaModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True, regional: bool = False, autotune_min_rows: int = 0, adapter: str | None = None) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
     global _row_token_cap, _cascade_info, _levers, _seeded_rows, _compile_mode, _warm_truncated, _regional
     global _compile_store_state, _autotune_min_rows
     _compile_mode, _warm_truncated, _regional = compile_mode, bool(warm_truncated), bool(regional)
     _autotune_min_rows = int(autotune_min_rows)
-    global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
+    global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms, _adapter
+    if adapter is not None and steer_npz is not None:
+        # The banks' vectors and the median norms that dose them are measurements of the base weights.
+        raise ValueError("--steer-npz is calibrated on the base model and does not describe it with --adapter merged")
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
     # first: a tokenizer that cannot load fails the start in seconds, not after the engine has compiled
@@ -414,6 +418,13 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     gc.collect()
 
     model = model.to(_device).eval()
+    _adapter = None
+    if adapter is not None:
+        # Before the bf16 cast, so the weights round once, and before the engine is built: it binds fused copies of
+        # the projection weights at construction. The identity on the model names it in capture_identity.
+        from kotodama.posttrain import lora
+
+        _adapter = model.adapter_identity = lora.merge(model, adapter)
     if _device.type == "cuda":
         model = model.bfloat16()
 
@@ -742,6 +753,7 @@ class ModelInfo(BaseModel):
     prefix_pool: dict | None = None
     cascade: dict | None = None
     startup: dict | None = None
+    adapter: dict | None = None
 
 
 # ── /logprobs: batched prefill-only scoring (the four-register rider battery) ──
@@ -913,6 +925,10 @@ def _check_span(request: GenerateRequest) -> None:
         raise HTTPException(400, "steer_span 'uniform' needs a server started with --levers")
     if request.injection is not None and not _levers:
         raise HTTPException(400, "'injection' needs a server started with --levers")
+    if request.injection is not None and _adapter is not None:
+        # Injection doses (and the act lever's mu) are measured on the base weights, which the merged adapter moves.
+        raise HTTPException(400, f"'injection' is calibrated on the base model; not served with an adapter merged "
+                                 f"({_adapter['name']})")
 
 
 @contextlib.contextmanager
@@ -1532,6 +1548,7 @@ def _record_startup() -> None:
                        seconds, _startup_budget_s_arg, _startup_info)
     else:
         logger.info("startup: ready after %.0fs (budget %.0fs; %s)", seconds, _startup_budget_s_arg, _startup_info)
+_adapter_arg: str | None = None  # CLI --adapter: a LoRA adapter directory merged into the weights at load
 
 
 @asynccontextmanager
@@ -1558,6 +1575,7 @@ async def lifespan(app: FastAPI):
         warm_truncated=_warm_truncated_arg,
         regional=_regional_arg,
         autotune_min_rows=_autotune_min_rows_arg,
+        adapter=_adapter_arg,
     )
     _record_startup()
     try:
@@ -1573,13 +1591,14 @@ def _model_name() -> str:
     """Canonical served model id, e.g. 'kotodama-3b-instruct'.
 
     Priority: explicit --served_model_name > derived from architecture size
-    (--model_size) + serving mode.
+    (--model_size) + serving mode, plus ``+<adapter>`` when --adapter merged one.
     """
     if _served_name_override:
         return _served_name_override
     size_label = SIZE_LABELS.get(_model_size_arg, _model_size_arg)
     mode_label = "instruct" if _serve_mode == "chat" else "base"
-    return f"kotodama-{size_label}-{mode_label}"
+    adapter_label = f"+{Path(_adapter_arg).name.removesuffix('.adapter')}" if _adapter_arg else ""
+    return f"kotodama-{size_label}-{mode_label}{adapter_label}"
 
 
 app = FastAPI(title="kotodama", lifespan=lifespan)
@@ -1642,6 +1661,7 @@ async def info():
                                                        "stats": dict(_prefix_pool.stats)},
         cascade=_cascade_info,
         startup=_startup_info,
+        adapter=_adapter,
     )
 
 
@@ -2302,6 +2322,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "~0.9 GB of KV per prompt slot on the 1B at 4096 context). 0 = rows // 4")
     parser.add_argument("--cascade_tail_tokens", type=int, default=1024,
                         help="With --cascade_attn: tokens a row can generate (its own KV slot)")
+    parser.add_argument("--adapter", default=None,
+                        help="LoRA adapter directory (kotodama.posttrain.sft --lora_rank) merged into the weights at "
+                             "load; the served model id gains +<directory name, less any .adapter suffix> and /info "
+                             "reports its rank, alpha, modules and digest. Steering calibrated on the base model "
+                             "(--steer-npz, 'injection' requests) is refused with it")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     parser.add_argument("--profile", default=None,
@@ -2325,6 +2350,7 @@ if __name__ == "__main__":
     inferred_mode = "chat" if "instruct" in args.checkpoint else "base"
 
     _served_name_override = args.served_model_name
+    _adapter_arg = args.adapter
     _device_arg = args.device
     _mode_arg = args.mode if args.mode is not None else inferred_mode
     _model_size_arg = args.model_size
