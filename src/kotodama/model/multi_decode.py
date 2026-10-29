@@ -1314,10 +1314,12 @@ class CascadeDecoder(MultiSampleDecoder):
 def decode_rows(dec: MultiSampleDecoder, prefill_logits: torch.Tensor, params: SamplingParams, n: int,
                 max_new_tokens: int, stop_ids: frozenset[int],
                 stop_check: Optional[Callable[[list[int]], bool]] = None,
-                slots: Optional[int] = None, seed: Optional[int] = None) -> list[list[int]]:
+                slots: Optional[int] = None, seed: Optional[int] = None,
+                stops: Optional[list[Optional[int]]] = None) -> list[list[int]]:
     """Generate up to ``max_new_tokens`` per row for the first ``n`` rows of one prompt (every row on lever slot
     ``slots``); a row ends at a stop token (not kept), when ``stop_check(row_ids)`` is true, or at capacity. ``seed``
-    (a seeded decoder): candidate i draws with ``candidate_seed(seed, i)``. Returns each row's generated ids."""
+    (a seeded decoder): candidate i draws with ``candidate_seed(seed, i)``. Returns each row's generated ids;
+    ``stops`` (n entries), when given, receives the stop token that ended each row (None: it ended otherwise)."""
     if not 1 <= n <= dec.rows:
         raise ValueError(f"n={n} outside [1, {dec.rows}]")
     out: list[list[int]] = [[] for _ in range(n)]
@@ -1335,6 +1337,8 @@ def decode_rows(dec: MultiSampleDecoder, prefill_logits: torch.Tensor, params: S
                 continue
             if toks[r] in stop_ids:
                 live[r] = False
+                if stops is not None:
+                    stops[r] = toks[r]
                 continue
             out[r].append(toks[r])
             if len(out[r]) >= max_new_tokens or (stop_check is not None and stop_check(out[r])):

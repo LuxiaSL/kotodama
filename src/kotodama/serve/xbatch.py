@@ -53,10 +53,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class XBatchResult:
-    """One request's outcome: ``rows[i]`` is candidate i's generated ids (stop tokens not kept)."""
+    """One request's outcome: ``rows[i]`` is candidate i's generated ids (stop tokens not kept); ``stops[i]`` the
+    stop token that ended candidate i (None: it ended otherwise)."""
 
     rows: list[list[int]]
     timing: dict[str, float]
+    stops: list[Optional[int]] = field(default_factory=list)
 
 
 @dataclass
@@ -150,6 +152,7 @@ class _Live:
     started: int = 0
     home: frozenset[int] = frozenset()  # the rows admitted from this job's prompt: only they can restart it
     slot: int = 0  # the job's lever slot (0: none)
+    stops: dict[int, int] = field(default_factory=dict)  # candidate -> the stop token that ended it
 
     @property
     def done(self) -> bool:
@@ -272,6 +275,7 @@ class XBatchRunner:
         past the last cache slot). An ended candidate releases its row (``lv.running`` drops it)."""
         cand = lv.running[row]
         if tok in self.stop_ids:
+            lv.stops[cand] = tok
             del lv.running[row]
             return
         out = lv.out[cand]
@@ -298,7 +302,8 @@ class XBatchRunner:
         self._release_lever(lv)
         lv.timing["decode_ms"] = round((time.perf_counter() - lv.t_admit) * 1000 - lv.timing["prefill_ms"], 2)
         lv.timing["total_ms"] = round((time.perf_counter() - lv.job.t_enqueue) * 1000, 2)
-        self._deliver(lv.job, XBatchResult(rows=lv.out, timing=lv.timing))
+        self._deliver(lv.job, XBatchResult(rows=lv.out, timing=lv.timing,
+                                           stops=[lv.stops.get(c) for c in range(lv.job.n)]))
 
     def _fill(self, dec: MultiSampleDecoder, active: list[_Live], free: list[int], head: XBatchJob) -> int:
         """Hand free rows out: a job's unstarted candidates restart in the job's own free rows (the only rows that

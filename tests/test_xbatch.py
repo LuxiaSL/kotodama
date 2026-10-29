@@ -4,7 +4,10 @@ The decoder: rows filled from DIFFERENT prompts of different lengths must each r
 of their own prompt plus their own continuation, including a row reused after a longer prompt held it. The runner:
 key grouping, bucket choice, per-row stops and budgets, per-request n, greedy equivalence with the single-stream
 engine, refill (continuous batching), steering installed for the batch and cleared after. The server: compatible
-requests go through the batcher, anything else falls back to the existing paths.
+requests go through the batcher, anything else falls back to the existing paths; a signed request leaves one sign
+record per candidate in the spool (its generated ids ending with the stop token that ended it, its sign_meta kept),
+each choice carries its sign_id, the records sign through a signing decoder, and signed requests the sign path cannot
+take are refused.
 """
 
 from __future__ import annotations
@@ -416,3 +419,80 @@ def test_server_routes_compatible_requests_through_the_batcher(monkeypatch, mode
                                              "vectors": [{"name": "nope", "alpha": 1.0}]})
     assert r.status_code == 400 and used == []  # steering without a bank: refused before it queues
     assert runner.stats["batches"] == 1 and eng.steer_buf.abs().sum() == 0
+
+
+def test_signed_requests_leave_records_in_the_spool(monkeypatch, model: KotodamaModel, tmp_path) -> None:
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from kotodama.model.multi_decode import CascadeDecoder
+    from kotodama.model.signer import RecordSigner, read_records
+    from kotodama.model.signing import ReducedRow, SignSpec, weights_digest
+    from kotodama.serve import server
+    from kotodama.serve.sign import SignSpool
+
+    eng = _engine(model)
+    stop = frozenset(range(4, 40))  # a broad stop set: some candidates end on a stop token, some on the budget
+    runner = _runner(eng, widths=(4,), stop_ids=stop)
+    runner.decode = lambda ids: _CharTok().decode(ids)
+
+    async def run_inline(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    spool = SignSpool(tmp_path / "spool")
+    sched = XBatchScheduler(runner, asyncio.Lock(), run_inline)
+    for k, v in {"_model": model, "_tokenizer": _CharTok(), "_engine": eng, "_multi": {}, "_xbatch": sched,
+                 "_device": torch.device("cpu"), "_max_seq_len": MAX_SEQ, "_prefix_cache": False,
+                 "_stop_token_ids": stop, "_run_generation": run_inline, "_sign_spool": spool,
+                 "_sign_writer": "replica-a", "_sign_weights": weights_digest(model)}.items():
+        monkeypatch.setattr(server, k, v)
+    client = TestClient(server.app)
+    torch.manual_seed(5)
+    body = {"prompt": "two friends talk", "max_tokens": 8, "n": 4, "temperature": 1.2, "top_p": 0,
+            "return_token_ids": True, "sign": True, "sign_meta": {"round": 2, "node": "n7"}}
+    r = client.post("/v1/completions", json=body)
+    assert r.status_code == 200, r.text
+    choices = r.json()["choices"]
+    recs = list(read_records(tmp_path / "spool" / "records" / "replica-a.jsonl"))
+    assert [c["sign_id"] for c in choices] == [rec.request_id for rec in recs] and len(recs) == 4
+    ended_on_stop = 0
+    for c, rec in zip(choices, recs):
+        completion = c["token_ids"]["completion"]
+        assert list(rec.prompt_ids) == c["token_ids"]["prompt"] and rec.weights == weights_digest(model)
+        assert rec.meta["round"] == 2 and rec.meta["node"] == "n7" and rec.meta["served_by"] == "replica-a"
+        if len(rec.generated_ids) == len(completion) + 1:
+            ended_on_stop += 1
+            assert rec.generated_ids[-1] in stop and list(rec.generated_ids[:-1]) == completion
+        else:
+            assert list(rec.generated_ids) == completion and len(completion) == 8
+    assert ended_on_stop >= 1
+    assert server._sign_info()["stats"]["records"] >= 4
+    # the records sign: each row's span is its fed positions (its generated ids but the last)
+
+    class Steps:
+        reducer_identity = "steps-v1"
+
+        def reduce(self, rows, *, token_ids, engine):
+            return [ReducedRow(features=[float(r.positions)], names_digest="s", lane_id="s") for r in rows]
+
+    dec = CascadeDecoder(eng, 4, groups=4, group_rows=2, tail_tokens=16, seeded=True,
+                         sign=SignSpec((0, 5, 10), tail=12, depth=True, attn=True, width=MAX_SEQ))
+    dec.compile_step(regional=True, backend="aot_eager")
+    with torch.inference_mode():
+        summary = spool.drain_once(RecordSigner(dec, Steps(), compile_mode="aot_eager"))
+    signed = [p for p in (tmp_path / "spool" / "signed").iterdir()]
+    assert len(signed) == 1
+    rows = [__import__("json").loads(line) for line in open(signed[0] / "rows.jsonl")]
+    fed = {rec.request_id: len(rec.generated_ids) - 1 for rec in recs}
+    for row in rows:
+        if fed[row["sign_id"]] >= 1:
+            assert row["reducer_meta"] == {} and "index" in row
+        else:
+            assert "no fed position" in row["skipped"]
+    assert summary["signed"] == sum(n >= 1 for n in fed.values())
+    # what the sign path cannot take is refused before anything runs
+    assert client.post("/v1/completions", json={**body, "temperature": 0}).status_code == 400  # greedy: not batched
+    assert client.post("/generate", json={"prompt": "hi", "sign": True, "stream": True}).status_code == 400
+    monkeypatch.setattr(server, "_sign_spool", None)
+    r = client.post("/v1/completions", json=body)
+    assert r.status_code == 400 and "--sign_spool" in r.text

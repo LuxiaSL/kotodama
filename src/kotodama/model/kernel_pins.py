@@ -23,6 +23,11 @@ same session pins them in the same table: each (kernel, tuning key) is keyed ``t
 key>``, a config by every launch option it sets. In replay the pinned config is put in the autotuner's cache before
 its first launch, so nothing is timed, and a launch that ends on another config is refused.
 
+While pins are installed, inductor's autotune caches (local, remote, bundled) are off: a kernel that loads a cached
+choice launches with one config and never reaches the pins, so a cache written by an unpinned process would run
+arithmetic the table does not name. (Changing these settings changes inductor's graph-cache keys: the first pinned
+start compiles once.)
+
 The table digest (``PinSession.digest``) names the pins in a lane's identity.
 """
 
@@ -181,6 +186,7 @@ def install(table_path: Optional[str | Path], mode: Mode, allow_missing: bool = 
 
     cls.autotune_to_one_config = autotune_to_one_config
     _install_triton(sess)
+    _cache_flags(off=True)
     _session = sess
     logger.info("kernel pins: %s (%s, %d pinned kernels)", mode, path, len(table))
     return sess
@@ -200,7 +206,28 @@ def uninstall() -> None:
         Autotuner = None
     if Autotuner is not None and hasattr(Autotuner, "_kotodama_unpinned_run"):
         Autotuner.run = Autotuner._kotodama_unpinned_run
+    _cache_flags(off=False)
     _session = None
+
+
+_CACHE_FLAGS = ("autotune_local_cache", "autotune_remote_cache", "bundled_autotune_remote_cache")
+_saved_flags: Optional[dict[str, Any]] = None
+
+
+def _cache_flags(off: bool) -> None:
+    """Turn inductor's autotune caches off (saving their settings), or restore them."""
+    global _saved_flags
+    import torch._inductor.config as ic
+
+    if off:
+        if _saved_flags is None:
+            _saved_flags = {name: getattr(ic, name) for name in _CACHE_FLAGS}
+        for name in _CACHE_FLAGS:
+            setattr(ic, name, False)
+    elif _saved_flags is not None:
+        for name, value in _saved_flags.items():
+            setattr(ic, name, value)
+        _saved_flags = None
 
 
 def _install_triton(sess: PinSession) -> None:

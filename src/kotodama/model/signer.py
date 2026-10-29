@@ -18,7 +18,9 @@ refuses is retried row by row, and the rows it still refuses are skipped with th
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import time
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -159,6 +161,19 @@ class SignResult:
     reduced: Optional[signing.ReducedRow] = None
     skipped: Optional[str] = None
     same_engine: bool = False
+    raw: Optional[signing.SignedRow] = None  # the signed surfaces, for the rows the audit sink samples (on the CPU)
+
+    @property
+    def steps(self) -> int:
+        """The positions the row's signature covers (its generated ids but the last, which was never fed)."""
+        return max(0, len(self.record.generated_ids) - 1)
+
+
+def audited(request_id: str, every: int) -> bool:
+    """Whether the audit sink keeps ``request_id``'s raw surfaces (a fixed 1 in ``every`` sample by id; 0: none)."""
+    if every <= 0:
+        return False
+    return int(hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:8], 16) % every == 0
 
 
 def _canonical(x: Any) -> Any:
@@ -180,13 +195,16 @@ class RecordSigner:
     engine's lever tables holding at least as many slots as a batch has distinct levers) and a reducer.
 
     ``plans``: the lever plans records may name, by digest; ``steering`` / ``adapter``: the broadcast steering bank
-    and merged adapter the signer's engine runs (records must match); ``compile_mode`` / ``pins_digest``: what the
-    decoder's regions were compiled under and the kernel pin table they replay (kotodama.model.kernel_pins), for the
-    engine identity."""
+    and merged adapter the signer's engine runs (records must match); ``compile_mode``: what the decoder's regions
+    were compiled under; ``pins`` (a kotodama.model.kernel_pins.PinSession, read at every batch) or ``pins_digest``:
+    the kernel pin table they replay. Both go in the engine identity. ``audit_every``: keep the raw signed surfaces of
+    a fixed 1 in N sample of rows (``audited``) for an offline re-reduction check (0: none). ``timing`` accumulates
+    the seconds spent capturing (prefill + scored steps + export) and reducing."""
 
     def __init__(self, decoder: Any, reducer: signing.SignatureReducer, *, compile_mode: str,
                  pins_digest: Optional[str] = None, plans: Optional[Mapping[str, LeverPlan]] = None,
-                 steering: Optional[str] = None, adapter: Optional[str] = None) -> None:
+                 steering: Optional[str] = None, adapter: Optional[str] = None, pins: Any = None,
+                 audit_every: int = 0) -> None:
         from kotodama.model.multi_decode import CascadeDecoder
 
         if not isinstance(decoder, CascadeDecoder) or decoder.sign is None:
@@ -199,12 +217,53 @@ class RecordSigner:
         self.plans = dict(plans or {})
         self.steering, self.adapter = steering, adapter
         self.weights: str = decoder._sign_weights
-        self.identity = signing.engine_identity(
-            compile_mode=compile_mode, width=decoder.rows, weights=self.weights, pins_digest=pins_digest,
-            extra={"decoder": {"class": type(decoder).__name__, "rows": decoder.rows, "groups": decoder.groups,
-                               "group_rows": decoder.group_rows, "tail_tokens": decoder.tail_tokens,
-                               "max_seq_len": decoder.max_seq_len, "seeded": decoder.seeded},
-                   "sign": dataclasses.asdict(self.spec), "steering": steering, "adapter": adapter})
+        self.compile_mode = compile_mode
+        self._pins, self._pins_digest = pins, pins_digest
+        self.audit_every = int(audit_every)
+        self.timing = {"capture_s": 0.0, "reduce_s": 0.0, "rows": 0}
+
+    @property
+    def identity(self) -> dict[str, Any]:
+        """The engine identity the signed rows are captured under (the pin table's digest as it stands now)."""
+        dec = self.dec
+        digest = self._pins.digest if self._pins is not None else self._pins_digest
+        return signing.engine_identity(
+            compile_mode=self.compile_mode, width=dec.rows, weights=self.weights, pins_digest=digest,
+            extra={"decoder": {"class": type(dec).__name__, "rows": dec.rows, "groups": dec.groups,
+                               "group_rows": dec.group_rows, "tail_tokens": dec.tail_tokens,
+                               "max_seq_len": dec.max_seq_len, "seeded": dec.seeded},
+                   "sign": dataclasses.asdict(self.spec), "steering": self.steering, "adapter": self.adapter})
+
+    @classmethod
+    def build(cls, engine: Any, reducer: signing.SignatureReducer, *, layers: Sequence[int], tail: int, width: int,
+              rows: int = 128, groups: int = 16, group_rows: int = 32, tail_tokens: int = 0,
+              compile_mode: str = "default", backend: str = "inductor", **kw: Any) -> "RecordSigner":
+        """A signer over ``engine``: a seeded signing CascadeDecoder of ``rows`` rows (depth path and attention
+        statistics on; ``tail_tokens`` default: the sign tail + 2, room for its longest scored span), compiled
+        regionally under ``compile_mode``."""
+        from kotodama.model.multi_decode import CascadeDecoder
+
+        spec = signing.SignSpec(tuple(layers), tail=tail, depth=True, attn=True, width=width)
+        dec = CascadeDecoder(engine, rows, groups=groups, group_rows=group_rows,
+                             tail_tokens=tail_tokens or tail + 2, seeded=True, sign=spec)
+        dec.compile_step(mode=compile_mode, regional=True, backend=backend)
+        return cls(dec, reducer, compile_mode=compile_mode, **kw)
+
+    @torch.inference_mode()
+    def warm(self, prompt_len: int = 32, span: int = 8) -> None:
+        """Run one batch of filler through the scoring step (no reducer): compiles and, with kernel pins recording,
+        records the kernels a signed batch launches."""
+        from kotodama.model.decode_engine import SamplingParams
+
+        dec, eng = self.dec, self.dec.engine
+        span = max(2, min(span, self.spec.tail + 1, dec.tail_tokens - 1))
+        g = torch.Generator().manual_seed(0)
+        prompt = torch.randint(3, eng.config.vocab_size, (1, prompt_len), generator=g).to(eng.device)
+        dec.release(range(dec.rows))
+        dec.admit(list(range(dec.rows)), eng.prefill(prompt), SamplingParams(temperature=1.0, repetition_penalty=1.0),
+                  seeds=[0] * dec.rows)
+        dec.score(torch.randint(3, eng.config.vocab_size, (1, span), generator=g).to(eng.device))
+        dec.release(range(dec.rows))
 
     def why_not(self, rec: SignRecord) -> Optional[str]:
         """Why ``rec`` cannot be signed here (None: it can)."""
@@ -295,6 +354,7 @@ class RecordSigner:
         law = SamplingParams(temperature=1.0, repetition_penalty=1.0)
         dev = eng.device
         for batch in self._batches(list(keyed.items()), [len(r.generated_ids) for r in records]):
+            t0 = time.perf_counter()
             bound: dict[str, int] = {}
             row_of: dict[int, int] = {}
             dec.release(range(dec.rows))
@@ -334,7 +394,16 @@ class RecordSigner:
             finally:
                 for slot in bound.values():
                     eng.levers.release(slot)
+            for i, row in zip(order, signed):
+                if audited(records[i].request_id, self.audit_every):
+                    results[i].raw = _to_cpu(row)
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+            t1 = time.perf_counter()
             self._reduce(records, results, order, signed)
+            self.timing["capture_s"] += t1 - t0
+            self.timing["reduce_s"] += time.perf_counter() - t1
+            self.timing["rows"] += len(order)
         dec.release(range(dec.rows))
         return results
 
@@ -363,29 +432,55 @@ class RecordSigner:
                 logger.warning("sign: skipped %s: %s", records[i].request_id, results[i].skipped)
 
 
+def _to_cpu(row: signing.SignedRow) -> signing.SignedRow:
+    surf = {k: ([t.cpu() for t in v] if isinstance(v, list) else v.cpu()) for k, v in row.surfaces.items()}
+    return dataclasses.replace(row, surfaces=surf)
+
+
 def write_results(out_dir: str | Path, results: Sequence[SignResult]) -> dict[str, Any]:
-    """Results into ``out_dir``: ``features.npy`` (the reduced rows' features stacked, fp32, in result order) and
-    ``rows.jsonl`` (per record: request id, its row in features.npy or the skip reason, lane id, names digest,
-    same_engine, the reducer's meta, the record's meta). Returns a summary."""
+    """Results into ``out_dir``:
+      * ``rows.jsonl``: per record, in order: sign_id, steps (positions signed), weights, lever, same_engine, the
+        record's meta, and either the skip reason or lane_id, names_digest, the features file and row index, and the
+        reducer's meta (feature names left out);
+      * ``features-<names digest>.npy``: the reduced rows of one feature layout stacked, fp32 (rows with few steps
+        have fewer features, so each layout has its own file);
+      * ``names.json``: each layout's feature names (from the reducer's meta), once;
+      * ``raw/<sign_id>.pt``: the raw signed surfaces of the rows the audit sink sampled.
+    Returns a summary."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    feats = []
+    feats: dict[str, list[np.ndarray]] = {}
+    names: dict[str, Any] = {}
+    raw = 0
     with open(out / "rows.jsonl", "w", encoding="utf-8") as f:
         for res in results:
-            line: dict[str, Any] = {"request_id": res.record.request_id, "meta": res.record.meta,
-                                    "same_engine": res.same_engine}
+            rec = res.record
+            line: dict[str, Any] = {"sign_id": rec.request_id, "steps": res.steps, "weights": rec.weights,
+                                    "lever": rec.lever, "same_engine": res.same_engine, "meta": rec.meta}
             if res.reduced is None:
                 line["skipped"] = res.skipped or "not signed"
             else:
-                x = res.reduced.features
+                red = res.reduced
+                x = red.features
                 x = x.detach().float().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x, np.float32)
-                line.update(index=len(feats), lane_id=res.reduced.lane_id, names_digest=res.reduced.names_digest,
-                            reducer_meta=res.reduced.meta)
-                feats.append(x.reshape(-1))
+                meta = dict(red.meta)
+                if "feature_names" in meta:
+                    names.setdefault(red.names_digest, meta.pop("feature_names"))
+                rows = feats.setdefault(red.names_digest, [])
+                line.update(lane_id=red.lane_id, names_digest=red.names_digest,
+                            file=f"features-{red.names_digest[:16]}.npy", index=len(rows), reducer_meta=meta)
+                rows.append(x.reshape(-1).astype(np.float32))
             f.write(json.dumps(line, default=str) + "\n")
-    if feats:
-        widths = {x.shape[0] for x in feats}
+            if res.raw is not None:
+                (out / "raw").mkdir(exist_ok=True)
+                torch.save(dataclasses.asdict(res.raw), out / "raw" / f"{rec.request_id}.pt")
+                raw += 1
+    for digest, rows in feats.items():
+        widths = {x.shape[0] for x in rows}
         if len(widths) != 1:
-            raise ValueError(f"reduced rows have different widths {sorted(widths)}")
-        np.save(out / "features.npy", np.stack(feats).astype(np.float32))
-    return {"signed": len(feats), "skipped": sum(r.reduced is None for r in results)}
+            raise ValueError(f"rows of one feature layout ({digest[:16]}) have different widths {sorted(widths)}")
+        np.save(out / f"features-{digest[:16]}.npy", np.stack(rows))
+    if names:
+        (out / "names.json").write_text(json.dumps(names, default=str))
+    return {"signed": sum(len(v) for v in feats.values()), "skipped": sum(r.reduced is None for r in results),
+            "layouts": len(feats), "audited": raw}

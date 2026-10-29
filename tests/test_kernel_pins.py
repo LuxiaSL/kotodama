@@ -7,7 +7,8 @@ What is pinned here:
   * record mode leaves the choice to the autotuner and records it, and a second instance of a recorded kernel takes
     the recorded config (one config per kernel in the recording process); first mode always takes the first config;
   * the digest is a function of the table alone, and a saved table replays the same choices;
-  * install patches CachingAutotuner.autotune_to_one_config so a kernel's launchers are cut to the pinned one;
+  * install patches CachingAutotuner.autotune_to_one_config so a kernel's launchers are cut to the pinned one, and
+    turns inductor's autotune caches off until uninstall restores them;
   * install patches triton's Autotuner (the hand-written ``@triton.autotune`` kernels): record keeps the timed choice
     per tuning key, replay launches the recorded config without timing anything (another process whose timings
     would pick otherwise), first takes the first config, and a tuning key the table does not hold is refused.
@@ -73,8 +74,12 @@ def test_install_patches_the_runtime_autotuner(tmp_path: Path) -> None:
     table = tmp_path / "pins.json"
     key = kp.kernel_key("def kernel(): pass", (1024,))
     table.write_text('{"%s": "XBLOCK=512|w4|s1"}' % key)
+    import torch._inductor.config as ic
+
+    before = {name: getattr(ic, name) for name in kp._CACHE_FLAGS}
     try:
         sess = kp.install(table, "replay")
+        assert not any(getattr(ic, name) for name in kp._CACHE_FLAGS)
         stub = types.SimpleNamespace(fn=types.SimpleNamespace(src="def kernel(): pass"), size_hints=(1024,),
                                      launchers=_launchers(128, 512, 1024))
         th.CachingAutotuner.autotune_to_one_config(stub)
@@ -86,6 +91,7 @@ def test_install_patches_the_runtime_autotuner(tmp_path: Path) -> None:
         kp.uninstall()
     assert kp.session() is None
     assert th.CachingAutotuner.autotune_to_one_config is th.CachingAutotuner._kotodama_unpinned_autotune
+    assert {name: getattr(ic, name) for name in kp._CACHE_FLAGS} == before
 
 
 def _autotuned(timings: dict[int, float]):

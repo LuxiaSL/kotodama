@@ -8,13 +8,17 @@ What is pinned here:
     adapter, a lever without its plan, too few generated ids, a span past the sign tail), the rest still sign;
   * a batch the reducer refuses is retried row by row and only the refused row is skipped, with the reducer's error;
   * records and lever plans round-trip through their files, and malformed records are refused naming the line;
-  * results are written as one feature matrix plus one JSON line per record.
+  * results are written as one feature matrix plus one JSON line per record;
+  * the sign spool (kotodama.serve.sign): records appended by writers are signed one batch per drain, in order, each
+    batch written before the spool's state moves past it; a line still being written waits; a drain that finds the
+    spool locked by another does nothing; a signer built by RecordSigner.build signs as the hand-built one does.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 
@@ -83,8 +87,12 @@ class _Keep:
         out = []
         for r, ids in zip(rows, token_ids):
             self.rows[tuple(ids)] = r
-            out.append(ReducedRow(features=np.array([r.positions, len(ids)], np.float32), names_digest="n",
-                                  lane_id=f"keep:{engine['weights'][:8]}", meta={"steps": r.positions}))
+            # two feature layouts, as a reducer's below and above a step-count threshold
+            digest = "short" if r.positions < 3 else "long"
+            feats = [r.positions, len(ids)] + ([0.5] if digest == "long" else [])
+            out.append(ReducedRow(features=np.array(feats, np.float32), names_digest=digest,
+                                  lane_id=f"keep:{engine['weights'][:8]}",
+                                  meta={"steps": r.positions, "feature_names": [f"{digest}{j}" for j in range(len(feats))]}))
         return out
 
 
@@ -139,7 +147,7 @@ def test_records_sign_to_their_generation_bytes(model: KotodamaModel) -> None:
     assert len(keep.calls) >= 2 and sum(keep.calls) == len(order)
     for i in set(order):
         _same(gen[i], keep.rows[recs[i].prompt_ids + recs[i].generated_ids])
-    assert results[0].reduced.meta == {"steps": STEPS} and results[0].reduced.lane_id.startswith("keep:")
+    assert results[0].reduced.meta["steps"] == STEPS and results[0].reduced.lane_id.startswith("keep:")
     assert signer.identity["decoder"]["rows"] == ROWS and signer.identity["sign"]["tail"] == SPEC.tail
     rt = json.loads(json.dumps(signer.identity))
     again = signer.sign([SignRecord(request_id="x", prompt_ids=recs[0].prompt_ids,
@@ -213,9 +221,60 @@ def test_results_are_written_as_features_and_rows(model: KotodamaModel, tmp_path
     recs = [SignRecord(request_id="a", prompt_ids=tuple(_ids(6, 1)), generated_ids=(5, 6, 7), weights=w,
                        meta={"seed": 1}),
             SignRecord(request_id="b", prompt_ids=(5,), generated_ids=(6,), weights=w)]
-    summary = write_results(tmp_path, RecordSigner(dec, _Keep(), compile_mode="aot_eager").sign(recs))
-    assert summary == {"signed": 1, "skipped": 1}
-    feats = np.load(tmp_path / "features.npy")
+    recs.append(SignRecord(request_id="c", prompt_ids=tuple(_ids(4, 2)), generated_ids=(5, 6, 7, 8, 9), weights=w))
+    signer = RecordSigner(dec, _Keep(), compile_mode="aot_eager", audit_every=1)
+    summary = write_results(tmp_path, signer.sign(recs))
+    assert summary == {"signed": 2, "skipped": 1, "layouts": 2, "audited": 2}
+    assert signer.timing["rows"] == 2 and signer.timing["capture_s"] > 0 and signer.timing["reduce_s"] > 0
     rows = [json.loads(line) for line in open(tmp_path / "rows.jsonl")]
-    assert feats.shape == (1, 2) and feats[0].tolist() == [2.0, 9.0]
-    assert rows[0]["index"] == 0 and rows[0]["meta"] == {"seed": 1} and "no fed position" in rows[1]["skipped"]
+    assert [r["sign_id"] for r in rows] == ["a", "b", "c"] and [r["steps"] for r in rows] == [2, 0, 4]
+    assert rows[0]["meta"] == {"seed": 1} and rows[0]["weights"] == w and "no fed position" in rows[1]["skipped"]
+    assert rows[0]["reducer_meta"] == {"steps": 2}  # feature names are written once per layout, not per row
+    short = np.load(tmp_path / rows[0]["file"])
+    long = np.load(tmp_path / rows[2]["file"])
+    assert short.tolist() == [[2.0, 9.0]] and long.tolist() == [[4.0, 9.0, 0.5]]
+    assert json.loads((tmp_path / "names.json").read_text()) == {"short": ["short0", "short1"],
+                                                                 "long": ["long0", "long1", "long2"]}
+    raw = torch.load(tmp_path / "raw" / "c.pt")
+    assert raw["positions"] == 4 and raw["surfaces"]["depth"].shape[0] == 4
+
+
+@torch.inference_mode()
+def test_the_spool_drains_one_batch_at_a_time(model: KotodamaModel, tmp_path) -> None:
+    from kotodama.serve.sign import SignSpool
+
+    eng, dec = _setup(model)
+    w = dec._sign_weights
+    rng = np.random.default_rng(3)
+    plan = LeverPlan(mlp={4: rng.standard_normal(CFG["hidden_size"]).astype(np.float32)}, span="decode")
+    recs = [SignRecord(request_id=f"q{i}", prompt_ids=tuple(_ids(5 + i, i)), generated_ids=tuple(_ids(3 + i, 50 + i)),
+                       weights=w, lever=plan.digest() if i == 2 else None) for i in range(6)]
+    spool = SignSpool(tmp_path / "spool", signed_dir=tmp_path / "bulk")
+    spool.add("srv-a", recs[:4], plans=[plan])
+    spool.add("srv-b", recs[4:])
+    with open(tmp_path / "spool" / "records" / "srv-b.jsonl", "a") as f:
+        f.write('{"format": "kotodama-sign-record/1", "request_id": "half')  # a writer mid-line
+    assert spool.pending() == 6 and spool.has_pending()
+    signer = RecordSigner(dec, _Keep(), compile_mode="aot_eager")
+    first = spool.drain_once(signer)
+    assert first["signed"] == ROWS and spool.pending() == 2
+    second = spool.drain_once(signer)
+    assert second["signed"] == 2 and spool.drain_once(signer) is None
+    assert spool.pending() == 0 and spool.has_pending()  # only the half-written line is left
+    batches = sorted(p for p in (tmp_path / "bulk").iterdir())
+    index = [json.loads(line) for line in open(tmp_path / "spool" / "index.jsonl")]
+    assert [Path(e["dir"]).name for e in index] == [b.name for b in batches] and index[0]["signed"] == ROWS
+    ids = [json.loads(line)["sign_id"] for b in batches for line in open(b / "rows.jsonl")]
+    assert ids == [r.request_id for r in recs]
+    assert json.loads((batches[0] / "engine.json").read_text())["weights"] == w
+    with spool._drain_lock() as mine:
+        assert mine
+        spool.add("srv-a", recs[:1])
+        assert spool.drain_once(signer) is None  # another drain holds the spool
+    built = RecordSigner.build(eng, _Keep(), layers=LAYERS, tail=SPEC.tail, width=SPEC.width, rows=ROWS, groups=4,
+                               group_rows=2, tail_tokens=32, compile_mode="default", backend="aot_eager")
+    built.warm()
+    keep = built.reducer
+    assert spool.drain_once(built)["signed"] == 1
+    _same(keep.rows[recs[0].prompt_ids + recs[0].generated_ids],
+          signer.reducer.rows[recs[0].prompt_ids + recs[0].generated_ids])

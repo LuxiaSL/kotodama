@@ -41,6 +41,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -237,6 +238,16 @@ _warm_truncated: bool = True
 _regional: bool = False
 # Row buckets narrower than this compile without kernel benchmarking (--autotune_min_rows): it buys them nothing.
 _autotune_min_rows: int = 0
+# Signing (--sign_spool, kotodama.serve.sign): a request that sets `sign` leaves one record per candidate in the
+# spool; with --sign_reducer the server also signs the spool whenever it is idle (one batch at a time, on the
+# generation thread under the engine lock). The weights digest names the served model in every record.
+_sign_spool: "SignSpool | None" = None
+_signer: "RecordSigner | None" = None
+_sign_writer: str = ""
+_sign_weights: str = ""
+_sign_stats: dict[str, Any] = {"records": 0, "batches": 0, "signed": 0, "skipped": 0, "errors": 0}
+# Kernel pins (--kernel_pins, kotodama.model.kernel_pins): the pin session, recording or replaying.
+_pins: Any = None
 # Startup: when this process started, how long it took to be ready (and against what budget), for /info.
 _PROCESS_T0 = time.time()
 _startup_info: dict | None = None
@@ -716,6 +727,10 @@ class GenerateRequest(BaseModel):
     steer_span: Literal["decode", "uniform"] = "decode"
     # A raw write instead of bank vectors (needs --levers).
     injection: InjectionSpec | None = None
+    # Sign the candidates (--sign_spool): each leaves a record in the sign spool, signed later by a drain (the server
+    # when idle, or a job); ``sign_meta`` travels with the record (the caller's ids).
+    sign: bool = False
+    sign_meta: dict[str, Any] | None = None
 
 
 class GenerateResponse(BaseModel):
@@ -729,6 +744,10 @@ class GenerateResponse(BaseModel):
     # only when the request sets return_token_ids
     prompt_ids: list[int] | None = None
     completion_ids: list[int] | None = None
+    # the stop token that ended the completion (never in completion_ids); None when it ended otherwise
+    stop_id: int | None = None
+    # the candidate's sign record id (requests that set `sign`)
+    sign_id: str | None = None
 
 
 class ModelInfo(BaseModel):
@@ -747,6 +766,8 @@ class ModelInfo(BaseModel):
     prefix_pool: dict | None = None
     cascade: dict | None = None
     startup: dict | None = None
+    sign: dict | None = None
+    kernel_pins: dict | None = None
 
 
 # ── /logprobs: batched prefill-only scoring (the four-register rider battery) ──
@@ -1225,7 +1246,8 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
                 timing["prefix_pool_tokens"] = pc_info["pool_tokens"]
 
         generated_ids: list[int] = []
-        if token_id not in _stop_token_ids:
+        stop_id: int | None = token_id if token_id in _stop_token_ids else None
+        if stop_id is None:
             generated_ids.append(token_id)
             for _ in range(request.max_new_tokens - 1):
                 if prompt_len + len(generated_ids) >= max_pos:
@@ -1233,6 +1255,7 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
                 tok = _engine.step(tok, params)
                 token_id = int(tok.item())
                 if token_id in _stop_token_ids:
+                    stop_id = token_id
                     break
                 generated_ids.append(token_id)
                 if request.stop_strings:
@@ -1256,6 +1279,7 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
         timing=timing,
         prompt_ids=input_ids[0].tolist(),
         completion_ids=list(generated_ids),
+        stop_id=stop_id,
     )
 
 
@@ -1522,6 +1546,15 @@ _warm_truncated_arg = True
 _regional_arg = True
 _startup_budget_s_arg = 1800.0
 _autotune_min_rows_arg = 0
+_kernel_pins_arg: str | None = None
+_sign_spool_arg: str | None = None
+_sign_reducer_arg: str | None = None
+_sign_reducer_kwargs_arg = "{}"
+_sign_layers_arg: tuple[int, ...] = ()
+_sign_tail_arg = 256
+_sign_width_arg = 0
+_sign_rows_arg = 128
+_sign_groups_arg = 16
 
 
 def _record_startup() -> None:
@@ -1541,7 +1574,13 @@ def _record_startup() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model, _tokenizer
+    global _model, _tokenizer, _pins
+    if _kernel_pins_arg:
+        from kotodama.model import kernel_pins
+
+        # before anything compiles: the pins decide every autotuned kernel from the first launch
+        _pins = kernel_pins.install(_kernel_pins_arg, "replay" if Path(_kernel_pins_arg).exists() else "record",
+                                    allow_missing=True)
     _model, _tokenizer = load_model(
         _checkpoint_path, _device_arg, mode=_mode_arg,
         model_size=_model_size_arg, engine=_engine_arg, prefix_cache=_prefix_cache_arg,
@@ -1564,6 +1603,12 @@ async def lifespan(app: FastAPI):
         regional=_regional_arg,
         autotune_min_rows=_autotune_min_rows_arg,
     )
+    sign_task = _start_signing()
+    if _pins is not None and _pins.mode == "record":
+        logger.info("kernel pins recorded: %s (%d kernels, %s)", _pins.save(), len(_pins.table), _pins.digest[:12])
+    elif _pins is not None and _pins.misses:
+        logger.warning("kernel pins: %d kernels missing from %s took their first config (digest now %s)",
+                       len(_pins.misses), _pins.path, _pins.digest[:12])
     _record_startup()
     try:
         yield
@@ -1571,7 +1616,46 @@ async def lifespan(app: FastAPI):
         # Uvicorn's graceful shutdown has already drained in-flight requests by
         # the time we get here; drop anything still queued (its awaiting request
         # was cancelled) so the non-daemon worker thread can't stall exit.
+        if sign_task is not None:
+            sign_task.cancel()
         _generate_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _start_signing() -> "asyncio.Task | None":
+    """Open the sign spool (--sign_spool) and, with --sign_reducer, build the signing decoder on the generation thread
+    and start the idle drain. Returns the drain task (None without a reducer)."""
+    global _sign_spool, _signer, _sign_writer, _sign_weights
+    if not _sign_spool_arg:
+        return None
+    import socket
+
+    from kotodama.model.signing import load_reducer, weights_digest
+    from kotodama.serve.sign import SignSpool
+
+    if _engine is None:
+        raise RuntimeError("--sign_spool needs the fast engine (--engine fast on cuda)")
+    _sign_spool = SignSpool(_sign_spool_arg)
+    _sign_writer = f"{socket.gethostname()}-{os.getpid()}"
+    _sign_weights = weights_digest(_engine.model)
+    logger.info("sign spool: %s (writer %s, weights %s)", _sign_spool.root, _sign_writer, _sign_weights[:12])
+    if not _sign_reducer_arg:
+        return None
+    from kotodama.model.signer import RecordSigner
+
+    reducer = load_reducer(_sign_reducer_arg, **json.loads(_sign_reducer_kwargs_arg or "{}"))
+
+    def build() -> RecordSigner:
+        signer = RecordSigner.build(_engine, reducer, layers=_sign_layers_arg, tail=_sign_tail_arg,
+                                    width=_sign_width_arg or _max_seq_len, rows=_sign_rows_arg,
+                                    groups=_sign_groups_arg, compile_mode=_without_autotune(_compile_mode),
+                                    pins=_pins)
+        signer.warm()
+        return signer
+
+    _signer = _generate_executor.submit(build).result()
+    logger.info("sign: draining %s when idle (%d-row signing decoder, reducer %s)", _sign_spool.root,
+                _signer.dec.rows, getattr(reducer, "reducer_identity", "?"))
+    return asyncio.get_running_loop().create_task(_sign_when_idle())
 
 
 def _model_name() -> str:
@@ -1647,6 +1731,10 @@ async def info():
                                                        "stats": dict(_prefix_pool.stats)},
         cascade=_cascade_info,
         startup=_startup_info,
+        sign=_sign_info(),
+        kernel_pins=None if _pins is None else {"mode": _pins.mode, "path": str(_pins.path), "kernels": len(_pins.table),
+                                                "hits": _pins.hits, "recorded": _pins.recorded,
+                                                "misses": len(_pins.misses), "digest": _pins.digest},
     )
 
 
@@ -1687,9 +1775,9 @@ async def generate_endpoint(request: GenerateRequest, http_request: Request):
         raise HTTPException(503, "Model not loaded")
     _refuse_unserved(request)
 
-    if request.seed is not None:  # seeded draws come from the batched decoders only
+    if request.seed is not None or request.sign:  # seeded draws and signed requests take the batched decoders only
         if request.stream:
-            raise HTTPException(400, "a seeded request cannot stream")
+            raise HTTPException(400, f"a {'signed' if request.sign else 'seeded'} request cannot stream")
         out = await _batched_candidates(request, 1)
         return out[0]
 
@@ -1763,6 +1851,9 @@ class OAICompletionRequest(BaseModel):
     penalty_scope: Literal["generated", "row"] = "generated"
     seed: int | None = Field(default=None, ge=0)
     min_p: float = Field(default=0.0, ge=0.0, lt=1.0)
+    # Sign the choices (as on /generate; needs --sign_spool): each choice then carries its sign_id.
+    sign: bool = False
+    sign_meta: dict[str, Any] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -1806,8 +1897,9 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
             timing["prefix_cache_hit"] = pc_info["prefix_hit"]
             timing["prefix_common_tokens"] = pc_info["common_prefix"]
         budget = min(request.max_new_tokens, _max_seq_len - prompt_len)
+        stops: list[int | None] = [None] * n
         rows = decode_rows(dec, prefill_logits, params, n, budget, _stop_token_ids, stop_check,
-                           slots=slot if _levers else None, seed=request.seed)
+                           slots=slot if _levers else None, seed=request.seed, stops=stops)
     elapsed = time.perf_counter() - t0
     timing["total_ms"] = round(elapsed * 1000, 2)
     timing["batched_rows"] = float(dec.rows)
@@ -1816,7 +1908,8 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
     prompt_ids = input_ids[0].tolist()
     return [GenerateResponse(text=_tokenizer.decode(r, skip_special_tokens=True), prompt_tokens=prompt_len,
                              completion_tokens=len(r), tokens_per_second=tps, timing=dict(timing),
-                             prompt_ids=prompt_ids, completion_ids=list(r)) for r in rows]
+                             prompt_ids=prompt_ids, completion_ids=list(r), stop_id=stop)
+            for r, stop in zip(rows, stops)]
 
 
 def _multi_bucket(n: int) -> "MultiSampleDecoder | None":
@@ -1920,15 +2013,101 @@ async def engine_generate_xbatch(request: GenerateRequest, n: int) -> list[Gener
         timing["steered"] = 1.0
     total = sum(len(r) for r in result.rows)
     tps = round(total / elapsed, 1) if elapsed > 0 else 0.0
+    stops = result.stops or [None] * len(result.rows)
     return [GenerateResponse(text=_tokenizer.decode(r, skip_special_tokens=True), prompt_tokens=len(prompt_ids),
                              completion_tokens=len(r), tokens_per_second=tps, timing=dict(timing),
-                             prompt_ids=list(prompt_ids), completion_ids=list(r)) for r in result.rows]
+                             prompt_ids=list(prompt_ids), completion_ids=list(r), stop_id=stop)
+            for r, stop in zip(result.rows, stops)]
+
+
+def _check_sign(request: GenerateRequest) -> None:
+    """400 on a signed request the sign path cannot reproduce: no spool, or broadcast steering (only levers travel
+    with a record, by their plan)."""
+    if _sign_spool is None:
+        raise HTTPException(400, "'sign' needs a server started with --sign_spool")
+    if _request_wants_steering(request) and not _levers:
+        raise HTTPException(400, "'sign' with steering needs --levers (a record carries its lever plan; the "
+                                 "broadcast steering rows do not travel)")
+
+
+def _spool_records(request: GenerateRequest, responses: list[GenerateResponse]) -> None:
+    """One sign record per candidate (kotodama.model.signer.SignRecord) into the spool; each response gets its
+    sign_id. The generated ids end with the stop token that ended the candidate, if one did: its position was fed."""
+    from kotodama.model.signer import SignRecord
+
+    assert _sign_spool is not None
+    plan = _request_lever(request) if _levers and _request_wants_steering(request) else None
+    base = uuid.uuid4().hex[:16]
+    law = {"temperature": request.temperature, "repetition_penalty": request.repetition_penalty,
+           "penalty_scope": request.penalty_scope, "min_p": request.min_p}
+    records = []
+    for i, resp in enumerate(responses):
+        resp.sign_id = f"{base}-{i}"
+        generated = list(resp.completion_ids or []) + ([resp.stop_id] if resp.stop_id is not None else [])
+        records.append(SignRecord(request_id=resp.sign_id, prompt_ids=tuple(resp.prompt_ids or ()),
+                                  generated_ids=tuple(generated), weights=_sign_weights,
+                                  lever=plan.digest() if plan is not None else None,
+                                  meta={**(request.sign_meta or {}), "candidate": i, "seed": request.seed,
+                                        "law": law, "served_by": _sign_writer}))
+    _sign_spool.add(_sign_writer, records, plans=[plan] if plan is not None else None)
+    _sign_stats["records"] += len(records)
+
+
+def _sign_info() -> dict | None:
+    if _sign_spool is None:
+        return None
+    return {"spool": str(_sign_spool.root), "writer": _sign_writer, "weights": _sign_weights,
+            "drains_when_idle": _signer is not None,
+            "reducer": getattr(_signer.reducer, "reducer_identity", None) if _signer is not None else None,
+            "stats": dict(_sign_stats)}
+
+
+# A replica signs its spool when it has been idle this long (no request holds the engine, nothing queued).
+_SIGN_IDLE_S = 2.0
+
+
+async def _sign_when_idle() -> None:
+    """Drain the sign spool one batch at a time whenever the engine is idle (--sign_reducer). A batch runs on the
+    generation thread under the engine lock, so a request that arrives meanwhile waits for one batch at most."""
+    assert _sign_spool is not None and _signer is not None
+    idle_since = time.monotonic()
+    while True:
+        await asyncio.sleep(0.5)
+        busy = _engine_lock.locked() or (_xbatch is not None and len(_xbatch.runner.queue) > 0)
+        if busy:
+            idle_since = time.monotonic()
+            continue
+        if time.monotonic() - idle_since < _SIGN_IDLE_S:
+            continue
+        try:
+            if not await asyncio.to_thread(_sign_spool.has_pending):
+                continue
+            async with _engine_lock:
+                summary = await _run_generation(_sign_spool.drain_once, _signer)
+        except Exception:  # a failed batch must not kill the loop or the server: log, count, back off
+            logger.exception("sign: a spool batch failed; retrying in 30s")
+            _sign_stats["errors"] += 1
+            await asyncio.sleep(30.0)
+            continue
+        if summary:
+            _sign_stats["batches"] += 1
+            _sign_stats["signed"] += summary.get("signed", 0)
+            _sign_stats["skipped"] += summary.get("skipped", 0)
 
 
 async def _batched_candidates(request: GenerateRequest, n: int) -> list[GenerateResponse]:
     """All n candidates from one batched path (cross-request batcher, else the n-row decoder), or [] when neither
     takes the request and the caller generates candidates one at a time. A seeded request that no batched path
-    takes is a 400: only the seeded row decoders draw from per-candidate seeds."""
+    takes is a 400: only the seeded row decoders draw from per-candidate seeds. A request that sets ``sign`` takes the
+    batched paths only, and its candidates' records go to the sign spool."""
+    if request.sign:
+        _check_sign(request)
+        out = await _batched_candidates(request.model_copy(update={"sign": False}), n)
+        if not out:
+            raise HTTPException(400, "'sign' needs the batched decoders (--xbatch_rows or --multi_rows) and a "
+                                     "pure-temperature law (temperature > 0, no top-k/top-p)")
+        _spool_records(request, out)
+        return out
     if request.seed is not None:
         if not _seeded_rows:
             raise HTTPException(400, "'seed' needs a server started with --seeded_rows")
@@ -1973,6 +2152,8 @@ def oai_completion_to_generate(request: OAICompletionRequest) -> GenerateRequest
         penalty_scope=request.penalty_scope,
         seed=request.seed,
         min_p=request.min_p,
+        sign=request.sign,
+        sign_meta=request.sign_meta,
     )
 
 
@@ -2002,6 +2183,8 @@ async def oai_completions(request: OAICompletionRequest):
         if request.return_token_ids:
             choice["token_ids"] = {"prompt": result.prompt_ids,
                                    "completion": result.completion_ids}
+        if result.sign_id is not None:
+            choice["sign_id"] = result.sign_id
         choices.append(choice)
 
     prompt_tokens = (len(request.prompt) if isinstance(request.prompt, list)
@@ -2067,6 +2250,9 @@ class OAIChatRequest(BaseModel):
     stream: bool = False
     n: int = Field(default=1, ge=1, le=64)
     return_token_ids: bool = False
+    # Sign the choices (as on /generate; needs --sign_spool): each choice then carries its sign_id.
+    sign: bool = False
+    sign_meta: dict[str, Any] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -2153,6 +2339,8 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
         top_p=request.top_p,
         repetition_penalty=repetition_penalty,
         stop_strings=stop_strings,
+        sign=request.sign,
+        sign_meta=request.sign_meta,
     )
     batched = await _batched_candidates(gen_req, request.n)
     for i in range(request.n):
@@ -2172,6 +2360,8 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
         if request.return_token_ids:
             choice["token_ids"] = {"prompt": result.prompt_ids,
                                    "completion": result.completion_ids}
+        if result.sign_id is not None:
+            choice["sign_id"] = result.sign_id
         choices.append(choice)
 
     prompt_tokens = _tokenizer.encode(prompt_text, add_special_tokens=False, return_tensors="pt").shape[1]
@@ -2307,6 +2497,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "~0.9 GB of KV per prompt slot on the 1B at 4096 context). 0 = rows // 4")
     parser.add_argument("--cascade_tail_tokens", type=int, default=1024,
                         help="With --cascade_attn: tokens a row can generate (its own KV slot)")
+    parser.add_argument("--kernel_pins", default=None,
+                        help="Kernel pin table (kotodama.model.kernel_pins): replayed when the file exists, else "
+                             "recorded at startup and saved, so every compiled kernel launches the same config in "
+                             "every process (restart-reproducible arithmetic; needed for signing). A kernel missing "
+                             "from a replayed table takes its first config, and /info reports the misses")
+    parser.add_argument("--sign_spool", default=None,
+                        help="Sign spool directory (kotodama.serve.sign): requests that set `sign` leave one record "
+                             "per candidate there, signed later by a drain (python -m kotodama.serve.sign) or, with "
+                             "--sign_reducer, by this server when idle")
+    parser.add_argument("--sign_reducer", default=None,
+                        help="With --sign_spool: a SignatureReducer (package.module:attr) this server signs its spool "
+                             "with whenever it is idle (a 128-row signing decoder beside the serving ones)")
+    parser.add_argument("--sign_reducer_kwargs", default="{}", help="JSON keyword arguments for --sign_reducer")
+    parser.add_argument("--sign_layers", default="",
+                        help="With --sign_reducer: the sampled effective layers, comma-separated")
+    parser.add_argument("--sign_tail", type=int, default=256,
+                        help="With --sign_reducer: positions signed per row (a longer span is skipped)")
+    parser.add_argument("--sign_width", type=int, default=0,
+                        help="With --sign_reducer: head-mean row columns (0 = the serving context limit)")
+    parser.add_argument("--sign_rows", type=int, default=128,
+                        help="With --sign_reducer: the signing decoder's width (the lane's canonical 128)")
+    parser.add_argument("--sign_groups", type=int, default=16,
+                        help="With --sign_reducer: prompts one signing batch holds")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     parser.add_argument("--profile", default=None,
@@ -2396,6 +2609,25 @@ if __name__ == "__main__":
     _regional_arg = args.regional
     _startup_budget_s_arg = args.startup_budget_s
     _autotune_min_rows_arg = args.autotune_min_rows
+    _kernel_pins_arg = args.kernel_pins
+    if args.sign_reducer and not args.sign_spool:
+        parser.error("--sign_reducer needs --sign_spool")
+    if args.sign_spool and _engine_arg != "fast":
+        parser.error("--sign_spool needs --engine fast")
+    try:
+        _sign_layers_arg = tuple(int(x) for x in args.sign_layers.split(",") if x.strip())
+        json.loads(args.sign_reducer_kwargs)
+    except ValueError as exc:
+        parser.error(f"--sign_layers / --sign_reducer_kwargs: {exc}")
+    if args.sign_reducer and not _sign_layers_arg:
+        parser.error("--sign_reducer needs --sign_layers")
+    _sign_spool_arg = args.sign_spool
+    _sign_reducer_arg = args.sign_reducer
+    _sign_reducer_kwargs_arg = args.sign_reducer_kwargs
+    _sign_tail_arg = args.sign_tail
+    _sign_width_arg = args.sign_width
+    _sign_rows_arg = args.sign_rows
+    _sign_groups_arg = args.sign_groups
 
     import uvicorn
 
