@@ -192,6 +192,22 @@ def test_tsumugi_layer_signatures() -> None:
     assert {c for c, b in set(sigs) if not b} == set(range(2, 9))
 
 
+def test_standard_layer_signatures_and_server_config() -> None:
+    """kotodama-standard: 28 layers over its 7 fitted boundaries fall into 13 signatures (boundary layers at
+    committed counts 0..6, interior layers at 2..7), and the server builds it with those boundaries."""
+    from kotodama.serve import server
+
+    shape = presets.shape("1b-standard")
+    sigs = layer_signatures(presets.STANDARD_FIT, shape["num_layers"])
+    assert len(sigs) == 28 and len(set(sigs)) == 13
+    assert {c for c, b in set(sigs) if b} == set(range(7))
+    assert {c for c, b in set(sigs) if not b} == set(range(2, 8))
+    cfg = server.MODEL_CONFIGS["1b-standard"]
+    assert cfg["attn_res_boundaries"] == list(presets.STANDARD_FIT)
+    assert (cfg["hidden_size"], cfg["num_layers"]) == (shape["hidden_size"], shape["num_layers"])
+    assert not cfg.get("loop_times")  # no looped depth
+
+
 @torch.inference_mode()
 def test_regional_options_are_refused_where_they_do_not_apply(model: KotodamaModel) -> None:
     dec = MultiSampleDecoder(_engine(model), ROWS)

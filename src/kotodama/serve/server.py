@@ -165,9 +165,14 @@ CONFIG_1B_DEEP_LOOPFIT = dict(CONFIG_3B, **presets.shape("1b-deep-loopfit"),
 CONFIG_1B_TSUMUGI = dict(CONFIG_3B, **presets.shape("1b-tsumugi"),
                                attn_res_boundaries=list(presets.DEFAULT_BOUNDARIES["1b-tsumugi"]))
 
+# kotodama-standard (presets "1b-standard"): the 1b shape with its own fitted boundaries. It routes in the kernels' own
+# precision, so its replicas run without KOTODAMA_ATTNRES_EPS_FP64_COMPAT (tsumugi's serve profile sets it).
+CONFIG_1B_STANDARD = dict(CONFIG_3B, **presets.shape("1b-standard"),
+                          attn_res_boundaries=list(presets.DEFAULT_BOUNDARIES["1b-standard"]))
+
 MODEL_CONFIGS = {"proxy": PROXY_CONFIG, "1b": CONFIG_1B, "1b-deep": CONFIG_1B_DEEP,
                  "1b-deep-loop": CONFIG_1B_DEEP_LOOP, "1b-deep-loopfit": CONFIG_1B_DEEP_LOOPFIT,
-                 "1b-tsumugi": CONFIG_1B_TSUMUGI, "3b": CONFIG_3B}
+                 "1b-tsumugi": CONFIG_1B_TSUMUGI, "1b-standard": CONFIG_1B_STANDARD, "3b": CONFIG_3B}
 
 
 def model_config_for(model_size: str) -> dict | None:
