@@ -40,8 +40,10 @@ says so).
 from __future__ import annotations
 
 import hashlib
+import importlib
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from pathlib import Path
+from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 import torch
 
@@ -256,3 +258,68 @@ def export(spec: SignSpec, bufs: dict[str, torch.Tensor], row: int, *, start: in
                      steered=bool(steered), layers=spec.layers,
                      route_sources=tuple(route_sources(c, b) for c, b in signatures),
                      final_sources=committed_sources(signatures), weights=weights, surfaces=surf)
+
+
+# Source files whose code is the engine's arithmetic: a change to any of them is another engine lane.
+ENGINE_SOURCES = ("regional.py", "multi_decode.py", "decode_engine.py", "cascade_attn.py", "signing.py", "llama.py",
+                  "kernel_pins.py")
+
+
+def engine_identity(*, compile_mode: str, width: int, weights: str, pins_digest: Optional[str],
+                    extra: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+    """What a decode-engine signature's arithmetic is made of, for its lane id: the engine sources' digests, torch and
+    triton versions, the regions' compile mode, the pinned kernel configs (kotodama.model.kernel_pins digest; None:
+    unpinned, so not restart-reproducible), the canonical decoder width and the weights digest."""
+    import torch as _torch
+
+    here = Path(__file__).parent
+    try:
+        import triton
+
+        triton_version = triton.__version__
+    except ImportError:
+        triton_version = None
+    ident: dict[str, Any] = {
+        "producer": "kotodama.model.signing",
+        "source_sha256": {name: hashlib.sha256((here / name).read_bytes()).hexdigest() for name in ENGINE_SOURCES},
+        "torch": _torch.__version__, "triton": triton_version, "compile_mode": compile_mode,
+        "kernel_pins": pins_digest, "width": int(width), "weights": weights,
+    }
+    if extra:
+        ident.update(extra)
+    return ident
+
+
+@dataclass
+class ReducedRow:
+    """One row's signature as a reducer emits it: the feature vector (fp32), the digest of its feature names, the
+    lane id the reducer assigned, and anything else the reducer records (``meta``)."""
+
+    features: Any
+    names_digest: str
+    lane_id: str
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class SignatureReducer(Protocol):
+    """Turns signed rows into signature vectors. kotodama defines the shape and never imports an implementation;
+    one is named by a dotted path (``load_reducer``). ``reduce`` receives finished rows, each row's full token ids
+    (prompt and span) and the engine identity they were captured under, and returns one ReducedRow per row."""
+
+    reducer_identity: str
+
+    def reduce(self, rows: Sequence[SignedRow], *, token_ids: Sequence[Sequence[int]],
+               engine: Mapping[str, Any]) -> list[ReducedRow]: ...
+
+
+def load_reducer(spec: str, **kwargs: Any) -> SignatureReducer:
+    """A reducer by dotted path, ``package.module:attr``: attr is a class or factory, called with ``kwargs``."""
+    module, _, attr = spec.partition(":")
+    if not module or not attr:
+        raise ValueError(f"reducer spec must be 'package.module:attr', got {spec!r}")
+    obj = getattr(importlib.import_module(module), attr)(**kwargs)
+    if not isinstance(obj, SignatureReducer):
+        raise TypeError(f"{spec} does not implement SignatureReducer (reduce + reducer_identity)")
+    return obj
+

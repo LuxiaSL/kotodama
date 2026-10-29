@@ -382,3 +382,37 @@ def test_scoring_a_generated_row_replays_its_signature(model: KotodamaModel, cls
                 assert all(torch.equal(a, b) for a, b in zip(x, ys)), name
             else:
                 assert torch.equal(x, ys), name
+
+
+class _EchoReducer:
+    """A stand-in reducer: one feature per row (its span length)."""
+
+    reducer_identity = "echo-v1"
+
+    def __init__(self, scale: float = 1.0) -> None:
+        self.scale = scale
+
+    def reduce(self, rows, *, token_ids, engine):
+        from kotodama.model.signing import ReducedRow
+
+        return [ReducedRow(features=np.array([r.positions * self.scale], np.float32), names_digest="n",
+                           lane_id=f"echo:{engine['weights'][:8]}") for r in rows]
+
+
+@torch.inference_mode()
+def test_reducer_protocol_and_engine_identity(model: KotodamaModel) -> None:
+    from kotodama.model.signing import SignatureReducer, engine_identity, load_reducer
+
+    eng = _engine(model)
+    dec = _dec(MultiSampleDecoder, eng, SignSpec(LAYERS, tail=4))
+    seqs = _decode(eng, dec, _ids(6, 9), steps=3)
+    ident = engine_identity(compile_mode="default", width=ROWS, weights=dec.signed(0).weights, pins_digest=None)
+    assert ident["weights"] == weights_digest(model) and set(ident["source_sha256"]) >= {"regional.py", "signing.py"}
+    red = load_reducer(f"{__name__}:_EchoReducer", scale=2.0)
+    assert isinstance(red, SignatureReducer)
+    out = red.reduce([dec.signed(r) for r in range(ROWS)], token_ids=seqs, engine=ident)
+    assert [float(o.features[0]) for o in out] == [6.0] * ROWS and out[0].lane_id.startswith("echo:")
+    with pytest.raises(ValueError, match="reducer spec"):
+        load_reducer("no_colon")
+    with pytest.raises(TypeError, match="SignatureReducer"):
+        load_reducer("collections:OrderedDict")
