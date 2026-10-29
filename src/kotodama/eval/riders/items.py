@@ -38,8 +38,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from kotodama.presets import TOKENIZER_NAME
-from kotodama.serve.chatml import render_chatml
+from kotodama.eval.bench.host import TOKENIZER_NAME, render_chatml
 
 # Box labels: single capitals, dict-key friendly, no A-E (exemplar-ish), no I/O.
 BOX_LABELS = ["F", "G", "H", "K", "L", "M", "P", "R"]

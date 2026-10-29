@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 import torch
 
+from kotodama.eval.bench.registry import BP_V32_RECIPE
 from kotodama.eval.binding import batteries as bt
 from kotodama.eval.binding import capacity as cap
 from kotodama.eval.binding import readers
@@ -239,7 +240,6 @@ def test_resolve_groups_and_pins(tmp_path):
         bt.path_for(bt.BATTERIES["swapdyn-v1"], tmp_path)
 
 
-BP_V32_RECIPE = {"seed": 2031, "per_cell": {"setbind": 64, "answer": 160, "adjacency": 225, "codevarmut": 100}}
 
 
 def test_bp_v32_regenerates_its_pin(tmp_path):

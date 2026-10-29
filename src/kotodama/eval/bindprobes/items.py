@@ -40,7 +40,7 @@ from kotodama.eval.bindprobes import (adjacency, answer, attr, codevar, codevarm
 from kotodama.eval.bindprobes.base import FamilyModule, Item
 from kotodama.eval.bindprobes.pools import (Pools, PoolSplit, check_split, load_pools,
                                             load_tokenizer)
-from kotodama.presets import TOKENIZER_NAME
+from kotodama.eval.bench.host import TOKENIZER_NAME
 
 FAMILIES: dict[str, FamilyModule] = {
     "attr": attr,          # type: ignore[dict-item]

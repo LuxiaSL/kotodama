@@ -4,7 +4,8 @@ Spec strings (CLI ``--model``):
     koto:CHECKPOINT[?size=1b-tsumugi][&bounds=0,1,7,…][&attn_res=config|on|off]
     hf:MODEL                (a Hugging Face repo id or a local model directory)
 
-A koto checkpoint loads through ``kotodama.serve.server.load_model`` with ``rope_fp32`` on (the serve law for the
+A koto checkpoint loads through the benchmark's host adapter (:func:`kotodama.eval.bench.host.load_koto`):
+``kotodama.serve.server.load_model`` with ``rope_fp32`` on (the serve law for the
 ladder and tsumugi lineages). Logits come from ``kotodama.model.capture.instrumented_forward`` (the parity-tested
 eager walker) when the model has AttnRes, else from the model's own forward. These are exactly the paths the stage
 gauges on record were scored with, so suite numbers are comparable with them. AttnRes geometry is explicit: a checkpoint whose boundaries differ from its preset loads silently wrong
@@ -77,26 +78,9 @@ def load(spec: ModelSpec, device: str = "cuda") -> LoadedModel:
 
 
 def _load_koto(spec: ModelSpec, device: str) -> LoadedModel:
-    from transformers import AutoTokenizer
+    from kotodama.eval.bench.host import load_koto
 
-    from kotodama import presets
-    from kotodama.model import capture
-    from kotodama.serve import server
-
-    server._rope_fp32_override = True
-    server._attn_res_override = spec.attn_res
-    server._attn_res_boundaries_override = spec.bounds
-    model, _ = server.load_model(spec.path, device=device, model_size=spec.size)
-    model.eval()
-    tok = AutoTokenizer.from_pretrained(presets.TOKENIZER_NAME)
-    if getattr(model.config, "attn_res", False):
-        def fwd(ids: torch.Tensor) -> torch.Tensor:
-            return capture.instrumented_forward(model, ids, light=True)[0]
-    else:   # the capture walker is AttnRes-only; a plain-residual model's own forward is the reference
-        def fwd(ids: torch.Tensor) -> torch.Tensor:
-            return model(ids)["logits"]
-    msl = getattr(model.config, "max_seq_len", None) or getattr(model.config, "max_position_embeddings", None)
-    return LoadedModel(spec, fwd, tok, next(model.parameters()).device, msl)
+    return load_koto(spec, device)
 
 
 def _load_hf(spec: ModelSpec, device: str) -> LoadedModel:

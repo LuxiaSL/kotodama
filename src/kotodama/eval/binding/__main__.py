@@ -196,10 +196,10 @@ def cmd_capacity(a: argparse.Namespace) -> int:
 def cmd_gen_capacity(a: argparse.Namespace) -> int:
     from transformers import AutoTokenizer
 
-    from kotodama import presets
+    from kotodama.eval.bench.host import TOKENIZER_NAME
     from kotodama.eval.binding import capacity as cap
 
-    tok = AutoTokenizer.from_pretrained(presets.TOKENIZER_NAME)
+    tok = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     rows = cap.generate(lambda s: len(tok.encode(s, add_special_tokens=False)))
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
