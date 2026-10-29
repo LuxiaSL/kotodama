@@ -264,6 +264,7 @@ def test_control_wording(dx):
 
 
 def test_pairs_link_and_variants_agree(dx):
+    pool = items.FairPool(dx)
     deixis.check_pairs(dx)
     by: dict[str, dict[str, Item]] = {}
     for it in dx:
@@ -286,7 +287,7 @@ def test_pairs_link_and_variants_agree(dx):
                 assert w.gold == sig[x.gold]
         for v in g.values():   # every variant under every shot condition
             for c in items.CONDITIONS:
-                assert items.build_prompt(v, c).endswith(deixis.render(v, False))
+                assert items.build_prompt(v, c, pool).endswith(deixis.render(v, False))
     with pytest.raises(ValueError):    # a P=3 pair missing its twin
         deixis.check_pairs([it for it in dx if it.meta["variant"] != "twin"])
     bad = [Item(**it.to_dict()) for it in dx]
@@ -346,9 +347,10 @@ def test_determinism():
 
 
 def test_prompt_bound_approx(dx):
+    pool = items.FairPool(dx)
     for it in dx:
         for c in items.CONDITIONS:
-            p = items.build_prompt(it, c)
+            p = items.build_prompt(it, c, pool)
             assert deixis.approx_tokens(p) < deixis.MAX_PROMPT_TOKENS
             assert len(p.encode()) < items.MAX_PROMPT_BYTES
 

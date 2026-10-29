@@ -91,10 +91,11 @@ def aggregate(rows: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
     summary: dict[str, Any] = {"summary": {}, "cells": {}, "errors": {}}
     out = ["# Bindprobes tables", "",
            ("## Summary — 3shot acc (collision-free exemplars), collision gap "
-            "(3shot − 3shot_collide), shot gap (3shot − 0shot)"), "",
+            "(3shot − 3shot_collide), shot gap (3shot − 0shot), fair acc (balanced exemplars: the "
+            "standard few-shot reading)"), "",
            ("| model | family | 3shot acc | 3shot cc [95% CI] | 0shot acc | collide acc "
-            "| collision gap | shot gap | n/cond |"),
-           "|---|---|---|---|---|---|---|---|---|"]
+            "| collision gap | shot gap | fair acc | n/cond |"),
+           "|---|---|---|---|---|---|---|---|---|---|"]
     for m in models:
         for f in fams:
             a = {c: by.get((m, f, c), []) for c in CONDITIONS}
@@ -103,7 +104,7 @@ def aggregate(rows: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
             ci = list(cc_acc(list(a["3shot"]))) if a["3shot"] else [float("nan")] * 3
             entry = {
                 "acc_3shot": accs["3shot"], "acc_0shot": accs["0shot"],
-                "acc_3shot_collide": accs["3shot_collide"],
+                "acc_3shot_collide": accs["3shot_collide"], "acc_fair": accs["fair"],
                 "collision_gap": accs["3shot"] - accs["3shot_collide"],
                 "shot_gap": accs["3shot"] - accs["0shot"],
                 "cc_3shot": ci[0], "cc_3shot_ci": ci[1:],
@@ -116,7 +117,7 @@ def aggregate(rows: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
             out.append(f"| {m} | {f} | {accs['3shot']:.3f} | {ci[0]:+.2f} "
                        f"[{ci[1]:+.2f},{ci[2]:+.2f}] | {accs['0shot']:.3f} | "
                        f"{accs['3shot_collide']:.3f} | {entry['collision_gap']:+.3f} | "
-                       f"{entry['shot_gap']:+.3f} | {n_cond} |")
+                       f"{entry['shot_gap']:+.3f} | {accs['fair']:.3f} | {n_cond} |")
     out.append("")
 
     for f in fams:

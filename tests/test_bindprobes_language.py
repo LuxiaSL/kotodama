@@ -55,10 +55,11 @@ def test_countable_and_singular_pools():
 
 def test_no_mass_noun_after_an_article(gen):
     for f in ("attr", "setbind"):
+        pool = items.FairPool(gen[f])
         for it in gen[f]:
             assert not set(items._objects(it)) & pools.NON_COUNTABLE, it.item_id
             for cond in items.CONDITIONS:
-                p = items.build_prompt(it, cond)
+                p = items.build_prompt(it, cond, pool)
                 assert not _MASS_AFTER_A.search(p), (it.item_id, cond)
                 assert not re.search(r"\b[Aa] [aeiou]", p) and not re.search(r"\bAn [^aeiou]", p)
         assert any(" lies on the shelf" in items.build_prompt(it, "0shot") for it in gen[f])

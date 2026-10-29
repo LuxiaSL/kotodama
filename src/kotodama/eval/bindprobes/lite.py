@@ -26,7 +26,7 @@ from typing import Any, Mapping, Optional, Sequence
 from kotodama.eval.bindprobes.aggregate import DEIXIS, cell_metrics, deixis_readouts
 from kotodama.eval.bindprobes.base import Item, cell_key
 from kotodama.eval.bindprobes.grid import build_payload_item
-from kotodama.eval.bindprobes.items import CONDITIONS, COND_NSHOTS, CORE_FAMILY_NAMES, family
+from kotodama.eval.bindprobes.items import CONDITIONS, COND_NSHOTS, CORE_FAMILY_NAMES, FairPool, family
 
 DEFAULT_PER_FAMILY = 200
 DEFAULT_SEED = 0
@@ -93,11 +93,12 @@ def select_items(items: Sequence[Item], per_family: Optional[int] = None,
 
 def build_jobs(items: Sequence[Item], conditions: Sequence[str] = CONDITIONS) -> list[Job]:
     jobs: list[Job] = []
+    pool = FairPool(items) if "fair" in conditions else None
     for cond in conditions:
         if cond not in COND_NSHOTS:
             raise ValueError(f"unknown condition {cond!r}; choose from {CONDITIONS}")
         for k, it in enumerate(items):
-            p = build_payload_item(it, cond)
+            p = build_payload_item(it, cond, pool)
             jobs.append(Job(id=p["id"], prompt=p["prompt"], candidates=p["candidates"],
                             item_index=k, family=it.family, condition=cond,
                             nshots=COND_NSHOTS[cond]))

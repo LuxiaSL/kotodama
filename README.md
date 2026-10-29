@@ -308,9 +308,12 @@ Every item also runs under few-shot conditions with exemplars.
   gates harness validity per register. The `3shot_relet` condition re-letters
   the exemplars' boxes to separate following a procedure from copying labels.
 - **Bindprobes, core** (`kotodama.eval.bindprobes`): the same question in
-  other shapes, each under `0shot`, `3shot` (collision-free exemplars) and
-  `3shot_collide` (exemplars re-labeled into the item's own names, different
-  bindings).
+  other shapes, each under `0shot`, `fair`, `3shot` (collision-free exemplars)
+  and `3shot_collide` (exemplars re-labeled into the item's own names, different
+  bindings). An item's own three exemplars come from its own cell, so in some
+  families they show where the answer sits. `fair` is the standard few-shot
+  reading: four exemplars from the whole battery, balanced on every cell
+  component, so they show the task's format but not the answer's position.
   - `attr`: N ∈ {2, 4, 6, 8} people each hold one object, plus unbound
     distractors; one is queried.
   - `codevar`: variable binding in Python with copies, reassignments and swaps;

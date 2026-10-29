@@ -21,7 +21,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from kotodama.eval.bindprobes.base import Item
 from kotodama.eval.bindprobes.errors import error_types, picked
-from kotodama.eval.bindprobes.items import (CONDITIONS, COND_NSHOTS, FAMILY_NAMES, build_prompt,
+from kotodama.eval.bindprobes.items import (CONDITIONS, COND_NSHOTS, FAMILY_NAMES, FairPool, build_prompt,
                                             load_items)
 from kotodama.eval.riders.grid import (BATCH, DEFAULT_ENDPOINT, LogprobsError, check_health,
                                        default_endpoint, read_result, request_batch)
@@ -51,9 +51,9 @@ def job_id(item: Item, condition: str) -> str:
     return f"{item.item_id}|{condition}"
 
 
-def build_payload_item(item: Item, condition: str) -> dict[str, Any]:
+def build_payload_item(item: Item, condition: str, pool: Optional[FairPool] = None) -> dict[str, Any]:
     """One ``/logprobs`` request item: candidates in the scored form ``" " + c``."""
-    return {"id": job_id(item, condition), "prompt": build_prompt(item, condition),
+    return {"id": job_id(item, condition), "prompt": build_prompt(item, condition, pool),
             "candidates": [" " + c for c in item.candidates]}
 
 
@@ -105,6 +105,7 @@ def run_grid(model: str, items: Sequence[Item], out_path: Path,
     if not 1 <= batch <= 64:
         raise ValueError(f"batch must be in [1, 64] (server LOGPROB_MAX_BATCH), got {batch}")
     fams = set(families)
+    pool = FairPool(items) if "fair" in conditions else None   # the whole file's exemplars, before any family filter
     items = [it for it in items if it.family in fams]
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -117,7 +118,7 @@ def run_grid(model: str, items: Sequence[Item], out_path: Path,
     with out_path.open("a", encoding="utf-8") as fh:
         for k in range(0, len(jobs), batch):
             chunk = jobs[k: k + batch]
-            payload = [build_payload_item(it, c) for it, c in chunk]
+            payload = [build_payload_item(it, c, pool) for it, c in chunk]
             by_id = {r["id"]: r for r in request_batch(endpoint, payload, top_n)}
             for it, c in chunk:
                 jid = job_id(it, c)

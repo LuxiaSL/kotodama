@@ -29,7 +29,7 @@ import pytest
 
 from kotodama.eval.binding import batteries as bt
 from kotodama.eval.bindprobes.base import Item
-from kotodama.eval.bindprobes.items import CONDITIONS, build_prompt, load_items, render_sha256
+from kotodama.eval.bindprobes.items import PINNED_CONDITIONS, build_prompt, load_items, render_sha256
 
 DATA = Path(__file__).parent / "data"
 GOLDEN: dict[str, Any] = json.loads(gzip.decompress((DATA / "bindprobes_render_golden.json.gz").read_bytes()))
@@ -56,7 +56,7 @@ def test_golden_covers_every_pinned_battery():
         assert (g["file"], g["sha256"]) == (b.file, b.sha256), b.name
         assert b.render_sha256 == g["render_sha256"], b.name
     for name, g in GOLDEN["batteries"].items():
-        for c in CONDITIONS:
+        for c in PINNED_CONDITIONS:
             assert len(g["conditions"][c]["items"]) == g["n_items"] * HEX, (name, c)
 
 
@@ -73,7 +73,7 @@ def test_sample_covers_every_file_family_and_generation():
         assert tag in tags, tag
 
 
-@pytest.mark.parametrize("cond", CONDITIONS)
+@pytest.mark.parametrize("cond", PINNED_CONDITIONS)
 def test_sample_renders_as_golden(cond):
     bad = []
     for r in SAMPLE:
@@ -100,7 +100,7 @@ def test_file_renders_as_golden(name):
         pytest.skip(f"{path} is another file than {name}'s")
     its = load_items(path)
     assert len(its) == g["n_items"]
-    for c in CONDITIONS:
+    for c in PINNED_CONDITIONS:
         whole = hashlib.sha256()
         bad = []
         for i, it in enumerate(its):

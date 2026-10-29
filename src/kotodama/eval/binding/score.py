@@ -106,17 +106,19 @@ def score_bindprobe_items(model: LoadedModel, items: Sequence[Any], conditions: 
                           name: str, max_batch: int = 32, top_n: int = 5) -> int:
     """Score bindprobes items × conditions into bindprobes grid rows; returns rows written this call."""
     from kotodama.eval.bindprobes.grid import build_payload_item, score_row
+    from kotodama.eval.bindprobes.items import FairPool
 
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     done = _clean_existing(out, lambda r: (r["item_id"], r["condition"]))
+    pool = FairPool(items) if "fair" in conditions else None
     jobs = [(it, c) for it in items for c in conditions if (it.item_id, c) not in done]
     log.info("%s → %s: %d of %d (item, condition) pending", name, out.name, len(jobs),
              len(items) * len(conditions))
     t0, n = time.time(), 0
     with torch.inference_mode(), out.open("a") as f:
         for chunk in _chunks(jobs, CHUNK):
-            payload = [build_payload_item(it, c) for it, c in chunk]
+            payload = [build_payload_item(it, c, pool) for it, c in chunk]
             res = score_logprob_items(model.logits_fn, model.tokenizer, payload, top_n=top_n, device=model.device,
                                       max_seq_len=model.max_seq_len, max_batch=max_batch,
                                       max_total_tokens=LOGPROB_MAX_TOTAL_TOKENS)

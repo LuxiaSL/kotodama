@@ -274,7 +274,7 @@ def test_exemplar_pools_disjoint_and_collide_reuses_labels(battery):
             assert items._objects(c) == items._objects(s)            # same objects, new labels
             assert c.gold != it.gold
         assert items.condition_shots(it, "0shot") == []
-        p0, p3, pc = (items.build_prompt(it, c) for c in items.CONDITIONS)
+        p0, p3, pc = (items.build_prompt(it, c) for c in items.PINNED_CONDITIONS)
         assert p3.endswith(p0) and pc.endswith(p0) and p3 != pc
         assert p3.count(fam.SEPARATOR) == pc.count(fam.SEPARATOR) == items.N_SHOTS
         for block in p3.split(fam.SEPARATOR)[:-1]:
@@ -286,11 +286,40 @@ def test_exemplar_pools_disjoint_and_collide_reuses_labels(battery):
 
 
 def test_prompt_length_bound(battery):
+    pool = items.FairPool(battery)
     for it in battery:
         for c in items.CONDITIONS:
-            assert len(items.build_prompt(it, c).encode()) < items.MAX_PROMPT_BYTES < 4096
+            assert len(items.build_prompt(it, c, pool).encode()) < items.MAX_PROMPT_BYTES < 4096
     big = [it for it in battery if it.cell in ([8, "last"], [3, 4], [4, 4, "holder"])]
     assert big
+
+
+def test_fair_shots_balanced_disjoint_deterministic(battery):
+    pool = items.FairPool(battery)
+    for it in battery:
+        fam = items.family(it.family)
+        shots = items.fair_shots(it, pool)
+        assert len(shots) == items.FAIR_SHOTS
+        assert shots == items.fair_shots(it, pool)                       # deterministic per item
+        words = set(fam.labels(it)) | items._objects(it) | set(it.candidates)
+        for s in shots:
+            assert not (set(fam.labels(s)) | items._objects(s) | set(s.candidates)) & words
+        for j, vals in enumerate(pool.values[it.family]):                # balanced on every cell component
+            m = sum(tuple(s.cell)[j] == tuple(it.cell)[j] for s in shots)
+            if len(vals) == 2:
+                assert m == items.FAIR_SHOTS // 2, (it.item_id, j)
+            elif len(vals) > 2:
+                assert m <= items.FAIR_SHOTS // 2, (it.item_id, j)
+        p = items.build_prompt(it, "fair", pool)
+        assert p.endswith(items.build_prompt(it, "0shot")) and p.count(fam.SEPARATOR) == items.FAIR_SHOTS
+    with pytest.raises(ValueError):
+        items.build_prompt(battery[0], "fair")                           # needs a pool
+
+
+def test_fair_leaves_the_render_pin_unchanged(battery):
+    assert items.PINNED_CONDITIONS == ("0shot", "3shot", "3shot_collide")
+    assert "fair" in items.CONDITIONS and items.COND_NSHOTS["fair"] == items.FAIR_SHOTS
+    assert items.render_sha256(battery) == items.render_sha256(list(battery))
 
 
 def test_validate_catches_corruption(battery):
@@ -437,7 +466,7 @@ def test_run_grid_over_fake_server_matches_in_process(tok, battery, tmp_path, mo
     monkeypatch.setattr(rgrid.requests, "get", lambda url, timeout: _Resp({"status": "ok"}))
     out = tmp_path / "grids" / "stub.jsonl"
     n = grid.run_grid("stub", sel, out, endpoint="http://bp.test", batch=5, top_n=3)
-    assert n == len(sel) * 3 and all(len(b["items"]) <= 5 for b in bodies)
+    assert n == len(sel) * len(items.CONDITIONS) and all(len(b["items"]) <= 5 for b in bodies)
     rows = [json.loads(x) for x in out.read_text().splitlines()]
     jobs = lite.build_jobs(sel)
     ref = score_logprob_items(_stub_logits, tok, jobs, 3, "cpu")
@@ -488,7 +517,7 @@ def test_aggregate_fake_grid(tmp_path, capsys):
     assert s["errors"]["m|attr|0shot"]["distractor"] == pytest.approx(1 / 3)
     c = s["summary"]["m|codevar"]
     assert c["acc_3shot"] == 0.5 and c["n"]["0shot"] == 0
-    assert "| m | attr | 1.000 |" in md and "| 4/last | — | 1.00 cc+1.00 m+1.00 | 0.50" in md
+    assert "| m | attr | 1.000 |" in md and "| 4/last | — | — | 1.00 cc+1.00 m+1.00 | 0.50" in md
     assert "### attr — m: recency control (qpos=last)" in md
     assert "| 3shot_collide | 1.00 | 0.00 | +1.00 |" in md
     (tmp_path / "m.jsonl").write_text("".join(json.dumps(r) + "\n" for r in _fake_grid()))
