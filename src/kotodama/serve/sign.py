@@ -206,6 +206,37 @@ class SignSpool:
             return summary
 
 
+def find(spool: SignSpool, sign_id: str) -> tuple[Optional[SignRecord], Optional[dict[str, Any]]]:
+    """``sign_id``'s record and its signed row in ``spool`` (each None when absent): the row is its line in
+    ``<batch>/rows.jsonl``, with ``batch_dir`` added; the newest batch wins (a drain that re-signed after a crash).
+    Scans the files (a replay is rare); a line is parsed only when it holds the id."""
+    needle = json.dumps(sign_id)
+    record = None
+    for path in sorted((spool.root / "records").glob("*.jsonl")):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if needle in line and line.endswith("\n"):
+                    rec = SignRecord.from_json(json.loads(line))
+                    if rec.request_id == sign_id:
+                        record = rec
+    row = None
+    index = spool.root / "index.jsonl"
+    if index.exists():
+        for entry in reversed(index.read_text(encoding="utf-8").splitlines()):
+            batch = Path(json.loads(entry)["dir"])
+            rows = batch / "rows.jsonl"
+            if not rows.exists():
+                continue
+            for line in rows.read_text(encoding="utf-8").splitlines():
+                if needle in line:
+                    cand = json.loads(line)
+                    if cand.get("sign_id") == sign_id:
+                        row = {**cand, "batch_dir": str(batch)}
+            if row is not None:
+                break
+    return record, row
+
+
 def import_rows(spool: SignSpool, path: str | Path, writer: str, *, weights: str, engine: Any) -> int:
     """Append the rows of JSONL ``path`` (see the module docstring) to ``spool`` as writer ``writer``'s records, each
     naming ``weights`` (the signing model's digest) and, with an injection, the lever plan the server makes of it on

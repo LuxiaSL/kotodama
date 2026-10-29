@@ -306,6 +306,9 @@ def test_server_signs_in_flight(monkeypatch, model: KotodamaModel, tmp_path) -> 
     assert r.status_code == 200, r.text
     choices = r.json()["choices"]
     assert len(server._sign_pending) == 3 and server._sign_info()["pending_inflight"] == 3
+    # an in-flight row waiting for its reduce is "not signed yet", not unknown
+    r = client.post("/replay", json={"sign_id": choices[0]["sign_id"]})
+    assert r.status_code == 409 and "not signed yet" in r.text
     with torch.inference_mode():
         server._sign_flush()
     assert server._sign_pending == [] and server._sign_stats["inflight_batches"] == 1
@@ -329,11 +332,59 @@ def test_server_signs_in_flight(monkeypatch, model: KotodamaModel, tmp_path) -> 
             continue
         assert np.array_equal(feats[row["file"]][row["index"]], res.reduced.features.astype(np.float32))
     assert sum("file" in row for row in rows) >= 2
+    # /replay: a signed record's raw surfaces, re-captured on the signer and checked against its signed row
+    from safetensors.torch import load as st_load
+
+    sid = rows[0]["sign_id"]
+    r = client.post("/replay", json={"sign_id": sid})
+    assert r.status_code == 200, r.text
+    exported = st_load(r.content)
+    header = client.post("/replay", json={"sign_id": sid, "format": "json"}).json()
+    assert header["schema"] == "anamnesis-replay-export-v1" and header["replayed_bitwise"] is True
+    rec0 = recs[0]
+    assert header["token_ids"] == list(rec0.prompt_ids + rec0.generated_ids)
+    assert header["positions"] == len(rec0.generated_ids) - 1 and header["layers"]["sampled"] == list(SPEC.layers)
+    assert set(exported) == set(header["tensors"]) and {"depth", "committed", "route", "q", "mean_rows"} <= set(exported)
+    with torch.inference_mode():
+        again = rs.capture(rec0)
+    for name, t in exported.items():
+        want = again.surfaces[name]
+        want = torch.stack(want) if isinstance(want, list) else want
+        assert torch.equal(t, want.cpu()), name
+        assert list(t.shape) == header["tensors"][name]["shape"]
+    assert header["lever_slot"] == again.lever_slot
+    # Tier B resid_pre: each effective layer's attention input, as the model's own eager forward computes it (the
+    # input of every attn_norm call, in effective-layer order, at the record's signed positions)
+    extra = st_load(client.post("/replay", json={"sign_id": sid, "extras": ["resid_pre"]}).content)
+    got = extra["resid_pre"]
+    assert list(got.shape) == [header["positions"], len(header["route_sources"]), CFG["hidden_size"]]
+    seen: list[torch.Tensor] = []
+    hooks = [layer.attn_norm.register_forward_pre_hook(lambda _m, args: seen.append(args[0].detach()))
+             for layer in model.layers]
+    try:
+        with torch.inference_mode():
+            model(torch.tensor([list(rec0.prompt_ids + rec0.generated_ids[:-1])]))
+    finally:
+        for h in hooks:
+            h.remove()
+    eager = torch.stack([x[0, header["start"]:header["start"] + header["positions"]] for x in seen], dim=1)
+    assert eager.shape == got.shape
+    torch.testing.assert_close(got, eager.float(), atol=2e-4, rtol=2e-4)
+    assert client.post("/replay", json={"sign_id": "nope"}).status_code == 404
+    # a stored signature the replay does not reproduce: refused, never returned unmarked
+    feats_path = batch / rows[0]["file"]
+    saved = np.load(feats_path)
+    np.save(feats_path, saved + 1.0)
+    assert client.post("/replay", json={"sign_id": sid}).status_code == 409
+    np.save(feats_path, saved)
     # a request the batcher cannot take (greedy) is served serially and signed by the drain from its record
     greedy = client.post("/v1/completions", json={**{k: v for k, v in body.items() if k != "seed"}, "temperature": 0,
                                                     "n": 2})
     assert greedy.status_code == 200 and all(c["sign_id"] for c in greedy.json()["choices"])
     assert spool.pending() == 2
+    pending_id = greedy.json()["choices"][0]["sign_id"]
+    r = client.post("/replay", json={"sign_id": pending_id})
+    assert r.status_code == 409 and "not signed yet" in r.text  # its record waits for the drain
     # signing by default: a request that does not set `sign` is signed; `sign: false` opts out and is counted
     monkeypatch.setattr(server, "_sign_default_arg", True)
     monkeypatch.setattr(server, "_profile_name", "test-profile")

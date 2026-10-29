@@ -276,6 +276,32 @@ def export(spec: SignSpec, bufs: dict[str, torch.Tensor], row: int, *, start: in
                      final_sources=committed_sources(signatures), weights=weights, surfaces=surf)
 
 
+def resid_pre(row: SignedRow) -> torch.Tensor:
+    """Each effective layer's attention input over ``row``'s span, [positions, layers, hidden] fp32, from its
+    captured surfaces (needs the depth path): layer l mixes the blocks committed before it and the partial entering
+    it (the embedding at layer 0, else layer l-1's output partial) with its captured pre-attention routing weights,
+    as the decode layer routes them; a layer with no committed block reads the partial unrouted. The decode step
+    mixes with unrounded weights, so this matches its attention input to the precision the weights are captured in
+    (the engine's dtype), not bit for bit."""
+    surf = row.surfaces
+    if "depth" not in surf:
+        raise ValueError("resid_pre needs a row captured with the depth path (SignSpec.depth)")
+    depth = surf["depth"].float()
+    embed = surf["embed"].float()
+    committed = [c.float() for c in surf["committed"]]
+    route = surf["route"].float()
+    out = []
+    for li, (n_attn, _) in enumerate(row.route_sources):
+        entering = embed if li == 0 else depth[:, li - 1]
+        if n_attn == 0:
+            out.append(entering)
+            continue
+        sources = torch.stack(committed[:n_attn - 1] + [entering], dim=0)
+        weights = route[:, li, 0, :n_attn].transpose(0, 1).unsqueeze(-1)
+        out.append((weights * sources).sum(0))
+    return torch.stack(out, dim=1)
+
+
 # Source files whose code is the engine's arithmetic: a change to any of them is another engine lane.
 ENGINE_SOURCES = ("regional.py", "multi_decode.py", "decode_engine.py", "cascade_attn.py", "signing.py", "llama.py",
                   "kernel_pins.py", "attn_stats.py")

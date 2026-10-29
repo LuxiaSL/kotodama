@@ -69,7 +69,7 @@ import torch
 torch.set_num_threads(_SERVE_THREADS)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from transformers import AutoTokenizer
 
@@ -1862,6 +1862,128 @@ async def memory():
         "reserved_gb": round(torch.cuda.memory_reserved(_device) / 1e9, 3),
         "peak_gb": round(torch.cuda.max_memory_allocated(_device) / 1e9, 3),
     }
+
+
+# ── /replay: a signed record's raw surfaces, re-captured bitwise (classical tools read them offline) ──
+# The schema is anamnesis's replay export (anamnesis-replay-export-v1): Tier A, the surfaces the signature reduced,
+# under the SignedRow contract's names and axes; the JSON header (provenance and shapes) rides in the safetensors
+# metadata under "anamnesis_replay", and alone with format "json".
+REPLAY_SCHEMA = "anamnesis-replay-export-v1"
+_REPLAY_AXES = {
+    "depth": ["step", "layer", "hidden"], "committed": ["block", "step", "hidden"],
+    "route": ["step", "layer", "input", "source"], "route_final": ["step", "source"],
+    "q": ["step", "sampled_layer", "head", "head_dim"], "k": ["step", "sampled_layer", "kv_head", "head_dim"],
+    "v": ["step", "sampled_layer", "kv_head", "head_dim"], "gate": ["step", "sampled_layer", "intermediate"],
+    "head_entropy": ["step", "layer", "head"], "mean_entropy": ["step", "layer"],
+    "head_scalars": ["step", "sampled_layer", "scalar", "head"], "mean_rows": ["step", "sampled_layer", "column"],
+    "logit_stats": ["step", "stat"],
+}
+# Tier B (on request): derived from Tier A by the engine's own routing rule (kotodama.model.signing.resid_pre)
+_REPLAY_EXTRAS = {"resid_pre": ["step", "layer", "hidden"]}
+
+
+class ReplayRequest(BaseModel):
+    sign_id: str = Field(min_length=1)
+    format: Literal["safetensors", "json"] = "safetensors"
+    # Tier B extras: "resid_pre", each effective layer's attention input (fp32; see signing.resid_pre)
+    extras: list[Literal["resid_pre"]] = []
+
+
+def _replay_export(rec: Any, row: dict, extras: tuple[str, ...] = ()) -> tuple[dict, dict]:
+    """``rec`` re-captured on the signer's decoder and checked against its signed row (generation thread): the
+    re-reduced features must equal the stored ones bit for bit, or the export is refused (409). Returns the export's
+    JSON header and its tensors (CPU)."""
+    import numpy as np
+
+    from kotodama.model.signer import deterministic_algorithms
+
+    assert _signer is not None and _sign_spool is not None
+    _signer.plans.update(_sign_spool.plans())
+    try:
+        signed = _signer.capture(rec)
+    except ValueError as exc:
+        raise HTTPException(409, f"this server cannot replay {rec.request_id}: {exc}") from exc
+    identity = _signer.identity
+    with deterministic_algorithms():
+        reduced = _signer.reducer.reduce([signed], engine=identity,
+                                         token_ids=[rec.prompt_ids + rec.generated_ids])[0]
+    x = reduced.features
+    x = x.detach().float().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x, np.float32)
+    stored = np.load(Path(row["batch_dir"]) / row["file"])[row["index"]]
+    if not np.array_equal(x.reshape(-1).astype(np.float32), stored):
+        raise HTTPException(409, f"the replay of {rec.request_id} does not reproduce its signed row (another "
+                                 "engine, pins or reducer than signed it); no export")
+    tensors: dict[str, torch.Tensor] = {}
+    for name in _REPLAY_AXES:
+        t = signed.surfaces.get(name)
+        if t is None:
+            continue
+        t = torch.stack(t) if isinstance(t, list) else t
+        tensors[name] = t.detach().contiguous().cpu()
+    if "resid_pre" in extras:
+        from kotodama.model.signing import resid_pre
+
+        tensors["resid_pre"] = resid_pre(signed).contiguous().cpu()
+    axes = {**_REPLAY_AXES, **_REPLAY_EXTRAS}
+    header = {
+        "schema": REPLAY_SCHEMA, "sign_id": rec.request_id, "request_id": rec.request_id,
+        "token_ids": list(rec.prompt_ids + rec.generated_ids), "prompt_length": len(rec.prompt_ids),
+        "start": signed.start, "positions": signed.positions, "lever_slot": signed.lever_slot,
+        "weights_sha256": rec.weights,
+        "engine_identity_sha256": hashlib.sha256(json.dumps(identity, sort_keys=True, default=str)
+                                                 .encode("utf-8")).hexdigest(),
+        "pins_sha256": _pins.digest if _pins is not None else None,
+        "lever_plan_sha256": rec.lever, "seed": rec.meta.get("seed"), "profile": rec.meta.get("profile"),
+        "lane_id": row.get("lane_id"), "replayed_bitwise": True,
+        "layers": {"effective": len(signed.route_sources), "sampled": list(signed.layers)},
+        "route_sources": [list(x) for x in signed.route_sources], "final_sources": signed.final_sources,
+        "tensors": {name: {"shape": list(t.shape), "dtype": str(t.dtype).removeprefix("torch."),
+                           "axes": axes[name]} for name, t in tensors.items()},
+        "extras": sorted(set(extras)),
+        "derived": {"resid_pre": "each effective layer's attention input: its captured pre-attention routing over the "
+                                 "blocks committed before it and the partial entering it (the embedding at layer 0, "
+                                 "else depth[:, l-1]), fp32; matches the engine's mix to the captured weights' "
+                                 "precision"} if "resid_pre" in extras else {},
+        "meta": rec.meta,
+    }
+    return header, tensors
+
+
+def _sign_waiting(sign_id: str) -> bool:
+    """Whether ``sign_id`` is an in-flight row still in memory (pending its reduce, or reduced and not yet written)."""
+    with _sign_pending_lock:
+        if any(rec.request_id == sign_id for rec, _, _ in _sign_pending):
+            return True
+    return any(res.record.request_id == sign_id for results, _ in _sign_unwritten for res in results)
+
+
+@app.post("/replay")
+async def replay_endpoint(request: ReplayRequest):
+    """A signed record's Tier A export (see REPLAY_SCHEMA): its raw surfaces re-captured on this server's signer,
+    returned only when the replay reproduces its signed row bit for bit. 404: no such record in this server's
+    spool; 409: not signed (yet, or skipped), or not reproducible here."""
+    if _signer is None or _sign_spool is None:
+        raise HTTPException(400, "/replay needs a server that signs (--sign_spool and --sign_reducer)")
+    from kotodama.serve.sign import find
+
+    rec, row = await asyncio.to_thread(find, _sign_spool, request.sign_id)
+    if rec is None and _sign_waiting(request.sign_id):
+        raise HTTPException(409, f"{request.sign_id} has no signed row: not signed yet (its in-flight batch is "
+                                 "waiting to be reduced)")
+    if rec is None:
+        raise HTTPException(404, f"no record {request.sign_id!r} in this server's spool")
+    if row is None or "file" not in row:
+        why = (row or {}).get("skipped") or "not signed yet (the drain has not reached it)"
+        raise HTTPException(409, f"{request.sign_id} has no signed row: {why}")
+    async with _engine_lock:
+        header, tensors = await _run_generation(_replay_export, rec, row, tuple(request.extras))
+    if request.format == "json":
+        return header
+    from safetensors.torch import save
+
+    blob = save(tensors, metadata={"anamnesis_replay": json.dumps(header, default=str)})
+    return Response(content=blob, media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{request.sign_id}.safetensors"'})
 
 
 @app.post("/logprobs")

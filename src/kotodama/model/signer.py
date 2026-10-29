@@ -371,8 +371,6 @@ class RecordSigner:
     @torch.inference_mode()
     def sign(self, records: Sequence[SignRecord]) -> list[SignResult]:
         """Sign ``records``; one result per record, in order."""
-        from kotodama.model.decode_engine import SamplingParams
-
         results = [SignResult(record=r) for r in records]
         keyed: dict[tuple, list[int]] = {}
         for i, rec in enumerate(records):
@@ -383,62 +381,83 @@ class RecordSigner:
                 continue
             results[i].same_engine = rec.engine is not None and _canonical(rec.engine) == _canonical(self.identity)
             keyed.setdefault((rec.prompt_ids, rec.lever), []).append(i)
-        dec, eng = self.dec, self.dec.engine
-        law = SamplingParams(temperature=1.0, repetition_penalty=1.0)
-        dev = eng.device
         for batch in self._batches(list(keyed.items()), [len(r.generated_ids) for r in records]):
             t0 = time.perf_counter()
-            bound: dict[str, int] = {}
-            row_of: dict[int, int] = {}
-            dec.release(range(dec.rows))
-            try:
-                nxt = 0
-                for (prompt, lever), idx in batch:
-                    slot = 0
-                    if lever is not None:
-                        if lever not in bound:
-                            bound[lever] = eng.levers.bind(self.plans[lever])
-                        slot = bound[lever]
-                    rows = list(range(nxt, nxt + len(idx)))
-                    nxt += len(idx)
-                    logits = eng.prefill(torch.tensor([prompt], device=dev), slot=slot)
-                    dec.admit(rows, logits, law, slots=[slot] * len(rows) if eng.levers is not None else None,
-                              seeds=[0] * len(rows))
-                    row_of.update(zip(idx, rows))
-                # the unused rows score filler from the last prompt (they stay in their own groups)
-                last_slot = slot
-                filler = list(range(nxt, dec.rows))
-                if filler:
-                    dec.admit(filler, logits, law,
-                              slots=[last_slot] * len(filler) if eng.levers is not None else None,
-                              seeds=[0] * len(filler))
-                S = max(len(records[i].generated_ids) for _, idx in batch for i in idx)
-                last = records[batch[-1][1][0]].generated_ids
-                tokens = torch.zeros((dec.rows, S), dtype=torch.long)
-                for r in range(dec.rows):
-                    tokens[r] = torch.tensor((list(last) + [last[-1]] * S)[:S])
-                for i, r in row_of.items():
-                    g = records[i].generated_ids
-                    tokens[r] = torch.tensor(list(g) + [g[-1]] * (S - len(g)))
-                dec.score(tokens.to(dev))
-                order = [i for _, idx in batch for i in idx]
-                signed = [trim(dec.signed(row_of[i], device=dev), len(records[i].generated_ids) - 1)
-                          for i in order]
-            finally:
-                for slot in bound.values():
-                    eng.levers.release(slot)
+            order, signed = self._capture(records, batch)
             for i, row in zip(order, signed):
                 if audited(records[i].request_id, self.audit_every):
                     results[i].raw = _to_cpu(row)
-            if dev.type == "cuda":
-                torch.cuda.synchronize(dev)
             t1 = time.perf_counter()
             self._reduce(records, results, order, signed)
             self.timing["capture_s"] += t1 - t0
             self.timing["reduce_s"] += time.perf_counter() - t1
             self.timing["rows"] += len(order)
+        dec = self.dec
         dec.release(range(dec.rows))
         return results
+
+    @torch.inference_mode()
+    def capture(self, rec: SignRecord) -> signing.SignedRow:
+        """``rec``'s signed span, re-captured on this signer's decoder as ``sign`` captures it (no reducer; on the
+        decoder's device). Raises ValueError when the signer cannot reproduce it (``why_not``)."""
+        reason = self.why_not(rec)
+        if reason is not None:
+            raise ValueError(f"{rec.request_id}: {reason}")
+        batch = next(self._batches([((rec.prompt_ids, rec.lever), [0])], [len(rec.generated_ids)]))
+        _, signed = self._capture([rec], batch)
+        self.dec.release(range(self.dec.rows))
+        return signed[0]
+
+    def _capture(self, records: Sequence[SignRecord],
+                 batch: list[tuple[tuple, list[int]]]) -> tuple[list[int], list[signing.SignedRow]]:
+        """One batch of records (``_batches``) admitted and scored: the record indices in row order and their signed
+        spans, each trimmed to its own fed positions (synchronised)."""
+        from kotodama.model.decode_engine import SamplingParams
+
+        dec, eng = self.dec, self.dec.engine
+        law = SamplingParams(temperature=1.0, repetition_penalty=1.0)
+        dev = eng.device
+        bound: dict[str, int] = {}
+        row_of: dict[int, int] = {}
+        dec.release(range(dec.rows))
+        try:
+            nxt = 0
+            for (prompt, lever), idx in batch:
+                slot = 0
+                if lever is not None:
+                    if lever not in bound:
+                        bound[lever] = eng.levers.bind(self.plans[lever])
+                    slot = bound[lever]
+                rows = list(range(nxt, nxt + len(idx)))
+                nxt += len(idx)
+                logits = eng.prefill(torch.tensor([prompt], device=dev), slot=slot)
+                dec.admit(rows, logits, law, slots=[slot] * len(rows) if eng.levers is not None else None,
+                          seeds=[0] * len(rows))
+                row_of.update(zip(idx, rows))
+            # the unused rows score filler from the last prompt (they stay in their own groups)
+            last_slot = slot
+            filler = list(range(nxt, dec.rows))
+            if filler:
+                dec.admit(filler, logits, law,
+                          slots=[last_slot] * len(filler) if eng.levers is not None else None,
+                          seeds=[0] * len(filler))
+            S = max(len(records[i].generated_ids) for _, idx in batch for i in idx)
+            last = records[batch[-1][1][0]].generated_ids
+            tokens = torch.zeros((dec.rows, S), dtype=torch.long)
+            for r in range(dec.rows):
+                tokens[r] = torch.tensor((list(last) + [last[-1]] * S)[:S])
+            for i, r in row_of.items():
+                g = records[i].generated_ids
+                tokens[r] = torch.tensor(list(g) + [g[-1]] * (S - len(g)))
+            dec.score(tokens.to(dev))
+            order = [i for _, idx in batch for i in idx]
+            signed = [trim(dec.signed(row_of[i], device=dev), len(records[i].generated_ids) - 1) for i in order]
+        finally:
+            for slot in bound.values():
+                eng.levers.release(slot)
+        if dev.type == "cuda":
+            torch.cuda.synchronize(dev)
+        return order, signed
 
     @torch.inference_mode()
     def sign_captured(self, records: Sequence[SignRecord],
