@@ -493,8 +493,15 @@ def test_signed_requests_leave_records_in_the_spool(monkeypatch, model: Kotodama
             assert "no fed position" in row["skipped"]
     assert summary["signed"] == sum(n >= 1 for n in fed.values())
     # what the sign path cannot take is refused before anything runs
-    assert client.post("/v1/completions", json={**body, "temperature": 0}).status_code == 400  # greedy: not batched
-    assert client.post("/generate", json={"prompt": "hi", "sign": True, "stream": True}).status_code == 400
+    # a law the batcher does not sample (greedy) is served serially, and its records still go to the spool
+    before = server._sign_stats["records"]
+    greedy = client.post("/v1/completions", json={**body, "temperature": 0, "n": 2})
+    assert greedy.status_code == 200 and all(c["sign_id"] for c in greedy.json()["choices"])
+    assert server._sign_stats["records"] == before + 2
+    # a signed stream streams and leaves its record (the final event carries its sign_id)
+    before = server._sign_stats["records"]
+    r = client.post("/generate", json={"prompt": "hi", "sign": True, "stream": True, "max_new_tokens": 4})
+    assert r.status_code == 200 and '"sign_id"' in r.text and server._sign_stats["records"] == before + 1
     monkeypatch.setattr(server, "_sign_spool", None)
     r = client.post("/v1/completions", json=body)
     assert r.status_code == 400 and "--sign_spool" in r.text

@@ -224,7 +224,9 @@ def test_results_are_written_as_features_and_rows(model: KotodamaModel, tmp_path
     recs.append(SignRecord(request_id="c", prompt_ids=tuple(_ids(4, 2)), generated_ids=(5, 6, 7, 8, 9), weights=w))
     signer = RecordSigner(dec, _Keep(), compile_mode="aot_eager", audit_every=1)
     summary = write_results(tmp_path, signer.sign(recs))
-    assert summary == {"signed": 2, "skipped": 1, "layouts": 2, "audited": 2}
+    # record b has one generated id: no fed position (its reason counted with the number replaced)
+    assert summary == {"signed": 2, "skipped": 1, "layouts": 2, "audited": 2,
+                       "skip_reasons": {"N generated ids: no fed position to sign": 1}}
     assert signer.timing["rows"] == 2 and signer.timing["capture_s"] > 0 and signer.timing["reduce_s"] > 0
     rows = [json.loads(line) for line in open(tmp_path / "rows.jsonl")]
     assert [r["sign_id"] for r in rows] == ["a", "b", "c"] and [r["steps"] for r in rows] == [2, 0, 4]

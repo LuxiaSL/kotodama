@@ -21,6 +21,7 @@ import dataclasses
 import hashlib
 from contextlib import contextmanager
 import json
+import re
 import time
 import logging
 from dataclasses import dataclass, field
@@ -555,4 +556,14 @@ def write_results(out_dir: str | Path, results: Sequence[SignResult]) -> dict[st
     if names:
         (out / "names.json").write_text(json.dumps(names, default=str))
     return {"signed": sum(len(v) for v in feats.values()), "skipped": sum(r.reduced is None for r in results),
-            "layouts": len(feats), "audited": raw}
+            "layouts": len(feats), "audited": raw, "skip_reasons": skip_reasons(results)}
+
+
+def skip_reasons(results: Sequence[SignResult]) -> dict[str, int]:
+    """The skipped results counted by reason, numbers in a reason replaced by N (so one cause is one key)."""
+    out: dict[str, int] = {}
+    for res in results:
+        if res.reduced is None:
+            key = re.sub(r"\d+", "N", res.skipped or "not signed")
+            out[key] = out.get(key, 0) + 1
+    return out

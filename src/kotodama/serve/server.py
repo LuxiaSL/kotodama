@@ -35,11 +35,13 @@ import asyncio
 import contextlib
 import functools
 import gc
+import hashlib
 import html
 import json
 import logging
 import math
 import os
+import sys
 import threading
 import time
 import uuid
@@ -246,7 +248,8 @@ _sign_spool: "SignSpool | None" = None
 _signer: "RecordSigner | None" = None
 _sign_writer: str = ""
 _sign_weights: str = ""
-_sign_stats: dict[str, Any] = {"records": 0, "batches": 0, "signed": 0, "skipped": 0, "errors": 0}
+_sign_stats: dict[str, Any] = {"records": 0, "batches": 0, "signed": 0, "skipped": 0, "errors": 0,
+                               "opted_out": 0, "unsigned": {}, "skipped_reasons": {}}
 # In-flight signing (--sign_inflight): signed requests decode on the signer's decoder (the widest bucket's geometry,
 # so their tokens are the unsigned ones'), each candidate's span is exported as it ends, and the rows are reduced on
 # the generation thread in batches of the signer's width (between steps once that many wait, else when idle) and
@@ -746,9 +749,10 @@ class GenerateRequest(BaseModel):
     steer_span: Literal["decode", "uniform"] = "decode"
     # A raw write instead of bank vectors (needs --levers).
     injection: InjectionSpec | None = None
-    # Sign the candidates (--sign_spool): each leaves a record in the sign spool, signed later by a drain (the server
-    # when idle, or a job); ``sign_meta`` travels with the record (the caller's ids).
-    sign: bool = False
+    # Sign the candidates (--sign_spool): each leaves a record in the sign spool, signed in flight (--sign_inflight)
+    # or later by a drain (the server when idle, or a job); ``sign_meta`` travels with the record (the caller's ids).
+    # None: the server's default (--sign_default); False opts out.
+    sign: bool | None = None
     sign_meta: dict[str, Any] | None = None
 
 
@@ -787,6 +791,7 @@ class ModelInfo(BaseModel):
     startup: dict | None = None
     sign: dict | None = None
     kernel_pins: dict | None = None
+    memory: dict | None = None
 
 
 # ── /logprobs: batched prefill-only scoring (the four-register rider battery) ──
@@ -1306,8 +1311,11 @@ def engine_generate(request: GenerateRequest) -> GenerateResponse:
 async def engine_generate_stream(
     request: GenerateRequest,
     http_request: Request | None = None,
+    sign: bool = False,
 ):
-    """Streaming generation on the fast engine.
+    """Streaming generation on the fast engine. ``sign``: the stream's generated ids (and the stop token that ended
+    it) leave a sign record when it ends, a disconnect included (the drain signs it); the final event carries its
+    sign_id.
 
     Emits text via windowed incremental detokenization: pending token ids are
     decoded together and flushed as soon as the text does not end in an incomplete
@@ -1337,11 +1345,22 @@ async def engine_generate_stream(
             except HTTPException as exc:
                 yield f"data: {json.dumps({'error': str(exc.detail)})}\n\n"
                 return
-            input_ids = torch.tensor([_prompt_ids(request, _tokenizer)], device=_device)
+            prompt_list = _prompt_ids(request, _tokenizer)
+            input_ids = torch.tensor([prompt_list], device=_device)
             prompt_len = input_ids.shape[1]
             if prompt_len >= max_pos:
                 yield f'data: {{"error": "Prompt too long: {prompt_len} tokens"}}\n\n'
                 return
+            generated_ids: list[int] = []
+
+            def _record(stop: int | None) -> dict:
+                if not sign:
+                    return {}
+                resp = GenerateResponse(text="", prompt_tokens=prompt_len, completion_tokens=len(generated_ids),
+                                        tokens_per_second=0.0, prompt_ids=prompt_list,
+                                        completion_ids=list(generated_ids), stop_id=stop)
+                _spool_records(request, [resp])
+                return {"sign_id": resp.sign_id}
 
             params = _engine_params(request)
             t_prefill = time.perf_counter()
@@ -1360,7 +1379,8 @@ async def engine_generate_stream(
             token_id = int(tok.item())
 
             if token_id in _stop_token_ids:
-                yield f"data: {json.dumps({'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': 0})}\n\n"
+                done = {'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': 0, **_record(token_id)}
+                yield f"data: {json.dumps(done)}\n\n"
                 return
 
             generated_count = 0
@@ -1378,12 +1398,14 @@ async def engine_generate_stream(
 
             generated_count = 1
             pending.append(token_id)
+            generated_ids.append(token_id)
             delta = _flush()
             if delta:
                 yield f"data: {json.dumps({'token': delta})}\n\n"
 
             stopped = False
             interrupted = False
+            stop_id: int | None = None
             for _ in range(request.max_new_tokens - 1):
                 if prompt_len + generated_count >= max_pos:
                     break
@@ -1396,9 +1418,11 @@ async def engine_generate_stream(
                 )
                 token_id = int(tok.item())
                 if token_id in _stop_token_ids:
+                    stop_id = token_id
                     break
                 generated_count += 1
                 pending.append(token_id)
+                generated_ids.append(token_id)
                 delta = _flush()
                 if delta:
                     yield f"data: {json.dumps({'token': delta})}\n\n"
@@ -1413,7 +1437,11 @@ async def engine_generate_stream(
                     tail = _tokenizer.decode(pending, skip_special_tokens=True)
                     if tail:
                         yield f"data: {json.dumps({'token': tail})}\n\n"
-                yield f"data: {json.dumps({'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': generated_count})}\n\n"
+                done = {'done': True, 'prompt_tokens': prompt_len, 'completion_tokens': generated_count,
+                        **_record(stop_id)}
+                yield f"data: {json.dumps(done)}\n\n"
+            else:
+                _record(stop_id)  # what was generated before the client left is still served inference
         finally:
             # ALWAYS release steering (the broadcast rows, or the request's lever slot) so state never leaks
             # between requests — including the disconnect / GeneratorExit paths. Prefer the engine thread; fall
@@ -1577,6 +1605,9 @@ _sign_rows_arg = 128
 _sign_groups_arg = 16
 _sign_inflight_arg = False
 _sign_audit_every_arg = 100
+_sign_default_arg = False
+_profile_name: str | None = None
+_sign_engine_digest: str | None = None  # sha256 of the signer's engine identity at startup (records' meta)
 
 
 def attnres_routing() -> dict[str, Any]:
@@ -1658,7 +1689,7 @@ async def lifespan(app: FastAPI):
 def _start_signing() -> "asyncio.Task | None":
     """Open the sign spool (--sign_spool) and, with --sign_reducer, build the signing decoder on the generation thread
     and start the idle drain. Returns the drain task (None without a reducer)."""
-    global _sign_spool, _signer, _sign_writer, _sign_weights
+    global _sign_spool, _signer, _sign_writer, _sign_weights, _sign_engine_digest
     if not _sign_spool_arg:
         return None
     import socket
@@ -1692,6 +1723,8 @@ def _start_signing() -> "asyncio.Task | None":
         assert _xbatch is not None
         _xbatch.runner.sign_decoder = _signer.dec
         _xbatch.runner.between_steps = _sign_between_steps
+    _sign_engine_digest = hashlib.sha256(json.dumps(_signer.identity, sort_keys=True, default=str)
+                                         .encode("utf-8")).hexdigest()
     logger.info("sign: %sdraining %s when idle (%d-row signing decoder, %d groups, %d-token tails, reducer %s)",
                 "signing in flight and " if _sign_inflight_arg else "", _sign_spool.root, _signer.dec.rows,
                 _signer.dec.groups, _signer.dec.tail_tokens, getattr(reducer, "reducer_identity", "?"))
@@ -1815,6 +1848,7 @@ async def info():
         kernel_pins=None if _pins is None else {"mode": _pins.mode, "path": str(_pins.path), "kernels": len(_pins.table),
                                                 "hits": _pins.hits, "recorded": _pins.recorded,
                                                 "misses": len(_pins.misses), "digest": _pins.digest},
+        memory=_memory_info(),
     )
 
 
@@ -1854,19 +1888,32 @@ async def generate_endpoint(request: GenerateRequest, http_request: Request):
     if _model is None or _tokenizer is None:
         raise HTTPException(503, "Model not loaded")
     _refuse_unserved(request)
+    request = _resolve_sign(request)
 
-    if request.seed is not None or request.sign:  # seeded draws and signed requests take the batched decoders only
+    if request.seed is not None or (request.sign and not request.stream):
         if request.stream:
-            raise HTTPException(400, f"a {'signed' if request.sign else 'seeded'} request cannot stream")
+            raise HTTPException(400, "a seeded request cannot stream")
         out = await _batched_candidates(request, 1)
-        return out[0]
+        if out:
+            return out[0]
+        if _engine_compatible(request):  # a signed request no batched path takes: served serially, drain-signed
+            async with _engine_lock:
+                result = await _run_generation(engine_generate, request)
+        else:
+            result = await _run_generation(generate, request=request, model=_model, tokenizer=_tokenizer)
+        _sign_serial(request, [result])
+        return result
 
     if request.stream:
+        if request.sign:
+            _check_sign(request)
         if _engine_compatible(request):
             return StreamingResponse(
-                engine_generate_stream(request, http_request),
+                engine_generate_stream(request, http_request, sign=request.sign),
                 media_type="text/event-stream",
             )
+        if request.sign:
+            _count_unsigned("streamed by the eager reference path")
         return StreamingResponse(
             generate_stream(_model, _tokenizer, request, http_request),
             media_type="text/event-stream",
@@ -1931,8 +1978,9 @@ class OAICompletionRequest(BaseModel):
     penalty_scope: Literal["generated", "row"] = "generated"
     seed: int | None = Field(default=None, ge=0)
     min_p: float = Field(default=0.0, ge=0.0, lt=1.0)
-    # Sign the choices (as on /generate; needs --sign_spool): each choice then carries its sign_id.
-    sign: bool = False
+    # Sign the choices (as on /generate; needs --sign_spool): each choice then carries its sign_id. None: the
+    # server's default (--sign_default); False opts out.
+    sign: bool | None = None
     sign_meta: dict[str, Any] | None = None
 
     @model_validator(mode="before")
@@ -2108,6 +2156,35 @@ async def engine_generate_xbatch(request: GenerateRequest, n: int,
             for r, stop in zip(result.rows, stops)]
 
 
+def _resolve_sign(request: GenerateRequest, candidates: int = 1) -> GenerateRequest:
+    """``request`` with ``sign`` decided: unset takes the server's default (--sign_default, on a server with a
+    spool); an explicit False on a signing-by-default server is counted (``opted_out``, by candidate)."""
+    if request.sign is None:
+        return request.model_copy(update={"sign": bool(_sign_default_arg and _sign_spool is not None)})
+    if request.sign is False and _sign_default_arg:
+        _sign_stats["opted_out"] = _sign_stats.get("opted_out", 0) + candidates
+    return request
+
+
+def _count_unsigned(reason: str, candidates: int = 1) -> None:
+    """Candidates a signing server generated without a record, by reason (/info sign.stats.unsigned)."""
+    unsigned = _sign_stats.setdefault("unsigned", {})
+    unsigned[reason] = unsigned.get(reason, 0) + candidates
+    logger.warning("sign: %d candidate(s) served unsigned: %s", candidates, reason)
+
+
+def _sign_serial(request: GenerateRequest, responses: list[GenerateResponse]) -> None:
+    """Records for candidates a signed request got from the serial paths (the drain signs them): the fast engine's
+    responses carry their ids; the eager reference path's do not carry the stop token, so they are counted
+    unsigned instead."""
+    if not request.sign or not responses:
+        return
+    if not _engine_compatible(request):
+        _count_unsigned("served by the eager reference path", len(responses))
+        return
+    _spool_records(request, responses)
+
+
 def _check_sign(request: GenerateRequest) -> None:
     """400 on a signed request the sign path cannot reproduce: no spool, or broadcast steering (only levers travel
     with a record, by their plan)."""
@@ -2145,7 +2222,7 @@ def _sign_records(request: GenerateRequest, responses: list[GenerateResponse]) -
                                   generated_ids=tuple(generated), weights=_sign_weights,
                                   lever=plan.digest() if plan is not None else None,
                                   meta={**(request.sign_meta or {}), "candidate": i, "seed": request.seed,
-                                        "law": law, "served_by": _sign_writer}))
+                                        "law": law, "served_by": _sign_writer, **_sign_provenance()}))
     return records, plan
 
 
@@ -2228,11 +2305,46 @@ def _sign_reduce_batch(take: list) -> None:
                 summary.get("batch"), summary.get("signed", 0), summary.get("skipped", 0), t2 - t0, t1 - t0, t2 - t1)
 
 
-def _sign_count(summary: dict) -> None:
+def _sign_count(summary: dict, inflight: bool = True) -> None:
     _sign_stats["batches"] += 1
     _sign_stats["signed"] += summary.get("signed", 0)
     _sign_stats["skipped"] += summary.get("skipped", 0)
-    _sign_stats["inflight_batches"] = _sign_stats.get("inflight_batches", 0) + 1
+    reasons = _sign_stats.setdefault("skipped_reasons", {})
+    for reason, n in (summary.get("skip_reasons") or {}).items():
+        reasons[reason] = reasons.get(reason, 0) + n
+    if inflight:
+        _sign_stats["inflight_batches"] = _sign_stats.get("inflight_batches", 0) + 1
+
+
+def _memory_info() -> dict | None:
+    """The device's memory as the server holds it (GB): allocated and reserved now and at their peaks since start,
+    and the large fixed holders: the engine's and the row decoders' KV, the signing decoder's sign buffers."""
+    if _device is None or getattr(_device, "type", None) != "cuda" or not torch.cuda.is_available():
+        return None
+    gb = 1e9
+    out: dict[str, Any] = {
+        "allocated_gb": round(torch.cuda.memory_allocated(_device) / gb, 2),
+        "reserved_gb": round(torch.cuda.memory_reserved(_device) / gb, 2),
+        "peak_allocated_gb": round(torch.cuda.max_memory_allocated(_device) / gb, 2),
+        "peak_reserved_gb": round(torch.cuda.max_memory_reserved(_device) / gb, 2),
+        "device_total_gb": round(torch.cuda.get_device_properties(_device).total_memory / gb, 2),
+    }
+    if _xbatch is not None:
+        widest = _xbatch.runner.decoders[_xbatch.runner.max_rows]
+        out["row_kv_gb"] = round(widest.kv_bytes() / gb, 2)  # the narrower buckets view the widest one's storage
+    if _signer is not None and _signer.dec.sign is not None:
+        dec = _signer.dec
+        out["sign_buffers_gb"] = round(sum(getattr(dec, f"sign_{n}").numel() * getattr(dec, f"sign_{n}").element_size()
+                                           for n in dec.sign_names) / gb, 2)
+    return out
+
+
+def _sign_provenance() -> dict[str, Any]:
+    """What every record names about the server that generated it: its serve profile, its kernel pin table's digest
+    (as it stands), the signer's engine identity digest (at startup; None without an in-process signer) and whether
+    it signs in flight."""
+    return {"profile": _profile_name, "pins": _pins.digest if _pins is not None else None,
+            "engine_identity": _sign_engine_digest, "inflight": _sign_inflight_arg}
 
 
 def _sign_info() -> dict | None:
@@ -2281,9 +2393,7 @@ async def _sign_when_idle() -> None:
             await asyncio.sleep(30.0)
             continue
         if summary:
-            _sign_stats["batches"] += 1
-            _sign_stats["signed"] += summary.get("signed", 0)
-            _sign_stats["skipped"] += summary.get("skipped", 0)
+            _sign_count(summary, inflight=False)
 
 
 async def _batched_candidates(request: GenerateRequest, n: int) -> list[GenerateResponse]:
@@ -2293,20 +2403,17 @@ async def _batched_candidates(request: GenerateRequest, n: int) -> list[Generate
     batched paths only, and its candidates' records go to the sign spool."""
     if request.sign:
         _check_sign(request)
-        if _sign_inflight_arg:
-            if not _xbatch_compatible(request, n):
-                raise HTTPException(400, "'sign' (in flight) needs the cross-request batcher: a pure-temperature law "
-                                         "(temperature > 0, no top-k/top-p), n within the widest bucket and "
-                                         "max_tokens within the row cap")
+        if _sign_inflight_arg and _xbatch_compatible(request, n):
             signed: list = []
             out = await engine_generate_xbatch(request, n, signed_out=signed)
             _sign_add_inflight(request, out, signed)
             return out
+        # not capturable in flight (another law, a candidate past the row cap, ...): generated as unsigned, its
+        # records signed by the drain; [] when no batched path takes it (the caller serves it serially and calls
+        # _sign_serial)
         out = await _batched_candidates(request.model_copy(update={"sign": False}), n)
-        if not out:
-            raise HTTPException(400, "'sign' needs the batched decoders (--xbatch_rows or --multi_rows) and a "
-                                     "pure-temperature law (temperature > 0, no top-k/top-p)")
-        _spool_records(request, out)
+        if out:
+            _spool_records(request, out)
         return out
     if request.seed is not None:
         if not _seeded_rows:
@@ -2364,16 +2471,17 @@ async def oai_completions(request: OAICompletionRequest):
     _refuse_unserved(request)
 
     choices = []
-    gen_req = oai_completion_to_generate(request)
-    batched = await _batched_candidates(gen_req, request.n)
-    for i in range(request.n):
-        if batched:
-            result = batched[i]
-        elif _engine_compatible(gen_req):
-            async with _engine_lock:
-                result = await _run_generation(engine_generate, gen_req)
-        else:
-            result = await _run_generation(generate, model=_model, tokenizer=_tokenizer, request=gen_req)
+    gen_req = _resolve_sign(oai_completion_to_generate(request), request.n)
+    results = await _batched_candidates(gen_req, request.n)
+    if not results:
+        for _ in range(request.n):
+            if _engine_compatible(gen_req):
+                async with _engine_lock:
+                    results.append(await _run_generation(engine_generate, gen_req))
+            else:
+                results.append(await _run_generation(generate, model=_model, tokenizer=_tokenizer, request=gen_req))
+        _sign_serial(gen_req, results)
+    for i, result in enumerate(results):
         choice = {
             "text": html.unescape(result.text),
             "index": i,
@@ -2450,8 +2558,9 @@ class OAIChatRequest(BaseModel):
     stream: bool = False
     n: int = Field(default=1, ge=1, le=64)
     return_token_ids: bool = False
-    # Sign the choices (as on /generate; needs --sign_spool): each choice then carries its sign_id.
-    sign: bool = False
+    # Sign the choices (as on /generate; needs --sign_spool): each choice then carries its sign_id. None: the
+    # server's default (--sign_default); False opts out.
+    sign: bool | None = None
     sign_meta: dict[str, Any] | None = None
 
     @model_validator(mode="before")
@@ -2490,11 +2599,18 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
             repetition_penalty=repetition_penalty,
             stop_strings=stop_strings,
             stream=True,
+            sign=request.sign,
+            sign_meta=request.sign_meta,
         )
+        gen_req = _resolve_sign(gen_req)
+        if gen_req.sign:
+            _check_sign(gen_req)
 
         if _engine_compatible(gen_req):
-            source_stream = engine_generate_stream(gen_req, http_request)
+            source_stream = engine_generate_stream(gen_req, http_request, sign=gen_req.sign)
         else:
+            if gen_req.sign:
+                _count_unsigned("streamed by the eager reference path")
             source_stream = generate_stream(_model, _tokenizer, gen_req, http_request)
 
         async def chat_stream():
@@ -2542,15 +2658,17 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
         sign=request.sign,
         sign_meta=request.sign_meta,
     )
-    batched = await _batched_candidates(gen_req, request.n)
-    for i in range(request.n):
-        if batched:
-            result = batched[i]
-        elif _engine_compatible(gen_req):
-            async with _engine_lock:
-                result = await _run_generation(engine_generate, gen_req)
-        else:
-            result = await _run_generation(generate, model=_model, tokenizer=_tokenizer, request=gen_req)
+    gen_req = _resolve_sign(gen_req, request.n)
+    results = await _batched_candidates(gen_req, request.n)
+    if not results:
+        for _ in range(request.n):
+            if _engine_compatible(gen_req):
+                async with _engine_lock:
+                    results.append(await _run_generation(engine_generate, gen_req))
+            else:
+                results.append(await _run_generation(generate, model=_model, tokenizer=_tokenizer, request=gen_req))
+        _sign_serial(gen_req, results)
+    for i, result in enumerate(results):
         total_completion_tokens += result.completion_tokens
         choice = {
             "index": i,
@@ -2714,7 +2832,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sign_reducer", default=None,
                         help="With --sign_spool: a SignatureReducer (package.module:attr) this server signs its spool "
                              "with whenever it is idle (a 128-row signing decoder beside the serving ones)")
-    parser.add_argument("--sign_reducer_kwargs", default="{}", help="JSON keyword arguments for --sign_reducer")
+    parser.add_argument("--sign_reducer_kwargs", default=None, help="JSON keyword arguments for --sign_reducer")
     parser.add_argument("--sign_layers", default="",
                         help="With --sign_reducer: the sampled effective layers, comma-separated")
     parser.add_argument("--sign_tail", type=int, default=256,
@@ -2731,6 +2849,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "tokens the unsigned bucket decodes), each candidate's span is captured as it ends and "
                              "reduced in this process, and its signatures land in the spool as signed batches (the "
                              "records too); the idle drain signs on the same decoder")
+    parser.add_argument("--sign_default", action=argparse.BooleanOptionalAction, default=False,
+                        help="Sign every generation request that does not set `sign` (an explicit `sign: false` "
+                             "opts out and is counted); /logprobs and /score_tokens are never signed. A server that "
+                             "signs (this, or --sign_inflight) takes the site's signer where its flags leave it unset: "
+                             "$KOTODAMA_SIGN_SPOOL, $KOTODAMA_SIGN_REDUCER, $KOTODAMA_SIGN_REDUCER_KWARGS, and "
+                             "$KOTODAMA_SIGN_PYTHONPATH (where the reducer's package lives, put on sys.path); one that "
+                             "signs by default refuses to start without a spool, a reducer and --sign_layers")
     parser.add_argument("--sign_audit_every", type=int, default=100,
                         help="With --sign_reducer: keep the raw signed surfaces of 1 row in N (0: none)")
     parser.add_argument("--host", default="0.0.0.0")
@@ -2824,6 +2949,20 @@ if __name__ == "__main__":
     _autotune_min_rows_arg = args.autotune_min_rows
     _emulate_casts_arg = args.emulate_casts
     _kernel_pins_arg = args.kernel_pins
+    if args.sign_default or args.sign_inflight:  # the site's signer, where the flags leave it unset
+        args.sign_spool = args.sign_spool or os.environ.get("KOTODAMA_SIGN_SPOOL") or None
+        args.sign_reducer = args.sign_reducer or os.environ.get("KOTODAMA_SIGN_REDUCER") or None
+        if args.sign_reducer_kwargs is None:
+            args.sign_reducer_kwargs = os.environ.get("KOTODAMA_SIGN_REDUCER_KWARGS") or None
+        for extra in (os.environ.get("KOTODAMA_SIGN_PYTHONPATH") or "").split(os.pathsep):
+            if extra and args.sign_reducer and extra not in sys.path:
+                sys.path.append(extra)  # after the server's own packages: nothing there shadows them
+    args.sign_reducer_kwargs = args.sign_reducer_kwargs or "{}"
+    if args.sign_default and not (args.sign_spool and args.sign_reducer and args.sign_layers):
+        parser.error("this server signs every request (--sign_default, set by its profile) but has no "
+                     f"{'sign spool' if not args.sign_spool else 'reducer' if not args.sign_reducer else 'sign layers'}"
+                     ": set KOTODAMA_SIGN_SPOOL, KOTODAMA_SIGN_REDUCER and KOTODAMA_SIGN_REDUCER_KWARGS (site.env), or "
+                     "pass --no-sign_default to serve without signatures")
     if args.sign_reducer and not args.sign_spool:
         parser.error("--sign_reducer needs --sign_spool")
     if args.sign_spool and _engine_arg != "fast":
@@ -2835,6 +2974,9 @@ if __name__ == "__main__":
         parser.error(f"--sign_layers / --sign_reducer_kwargs: {exc}")
     if args.sign_reducer and not _sign_layers_arg:
         parser.error("--sign_reducer needs --sign_layers")
+    if args.sign_inflight and not args.sign_spool and not args.sign_default:
+        print("no sign spool and --no-sign_default: --sign_inflight is off (this server signs nothing)")
+        args.sign_inflight = False
     if args.sign_inflight and not (args.sign_reducer and _xbatch_rows_arg and args.cascade_attn):
         parser.error("--sign_inflight needs --sign_reducer, --xbatch_rows and --cascade_attn")
     if args.sign_inflight and _autotune_min_rows_arg <= max(_xbatch_rows_arg) and _compile_mode_arg.startswith(
@@ -2857,6 +2999,8 @@ if __name__ == "__main__":
     _sign_rows_arg = args.sign_rows
     _sign_groups_arg = args.sign_groups
     _sign_inflight_arg = args.sign_inflight
+    _sign_default_arg = args.sign_default
+    _profile_name = _profile_arg
     _sign_audit_every_arg = args.sign_audit_every
 
     import uvicorn

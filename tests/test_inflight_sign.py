@@ -329,8 +329,39 @@ def test_server_signs_in_flight(monkeypatch, model: KotodamaModel, tmp_path) -> 
             continue
         assert np.array_equal(feats[row["file"]][row["index"]], res.reduced.features.astype(np.float32))
     assert sum("file" in row for row in rows) >= 2
-    # in flight, a signed request the batcher cannot take is refused
-    assert client.post("/v1/completions", json={**body, "temperature": 0}).status_code == 400
+    # a request the batcher cannot take (greedy) is served serially and signed by the drain from its record
+    greedy = client.post("/v1/completions", json={**{k: v for k, v in body.items() if k != "seed"}, "temperature": 0,
+                                                    "n": 2})
+    assert greedy.status_code == 200 and all(c["sign_id"] for c in greedy.json()["choices"])
+    assert spool.pending() == 2
+    # signing by default: a request that does not set `sign` is signed; `sign: false` opts out and is counted
+    monkeypatch.setattr(server, "_sign_default_arg", True)
+    monkeypatch.setattr(server, "_profile_name", "test-profile")
+    quiet = {k: v for k, v in body.items() if k not in ("sign", "sign_meta", "seed")}
+    r = client.post("/v1/completions", json={**quiet, "temperature": 0})
+    assert r.status_code == 200 and all(c.get("sign_id") for c in r.json()["choices"])
+    assert spool.pending() == 5
+    r = client.post("/v1/completions", json={**quiet, "temperature": 0, "sign": False})
+    assert r.status_code == 200 and not any(c.get("sign_id") for c in r.json()["choices"])
+    assert spool.pending() == 5 and server._sign_stats["opted_out"] == 3
+    # a stream leaves one record, its sign_id in the final event, its ids the ones streamed
+    r = client.post("/generate", json={"prompt": "a stream", "max_new_tokens": 6, "temperature": 0, "stream": True})
+    done = [json.loads(line[6:]) for line in r.text.splitlines() if line.startswith("data: ")][-1]
+    assert done["done"] and done["sign_id"] and spool.pending() == 6
+    recs = {rec.request_id: rec for path in (tmp_path / "spool" / "records").glob("*.jsonl")
+            for rec in read_records(path)}
+    streamed = recs[done["sign_id"]]
+    assert len(streamed.generated_ids) in (done["completion_tokens"], done["completion_tokens"] + 1)
+    # every record names the server that generated it
+    assert streamed.meta["profile"] == "test-profile" and streamed.meta["inflight"] is True
+    assert {"pins", "engine_identity", "served_by", "seed", "law"} <= set(streamed.meta)
+    # the drain signs them; spans it skips are counted by reason
+    summaries = []
+    with torch.inference_mode():
+        while (summary := spool.drain_once(rs)) is not None:  # one batch of the decoder's width at a time
+            summaries.append(summary)
+    assert sum(x["signed"] + x["skipped"] for x in summaries) == 6 and spool.pending() == 0
+    assert all(sum(x["skip_reasons"].values()) == x["skipped"] for x in summaries)
 
 
 @torch.inference_mode()
@@ -349,3 +380,18 @@ def test_warm_hands_the_reducer_one_batch(model: KotodamaModel) -> None:
             raise RuntimeError("no")
 
     RecordSigner(signer, Broken(), compile_mode="aot_eager").warm(prompt_len=8, span=4, reduce=True)  # logged
+
+
+def test_a_signing_profile_refuses_to_start_unconfigured(tmp_path) -> None:
+    """A server whose profile signs every request, on a site without a sign spool or reducer, exits before loading
+    anything, naming the fix; --no-sign_default serves unsigned (in-flight signing then off)."""
+    import subprocess
+    import sys
+
+    from pathlib import Path
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KOTODAMA_SIGN_")}
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    cmd = [sys.executable, "-m", "kotodama.serve.server", "--profile", "tsumugi-1b", "--port", "1"]
+    out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+    assert out.returncode == 2 and "KOTODAMA_SIGN_SPOOL" in out.stderr and "--no-sign_default" in out.stderr
