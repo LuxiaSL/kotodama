@@ -1,6 +1,7 @@
 """Serve profiles (kotodama.serve.profiles): every profile in configs/serve names only server flags and parses to a
 complete command line; a flag given on the command line overrides the profile; the profile's environment never
-overrides one already set; a key that is not a server flag is refused."""
+overrides one already set; a key that is not a server flag is refused. A tsumugi-lineage shape started without the
+AttnRes eps compatibility it trained with is refused unless explicitly allowed."""
 
 from __future__ import annotations
 
@@ -87,3 +88,13 @@ def test_narrow_row_buckets_skip_kernel_benchmarking(monkeypatch) -> None:
     monkeypatch.setattr(server, "_autotune_min_rows", 0)
     monkeypatch.setattr(server, "_compile_mode", "max-autotune")
     assert server._row_compile_mode(16) == "max-autotune"
+
+
+def test_a_tsumugi_shape_without_the_eps_compat_is_refused() -> None:
+    from kotodama.serve.server import attnres_eps_refusal
+
+    assert "KOTODAMA_ATTNRES_EPS_FP64_COMPAT" in attnres_eps_refusal("1b-tsumugi", {}, allowed=False)
+    assert attnres_eps_refusal("1b-moonshot-loop", {}, allowed=False) is not None  # the alias resolves to it
+    assert attnres_eps_refusal("1b-tsumugi", {"KOTODAMA_ATTNRES_EPS_FP64_COMPAT": "1"}, allowed=False) is None
+    assert attnres_eps_refusal("1b-tsumugi", {}, allowed=True) is None
+    assert attnres_eps_refusal("1b-standard", {}, allowed=False) is None  # routes in the kernels' own precision
