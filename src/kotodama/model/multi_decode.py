@@ -30,7 +30,7 @@ import torch.nn.functional as F
 
 from kotodama.model.cascade_attn import attend_for, merge, pack_group_queries, unpack_group_outputs
 from kotodama.model.decode_engine import DecodeEngine, SamplingParams
-from kotodama.model import signing
+from kotodama.model import attn_stats, signing
 from kotodama.model.llama import apply_rope
 from kotodama.model.regional import (REGION_MODES, StepGraph, build_regions, check_norms, layer_signatures,
                                      own_code, route_weights, run_regions, sign_write)
@@ -331,7 +331,10 @@ class MultiSampleDecoder(nn.Module):
         out = self._attend(layer_idx, q, k, v)  # (B, 1, n_heads * head_dim)
         if stats:
             _, kvs, state = self._regional_attend()
-            signing.stats_write(self._stats_args(layer_idx), self._probs(q, kvs[layer_idx], state), stats == 2)
+            if self._stats_fn is not None:
+                self._stats_fn(self._stats_args(layer_idx), q, kvs[layer_idx], state, stats == 2)
+            else:
+                signing.stats_write(self._stats_args(layer_idx), self._probs(q, kvs[layer_idx], state), stats == 2)
         return F.linear(out, attn.o_proj.weight)
 
     def _attend(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -540,6 +543,9 @@ class MultiSampleDecoder(nn.Module):
 
     # The attention probabilities of this decoder's attention (signing statistics), on the regional attend's tensors.
     _probs = staticmethod(_slot_probs)
+    # A function that writes a layer's attention statistics itself (stats_tuple, q, kv, state, sampled), in place of
+    # ``_probs`` + signing.stats_write; None: the reference.
+    _stats_fn: Optional[Callable] = None
 
     # ── signing (kotodama.model.signing) ────────────────────────────────────
 
@@ -587,7 +593,7 @@ class MultiSampleDecoder(nn.Module):
         self._regional_layers, self.regional_variants = build_regions(
             eng, self.regional_signatures(), kvs, "decode_layer", attend=attend, steer=bool(eng.steer_enabled),
             capture_col=self.capture_layers.index, sign_args=self._sign_args, probs=self._probs,
-            stats_args=self._stats_args, **opts)
+            stats_args=self._stats_args, stats_fn=self._stats_fn, **opts)
 
     def _final_logits(self, committed: list[torch.Tensor], partial: torch.Tensor) -> torch.Tensor:
         """The step's tail after the last layer: final routing, norm and LM head, then every row's position advances.
@@ -1105,6 +1111,8 @@ class CascadeDecoder(MultiSampleDecoder):
         super().__init__(engine, rows, kv_from=kv_from, readout_k=readout_k, capture_layers=capture_layers,
                          seeded=seeded, sign=sign)
         self.attend_backend, self._attend_fn = attend_for(engine.device, engine.dtype)
+        # attention statistics by the fused kernel where it runs (kotodama.model.attn_stats), else the reference
+        self._stats_fn = attn_stats.cascade_stats if attn_stats.available(engine.device, engine.dtype) else None
         self._row_group = [-1] * self.rows  # host: the group each row reads its prompt from (-1: none)
         self._group_members: list[set[int]] = [set() for _ in range(self.groups)]
         self._group_len = [0] * self.groups  # host mirror of prompt_lens

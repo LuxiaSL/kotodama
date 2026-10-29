@@ -262,7 +262,7 @@ def export(spec: SignSpec, bufs: dict[str, torch.Tensor], row: int, *, start: in
 
 # Source files whose code is the engine's arithmetic: a change to any of them is another engine lane.
 ENGINE_SOURCES = ("regional.py", "multi_decode.py", "decode_engine.py", "cascade_attn.py", "signing.py", "llama.py",
-                  "kernel_pins.py")
+                  "kernel_pins.py", "attn_stats.py")
 
 
 def engine_identity(*, compile_mode: str, width: int, weights: str, pins_digest: Optional[str],

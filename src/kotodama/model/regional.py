@@ -104,7 +104,7 @@ def cache_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[to
 def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_heads: int, n_kv_heads: int,
                        head_dim: int, intermediate: int, qk_norm: bool, levers: bool, steer: bool,
                        attend: Callable, linear: Callable = F.linear, sign: int = 0, stats: int = 0,
-                       probs: Optional[Callable] = None) -> Callable:
+                       probs: Optional[Callable] = None, stats_fn: Optional[Callable] = None) -> Callable:
     """One layer as a function of tensors, mirroring the loop body of MultiSampleDecoder._forward_step and of
     DecodeEngine's step and block forwards: pre-attention routing over ``committed + [partial]``, the attention
     sublayer (KV write and attend through ``attend(q, k, v, kv, state)``), the lever and broadcast-steering adds,
@@ -117,7 +117,8 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
     writes its routing (1) and a sampled layer's surfaces too (2) through ``sign_write`` (``sign_args``: its sign
     tuple); the arithmetic of everything it returns is the same as without. With ``stats`` (1: every layer's statistics, 2: a sampled layer's too) the layer
     writes its attention statistics through kotodama.model.signing.stats_write from ``probs(q, kv, state)`` (the
-    attention's probabilities in absolute column order; ``stats_args``: its stats tuple). The function gets a code
+    attention's probabilities in absolute column order; ``stats_args``: its stats tuple), or with ``stats_fn`` through
+    ``stats_fn(stats_args, q, kv, state, sampled)``, which writes the same statistics itself (a fused kernel). The function gets a code
     object of its own named ``name``, so its compiled graphs are cached apart from every other signature's."""
     q_dim, kv_dim = n_heads * head_dim, n_kv_heads * head_dim
 
@@ -149,7 +150,9 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         attended = attend(q, k, v, kv, state)
-        if stats:
+        if stats and stats_fn is not None:
+            stats_fn(stats_args, q, kv, state, stats == 2)
+        elif stats:
             stats_write(stats_args, probs(q, kv, state), stats == 2)
         attn_out = linear(attended, w_o)
         if levers:
@@ -252,7 +255,8 @@ def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, int, int]],
                   kvs: Sequence[tuple[torch.Tensor, ...]], prefix: str, *, attend: Callable, steer: bool,
                   linear: Callable = F.linear, capture_col: Optional[Callable[[int], int]] = None,
                   sign_args: Optional[Callable[[int], tuple]] = None, probs: Optional[Callable] = None,
-                  stats_args: Optional[Callable[[int], tuple]] = None, **opts) -> tuple[list[Region], int]:
+                  stats_args: Optional[Callable[[int], tuple]] = None, stats_fn: Optional[Callable] = None,
+                  **opts) -> tuple[list[Region], int]:
     """One compiled layer per distinct signature (committed sources, boundary, capture, sign, stats) over a
     DecodeEngine's weights, and each effective layer's (compiled layer, boundary, capture column or -1, its tensors,
     its KV buffers, its sign tuple or None, its stats tuple or None). The compiled functions are named
@@ -272,7 +276,7 @@ def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, int, int]],
             name = (f"{prefix}_c{c}{'_boundary' if boundary else ''}{'_capture' if capture else ''}"
                     f"{f'_sign{sign}' if sign else ''}{f'_stats{stats}' if stats else ''}")
             fns[sig] = torch.compile(make_layer(name, is_boundary=boundary, capture=capture, sign=sign, stats=stats,
-                                                probs=probs, **static), **opts)
+                                                probs=probs, stats_fn=stats_fn, **static), **opts)
         layer = model.layers[li]
         attn = layer.attn
         tensors = (layer.attn_res_query, layer.attn_res_norm.weight, layer.mlp_res_query, layer.mlp_res_norm.weight,
