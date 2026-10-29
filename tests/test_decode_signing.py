@@ -328,7 +328,7 @@ def test_signed_rows_name_their_weights(model: KotodamaModel) -> None:
     assert weights_digest(bf16) == digest and weights_digest(bf16.to(torch.bfloat16)) != digest  # loaded dtype
 
 
-# anamnesis's pinned module for the lane weights rule v1 (its tests/test_weights_binding.py), mirrored so both codebases
+# anamnesis's pinned module for the lane weights rule v1 (from its own test suite), mirrored so both codebases
 # pin the same bytes: a float32 linear, a bfloat16 parameter, a persistent scalar buffer, a non-persistent buffer
 # (not hashed) and a tied pair (hashed under each key).
 _PINNED_DIGEST = "1176665bb75973e4742f40273ca02227d0587f84c951bee891e22b231d2e31e0"

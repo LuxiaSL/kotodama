@@ -3,7 +3,7 @@ inductor's runtime autotuner, without a GPU.
 
 What is pinned here:
   * replay keeps exactly the recorded config, refuses a kernel the table does not hold (or, allowed, takes its first
-    config and records the miss, which changes the digest), and refuses a pinned config the kernel no longer has;
+    config and records the miss, which changes the digest), and refuses a pinned config the kernel does not have;
   * record mode leaves the choice to the autotuner and records it; first mode always takes the first config;
   * the digest is a function of the table alone, and a saved table replays the same choices;
   * install patches CachingAutotuner.autotune_to_one_config so a kernel's launchers are cut to the pinned one.
