@@ -151,9 +151,9 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
         q_pre, k_pre = q, k
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
+        lse = None
         if stats and stats_fn is not None:
             attended, lse = attend(q, k, v, kv, state, lse=True)
-            stats_fn(stats_args, q, kv, state, stats == 2, lse)
         else:
             attended = attend(q, k, v, kv, state)
         if stats and stats_fn is None:
@@ -178,6 +178,10 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
         out = new + mlp_out
         if sign and sign_args[9] is not None:  # the output partial (the depth path, or a sampled layer's hidden)
             sign_args[9][sign_args[1], sign_args[2], sign_args[10].expand(B)] = out[:, -1]
+        if lse is not None:
+            # last: a fused kernel is opaque to the compiler, and launched mid-layer it would split the fusions of
+            # everything after it (the layer's arithmetic would then differ from the unsigned layer's)
+            stats_fn(stats_args, q, kv, state, stats == 2, lse)
         if capture:
             return out, x_mlp
         return out
@@ -201,6 +205,21 @@ def own_code(fn: Callable, name: str) -> Callable:
 # The region mode for each whole-step mode: the same autotuning, without CUDA graphs (the whole step is captured as
 # one graph around the regions instead).
 REGION_MODES = {"reduce-overhead": "default", "max-autotune": "max-autotune-no-cudagraphs"}
+
+
+def region_options(mode: str, emulate_casts: bool = False) -> dict:
+    """The inductor options of a region compiled for whole-step ``mode``: its region mode's (REGION_MODES), and with
+    ``emulate_casts`` intermediates rounded to their dtype where eager rounds them (``emulate_precision_casts``).
+    Inductor otherwise keeps a fused chain's intermediates in fp32, so where a fusion boundary falls changes the
+    arithmetic, and a signing layer's extra stores move fusion boundaries: with the rounding fixed, a signing decoder
+    computes what an unsigned one does, bit for bit, under one kernel pin table
+    (scripts/benchmark/check_signed_generation.py). It costs the 1B's 128-row step ~4%."""
+    import torch._inductor
+
+    opts = dict(torch._inductor.list_mode_options(REGION_MODES.get(mode, mode)))
+    if emulate_casts:
+        opts["emulate_precision_casts"] = True
+    return opts
 
 
 class StepGraph:

@@ -246,7 +246,8 @@ class RecordSigner:
             extra={"decoder": {"class": type(dec).__name__, "rows": dec.rows, "groups": dec.groups,
                                "group_rows": dec.group_rows, "tail_tokens": dec.tail_tokens,
                                "max_seq_len": dec.max_seq_len, "seeded": dec.seeded},
-                   "sign": dataclasses.asdict(self.spec), "steering": self.steering, "adapter": self.adapter})
+                   "sign": dataclasses.asdict(self.spec), "steering": self.steering, "adapter": self.adapter,
+                   "emulate_casts": dec.engine.emulate_casts})
 
     @classmethod
     def build(cls, engine: Any, reducer: signing.SignatureReducer, *, layers: Sequence[int], tail: int, width: int,

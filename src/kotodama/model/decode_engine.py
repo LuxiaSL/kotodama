@@ -47,8 +47,8 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from kotodama.model.gemv_kernels import decode_gemv, use_custom_gemv
 from kotodama.model.levers import LeverTables
 from kotodama.model.llama import KotodamaModel, apply_rope
-from kotodama.model.regional import (REGION_MODES, StepGraph, build_regions, cache_attend, check_norms, layer_signatures,
-                                     run_regions)
+from kotodama.model.regional import (StepGraph, build_regions, cache_attend, check_norms, layer_signatures,
+                                     region_options, run_regions)
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +175,7 @@ class DecodeEngine(nn.Module):
         prefill_backends: Optional[list[SDPBackend]] = None,
         steer_enabled: bool = False,
         levers: int = 0,
+        emulate_casts: bool = False,
     ) -> None:
         super().__init__()
         if not model.config.attn_res:
@@ -186,6 +187,9 @@ class DecodeEngine(nn.Module):
             )
         self.model = model
         self.config = model.config
+        # compiled regions round intermediates as eager does (regional.region_options), the engine's and every
+        # decoder's built on it: signing decoders then decode what unsigned ones do
+        self.emulate_casts = bool(emulate_casts)
         self.device = device or next(model.parameters()).device
         self.dtype = dtype
         self.max_seq_len = int(max_seq_len or model.config.max_position_embeddings)
@@ -1406,8 +1410,8 @@ class DecodeEngine(nn.Module):
         opts = dict(fullgraph=True, dynamic=False, backend=backend)
         block_opts = dict(opts)
         if backend == "inductor":
-            opts["mode"] = REGION_MODES.get(mode, mode)
-            block_opts["mode"] = REGION_MODES.get(block_mode, block_mode)
+            opts["options"] = region_options(mode, self.emulate_casts)
+            block_opts["options"] = region_options(block_mode, self.emulate_casts)
         kvs = list(zip(self.k_caches, self.v_caches))
         sigs = [(c, b, False, False, 0) for c, b in layer_signatures(self._boundaries, self.n_layers)]
         build = dict(attend=cache_attend, linear=decode_linear, **opts)
@@ -1440,9 +1444,11 @@ class DecodeEngine(nn.Module):
             else:
                 self._block_runs[b] = self._regional_block_forward
         self._compiled_block = self._regional_block
+        region_mode = f"{mode}{' (emulated casts)' if self.emulate_casts else ''}" if backend == "inductor" else backend
         logger.info("DecodeEngine: regional step and block forward, %d layer signatures over %d layers (blocks %s), "
                     "regions %s, %s", self.regional_variants, self.n_layers, self.block_buckets,
-                    opts.get("mode", backend), "whole-forward CUDA graphs" if cuda_graph else "no CUDA graph")
+                    region_mode,
+                    "whole-forward CUDA graphs" if cuda_graph else "no CUDA graph")
 
     @torch.inference_mode()
     def warm_blocks(self) -> None:

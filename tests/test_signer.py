@@ -283,6 +283,7 @@ def test_the_spool_drains_one_batch_at_a_time(model: KotodamaModel, tmp_path) ->
     # the warm-up prefill runs every block bucket the cache has room for (a long prompt's chunks launch kernels a
     # short one does not, and a recorded pin table must hold them)
     assert lens == [min(sum(eng.block_buckets), eng.max_seq_len - built.dec.tail_tokens)]
+    assert built.identity["emulate_casts"] is False  # part of the lane: it changes the regions' arithmetic
     keep = built.reducer
     assert spool.drain_once(built)["signed"] == 1
     _same(keep.rows[recs[0].prompt_ids + recs[0].generated_ids],

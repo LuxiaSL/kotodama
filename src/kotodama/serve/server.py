@@ -373,7 +373,7 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True, regional: bool = False, autotune_min_rows: int = 0) -> tuple[KotodamaModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True, regional: bool = False, autotune_min_rows: int = 0, emulate_casts: bool = False) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
     global _row_token_cap, _cascade_info, _levers, _seeded_rows, _compile_mode, _warm_truncated, _regional
     global _compile_store_state, _autotune_min_rows
@@ -492,6 +492,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             "levers": levers, "seeded_rows": seeded_rows, "steer_npz": steer_npz is not None,
             "compile_mode": compile_mode, "warm_truncated": bool(warm_truncated), "regional": bool(regional),
             "autotune_min_rows": int(autotune_min_rows),
+            # present only when on, so the stores of servers without it keep their keys
+            **({"emulate_casts": True} if emulate_casts else {}),
         })
         store_key = compile_cache.cache_key(store_fields)
         store_hit, store_claim = compile_cache.acquire(compile_store, store_key)
@@ -509,7 +511,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             # graphs.
             # --levers: per-request lever tables replace the broadcast rows (banks resolve into levers).
             eng = DecodeEngine(model, max_seq_len=_max_seq_len, steer_enabled=steer_npz is not None and not levers,
-                               levers=levers)
+                               levers=levers, emulate_casts=emulate_casts)
             global _regional
             if _regional:
                 try:
@@ -1553,6 +1555,7 @@ _warm_truncated_arg = True
 _regional_arg = True
 _startup_budget_s_arg = 1800.0
 _autotune_min_rows_arg = 0
+_emulate_casts_arg = False
 _kernel_pins_arg: str | None = None
 _sign_spool_arg: str | None = None
 _sign_reducer_arg: str | None = None
@@ -1620,6 +1623,7 @@ async def lifespan(app: FastAPI):
         warm_truncated=_warm_truncated_arg,
         regional=_regional_arg,
         autotune_min_rows=_autotune_min_rows_arg,
+        emulate_casts=_emulate_casts_arg,
     )
     sign_task = _start_signing()
     if _pins is not None and _pins.mode == "record":
@@ -2493,6 +2497,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "width, and capture each step whole as one CUDA graph; a fraction of the compile time at "
                              "the same or better step time. --no-regional compiles the whole-step graphs (a model "
                              "whose norms the regions cannot run falls back to them, logged)")
+    parser.add_argument("--emulate_casts", action=argparse.BooleanOptionalAction, default=False,
+                        help="Compiled decode regions round intermediates as eager does (kotodama.model.regional."
+                             "region_options): a signing decoder then decodes the tokens an unsigned one does, bit for "
+                             "bit, under one --kernel_pins table (~4%% of a step)")
     parser.add_argument("--autotune_min_rows", type=int, default=0,
                         help="Row buckets narrower than this compile without kernel benchmarking (max-autotune's "
                              "choices buy nothing at narrow widths on the regional step, and cost minutes each); "
@@ -2631,6 +2639,7 @@ if __name__ == "__main__":
     _regional_arg = args.regional
     _startup_budget_s_arg = args.startup_budget_s
     _autotune_min_rows_arg = args.autotune_min_rows
+    _emulate_casts_arg = args.emulate_casts
     _kernel_pins_arg = args.kernel_pins
     if args.sign_reducer and not args.sign_spool:
         parser.error("--sign_reducer needs --sign_spool")

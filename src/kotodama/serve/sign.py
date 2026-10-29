@@ -188,6 +188,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--compile_mode", default="default")
     ap.add_argument("--pins", default=None, help="kernel pin table: replayed when it exists, else recorded")
     ap.add_argument("--rope_fp32", action="store_true")
+    ap.add_argument("--emulate_casts", action="store_true",
+                    help="compiled regions round intermediates as eager does (the generating server's setting: a "
+                         "signing decoder then decodes what an unsigned one does)")
     ap.add_argument("--once", action="store_true", help="drain what is pending and exit (default: keep polling)")
     ap.add_argument("--poll_s", type=float, default=30.0)
     a = ap.parse_args(argv)
@@ -209,7 +212,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         server._rope_fp32_override = True
     model, _ = server.load_model(a.checkpoint, "cuda", mode="base", model_size=a.model_size, engine="reference",
                                  max_seq_len=a.max_seq_len)
-    eng = DecodeEngine(model, max_seq_len=a.max_seq_len, levers=a.levers)
+    eng = DecodeEngine(model, max_seq_len=a.max_seq_len, levers=a.levers, emulate_casts=a.emulate_casts)
     eng.compile_step(mode=a.compile_mode, regional=True)
     reducer = load_reducer(a.reducer, **json.loads(a.reducer_kwargs))
     signer = RecordSigner.build(eng, reducer, layers=[int(x) for x in a.layers.split(",")], tail=a.tail,

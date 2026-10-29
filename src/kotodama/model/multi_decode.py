@@ -32,7 +32,7 @@ from kotodama.model.cascade_attn import attend_for, merge, pack_group_queries, u
 from kotodama.model.decode_engine import DecodeEngine, SamplingParams
 from kotodama.model import attn_stats, signing
 from kotodama.model.llama import apply_rope
-from kotodama.model.regional import (REGION_MODES, StepGraph, build_regions, check_norms, layer_signatures,
+from kotodama.model.regional import (StepGraph, build_regions, check_norms, layer_signatures, region_options,
                                      own_code, route_weights, run_regions, sign_write)
 
 logger = logging.getLogger(__name__)
@@ -673,7 +673,7 @@ class MultiSampleDecoder(nn.Module):
             raise ValueError("whole-step CUDA graph capture needs a CUDA engine")
         opts = dict(fullgraph=True, dynamic=False, backend=backend)
         if backend == "inductor":
-            opts["mode"] = REGION_MODES.get(mode, mode)
+            opts["options"] = region_options(mode, self.engine.emulate_casts)
         self._build_regions(**opts)
         tag = f"{type(self).__name__}{self.rows}_{id(self):x}"
         self._regional_final = torch.compile(own_code(self._final_logits, f"final_{tag}"), **opts)
@@ -697,9 +697,11 @@ class MultiSampleDecoder(nn.Module):
         self._compiled_greedy = step_with(self._sample_greedy)
         self._compiled_truncated = step_with(self._sample_truncated)
         self._compiled_score = step_with(self._score_logits)
+        region_mode = f"{mode}{' (emulated casts)' if self.engine.emulate_casts else ''}" if backend == "inductor" else backend
         logger.info("%s (%d rows): regional decode step, %d layer signatures over %d layers, regions %s, %s",
                     type(self).__name__, self.rows, self.regional_variants, self.n_layers,
-                    opts.get("mode", backend), "whole-step CUDA graph" if cuda_graph else "no CUDA graph")
+                    region_mode,
+                    "whole-step CUDA graph" if cuda_graph else "no CUDA graph")
 
     # ── public API ──────────────────────────────────────────────────────────
 

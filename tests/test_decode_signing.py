@@ -401,6 +401,17 @@ class _Pinned(torch.nn.Module):
             self.emb.weight.copy_(torch.tensor([[0.25], [2.0]]))
 
 
+def test_region_options_emulate_casts_only_when_asked() -> None:
+    """A region compiles under its whole-step mode's region options; emulated casts are added only when the engine asks
+    (they change the arithmetic of every compiled decode region, and cost a few % of a step)."""
+    from kotodama.model.regional import region_options
+
+    assert region_options("reduce-overhead") == {}
+    assert region_options("reduce-overhead", True) == {"emulate_precision_casts": True}
+    tuned = region_options("max-autotune", True)
+    assert tuned["max_autotune"] and tuned["emulate_precision_casts"] and "triton.cudagraphs" not in tuned
+
+
 def test_logit_stats_top5_is_the_fp64_top5() -> None:
     """The top-5 mass selects on the logits as given and sums e at those columns: the same bytes as summing e's own
     top five, with exact ties, ties made by the fp64 shift, and a tiny value beside large ones."""
