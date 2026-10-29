@@ -12,6 +12,12 @@ server never idles or was started without a reducer. Layout:
     <spool>/index.jsonl              one line per signed batch: its name, directory, host, and row counts
     <spool>/state.json               per records file, the byte offset signed (or skipped) up to
 
+Rows generated elsewhere (or a served row's tokens under another lever: worn vs unworn on the same tokens) enter a
+spool through ``import_rows`` (the command line's --import_rows): one JSON object per line, ``{"id", "ids",
+"prompt_length", "injection" (the server's request field, or null), "steer_span" (default "decode"), "meta"}``; an
+injection becomes its lever plan by the server's own conversion, so an imported row and a served one with the same
+injection name the same plan.
+
 Records are small and belong with the run; signed batches are bulk (~19 KB per row on the 1B), so a drain can write
 them elsewhere (``signed_dir``, e.g. node-local storage) and the index says where each batch went.
 
@@ -165,6 +171,53 @@ class SignSpool:
             return summary
 
 
+def import_rows(spool: SignSpool, path: str | Path, writer: str, *, weights: str, engine: Any) -> int:
+    """Append the rows of JSONL ``path`` (see the module docstring) to ``spool`` as writer ``writer``'s records, each
+    naming ``weights`` (the signing model's digest) and, with an injection, the lever plan the server makes of it on
+    ``engine`` (a DecodeEngine with lever tables). Returns the rows imported. Refuses a writer the spool already has
+    (an import is appended once) and an injection a drain cannot rebuild (rule N reads per-layer partial norms the
+    drain does not load)."""
+    from kotodama.serve.server import InjectionSpec
+    from kotodama.serve.steering import act_injection_to_plan, injection_to_plan
+
+    if (spool.root / "records" / f"{writer}.jsonl").exists():
+        raise FileExistsError(f"the spool already has records from writer {writer!r}: an import is appended once")
+    cfg = engine.config
+    records: list[SignRecord] = []
+    plans: dict[str, LeverPlan] = {}
+    with open(path, encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            where = f"{path}:{n}"
+            row = json.loads(line)
+            ids = [int(t) for t in row["ids"]]
+            plen = int(row["prompt_length"])
+            if not 0 < plen < len(ids):
+                raise ValueError(f"{where}: prompt_length {plen} must leave at least one generated id of {len(ids)}")
+            plan = None
+            if row.get("injection") is not None:
+                if engine.levers is None:
+                    raise ValueError(f"{where}: an injection needs a drain with lever tables (--levers)")
+                inj = InjectionSpec(**row["injection"])
+                span = row.get("steer_span", "decode")
+                if inj.kind == "act":
+                    plan = act_injection_to_plan(inj.sites, inj.neurons, inj.mu, inj.alpha, inj.vectors, span,
+                                                 cfg.num_layers, cfg.intermediate_size)
+                elif inj.rule == "N":
+                    raise ValueError(f"{where}: injection rule N reads per-layer partial norms a drain does not load")
+                else:
+                    plan = injection_to_plan(inj.sites, inj.vectors, inj.alpha, inj.rule, inj.kind, span, None,
+                                             list(engine._boundaries), cfg.num_layers, cfg.hidden_size)
+                plans[plan.digest()] = plan
+            records.append(SignRecord(request_id=str(row["id"]), prompt_ids=tuple(ids[:plen]),
+                                      generated_ids=tuple(ids[plen:]), weights=weights,
+                                      lever=plan.digest() if plan is not None else None,
+                                      meta={**(row.get("meta") or {}), "imported_by": writer}))
+    spool.add(writer, records, plans=list(plans.values()))
+    return len(records)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Drain a sign spool: sign its records through a pinned signing decoder "
                                              "and a SignatureReducer")
@@ -191,6 +244,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--emulate_casts", action="store_true",
                     help="compiled regions round intermediates as eager does (the generating server's setting: a "
                          "signing decoder then decodes what an unsigned one does)")
+    ap.add_argument("--import_rows", default=None,
+                    help="JSONL of rows to append to the spool before draining (see the module docstring)")
+    ap.add_argument("--import_writer", default=None, help="the writer name the imported records go under")
     ap.add_argument("--once", action="store_true", help="drain what is pending and exit (default: keep polling)")
     ap.add_argument("--poll_s", type=float, default=30.0)
     a = ap.parse_args(argv)
@@ -223,6 +279,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         signer.warm()
         logger.info("kernel pins recorded: %s (%d kernels, %s)", pins.save(), len(pins.table), pins.digest[:12])
     spool = SignSpool(a.spool, signed_dir=a.signed_dir)
+    if a.import_rows:
+        writer = a.import_writer or Path(a.import_rows).stem
+        n = import_rows(spool, a.import_rows, writer, weights=signer.weights, engine=eng)
+        logger.info("sign spool: imported %d rows from %s as writer %s", n, a.import_rows, writer)
     with torch.inference_mode():
         while True:
             summary = spool.drain_once(signer)

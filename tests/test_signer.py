@@ -288,3 +288,59 @@ def test_the_spool_drains_one_batch_at_a_time(model: KotodamaModel, tmp_path) ->
     assert spool.drain_once(built)["signed"] == 1
     _same(keep.rows[recs[0].prompt_ids + recs[0].generated_ids],
           signer.reducer.rows[recs[0].prompt_ids + recs[0].generated_ids])
+
+
+@torch.inference_mode()
+def test_imported_rows_sign_like_served_ones(model: KotodamaModel, tmp_path) -> None:
+    """Rows from a JSONL (ids, prompt_length, the server's injection field) become records whose lever is the plan the
+    server makes of that injection: the worn rows sign to their generation's bytes under it, and an unworn import of
+    the same tokens signs without it. An import is appended once per writer; a rule-N injection is refused."""
+    from kotodama.serve.sign import SignSpool, import_rows
+    from kotodama.serve.steering import injection_to_plan
+
+    eng, dec = _setup(model)
+    rng = np.random.default_rng(5)
+    inj = {"sites": [5], "vectors": [rng.standard_normal(CFG["hidden_size"]).tolist()], "alpha": 0.7, "rule": "S",
+           "kind": "attn"}
+    plan = injection_to_plan(inj["sites"], inj["vectors"], inj["alpha"], inj["rule"], inj["kind"], "decode", None,
+                             list(eng._boundaries), CFG["num_layers"], CFG["hidden_size"])
+    slot = eng.levers.bind(plan)
+    prompts = [_ids(7, 11), _ids(9, 12), _ids(6, 13), _ids(8, 14)]
+    recs, gen = _generate(eng, dec, prompts, slot)
+    eng.levers.release(slot)
+    rows = [{"id": f"w{r}", "ids": list(rec.prompt_ids + rec.generated_ids), "prompt_length": len(rec.prompt_ids),
+             "injection": inj if r % 2 else None, "meta": {"arm": "worn" if r % 2 else "unworn"}}
+            for r, rec in enumerate(recs)]
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    spool = SignSpool(tmp_path / "spool")
+    assert import_rows(spool, path, "msteer", weights=dec._sign_weights, engine=eng) == len(rows)
+    assert set(spool.plans()) == {plan.digest()}
+    with pytest.raises(FileExistsError):
+        import_rows(spool, path, "msteer", weights=dec._sign_weights, engine=eng)
+    keep = _Keep()
+    signer = RecordSigner(dec, keep, compile_mode="aot_eager")
+    while spool.drain_once(signer) is not None:
+        pass
+    for r in range(ROWS):
+        _same(gen[r], keep.rows[recs[r].prompt_ids + recs[r].generated_ids])
+    signed = {json.loads(line)["sign_id"]: json.loads(line) for b in (tmp_path / "spool" / "signed").iterdir()
+              for line in open(b / "rows.jsonl")}
+    assert signed["w1"]["lever"] == plan.digest() and signed["w0"]["lever"] is None
+    assert signed["w1"]["meta"]["arm"] == "worn" and signed["w0"]["meta"]["imported_by"] == "msteer"
+    # the worn row's tokens imported unworn sign without the lever (another spool: _Keep keys rows by tokens)
+    twin = tmp_path / "twin.jsonl"
+    twin.write_text(json.dumps({**rows[1], "id": "u1", "injection": None}) + "\n")
+    other = SignSpool(tmp_path / "spool-twin")
+    import_rows(other, twin, "twin", weights=dec._sign_weights, engine=eng)
+    unworn = _Keep()
+    other.drain_once(RecordSigner(dec, unworn, compile_mode="aot_eager"))
+    got = unworn.rows[recs[1].prompt_ids + recs[1].generated_ids]
+    assert not torch.equal(got.surfaces["q"], gen[1].surfaces["q"])
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text(json.dumps({**rows[1], "injection": {**inj, "rule": "N"}}) + "\n")
+    with pytest.raises(ValueError, match="rule N"):
+        import_rows(spool, bad, "bad", weights=dec._sign_weights, engine=eng)
+    bad.write_text(json.dumps({**rows[0], "prompt_length": len(rows[0]["ids"])}) + "\n")
+    with pytest.raises(ValueError, match="prompt_length"):
+        import_rows(spool, bad, "bad2", weights=dec._sign_weights, engine=eng)
