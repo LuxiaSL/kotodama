@@ -481,8 +481,6 @@ class MultiSampleDecoder(nn.Module):
             nxt = (scaled + gumbel).argmax(dim=-1, keepdim=True)  # (B, 1)
         if self.seeded:
             self.row_step.add_(1)
-        if self.sign is not None:
-            self.sign_logit_stats[self.row_ids, self.sign_slot, 0] = signing.logit_stats(raw, nxt)
         if self.readout_k > 0:
             lp = torch.log_softmax(raw, dim=-1)
             self.step_logprob.copy_(lp.gather(1, nxt).view(-1))
@@ -493,17 +491,36 @@ class MultiSampleDecoder(nn.Module):
         self.cur_tokens.copy_(nxt)
         return self.cur_tokens
 
+    def _sign_logits(self, logits: torch.Tensor, chosen: torch.Tensor) -> None:
+        """A signing decoder's logit statistics of the step's raw logits and its chosen token (sampled, or the scored
+        one). Eager, after the step's sampler or scorer, so sampling and scoring compute them with the same kernels:
+        inside the compiled samplers each would fuse them its own way."""
+        if self.sign is not None:
+            self.sign_logit_stats[self.row_ids, self.sign_slot, 0] = signing.logit_stats(logits.float(), chosen)
+
     def _step_sampled(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self._sample_rows(self._forward_step(tokens))
+        logits = self._forward_step(tokens)
+        out = self._sample_rows(logits)
+        self._sign_logits(logits, self.cur_tokens)
+        return out
 
     def _step_greedy(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self._sample_rows(self._forward_step(tokens), greedy=True)
+        logits = self._forward_step(tokens)
+        out = self._sample_rows(logits, greedy=True)
+        self._sign_logits(logits, self.cur_tokens)
+        return out
 
     def _step_truncated(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self._sample_rows(self._forward_step(tokens), truncated=True)
+        logits = self._forward_step(tokens)
+        out = self._sample_rows(logits, truncated=True)
+        self._sign_logits(logits, self.cur_tokens)
+        return out
 
     def _step_scored(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self._score_logits(self._forward_step(tokens))
+        logits = self._forward_step(tokens)
+        out = self._score_logits(logits)
+        self._sign_logits(logits, self.score_target)
+        return out
 
     # ── the regional step (compile_step(regional=True)) ─────────────────────
 
@@ -630,8 +647,6 @@ class MultiSampleDecoder(nn.Module):
         raw = logits.float()
         lp = torch.log_softmax(raw, dim=-1)
         self.score_lp.copy_(lp.gather(1, self.score_target).view(-1))
-        if self.sign is not None:  # a scored token is the step's chosen token, as a sampled one is
-            self.sign_logit_stats[self.row_ids, self.sign_slot, 0] = signing.logit_stats(raw, self.score_target)
         return self.score_lp
 
     def _compile_regional(self, mode: str, backend, cuda_graph: Optional[bool]) -> None:
@@ -650,9 +665,13 @@ class MultiSampleDecoder(nn.Module):
 
         def step_with(sampler: Callable[[torch.Tensor], torch.Tensor]) -> Callable[[torch.Tensor], torch.Tensor]:
             compiled = torch.compile(own_code(sampler, f"{sampler.__name__.lstrip('_')}_{tag}"), **opts)
+            chosen = self.score_target if sampler == self._score_logits else self.cur_tokens
 
             def run(tokens: torch.Tensor) -> torch.Tensor:
-                return compiled(self._regional_forward(tokens))
+                logits = self._regional_forward(tokens)
+                out = compiled(logits)
+                self._sign_logits(logits, chosen)
+                return out
 
             return StepGraph(run, self.cur_tokens, pool) if cuda_graph else run
 
@@ -1003,6 +1022,9 @@ class MultiSampleDecoder(nn.Module):
             return
         if backend != "inductor" or cuda_graph is not None:
             raise ValueError("backend and cuda_graph apply to the regional step only (regional=True)")
+        if self.sign is not None:
+            raise ValueError("a signing decoder compiles regionally (regional=True): the whole-step graph would fuse "
+                             "its logit statistics differently in each step variant")
         import torch._dynamo
 
         torch._dynamo.mark_static_address(self.cur_tokens)

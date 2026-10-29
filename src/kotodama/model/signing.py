@@ -95,7 +95,7 @@ def weights_digest(model: torch.nn.Module) -> str:
         x = t.detach().contiguous().cpu()
         h.update(name.encode("utf-8") + b"\0" + str(x.dtype).encode("utf-8") + b"\0"
                  + ",".join(str(int(d)) for d in x.shape).encode("utf-8") + b"\0")
-        h.update(x.view(torch.uint8).numpy().tobytes() if x.numel() else b"")
+        h.update(x.reshape(-1).view(torch.uint8).numpy().tobytes() if x.numel() else b"")
     return h.hexdigest()
 
 

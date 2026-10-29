@@ -307,7 +307,7 @@ def _digest_by_rule(model: torch.nn.Module) -> str:
     for name in sorted(model.state_dict()):
         t = model.state_dict()[name].detach().contiguous().cpu()
         h.update(f"{name}\0{t.dtype}\0{','.join(map(str, t.shape))}\0".encode())
-        h.update(t.view(torch.uint8).numpy().tobytes())
+        h.update(t.reshape(-1).view(torch.uint8).numpy().tobytes())
     return h.hexdigest()
 
 
@@ -328,13 +328,36 @@ def test_signed_rows_name_their_weights(model: KotodamaModel) -> None:
     assert weights_digest(bf16) == digest and weights_digest(bf16.to(torch.bfloat16)) != digest  # loaded dtype
 
 
+# anamnesis's pinned module for the lane weights rule v1 (its tests/test_weights_binding.py), mirrored so both codebases
+# pin the same bytes: a float32 linear, a bfloat16 parameter, a persistent scalar buffer, a non-persistent buffer
+# (not hashed) and a tied pair (hashed under each key).
+_PINNED_DIGEST = "1176665bb75973e4742f40273ca02227d0587f84c951bee891e22b231d2e31e0"
+
+
+class _Pinned(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = torch.nn.Linear(2, 1)
+        self.bf = torch.nn.Parameter(torch.tensor([1.0, -1.5], dtype=torch.bfloat16))
+        self.register_buffer("steps", torch.tensor(7, dtype=torch.int64))
+        self.register_buffer("scratch", torch.ones(3), persistent=False)
+        self.emb = torch.nn.Embedding(2, 1)
+        self.head = torch.nn.Linear(1, 2, bias=False)
+        self.head.weight = self.emb.weight
+        with torch.no_grad():
+            self.linear.weight.copy_(torch.tensor([[1.0, -2.0]]))
+            self.linear.bias.copy_(torch.tensor([0.5]))
+            self.emb.weight.copy_(torch.tensor([[0.25], [2.0]]))
+
+
 def test_weights_digest_matches_anamnesis() -> None:
-    """The same rule as anamnesis's own ``weights_digest``, where anamnesis is installed."""
-    anamnesis_lane = pytest.importorskip("anamnesis.lane_weights", reason="anamnesis with weights_digest not installed")
+    """The rule's pinned constant on anamnesis's own module, and anamnesis's implementation where it is installed."""
+    assert weights_digest(_Pinned()) == _PINNED_DIGEST
+    theirs = pytest.importorskip("anamnesis.extraction.weights_digest", reason="anamnesis weights_digest not installed")
     torch.manual_seed(3)
     tiny = KotodamaModel(KotodamaModelConfig(**dict(CFG, num_layers=4, loop_start=1, loop_len=2,
                                                     loop_times=1, attn_res_boundaries=[0, 2])))
-    assert weights_digest(tiny) == anamnesis_lane.weights_digest(tiny)
+    assert weights_digest(tiny) == theirs.weights_digest(tiny)
 
 
 @pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])
@@ -359,4 +382,3 @@ def test_scoring_a_generated_row_replays_its_signature(model: KotodamaModel, cls
                 assert all(torch.equal(a, b) for a, b in zip(x, ys)), name
             else:
                 assert torch.equal(x, ys), name
-
