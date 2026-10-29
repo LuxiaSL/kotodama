@@ -65,9 +65,10 @@ def sign_write(sign: tuple, q: Optional[torch.Tensor], k: Optional[torch.Tensor]
                gate: Optional[torch.Tensor], w_attn: Optional[torch.Tensor], w_mlp: torch.Tensor) -> None:
     """A signing layer's last position into the sign buffers (kotodama.model.signing): sign = (route buffer, row ids,
     each row's slot, the layer's column (0-d), then the q, k, v, gate buffers and the sampled column, or Nones for a
-    layer that writes its routing only). q / k / v are (B, heads, S, head_dim) before RoPE, gate (B, S, intermediate),
-    the routing weights (n, B, S) (``w_attn`` None: the attention input reads no routing)."""
-    route_buf, row_ids, slot, layer_col, q_buf, k_buf, v_buf, gate_buf, sampled_col = sign
+    layer that writes its routing only, then the partial buffer and the layer's column in it (0-d), or Nones; the
+    layer writes its output partial there itself). q / k / v are (B, heads, S, head_dim) before RoPE, gate
+    (B, S, intermediate), the routing weights (n, B, S) (``w_attn`` None: the attention input reads no routing)."""
+    route_buf, row_ids, slot, layer_col, q_buf, k_buf, v_buf, gate_buf, sampled_col = sign[:9]
     B = w_mlp.shape[1]
     width = route_buf.shape[-1] // 2
     halves = []
@@ -175,6 +176,8 @@ def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_hea
         if levers:
             mlp_out = mlp_out + lever_m.unsqueeze(1)
         out = new + mlp_out
+        if sign and sign_args[9] is not None:  # the output partial (the depth path, or a sampled layer's hidden)
+            sign_args[9][sign_args[1], sign_args[2], sign_args[10].expand(B)] = out[:, -1]
         if capture:
             return out, x_mlp
         return out
@@ -295,13 +298,11 @@ def build_regions(eng, signatures: Sequence[tuple[int, bool, bool, int, int]],
 def run_regions(regions: Sequence[Region], embed: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                 state: tuple[torch.Tensor, ...], levers: Optional[tuple[torch.Tensor, ...]],
                 steer_buf: Optional[torch.Tensor],
-                capture_buf: Optional[torch.Tensor],
-                sign_partials: Optional[tuple] = None) -> tuple[list[torch.Tensor], torch.Tensor]:
+                capture_buf: Optional[torch.Tensor]) -> tuple[list[torch.Tensor], torch.Tensor]:
     """The depth loop over ``regions`` from the embedding: each layer's lever rows (``levers``: attn, mlp, act keep,
     act add, each indexed by layer), broadcast steering row (``steer_buf[li]``) and, for a captured layer, its MLP
-    input written to ``capture_buf[:, col]`` (the last position's). ``sign_partials`` = (buffer, each layer's column
-    in it or -1, row ids, each row's slot): a signed layer's output partial (last position) is written there after
-    its region returns. Returns (the committed block outputs, the last partial) for the tail."""
+    input written to ``capture_buf[:, col]`` (the last position's). Returns (the committed block outputs, the last
+    partial) for the tail."""
     committed: list[torch.Tensor] = []
     partial = embed
     for li, (fn, boundary, col, tensors, kv, sign, stats) in enumerate(regions):
@@ -314,9 +315,6 @@ def run_regions(regions: Sequence[Region], embed: torch.Tensor, cos: torch.Tenso
         if col >= 0:
             out, x_mlp = out
             capture_buf[:, col] = x_mlp[:, -1]
-        if sign_partials is not None and sign_partials[1][li] >= 0:
-            buf, cols, row_ids, slot = sign_partials
-            buf[row_ids, slot, cols[li]] = out[:, -1]
         if boundary:
             committed.append(partial)
         partial = out

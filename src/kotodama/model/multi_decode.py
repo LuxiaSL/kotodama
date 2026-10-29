@@ -562,10 +562,13 @@ class MultiSampleDecoder(nn.Module):
     def _sign_args(self, layer_idx: int) -> tuple:
         """A layer's sign tuple (regional.sign_write): its routing, and a sampled layer's surfaces."""
         head = (self.sign_route, self.row_ids, self.sign_slot, self._sign_layer_ids[layer_idx])
+        col = self._sign_partial_cols[layer_idx]
+        tail = (None, None) if col < 0 else (self.sign_depth if self.sign.depth else self.sign_hidden,
+                                              self._sign_layer_ids[col])
         if layer_idx not in self.sign.layers:
-            return head + (None,) * 5
+            return head + (None,) * 5 + tail
         return head + tuple(getattr(self, f"sign_{n}") for n in signing.REGION_SURFACES) + (
-            self._sign_cols[self.sign.layers.index(layer_idx)],)
+            self._sign_cols[self.sign.layers.index(layer_idx)],) + tail
 
     def _stats_args(self, layer_idx: int) -> tuple:
         """A layer's stats tuple (kotodama.model.signing.stats_write)."""
@@ -641,8 +644,7 @@ class MultiSampleDecoder(nn.Module):
         sin = eng.rope_sin_t.index_select(0, self.pos).unsqueeze(1)
         committed, partial = run_regions(self._regional_layers, embed, cos, sin, self._regional_state, levers,
                                          eng.steer_buf if eng.steer_enabled else None,
-                                         self.mlp_in if self.capture_layers else None,
-                                         self._sign_partials() if self.sign is not None else None)
+                                         self.mlp_in if self.capture_layers else None)
         return self._regional_final(committed, partial)
 
     def _sample_plain(self, logits: torch.Tensor) -> torch.Tensor:
