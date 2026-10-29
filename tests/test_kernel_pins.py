@@ -11,7 +11,10 @@ What is pinned here:
     turns inductor's autotune caches off until uninstall restores them;
   * install patches triton's Autotuner (the hand-written ``@triton.autotune`` kernels): record keeps the timed choice
     per tuning key, replay launches the recorded config without timing anything (another process whose timings
-    would pick otherwise), first takes the first config, and a tuning key the table does not hold is refused.
+    would pick otherwise), first takes the first config, and a tuning key the table does not hold is refused;
+  * install patches inductor's GEMM selection (max-autotune): record keeps the first graph's timed choice per GEMM
+    key and hands it to every later graph with that key (whose own timings would pick otherwise), replay keeps the
+    table's choice timing nothing, and a GEMM the table does not hold is refused.
 """
 
 from __future__ import annotations
@@ -146,3 +149,51 @@ def test_install_pins_triton_autotune(tmp_path: Path) -> None:
     finally:
         kp.uninstall()
     assert autotuner.Autotuner.run is autotuner.Autotuner._kotodama_unpinned_run
+
+
+class _Choice:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def hash_key(self) -> str:
+        return f"choice-{self.name}"
+
+
+def test_install_pins_gemm_selection(tmp_path: Path, monkeypatch) -> None:
+    sa = pytest.importorskip("torch._inductor.select_algorithm")
+    cls = sa.AlgorithmSelectorCache
+    real = getattr(cls, "_kotodama_unpinned_do_autotuning", cls.do_autotuning)
+    timed: list[str] = []
+    speeds: dict[str, float] = {}
+
+    def fake(self, name, input_nodes, layout, input_gen_fns, inputs_key, choices, *args, **kwargs):
+        timed.append(inputs_key)
+        return {c: speeds[c.name] for c in choices}
+
+    monkeypatch.setattr(cls, "_kotodama_unpinned_do_autotuning", fake)
+    monkeypatch.setattr(cls, "do_autotuning", real)
+
+    def select(key: str = "[(128, 1536)]", names=("aten", "tmpl_a", "tmpl_b")):
+        choices = [_Choice(n) for n in names]
+        t = cls.do_autotuning(None, "mm", [], None, None, key, choices, None)
+        return min(t, key=t.__getitem__).name
+
+    try:
+        sess = kp.install(tmp_path / "pins.json", "record")
+        speeds.update(aten=2.0, tmpl_a=1.0, tmpl_b=3.0)
+        assert select() == "tmpl_a" and len(timed) == 1
+        # a later graph with the same GEMM, whose own timings would pick the extern kernel: the recorded choice
+        speeds.update(aten=0.1, tmpl_a=5.0)
+        assert select() == "tmpl_a" and len(timed) == 1
+        assert select(key="[(64, 1536)]") == "aten" and len(timed) == 2  # another GEMM is timed
+        assert all(k.startswith("gemm:mm:") for k in sess.table) and len(sess.table) == 2
+        sess.save()
+        rep = kp.install(tmp_path / "pins.json", "replay")
+        speeds.update(aten=0.0, tmpl_a=9.0, tmpl_b=0.0)
+        assert select() == "tmpl_a" and select(key="[(64, 1536)]") == "aten" and len(timed) == 2
+        assert rep.hits == 2 and rep.digest == sess.digest
+        with pytest.raises(kp.KernelPinMiss, match="not in the pin table"):
+            select(names=("aten", "tmpl_c"))  # another candidate set is another GEMM
+    finally:
+        kp.uninstall()
+    assert cls.do_autotuning is fake  # uninstall restores what install found

@@ -23,6 +23,13 @@ same session pins them in the same table: each (kernel, tuning key) is keyed ``t
 key>``, a config by every launch option it sets. In replay the pinned config is put in the autotuner's cache before
 its first launch, so nothing is timed, and a launch that ends on another config is refused.
 
+Under max-autotune, inductor also picks each GEMM's implementation (an extern kernel such as cuBLAS, or one of its
+Triton templates) by timing the candidates when it lowers a graph, once per graph: two graphs with the same GEMM (an
+unsigned decoder's layer and a signing decoder's) can pick different implementations, which round differently. The
+same session pins those choices: a GEMM is keyed ``gemm:<op>:<sha256 of its input layouts, the fp32 matmul precision
+and every candidate's identity>``, a choice by the chosen candidate's ``hash_key``; the first graph's choice stands
+for every later graph in the process (record), or the table's (replay).
+
 While pins are installed, inductor's autotune caches (local, remote, bundled) are off: a kernel that loads a cached
 choice launches with one config and never reaches the pins, so a cache written by an unpinned process would run
 arithmetic the table does not name. (Changing these settings changes inductor's graph-cache keys: the first pinned
@@ -186,6 +193,7 @@ def install(table_path: Optional[str | Path], mode: Mode, allow_missing: bool = 
 
     cls.autotune_to_one_config = autotune_to_one_config
     _install_triton(sess)
+    _install_gemm(sess)
     _cache_flags(off=True)
     _session = sess
     logger.info("kernel pins: %s (%s, %d pinned kernels)", mode, path, len(table))
@@ -206,6 +214,12 @@ def uninstall() -> None:
         Autotuner = None
     if Autotuner is not None and hasattr(Autotuner, "_kotodama_unpinned_run"):
         Autotuner.run = Autotuner._kotodama_unpinned_run
+    try:
+        from torch._inductor.select_algorithm import AlgorithmSelectorCache
+    except ImportError:
+        AlgorithmSelectorCache = None
+    if AlgorithmSelectorCache is not None and hasattr(AlgorithmSelectorCache, "_kotodama_unpinned_do_autotuning"):
+        AlgorithmSelectorCache.do_autotuning = AlgorithmSelectorCache._kotodama_unpinned_do_autotuning
     _cache_flags(off=False)
     _session = None
 
@@ -258,3 +272,44 @@ def _install_triton(sess: PinSession) -> None:
         return out
 
     Autotuner.run = run
+
+
+def gemm_key(name: str, inputs_key: str, choices: Sequence[Any]) -> str:
+    """A GEMM selection's identity: its op, its inputs' layouts, the fp32 matmul precision and its candidates."""
+    import torch
+
+    parts = [inputs_key, torch.get_float32_matmul_precision(), *sorted(str(c.hash_key()) for c in choices)]
+    return f"gemm:{name}:" + hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
+
+
+def pinned_timings(sess: PinSession, key: str, choices: Sequence[Any]) -> Optional[dict]:
+    """The timings that make inductor keep ``key``'s pinned choice (0 for it, inf for the rest), or None to time the
+    candidates (record mode, unrecorded). Raises KernelPinMiss."""
+    chosen = sess._choose(key, list(choices), lambda c: str(c.hash_key()))
+    if chosen is None:
+        return None
+    return {c: (0.0 if c is chosen else float("inf")) for c in choices}
+
+
+def _install_gemm(sess: PinSession) -> None:
+    """Patch inductor's GEMM selection (``AlgorithmSelectorCache.do_autotuning``) for ``sess`` (no-op when this
+    torch has none)."""
+    try:
+        from torch._inductor.select_algorithm import AlgorithmSelectorCache
+    except ImportError:
+        return
+    cls = AlgorithmSelectorCache
+    original = getattr(cls, "_kotodama_unpinned_do_autotuning", cls.do_autotuning)
+    cls._kotodama_unpinned_do_autotuning = original
+
+    def do_autotuning(self, name, input_nodes, layout, input_gen_fns, inputs_key, choices, *args, **kwargs):
+        key = gemm_key(name, inputs_key, choices)
+        timings = pinned_timings(sess, key, choices)
+        if timings is not None:
+            return timings
+        timings = original(self, name, input_nodes, layout, input_gen_fns, inputs_key, choices, *args, **kwargs)
+        if timings:
+            sess._record(key, str(min(timings, key=timings.__getitem__).hash_key()))
+        return timings
+
+    cls.do_autotuning = do_autotuning
