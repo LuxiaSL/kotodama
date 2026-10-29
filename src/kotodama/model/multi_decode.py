@@ -500,10 +500,13 @@ class MultiSampleDecoder(nn.Module):
 
     def _sign_logits(self, logits: torch.Tensor, chosen: torch.Tensor) -> None:
         """A signing decoder's logit statistics of the step's raw logits and its chosen token (sampled, or the scored
-        one). Eager, after the step's sampler or scorer, so sampling and scoring compute them with the same kernels:
-        inside the compiled samplers each would fuse them its own way."""
+        one). After the step's sampler or scorer, through one function every step variant shares (compiled on its own
+        by the regional step), so sampling and scoring compute them with the same kernels: inside the compiled
+        samplers each would fuse them its own way."""
         if self.sign is not None:
-            self.sign_logit_stats[self.row_ids, self.sign_slot, 0] = signing.logit_stats(logits.float(), chosen)
+            self.sign_logit_stats[self.row_ids, self.sign_slot, 0] = self._logit_stats(logits.float(), chosen)
+
+    _logit_stats = staticmethod(signing.logit_stats)
 
     def _step_sampled(self, tokens: torch.Tensor) -> torch.Tensor:
         logits = self._forward_step(tokens)
@@ -674,6 +677,8 @@ class MultiSampleDecoder(nn.Module):
         self._build_regions(**opts)
         tag = f"{type(self).__name__}{self.rows}_{id(self):x}"
         self._regional_final = torch.compile(own_code(self._final_logits, f"final_{tag}"), **opts)
+        if self.sign is not None:
+            self._logit_stats = torch.compile(own_code(signing.logit_stats, f"logit_stats_{tag}"), **opts)
         pool = torch.cuda.graph_pool_handle() if cuda_graph else None
 
         def step_with(sampler: Callable[[torch.Tensor], torch.Tensor]) -> Callable[[torch.Tensor], torch.Tensor]:

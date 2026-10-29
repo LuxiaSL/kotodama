@@ -345,7 +345,8 @@ def test_signing_compiles_a_bounded_number_of_signatures(model: KotodamaModel) -
     assert signed.regional_variants <= base + extra
     signed.admit(list(range(ROWS)), eng.prefill(_ids(8, 6)), PARAMS)
     signed.step(PARAMS)
-    assert counter.frame_count == signed.regional_variants + 2  # the signatures, the tail and the sampler
+    # the signatures, the tail, the sampler and the logit statistics
+    assert counter.frame_count == signed.regional_variants + 3
 
 
 def _digest_by_rule(model: torch.nn.Module) -> str:
