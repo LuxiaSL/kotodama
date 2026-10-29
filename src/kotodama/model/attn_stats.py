@@ -36,7 +36,7 @@ if _TRITON:
         q_ptr, pk_ptr, tk_ptr, plen_ptr, rslot_ptr, tpos_ptr, s0_ptr, pos_ptr,
         ps_ptr, pm_ptr, rec_ptr, sink_ptr, ment_ptr, mrow_ptr,
         stride_qb, stride_qh, stride_pg, stride_pw, stride_ph, stride_tb, stride_tt, stride_th,
-        scale,
+        SCALE: tl.constexpr,  # a constexpr: a runtime float would arrive as fp64 inside a compiled graph
         M_GROUP: tl.constexpr, H: tl.constexpr, HP: tl.constexpr, R: tl.constexpr, HK: tl.constexpr,
         D: tl.constexpr, BN: tl.constexpr, WIDTH: tl.constexpr, SAMPLED: tl.constexpr,
     ):
@@ -72,7 +72,7 @@ if _TRITON:
                 kt = tl.load(tk_ptr + b * stride_tb + t[:, None] * stride_tt + hk * stride_th + ds[None, :],
                              mask=((~in_prompt) & valid)[:, None], other=0.0)
                 k = tl.where(in_prompt[:, None], kp, kt)
-                sk = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
+                sk = tl.dot(q, tl.trans(k)).to(tl.float32) * SCALE
                 s = tl.where((head_kv == hk)[:, None], sk, s)
             s = tl.where(valid[None, :] & hmask[:, None], s, float("-inf"))
             m_new = tl.maximum(m_i, tl.max(s, axis=1))
@@ -99,7 +99,7 @@ if _TRITON:
                 kt = tl.load(tk_ptr + b * stride_tb + t[:, None] * stride_tt + hk * stride_th + ds[None, :],
                              mask=((~in_prompt) & valid)[:, None], other=0.0)
                 k = tl.where(in_prompt[:, None], kp, kt)
-                sk = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
+                sk = tl.dot(q, tl.trans(k)).to(tl.float32) * SCALE
                 s = tl.where((head_kv == hk)[:, None], sk, s)
             live = valid[None, :] & hmask[:, None]
             p = tl.where(live, tl.exp(s - lse[:, None]), 0.0)
@@ -139,7 +139,7 @@ def cascade_stats(st: tuple, q: torch.Tensor, kv: tuple[torch.Tensor, ...], stat
         ent, pm, rec, sink, ment, mrow,
         qr.stride(0), qr.stride(1), prompt_k.stride(0), prompt_k.stride(1), prompt_k.stride(2),
         tail_k.stride(0), tail_k.stride(1), tail_k.stride(2),
-        D ** -0.5,
+        SCALE=D ** -0.5,
         M_GROUP=members.shape[1], H=H, HP=triton.next_power_of_2(H), R=H // hk, HK=hk, D=D, BN=block,
         WIDTH=width, SAMPLED=bool(sampled),
     )
