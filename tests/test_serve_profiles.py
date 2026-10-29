@@ -5,6 +5,7 @@ the forward ops run, which a profile's env applied after their import does not c
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -40,15 +41,15 @@ def test_profile_is_a_complete_server_command_line(path: Path, monkeypatch) -> N
         assert os.environ[k] == v
 
 
-def test_command_line_overrides_the_profile_and_env_is_not_clobbered(monkeypatch) -> None:
-    monkeypatch.setenv("KOTODAMA_ATTNRES_EPS_FP64_COMPAT", "0")
+def test_command_line_overrides_the_profile_and_env_is_not_clobbered(monkeypatch, tmp_path) -> None:
+    (tmp_path / "p.yaml").write_text(f"extends: {profiles.PROFILE_DIR / 'tsumugi-1b.yaml'}\nenv:\n  KOTO_TEST_VAR: one\n")
+    monkeypatch.setenv("KOTO_TEST_VAR", "zero")
     parser = build_arg_parser()
-    profiles.apply(parser, "tsumugi-1b")
+    profiles.apply(parser, str(tmp_path / "p.yaml"))
     args = parser.parse_args(["--levers", "4", "--port", "9123", "--checkpoint", "/x/y.pt"])
     assert args.levers == 4 and args.port == 9123 and args.checkpoint == "/x/y.pt"
     assert args.xbatch_rows == "16,32,64,128" and args.cascade_attn is True
-    import os
-    assert os.environ["KOTODAMA_ATTNRES_EPS_FP64_COMPAT"] == "0"
+    assert os.environ["KOTO_TEST_VAR"] == "zero"
 
 
 def test_unknown_keys_and_names_are_refused(tmp_path: Path) -> None:

@@ -33,7 +33,5 @@ levers: 64
 # decode on the widest bucket).
 seeded_rows: true
 
-env:
-  # The AttnRes kernels add their eps as the trunk trained it (fp64 under compile); see
-  # kotodama/model/flash_attn_res/kernels/configs.py.
-  KOTODAMA_ATTNRES_EPS_FP64_COMPAT: "1"
+# No KOTODAMA_ATTNRES_EPS_FP64_COMPAT: the decode engine routes AttnRes with its own math in fp32, which that variable
+# does not reach, and post-training trains on the numerics the model is served with.
