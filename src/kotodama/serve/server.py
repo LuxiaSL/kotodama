@@ -47,7 +47,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Literal
 
 # CPU threading: 2 threads is optimal for single-request GPU inference.
 # cuDNN SDPA needs >= 2 threads; beyond that, overhead is kernel launch
@@ -2394,22 +2394,6 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
 
 _device_arg = "cuda"
 
-# Shapes whose trunk trained before the AttnRes kernels' constexpr eps: they route with the runtime eps in fp64
-# (KOTODAMA_ATTNRES_EPS_FP64_COMPAT=1, which their serve profiles set).
-EPS_FP64_SHAPES: frozenset[str] = frozenset({"1b-tsumugi"})
-
-
-def attnres_eps_refusal(model_size: str, env: "Mapping[str, str]", allowed: bool) -> str | None:
-    """Why a start would serve a model in other arithmetic than it trained with, or None: a tsumugi-lineage shape
-    without KOTODAMA_ATTNRES_EPS_FP64_COMPAT=1 (unless ``allowed``, --allow_attnres_eps_mismatch)."""
-    shape = presets.ALIASES.get(model_size, model_size)
-    if shape not in EPS_FP64_SHAPES or allowed or env.get("KOTODAMA_ATTNRES_EPS_FP64_COMPAT") == "1":
-        return None
-    return (f"--model_size {model_size} trained with the AttnRes eps in fp64: start it with --profile tsumugi-1b (or "
-            "tsumugi-1b-quick), or set KOTODAMA_ATTNRES_EPS_FP64_COMPAT=1; --allow_attnres_eps_mismatch serves it "
-            "in fp32 routing anyway")
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
     """The server's command line (every flag a serve profile may set)."""
     parser = argparse.ArgumentParser(description="kotodama inference server")
@@ -2431,10 +2415,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "per-conversation replica pinning)")
     parser.add_argument("--model_size", choices=list(MODEL_CONFIGS) + [a for a, k in presets.ALIASES.items() if k in MODEL_CONFIGS], default="3b",
                         help="Model architecture size (3b=2.97B, 1b=1.42B ladder, proxy=108M legacy)")
-    parser.add_argument("--allow_attnres_eps_mismatch", action="store_true",
-                        help="Serve a model of the tsumugi lineage without KOTODAMA_ATTNRES_EPS_FP64_COMPAT=1 (its trunk "
-                             "trained with the AttnRes eps in fp64; without the variable the kernels route in fp32, "
-                             "other arithmetic than it trained with). Without this flag such a start is refused")
     parser.add_argument("--served_model_name", default=None,
                         help="Override the model id reported by /info and /v1/models "
                              "(default: kotodama-<size>-<base|instruct>)")
@@ -2577,9 +2557,6 @@ if __name__ == "__main__":
     _device_arg = args.device
     _mode_arg = args.mode if args.mode is not None else inferred_mode
     _model_size_arg = args.model_size
-    refusal = attnres_eps_refusal(_model_size_arg, os.environ, args.allow_attnres_eps_mismatch)
-    if refusal:
-        parser.error(refusal)
     _attn_res_override = args.attn_res
     _attn_res_boundaries_override = args.attn_res_boundaries
     _rope_fp32_override = args.rope_fp32
