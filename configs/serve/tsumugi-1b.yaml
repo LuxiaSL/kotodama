@@ -29,7 +29,8 @@ cascade_attn: true
 # Lever slots: one per steered request in flight (a request's whole steering, dose included, is one slot), so a
 # 128-row batch of steered n=2 requests needs 64.
 levers: 64
-# A request's `seed` reproduces its candidates whatever shares their batch.
+# A request's `seed` reproduces its candidates whatever shares their batch (seeded requests prefill cold and
+# decode on the widest bucket).
 seeded_rows: true
 
 env:

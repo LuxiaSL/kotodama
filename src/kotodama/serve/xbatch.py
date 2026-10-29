@@ -80,7 +80,8 @@ class XBatchJob:
     steer_writes: Optional[list[tuple[int, torch.Tensor, float]]] = None
     steer_kwargs: dict[str, Any] = field(default_factory=dict)
     lever: Any = None  # a kotodama.model.levers.LeverPlan (runner built with levers), None: unsteered
-    seed: Optional[int] = None  # seeded decoders: candidate i draws with candidate_seed(seed, i), in any batch
+    # seeded decoders: candidate i draws with candidate_seed(seed, i), in any batch (always on the widest bucket)
+    seed: Optional[int] = None
     t_enqueue: float = field(default_factory=time.perf_counter)
 
 
@@ -343,6 +344,9 @@ class XBatchRunner:
             if not self._room_for(job):  # every lever slot is bound: it waits at the head of the queue
                 self.queue.requeue([job])
                 return taken
+            if job.seed is not None and dec.rows != self.max_rows:  # seeded jobs run on the widest bucket only
+                self.queue.requeue([job])
+                return taken
             taken += 1
             self.stats["refilled"] += 1
             lv = self._admit(dec, job, free)
@@ -356,7 +360,10 @@ class XBatchRunner:
         if not jobs:
             return 0
         head = jobs[0]
-        dec = self.bucket_for(sum(j.n for j in jobs))
+        # A batch holding a seeded job runs the widest bucket: rows decode bit for bit whatever shares a decoder of
+        # one width, but decoders of different widths round the logits differently, which can flip a seeded draw.
+        seeded = any(j.seed is not None for j in jobs)
+        dec = self.decoders[self.max_rows] if seeded else self.bucket_for(sum(j.n for j in jobs))
         free = list(range(dec.rows))
         dec.release(free)  # whatever the decoder's rows held belongs to an earlier batch
         active: list[_Live] = []

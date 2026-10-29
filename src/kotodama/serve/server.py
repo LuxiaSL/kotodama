@@ -1883,7 +1883,7 @@ class OAICompletionRequest(BaseModel):
 def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResponse]:
     """n candidates of one prompt: one engine prefill (prefix cache included), then the batched decoder. Same
     tokenization, steering, stop and capacity rules as engine_generate per candidate. Caller must hold _engine_lock."""
-    dec = _multi_bucket(n)
+    dec = _multi_bucket(n, seeded=request.seed is not None)
     assert _engine is not None and dec is not None and _tokenizer is not None
     timing: dict[str, float] = {}
     input_ids = torch.tensor([_prompt_ids(request, _tokenizer)], device=_device)
@@ -1919,10 +1919,13 @@ def engine_generate_multi(request: GenerateRequest, n: int) -> list[GenerateResp
             for r, stop in zip(rows, ended_on)]
 
 
-def _multi_bucket(n: int) -> "MultiSampleDecoder | None":
-    """The smallest row bucket that holds n candidates, or None."""
+def _multi_bucket(n: int, seeded: bool = False) -> "MultiSampleDecoder | None":
+    """The smallest row bucket that holds n candidates (seeded: the widest, so a seed's draws never depend on the
+    width its batch happened to take), or None."""
     fits = [r for r in _multi if r >= n]
-    return _multi[min(fits)] if fits else None
+    if not fits:
+        return None
+    return _multi[max(fits) if seeded else min(fits)]
 
 
 def build_cascade_decoder(eng: "DecodeEngine", rows: int, groups: int, tail_tokens: int,
@@ -2488,8 +2491,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "as a warning and reported in /info (startup). 0 = no budget")
     parser.add_argument("--seeded_rows", action=argparse.BooleanOptionalAction, default=False,
                         help="Row decoders draw each candidate's noise from its own seed and step: a request's 'seed' "
-                             "then reproduces its candidates whatever shares their batch (up to kernel rounding of "
-                             "the logits, which can flip a near-tie). Without it a 'seed' is a 400")
+                             "then reproduces its candidates whatever shares their batch. Seeded requests prefill cold "
+                             "and decode on the widest bucket (decoders of different widths round the logits "
+                             "differently, which can flip a draw). Without it a 'seed' is a 400")
     parser.add_argument("--prefix_pool_block", type=int, default=16,
                         help="Token block size of the prefix KV pool (>= 16): prefixes are shared in whole blocks")
     parser.add_argument("--cascade_attn", action=argparse.BooleanOptionalAction, default=False,

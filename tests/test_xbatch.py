@@ -7,8 +7,9 @@ engine, refill (continuous batching), steering installed for the batch and clear
 requests go through the batcher, anything else falls back to the existing paths; a signed request leaves one sign
 record per candidate in the spool (its generated ids ending with the stop token that ended it, its sign_meta kept),
 each choice carries its sign_id, the records sign through a signing decoder, and signed requests the sign path cannot
-take are refused. A seeded job's prompt is prefilled cold (never through a prefix cache), so its draws do not depend
-on what the cache held.
+take are refused. A seeded job's prompt is prefilled cold (never through a prefix cache) and it decodes on the widest
+bucket (never pulled into a narrower batch by refill), so its draws depend neither on what the cache held nor on how
+wide a batch its batchmates made.
 """
 
 from __future__ import annotations
@@ -530,3 +531,46 @@ def test_seeded_jobs_prefill_cold(monkeypatch, model: KotodamaModel) -> None:
     server._engine_prefill(torch.tensor([_ids(8, 1)]), fresh=True)
     server._engine_prefill(torch.tensor([_ids(8, 1)]))
     assert used == ["cold", "cached"]
+
+
+@torch.inference_mode()
+def test_seeded_jobs_decode_on_the_widest_bucket(model: KotodamaModel) -> None:
+    eng = _engine(model)
+    wide = MultiSampleDecoder(eng, 8, seeded=True)
+    decs = {4: MultiSampleDecoder(eng, 4, kv_from=wide, seeded=True), 8: wide}
+    widths: list[int] = []
+    for d in decs.values():
+        real = d.admit
+
+        def admit(*a, _real=real, _d=d, **k):
+            widths.append(_d.rows)
+            return _real(*a, **k)
+
+        d.admit = admit
+    late: list = []
+
+    def prefill(ids, **kw):
+        while late:  # a job that arrives while the batch is running
+            runner.queue.put(late.pop())
+        return eng.prefill_reference(ids), None
+
+    runner = XBatchRunner(decs, prefill=prefill, set_steer=eng.set_steer, decode=lambda ids: "", stop_ids=frozenset(),
+                          max_seq_len=MAX_SEQ, device=torch.device("cpu"), refill=True)
+    rec = _Rec()
+    hot = SamplingParams(temperature=0.9, repetition_penalty=1.2)
+
+    def seeded(name: str, seed: int):
+        job = rec.job(name, _ids(8, seed), 2, params=hot, max_new=3)
+        job.seed = seed
+        return job
+
+    runner.queue.put(seeded("a", 1))  # 2 rows: would fit the 4-wide bucket
+    runner.run_batch()
+    assert widths == [8]
+    widths.clear()
+    runner.queue.put(rec.job("u", _ids(8, 2), 2, params=hot, max_new=6))  # unseeded: the narrow bucket
+    late.append(seeded("b", 3))  # arrives mid-batch: refill must not pull it into the 4-wide batch
+    runner.run_batch()
+    assert widths == [4] and "b" not in rec.out
+    runner.run_batch()
+    assert widths == [4, 8] and "b" in rec.out
