@@ -42,6 +42,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -267,20 +268,27 @@ def sign_check(a, eng: DecodeEngine, tok, slot: int) -> dict:
                 t_steady += time.perf_counter() - t0
         return toks, reads, t_steady / max(1, steps - 8) * 1000, firsts
 
-    def lockstep(decs, fed: torch.Tensor) -> list[dict]:
+    def lockstep(decs, fed: torch.Tensor, sums: Optional[list] = None) -> list[dict]:
         """Every decoder admitted as in ``run`` (law 0) and fed the same tokens ``fed`` (rows, steps) through its
         regional forward; per later decoder against the first, over every step: the largest |logprob| difference,
-        the largest per-row KL, and the steps x rows whose argmax differs."""
+        the largest per-row KL, and the steps x rows whose argmax differs. ``sums``: a list that receives each
+        decoder's per-step checksums (a fixed random projection of the logprobs, fp64), for repeat comparisons."""
         for dec in decs:
             dec.release(range(dec.rows))
             dec.admit(list(range(dec.rows)), eng.prefill(prompts[0]), laws[0], slots=slots[:dec.rows],
                       seeds=seeds[:dec.rows])
         cmp = [{"max_abs_logprob": 0.0, "kl_max": 0.0, "argmax_differ": 0} for _ in decs[1:]]
+        if sums is not None:
+            sums.extend([] for _ in decs)
         for t in range(fed.shape[1]):
             outs = []
-            for dec in decs:
+            for i, dec in enumerate(decs):
                 outs.append(F.log_softmax(dec._regional_forward(fed[:dec.rows, t:t + 1].clone()).float(), -1))
                 dec._advance_host()
+                if sums is not None:
+                    w = torch.randn(outs[-1].shape, generator=torch.Generator(device="cuda").manual_seed(t),
+                                    device="cuda", dtype=torch.float64)
+                    sums[i].append(float((outs[-1].double() * w).sum()))
             ref = outs[0]
             for c, o in zip(cmp, outs[1:]):
                 n = o.shape[0]
@@ -318,12 +326,20 @@ def sign_check(a, eng: DecodeEngine, tok, slot: int) -> dict:
                       "step0_max_abs_logprob": float((r0[0][0] - r1[0][0]).abs().max()),
                       "ms_off": round(ms0, 3), "ms_on": round(ms1, 3), "overhead": round(ms1 / ms0 - 1, 4)}
     off2 = make(B, None)
-    cmp = lockstep([off, off2, on], fed)
-    ident["forced"] = {"off_vs_off2": cmp[0], "on_vs_off": cmp[1]}
+    first, again = [], []
+    cmp = lockstep([off, off2, on], fed, first)
+    lockstep([off, off2, on], fed, again)
+    ident["forced"] = {"off_vs_off2": cmp[0], "on_vs_off": cmp[1],
+                       "same_instance_repeat_bitwise": {name: x == y for name, x, y in
+                                                        zip(("off", "off2", "on"), first, again)}}
     out["on_off"] = ident
     logger.info("sign on/off: %s", json.dumps(ident))
     del off, off2
     torch.cuda.empty_cache()
+    if a.sign_sums_out:  # per-step checksums of each decoder, for comparing processes (a warm cache vs a cold one)
+        Path(a.sign_sums_out).write_text(json.dumps(dict(zip(("off", "off2", "on"), first))))
+    if a.sign_parts == "onoff":
+        return out
     # (2) the forced rows' signatures vs the replay capture over the same sequences (row 0: no lever; row 1: lever)
     model = eng.model
     targets = list(range(8))
@@ -404,6 +420,8 @@ def main() -> int:
                     help="the sampled effective layers (default: the tsumugi lane's)")
     ap.add_argument("--sign_attn", action="store_true", help="also the attention statistics at every layer")
     ap.add_argument("--sign_width", type=int, default=1024, help="columns of the head-mean rows (--sign_attn)")
+    ap.add_argument("--sign_parts", default="all", choices=("all", "onoff"), help="onoff: the on/off section only")
+    ap.add_argument("--sign_sums_out", default=None, help="write each decoder's per-step logprob checksums here")
     ap.add_argument("--max_seq_len", type=int, default=4096)
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--cold", action="store_true", help="inductor caches off: cold compile seconds")
