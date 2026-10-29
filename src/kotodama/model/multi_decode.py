@@ -503,9 +503,7 @@ class MultiSampleDecoder(nn.Module):
         return self._sample_rows(self._forward_step(tokens), truncated=True)
 
     def _step_scored(self, tokens: torch.Tensor) -> torch.Tensor:
-        lp = torch.log_softmax(self._forward_step(tokens).float(), dim=-1)
-        self.score_lp.copy_(lp.gather(1, self.score_target).view(-1))
-        return self.score_lp
+        return self._score_logits(self._forward_step(tokens))
 
     # ── the regional step (compile_step(regional=True)) ─────────────────────
 
@@ -629,8 +627,11 @@ class MultiSampleDecoder(nn.Module):
         return self._sample_rows(logits, truncated=True)
 
     def _score_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        lp = torch.log_softmax(logits.float(), dim=-1)
+        raw = logits.float()
+        lp = torch.log_softmax(raw, dim=-1)
         self.score_lp.copy_(lp.gather(1, self.score_target).view(-1))
+        if self.sign is not None:  # a scored token is the step's chosen token, as a sampled one is
+            self.sign_logit_stats[self.row_ids, self.sign_slot, 0] = signing.logit_stats(raw, self.score_target)
         return self.score_lp
 
     def _compile_regional(self, mode: str, backend, cuda_graph: Optional[bool]) -> None:
@@ -937,7 +938,9 @@ class MultiSampleDecoder(nn.Module):
     def score(self, tokens: torch.Tensor) -> torch.Tensor:
         """Teacher-force ``tokens`` ((B, S) or (1, S)) through the decode step from where every row stands: step t
         feeds tokens[:, t] and scores tokens[:, t + 1] under the row's own lever (raw log-softmax). Returns the
-        logprobs (B, S - 1); the rows end S - 1 positions further on (``rewind`` takes them back)."""
+        logprobs (B, S - 1); the rows end S - 1 positions further on (``rewind`` takes them back). A signing
+        decoder signs the scored span as it signs a generated one (the scored token is each step's chosen token),
+        so scoring a generated row's tokens from the same prompt replays its signature."""
         if tokens.ndim != 2 or tokens.shape[0] not in (1, self.rows) or tokens.shape[1] < 2:
             raise ValueError(f"tokens must be (1, S) or ({self.rows}, S) with S >= 2, got {tuple(tokens.shape)}")
         S = tokens.shape[1]

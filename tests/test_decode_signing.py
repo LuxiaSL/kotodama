@@ -9,6 +9,8 @@ What is pinned here:
     mass and the head-mean rows at the sampled layers), computed from the replay's attention weights;
   * signing does not change generation: a signed and an unsigned regional decoder give the same tokens and readouts,
     bit for bit;
+  * replay through the engine: scoring a generated row's own tokens from the same prompt signs it bit for bit as its
+    generation did (every surface, the logit statistics included);
   * the span bookkeeping: a row's span starts at its admission, a re-admitted row starts over, a row past the tail
     is reported incomplete, and the row's lever slot and steering are recorded;
   * signing compiles at most the sampled layers' signatures on top of the unsigned ones' count.
@@ -333,4 +335,28 @@ def test_weights_digest_matches_anamnesis() -> None:
     tiny = KotodamaModel(KotodamaModelConfig(**dict(CFG, num_layers=4, loop_start=1, loop_len=2,
                                                     loop_times=1, attn_res_boundaries=[0, 2])))
     assert weights_digest(tiny) == anamnesis_lane.weights_digest(tiny)
+
+
+@pytest.mark.parametrize("cls", [MultiSampleDecoder, CascadeDecoder])
+@torch.inference_mode()
+def test_scoring_a_generated_row_replays_its_signature(model: KotodamaModel, cls) -> None:
+    eng = _engine(model)
+    dec = _dec(cls, eng, SignSpec(LAYERS, tail=16, depth=True, attn=True, width=40))
+    dec.compile_step(regional=True, backend="aot_eager")
+    P = 9
+    prompt = _ids(P, 11)
+    seqs = _decode(eng, dec, prompt)
+    generated = [dec.signed(r) for r in range(ROWS)]
+    dec.release(range(ROWS))
+    dec.admit(list(range(ROWS)), eng.prefill(prompt), PARAMS, seeds=[1, 2, 3, 4])
+    dec.score(torch.tensor([s[P:] for s in seqs]))  # the first token, then every generated token
+    for r in range(ROWS):
+        replayed = dec.signed(r)
+        assert (replayed.positions, replayed.start) == (generated[r].positions, generated[r].start)
+        for name, x in generated[r].surfaces.items():
+            ys = replayed.surfaces[name]
+            if isinstance(x, list):
+                assert all(torch.equal(a, b) for a, b in zip(x, ys)), name
+            else:
+                assert torch.equal(x, ys), name
 
