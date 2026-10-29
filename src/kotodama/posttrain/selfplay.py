@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from kotodama.posttrain import selfcopy
-from kotodama.posttrain.transcript import Transcript, Turn, render_prompt, stop_sequences, to_row
+from kotodama.posttrain.transcript import SEP, Transcript, Turn, render, render_prompt, stop_sequences, to_row
 from kotodama.serve.laws import law
 
 logger = logging.getLogger(__name__)
@@ -262,6 +262,48 @@ def next_speaker(cast: list[str], turns: list[Turn]) -> str:
         return cast[(cast.index(turns[-1].speaker) + 1) % len(cast)]
     except ValueError:
         return cast[0]
+
+
+def speaker_tag_prompt(header: str, turns: list[Turn]) -> str:
+    """The document up to the start of the next turn's name tag: what the model continues to name the next speaker."""
+    if turns:
+        return render(Transcript(tuple(turns), header))[0] + SEP
+    return header + SEP if header else ""
+
+
+def match_speaker(text: str, cast: list[str], exclude: Optional[str] = None) -> Optional[str]:
+    """The cast member a sampled name tag names (exact, then case-insensitive), or None; ``exclude`` never matches."""
+    name = text.strip().rstrip(":").strip()
+    options = [c for c in cast if c != exclude]
+    for c in options:
+        if name == c:
+            return c
+    for c in options:
+        if name.casefold() == c.casefold():
+            return c
+    return None
+
+
+async def model_speaker(cast: list[str], turns: list[Turn], header: str, complete: Complete, samples: int = 4,
+                        max_tokens: int = 8) -> tuple[str, bool]:
+    """(next speaker, chosen by the model). The model writes the next turn's name tag: ``samples`` draws of a short
+    continuation of the document up to the turn break, stopped at the colon. The first draw that names a cast member
+    other than the last speaker is the choice, so the choice follows the model's own distribution over who speaks
+    next. Falls back to round-robin (False) when no draw names one, or when the request fails."""
+    rotate = next_speaker(cast, turns)
+    if len(cast) < 2:
+        return rotate, False
+    last = turns[-1].speaker if turns else None
+    try:
+        raw = await complete(speaker_tag_prompt(header, turns), samples, [":", "\n"], max_tokens=max_tokens)
+    except Exception as e:  # a failed tag draw costs this turn the model's choice, never the scene
+        logger.warning("speaker tag draw failed (%s); rotating", e)
+        return rotate, False
+    for text, _finish, _hit in raw:
+        got = match_speaker(text, cast, exclude=last)
+        if got is not None:
+            return got, True
+    return rotate, False
 
 
 # ── generation ───────────────────────────────────────────────────────────────

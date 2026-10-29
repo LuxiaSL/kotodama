@@ -72,7 +72,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from kotodama.posttrain import compliance
-from kotodama.posttrain.selfplay import (Complete, PromptTooLong, SeedSpec, SelfPlayConfig, evaluate, next_speaker,
+from kotodama.posttrain.selfplay import (Complete, PromptTooLong, SeedSpec, SelfPlayConfig, evaluate, model_speaker,
+                                         next_speaker,
                                          novelty_counts, oai_completer, parse_seed, parse_steer, speech_key,
                                          split_completion, spoken_text)
 from kotodama.posttrain.transcript import Transcript, Turn, render_prompt, stop_sequences, to_row
@@ -105,6 +106,7 @@ class LoomConfig:
     rerolls: int = 0  # a node whose K candidates are all vetoed draws K more, up to this many times, before degrading
     engage_replies: int = 2
     overlong: str = "veto"  # veto | keep
+    speaker: str = "rotate"  # rotate (round-robin over the cast) | model (the model names the next speaker)
 
 
 @dataclass
@@ -211,8 +213,14 @@ async def grow(seed: SeedSpec, tree: str, complete: Complete, cfg: LoomConfig, s
         return window_turns(turns, seed.header, n_seed, cfg.window_chars)
 
     async def expand(node: Node) -> list[Node]:
-        speaker = next_speaker(seed.cast, list(node.turns))
         seen = visible(node.turns)
+        if cfg.speaker == "model":
+            speaker, chose = await model_speaker(seed.cast, list(seen), seed.header, complete)
+            stats["requests"] += 1
+            stats["speaker_model" if chose else "speaker_rotate"] = stats.get(
+                "speaker_model" if chose else "speaker_rotate", 0) + 1
+        else:
+            speaker = next_speaker(seed.cast, list(node.turns))
         prompt = render_prompt(Transcript(seen, seed.header), speaker)
         if len(prompt) > cfg.max_prompt_chars:
             end(node, "length_cap")
@@ -753,6 +761,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--template_max", type=int, default=3)
     ap.add_argument("--engage_replies", type=int, default=2)
     ap.add_argument("--overlong", choices=["veto", "keep"], default="veto")
+    ap.add_argument("--speaker", choices=["rotate", "model"], default="rotate",
+                    help="who speaks next: rotate = round-robin over the cast; model = the model writes the next "
+                         "turn's name tag (first of 4 draws naming a cast member other than the last speaker; "
+                         "round-robin when none does)")
     ap.add_argument("--steer", default="")
     ap.add_argument("--steer_rule", choices=["K", "N", "S"], default="K")
     ap.add_argument("--seed", type=int, default=0)
@@ -785,7 +797,8 @@ def main(argv: list[str] | None = None) -> int:
                      window_chars=a.window_chars, deep_after=a.deep_after, deep_width=a.deep_width,
                      select=a.select, select_lambda=a.select_lambda, engage_replies=a.engage_replies,
                      overlong=a.overlong, novelty_speech_only=a.novelty_speech_only, novelty_norm=a.novelty_norm,
-                     novelty_prior=a.novelty_prior, deep_children=a.deep_children, rerolls=a.rerolls)
+                     novelty_prior=a.novelty_prior, deep_children=a.deep_children, rerolls=a.rerolls,
+                     speaker=a.speaker)
     sp = SelfPlayConfig(candidates=a.candidates, max_tokens=a.max_tokens, min_turns=a.min_turns,
                         cycle_window=a.cycle_window, template_window=a.template_window, template_max=a.template_max)
     complete, close = oai_completer(a.endpoint, sampling, a.max_tokens, model=a.model,

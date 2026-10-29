@@ -328,3 +328,43 @@ def test_novelty_count_and_own_opening_repeat() -> None:
     assert not sp.own_opening_repeat("Well, I suppose we wait here then.", "B", turns)  # B never opened so
     assert not sp.own_opening_repeat("Well, I suppose we wait here then.", "A", turns, back=1)  # only "maybe the"
     assert not sp.own_opening_repeat("Well, I.", "A", turns)  # under 4 spoken words
+
+
+def test_match_speaker() -> None:
+    cast = ["Ann", "Scott", "Bea"]
+    assert sp.match_speaker(" Scott", cast) == "Scott"
+    assert sp.match_speaker("scott:", cast) == "Scott"  # case-insensitive after an exact miss
+    assert sp.match_speaker("Scott", cast, exclude="Scott") is None  # the last speaker is never chosen
+    assert sp.match_speaker("(pause)", cast) is None
+
+
+def test_speaker_tag_prompt_ends_at_the_turn_break() -> None:
+    p = sp.speaker_tag_prompt("H", [Turn("Ann", "Hi."), Turn("Scott", "Hey.")])
+    assert p == "H\n\nAnn: Hi.\n\nScott: Hey.\n\n"
+    assert sp.speaker_tag_prompt("H", []) == "H\n\n"
+
+
+def _tags(*texts, fail: bool = False):
+    calls = []
+
+    async def complete(prompt, n, stops, **kw):
+        calls.append((prompt, n, stops, kw))
+        if fail:
+            raise RuntimeError("down")
+        return [(t, "stop", False) for t in texts][:n]
+
+    return complete, calls
+
+
+def test_model_speaker_takes_the_first_valid_tag() -> None:
+    cast, turns = ["Ann", "Scott", "Bea"], [Turn("Ann", "Hi.")]
+    complete, calls = _tags("Ann", "narration", "Bea", "Scott")  # Ann just spoke: skipped; "narration" is no one
+    assert asyncio.run(sp.model_speaker(cast, turns, "H", complete)) == ("Bea", True)
+    assert calls[0][2] == [":", "\n"] and calls[0][3] == {"max_tokens": 8} and calls[0][1] == 4
+
+
+def test_model_speaker_falls_back_to_rotation() -> None:
+    cast, turns = ["Ann", "Scott", "Bea"], [Turn("Ann", "Hi.")]
+    assert asyncio.run(sp.model_speaker(cast, turns, "H", _tags("Ann", "Zed")[0])) == ("Scott", False)
+    assert asyncio.run(sp.model_speaker(cast, turns, "H", _tags(fail=True)[0])) == ("Scott", False)
+    assert asyncio.run(sp.model_speaker(["Solo"], [], "H", _tags("Solo")[0])) == ("Solo", False)

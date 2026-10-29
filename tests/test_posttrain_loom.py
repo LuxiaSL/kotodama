@@ -491,3 +491,24 @@ def test_main_sends_the_model_field_and_records_it(tmp_path, monkeypatch) -> Non
     assert loom.main(["--seeds", str(seeds), "--endpoint", "http://x", "--out", str(out), "--model", "pool-b"]) == 0
     assert seen["model"] == "pool-b"
     assert json.loads((out / "run.json").read_text())["model"] == "pool-b"
+
+
+def test_model_speaker_mode_lets_the_model_name_the_next_speaker() -> None:
+    seed = SeedSpec("s3", ["Mara", "Teo", "Ines"], "Three on a ferry.", [])
+    tags = []
+
+    async def complete(prompt: str, n: int, stops: list[str], **kw):
+        if stops == [":", "\n"]:  # the name-tag draw: always pick Ines unless she just spoke, then Mara
+            last = prompt.rstrip("\n").rsplit("\n\n", 1)[-1].split(":", 1)[0]
+            tags.append(last)
+            return [("Mara" if last == "Ines" else "Ines", "stop", False)] * n
+        depth = prompt.count("\n\n")
+        return [(f"line {depth}-{i} about the tide{stops[0]}", "stop", False) for i in range(n)]
+
+    cfg = loom.LoomConfig(candidates=2, children=1, width=1, max_depth=4, min_turns=2, speaker="model")
+    recs = {"node": [], "path": [], "state": []}
+    st = asyncio.run(loom.grow(seed, "t3", complete, cfg, SelfPlayConfig(min_turns=2), "x",
+                               lambda k, r: recs[k].append(r)))
+    speakers = [t["speaker"] for t in max(recs["path"], key=lambda p: p["depth"])["turns"]]
+    assert speakers[:4] == ["Ines", "Mara", "Ines", "Mara"]  # never the strict rotation Mara, Teo, Ines
+    assert st["speaker_model"] == len(tags) and st.get("speaker_rotate", 0) == 0
