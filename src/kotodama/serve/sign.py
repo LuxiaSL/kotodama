@@ -224,6 +224,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         while True:
             summary = spool.drain_once(signer)
             if summary is not None:
+                if pins is not None and pins.mode == "record":
+                    # a batch can launch kernels the warm-up did not (its prompts' lengths): keep them in the table
+                    pins.save()
                 print(json.dumps(summary), flush=True)
                 continue
             if a.once:

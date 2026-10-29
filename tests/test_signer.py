@@ -273,7 +273,16 @@ def test_the_spool_drains_one_batch_at_a_time(model: KotodamaModel, tmp_path) ->
         assert spool.drain_once(signer) is None  # another drain holds the spool
     built = RecordSigner.build(eng, _Keep(), layers=LAYERS, tail=SPEC.tail, width=SPEC.width, rows=ROWS, groups=4,
                                group_rows=2, tail_tokens=32, compile_mode="default", backend="aot_eager")
-    built.warm()
+    lens = []
+    prefill = eng.prefill
+    eng.prefill = lambda ids, *a, **k: (lens.append(ids.shape[1]), prefill(ids, *a, **k))[1]
+    try:
+        built.warm()
+    finally:
+        eng.prefill = prefill
+    # the warm-up prefill runs every block bucket the cache has room for (a long prompt's chunks launch kernels a
+    # short one does not, and a recorded pin table must hold them)
+    assert lens == [min(sum(eng.block_buckets), eng.max_seq_len - built.dec.tail_tokens)]
     keep = built.reducer
     assert spool.drain_once(built)["signed"] == 1
     _same(keep.rows[recs[0].prompt_ids + recs[0].generated_ids],

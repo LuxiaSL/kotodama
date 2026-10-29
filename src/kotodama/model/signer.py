@@ -264,12 +264,15 @@ class RecordSigner:
         return cls(dec, reducer, compile_mode=compile_mode, **kw)
 
     @torch.inference_mode()
-    def warm(self, prompt_len: int = 32, span: int = 8) -> None:
+    def warm(self, prompt_len: Optional[int] = None, span: int = 8) -> None:
         """Run one batch of filler through the scoring step (no reducer): compiles and, with kernel pins recording,
-        records the kernels a signed batch launches."""
+        records the kernels a signed batch launches. The default prompt is as long as the prefill's block buckets
+        together, so its prefill runs every bucket (a long prompt's chunks launch kernels a short one does not)."""
         from kotodama.model.decode_engine import SamplingParams
 
         dec, eng = self.dec, self.dec.engine
+        if prompt_len is None:
+            prompt_len = min(sum(eng.block_buckets), eng.max_seq_len - dec.tail_tokens)
         span = max(2, min(span, self.spec.tail + 1, dec.tail_tokens - 1))
         g = torch.Generator().manual_seed(0)
         prompt = torch.randint(3, eng.config.vocab_size, (1, prompt_len), generator=g).to(eng.device)
