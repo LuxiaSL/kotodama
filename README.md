@@ -9,12 +9,12 @@
 > Research, code and development: Luxia ([@LuxiaSL](https://github.com/LuxiaSL)) and
 > Claude (Anthropic). Trained on compute provided by Anima Labs.
 
-Kotodama is a from-scratch language-model pretraining stack in one Python
+Kotodama is a stack for pretraining language models from scratch, in one Python
 package, `kotodama`. It trains Llama-style decoders with **Block Attention
-Residuals** (AttnRes) whose block boundaries are placed from the network's own
-layer geometry, optimizes matrix parameters with **Muon**, supports **looped
-depth** (a run of layers executed several times with shared weights), and can
-pre-pretrain on **neural-cellular-automata (NCA) trajectories** before language.
+Residuals** (AttnRes), placing the block boundaries from the network's own layer
+geometry. Matrix parameters are optimized with **Muon**. A run of layers can
+execute several times with shared weights (**looped depth**), and training can
+begin on **neural-cellular-automata (NCA) trajectories** before language.
 Around the trainer sit an evaluation suite (lm-eval, Uncheatable BPB, induction,
 judge-free binding batteries), per-layer telemetry, and an OpenAI-compatible
 serving stack.
@@ -43,10 +43,10 @@ An earlier model,
 - **Decoder:** grouped-query attention, RoPE (θ = 500K), RMSNorm with QK-norm,
   SwiGLU feed-forward, tied input/output embeddings, z-loss on the logits.
 - **Tokenizer:** SmolLM2 (`HuggingFaceTB/SmolLM2-135M`, vocabulary 49,152).
-- **Block Attention Residuals** ([Moonshot AI, 2026](https://arxiv.org/abs/2603.15031)): instead of one running
-  residual sum, the layers are grouped into blocks; each sublayer reads a
-  softmax-weighted mixture of the committed block outputs and the current
-  block's partial sum, routed by a learned per-layer pseudo-query. Fused Triton
+- **Block Attention Residuals** ([Moonshot AI, 2026](https://arxiv.org/abs/2603.15031)): they replace the single
+  running residual sum with blocks of layers. Each sublayer reads a mixture of
+  the finished blocks' outputs and the current block's partial sum. A learned
+  query at each layer sets the softmax weights of that mixture. Fused Triton
   kernels for the two routing phases are vendored in
   `kotodama/model/flash_attn_res/`; a PyTorch fallback runs on CPU.
 - **Muon** (momentum orthogonalized by Newton–Schulz) for hidden matrices,
@@ -219,11 +219,12 @@ effective values; it is regenerated on purpose with
 ### AttnRes boundaries from layer geometry
 
 Kotodama places block starts from the model's own geometry rather than
-uniformly. The DD method profiles a checkpoint trained **without** AttnRes,
-scores layer-to-layer transitions (attention entropy; in `fit_boundaries.py`
-also linear CKA between adjacent layers' outputs), and suggests
-block starts under explicit rules (an isolated embedding layer, a cushioned
-last block, a contiguous middle block). `scripts/eval/nca_profile.py` is the
+uniformly. The DD method works in three steps. It profiles a checkpoint
+trained **without** AttnRes. It scores the transitions between adjacent layers by
+attention entropy (and, in `fit_boundaries.py`, by linear CKA between their
+outputs). Then it suggests where blocks should start, under explicit rules: the
+embedding layer gets its own block, the last block keeps a few layers of cushion,
+and the middle block stays contiguous. `scripts/eval/nca_profile.py` is the
 archived algorithm that produced DD-3B, kept verbatim and pinned by a test.
 `scripts/eval/fit_boundaries.py` fits every snapshot of a no-AttnRes run on
 held-out language text and declares a fit settled at the first snapshot after
@@ -250,10 +251,10 @@ A trunk trains at constant LR to a token ceiling and never decays
 | `--save_schedule 250M:4B,1B:end` | weights-only saves on a piecewise token cadence → `<checkpoint_dir>/weights/` (never pruned) |
 | `--anchor_tokens 10B,20B,...` | protected full (resumable) checkpoints → `<checkpoint_dir>/anchors/` |
 
-An annealed read at any anchor is a **branch**: the anchor is copied into a
-fresh directory and training resumes there (from the newest `step_*.pt` in
-`--checkpoint_dir`) with a short LR decay that starts exactly at the anchor step
-(the cooldown command under [Train](#train)). The trunk is never disturbed, so
+An annealed read is a **branch** from an anchor. Copy the anchor into a fresh
+directory and resume training there, from the newest `step_*.pt` in
+`--checkpoint_dir`, with a short learning-rate decay that starts exactly at the
+anchor step. The cooldown command under [Train](#train) does this. The trunk is never disturbed, so
 one run yields annealed models at every anchor.
 
 Other run-shape flags:
@@ -335,10 +336,10 @@ Every item also runs under few-shot conditions with exemplars.
 - **The binding suite** (`kotodama.eval.binding`): one runner for every battery
   above and below. It loads a model once (a kotodama checkpoint or any Hugging Face
   model), scores each requested battery in-process with the same scorer as
-  `/logprobs`, and writes resumable rows. Prompt files are pinned by sha256, and a
-  bindprobes item file also by the sha256 of every prompt it renders (each item
-  renders with the templates of the generation that built it), so a recorded
-  number always names its exact strings. Beyond the bindprobes families
+  `/logprobs`, and writes resumable rows. Prompt files are pinned by their sha256. A
+  bindprobes item file is also pinned by the sha256 of every prompt that it renders,
+  because each item renders with the templates of the version that generated it.
+  So every recorded number traces to the exact strings that it was scored on. Beyond the bindprobes families
   it carries:
   - stage gauges `joinlite-v1` (static I / you and a speaker-swap counterfactual)
     and `swapdyn-v1` (the swap on transfer dialogues). A shift above +.02 at the
