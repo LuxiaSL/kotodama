@@ -220,13 +220,23 @@ def cascade_stats(st: tuple, q: torch.Tensor, kv: tuple[torch.Tensor, ...], stat
     head_ent, mean_ent, head_sc, mean_rows, row_ids, slot, layer_col, sampled_col, start, pos = st
     tail_k, _, prompt_k, _ = kv
     tail_pos, members, row_slot, prompt_lens, _ = state
+    scol = sampled_col if sampled else layer_col  # read only at sampled layers
+    torch.ops.kotodama.cascade_stats(head_ent, mean_ent, head_sc, mean_rows, row_ids, slot, layer_col, scol, start,
+                                     pos, q, tail_k, prompt_k, tail_pos, members, row_slot, prompt_lens, lse,
+                                     bool(sampled), block, splits, warps, stages, sub)
+
+
+def _launch(head_ent: torch.Tensor, mean_ent: torch.Tensor, head_sc: torch.Tensor, mean_rows: torch.Tensor,
+            row_ids: torch.Tensor, slot: torch.Tensor, layer_col: torch.Tensor, scol: torch.Tensor,
+            start: torch.Tensor, pos: torch.Tensor, q: torch.Tensor, tail_k: torch.Tensor, prompt_k: torch.Tensor,
+            tail_pos: torch.Tensor, members: torch.Tensor, row_slot: torch.Tensor, prompt_lens: torch.Tensor,
+            lse: torch.Tensor, sampled: bool, block: int, splits: int, warps: int, stages: int, sub: int) -> None:
     B, H, _, D = q.shape
     hk = tail_k.shape[2]
     G, M = members.shape
     width = mean_rows.shape[-1]
     qr = q[:, :, 0].contiguous()
     lse = lse.float().contiguous()
-    scol = sampled_col if sampled else layer_col  # read only at sampled layers
     f32 = dict(device=q.device, dtype=torch.float32)
     common = dict(SCALE=D ** -0.5, H=H, R=H // hk, HK=hk, D=D, BN=block, NS=splits, WIDTH=width,
                   SAMPLED=bool(sampled))
@@ -245,3 +255,23 @@ def cascade_stats(st: tuple, q: torch.Tensor, kv: tuple[torch.Tensor, ...], stat
         qr.stride(0), qr.stride(1), tail_k.stride(0), tail_k.stride(1), tail_k.stride(2),
         *head_ent.stride()[:3], *mean_ent.stride()[:3], *head_sc.stride()[:3], *mean_rows.stride()[:3],
         M=M, HP=triton.next_power_of_2(H), num_warps=4, **common)
+
+
+# The launches behind a custom op that names what it writes (the four stats buffers): the compiler treats it as one
+# opaque node with those mutations, as it treats the attention's flash kernel, instead of analysing two raw triton
+# launches inside the layer's graph (which changed the layer's own arithmetic: rows of a signed step then differed
+# from the unsigned step's).
+@torch.library.custom_op("kotodama::cascade_stats", mutates_args=("head_ent", "mean_ent", "head_sc", "mean_rows"))
+def _cascade_stats_op(head_ent: torch.Tensor, mean_ent: torch.Tensor, head_sc: torch.Tensor, mean_rows: torch.Tensor,
+                      row_ids: torch.Tensor, slot: torch.Tensor, layer_col: torch.Tensor, scol: torch.Tensor,
+                      start: torch.Tensor, pos: torch.Tensor, q: torch.Tensor, tail_k: torch.Tensor,
+                      prompt_k: torch.Tensor, tail_pos: torch.Tensor, members: torch.Tensor, row_slot: torch.Tensor,
+                      prompt_lens: torch.Tensor, lse: torch.Tensor, sampled: bool, block: int, splits: int,
+                      warps: int, stages: int, sub: int) -> None:
+    _launch(head_ent, mean_ent, head_sc, mean_rows, row_ids, slot, layer_col, scol, start, pos, q, tail_k, prompt_k,
+            tail_pos, members, row_slot, prompt_lens, lse, sampled, block, splits, warps, stages, sub)
+
+
+@_cascade_stats_op.register_fake
+def _(*_args) -> None:
+    return None
