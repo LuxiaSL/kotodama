@@ -1,0 +1,79 @@
+"""Pinned kernel configs (kotodama.model.kernel_pins): the choice logic on stand-in launchers, and the patch of
+inductor's runtime autotuner, without a GPU.
+
+What is pinned here:
+  * replay keeps exactly the recorded config, refuses a kernel the table does not hold (or, allowed, takes its first
+    config and records the miss, which changes the digest), and refuses a pinned config the kernel no longer has;
+  * record mode leaves the choice to the autotuner and records it; first mode always takes the first config;
+  * the digest is a function of the table alone, and a saved table replays the same choices;
+  * install patches CachingAutotuner.autotune_to_one_config so a kernel's launchers are cut to the pinned one.
+"""
+
+from __future__ import annotations
+
+import types
+from pathlib import Path
+
+import pytest
+
+from kotodama.model import kernel_pins as kp
+
+
+class _Cfg:
+    def __init__(self, xblock: int, warps: int = 4, stages: int = 1) -> None:
+        self.kwargs = {"XBLOCK": xblock}
+        self.num_warps = warps
+        self.num_stages = stages
+
+
+def _launchers(*blocks: int) -> list:
+    return [types.SimpleNamespace(config=_Cfg(b)) for b in blocks]
+
+
+def test_config_and_kernel_keys_are_stable() -> None:
+    assert kp.config_key(_Cfg(256)) == "XBLOCK=256|w4|s1"
+    assert kp.kernel_key("src", (128, 64)) == kp.kernel_key("src", (128, 64)) != kp.kernel_key("src", (64,))
+
+
+def test_replay_keeps_the_recorded_config(tmp_path: Path) -> None:
+    rec = kp.PinSession(mode="record", path=tmp_path / "pins.json")
+    launchers = _launchers(128, 256, 512)
+    assert rec.choose("k1", launchers) is None  # the autotuner decides
+    rec.record("k1", launchers[1])
+    rec.save()
+    import json
+
+    rep = kp.PinSession(mode="replay", path=rec.path, table=json.loads(rec.path.read_text()))
+    assert rep.choose("k1", _launchers(128, 256, 512)).config.kwargs == {"XBLOCK": 256}
+    assert rep.hits == 1 and rep.digest == rec.digest
+    with pytest.raises(kp.KernelPinMiss, match="not in the pin table"):
+        rep.choose("k2", launchers)
+    with pytest.raises(kp.KernelPinMiss, match="not among its configs"):
+        rep.choose("k1", _launchers(128, 512))
+    lenient = kp.PinSession(mode="replay", path=rec.path, table=dict(rep.table), allow_missing=True)
+    before = lenient.digest
+    assert lenient.choose("k2", _launchers(64, 128)).config.kwargs == {"XBLOCK": 64}
+    assert lenient.misses == ["k2"] and lenient.digest != before
+
+
+def test_first_mode_takes_the_first_config() -> None:
+    assert kp.PinSession(mode="first", path=None).choose("k", _launchers(512, 128)).config.kwargs == {"XBLOCK": 512}
+
+
+def test_install_patches_the_runtime_autotuner(tmp_path: Path) -> None:
+    th = pytest.importorskip("torch._inductor.runtime.triton_heuristics")
+    table = tmp_path / "pins.json"
+    key = kp.kernel_key("def kernel(): pass", (1024,))
+    table.write_text('{"%s": "XBLOCK=512|w4|s1"}' % key)
+    saved = th.CachingAutotuner.autotune_to_one_config
+    try:
+        sess = kp.install(table, "replay")
+        stub = types.SimpleNamespace(fn=types.SimpleNamespace(src="def kernel(): pass"), size_hints=(1024,),
+                                     launchers=_launchers(128, 512, 1024))
+        th.CachingAutotuner.autotune_to_one_config(stub)
+        assert [x.config.kwargs["XBLOCK"] for x in stub.launchers] == [512] and sess.hits == 1
+        assert kp.session() is sess
+        with pytest.raises(FileNotFoundError):
+            kp.install(tmp_path / "missing.json", "replay")
+    finally:
+        th.CachingAutotuner.autotune_to_one_config = saved
