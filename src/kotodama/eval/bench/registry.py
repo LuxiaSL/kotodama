@@ -127,7 +127,8 @@ REGISTRY: dict[str, Eval] = {e.name: e for e in (
                "four-register spread"),
           Flag("pooled prose (narrative + screenplay + chat)", "pooling hides a format term of up to 40 points", "4/8 models",
                "four-register spread"),
-          Flag("3shot, prose registers", "fixed exemplars hurt prose (and help code)", "8/8 models", "condition comparison")),
+          Flag("3shot, prose registers", "fixed exemplars hurt prose and help code", "chat 8/8, screenplay 6/8, narrative 5/8; "
+               "code helped 8/8", "condition comparison")),
          "audited"),
 )}
 
