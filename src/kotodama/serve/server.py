@@ -796,11 +796,11 @@ class ModelInfo(BaseModel):
 
 # ── /logprobs: batched prefill-only scoring (the four-register rider battery) ──
 # One forward per BATCH, no decode loop (the computation lives in
-# kotodama.eval.riders.score, shared with the training loop's in-loop riders).
+# kotodama.serve.logprobs, shared with the training loop's in-loop riders).
 # This is the fast path for logprob evals; the decode engine is irrelevant here
 # because nothing is generated.
 
-from kotodama.eval.riders.score import (  # noqa: E402
+from kotodama.serve.logprobs import (  # noqa: E402
     LOGPROB_MAX_BATCH,
     LOGPROB_MAX_TOTAL_TOKENS,
     LogprobLimitError,

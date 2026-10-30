@@ -185,3 +185,15 @@ def test_preset_1b_standard():
     assert std["attnres_eps_fp64_compat"] is False and tsu["attnres_eps_fp64_compat"] is True
     differ = {k for k in std if std[k] != tsu.get(k)}
     assert differ <= {"model_size", "attn_res_boundaries", "attnres_eps_fp64_compat", "checkpoint_shm_dir", "config", "_config_file"}, differ
+
+
+def test_prerelease_shape_name_still_resolves():
+    from kotodama import presets
+    from kotodama.serve import server
+
+    # the pre-release name stays loadable: checkpoints and published config.json files carry it
+    assert presets.resolve("1b-moonshot-loop") == "1b-tsumugi"
+    assert presets.shape("1b-moonshot-loop") == presets.shape("1b-tsumugi")
+    assert presets.DEFAULT_BOUNDARIES["1b-moonshot-loop"] == presets.TSUMUGI_LOOP
+    assert server.model_config_for("1b-moonshot-loop") is server.MODEL_CONFIGS["1b-tsumugi"]
+    assert server.model_config_for("no-such-shape") is None

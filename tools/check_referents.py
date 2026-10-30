@@ -34,7 +34,7 @@ How a line is read
    entry of the repository; a placeholder or a glob is a schema and never a
    referent. It resolves when some file or directory here ends with it, so a
    relative pointer written from a sibling module's point of view
-   (`riders/score.py`) still resolves.
+   (`serve/logprobs.py`) still resolves.
 4. **Dotted module paths** rooted at a package this repository ships resolve to a
    module file, or to a module plus a top-level symbol that module defines. The
    package roots are read off the tree, and the resolution is static (AST), never

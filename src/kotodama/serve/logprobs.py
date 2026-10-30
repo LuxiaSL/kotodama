@@ -1,9 +1,9 @@
-"""Closed-candidate logprob scoring — the one implementation behind ``/logprobs``.
+"""Closed-candidate logprob scoring for the server's ``/logprobs`` and the training loop's in-loop evals.
 
-``kotodama.serve.server`` exposes it over HTTP (``_score_logprobs``) and the
-training loop calls it in-process on the live weights (``kotodama.training.inloop``);
-both go through :func:`score_logprob_batch`, so a rider row means the same thing
-from either path (parity: ``tests/test_inloop.py``).
+This is the server's own copy of the binding benchmark's scorer, so serving never imports the benchmark package.
+``tests/test_bench_plugin.py`` checks that the two return identical results when the benchmark is installed. Both the
+server (``kotodama.serve.server._score_logprobs``) and the in-loop riders (``kotodama.training.inloop``) go through
+:func:`score_logprob_batch`, so a rider row means the same thing from either path (``tests/test_inloop.py``).
 
 One forward per batch, no decode loop: prompts are right-padded with id 0 and
 logits are gathered at each sequence's last REAL position — exactly correct

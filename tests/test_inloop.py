@@ -16,14 +16,19 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from kotodama.eval.riders import items as ri
-from kotodama.eval.riders import lite
-from kotodama.eval.riders.errors import coarse_error_type, error_types, passed_through, picked
-from kotodama.eval.riders.score import (LogprobLimitError, plan_batches, score_logprob_batch,
-                                        score_logprob_items)
+from kotodama.serve.logprobs import (LogprobLimitError, plan_batches, score_logprob_batch,
+                                     score_logprob_items)
 from kotodama.training.inloop import (InloopConfig, InloopEvaluator, inloop_schedule,
                                       merge_shards, parse_schedule, parse_suites, shard)
 from kotodama.training.muon import decay_start_step
+
+try:   # the riders suite comes from the binding benchmark (the bench extra)
+    from binding_bench.riders import items as ri
+    from binding_bench.riders import lite
+    from binding_bench.riders.errors import coarse_error_type, error_types, passed_through, picked
+except ImportError:
+    ri = lite = None  # type: ignore[assignment]
+needs_bench = pytest.mark.skipif(ri is None, reason="the binding benchmark is not installed (kotodama[bench])")
 
 VOCAB = 49152  # the presets tokenizer's size: rider candidates are real token ids
 
@@ -123,6 +128,7 @@ def battery() -> tuple[list[ri.Item], list[ri.Item]]:
     return ri.generate(list(ri.BANKED_VERIFIED_NAMES), 20, 5, ri.DEFAULT_SEED)
 
 
+@needs_bench
 def test_select_items_balanced_and_deterministic(battery):
     its, _ = battery
     sel = lite.select_items(its, 40, seed=3)
@@ -135,6 +141,7 @@ def test_select_items_balanced_and_deterministic(battery):
     assert len({it.item_id for it in lite.select_items(its, 10_000)}) == 20 * len(ri.CELLS)
 
 
+@needs_bench
 def test_reletter_shots(battery):
     its, shots = battery
     relet = lite.reletter_shots(shots, its)
@@ -161,6 +168,7 @@ def test_reletter_shots(battery):
         lite.reletter_shots(shots, its, mapping={"F": "G", "G": "F", "H": "K"})
 
 
+@needs_bench
 def test_build_jobs(battery):
     its, shots = battery
     sel = lite.select_items(its, 3)
@@ -180,6 +188,7 @@ def _item(**kw: Any) -> ri.Item:
     return ri.Item(**base)
 
 
+@needs_bench
 def test_error_typing():
     # F=bell G=cup H=key; swap(F,G) -> F=cup G=bell H=key; query F -> gold cup
     it = _item(boxes0={"F": "bell", "G": "cup", "H": "key"},
@@ -216,6 +225,7 @@ def _rows(rd: str, cond: str, ranks: list[int], etype: str = "wrong_box") -> lis
              **({} if r == 1 else {"error_type": etype})} for r in ranks]
 
 
+@needs_bench
 def test_summarize():
     rows = (_rows("narrative", "0shot", [1, 2, 2, 2])
             + _rows("narrative", "3shot", [1, 1, 1, 2], "init_query")
@@ -284,6 +294,7 @@ def test_score_limits(tok):
     assert score_logprob_batch(fn, tok, [], 5, "cpu") == []
 
 
+@needs_bench
 def test_server_and_inloop_scoring_identical(tok, battery, monkeypatch):
     """The /logprobs handler and the in-loop path run one function: same items,
     same model -> identical result dicts (ids, logprobs, ranks, entropy, top-n)."""
@@ -330,6 +341,7 @@ def _comparable(m: dict[str, float]) -> dict[str, float]:
     return {k: v for k, v in m.items() if not k.endswith("time_s")}
 
 
+@needs_bench
 def test_evaluator_single_process(tok, tmp_path):
     model = _tiny().train()
     before = {k: v.clone() for k, v in model.state_dict().items()}
@@ -369,6 +381,7 @@ def test_evaluator_single_process(tok, tmp_path):
     assert ev2.plan(200, 180, 199, start_step=100) == [s for s in pending if s >= 100]
 
 
+@needs_bench
 def test_evaluator_suite_failure_is_reported_not_raised(tok, tmp_path, monkeypatch):
     model = _tiny()
     ev = InloopEvaluator(_cfg(), out_dir=tmp_path, rank=0, world_size=1,
@@ -383,6 +396,7 @@ def test_evaluator_suite_failure_is_reported_not_raised(tok, tmp_path, monkeypat
     assert "boom" in meta["errors"]["induction"]
 
 
+@needs_bench
 def test_evaluator_requires_paths(tok, tmp_path):
     kw = dict(out_dir=tmp_path, rank=0, world_size=1, device=torch.device("cpu"),
               max_seq_len=1024, vocab_size=VOCAB, tokenizer=tok)
@@ -471,6 +485,7 @@ def _worker(rank: int, world: int, port: int, out_dir: str) -> None:
         dist.destroy_process_group()
 
 
+@needs_bench
 def test_two_process_gloo_matches_single(tok, tmp_path):
     single = InloopEvaluator(_cfg(), out_dir=tmp_path / "single", rank=0, world_size=1,
                              device=torch.device("cpu"), max_seq_len=1024,

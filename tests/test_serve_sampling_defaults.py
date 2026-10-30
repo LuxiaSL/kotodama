@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from kotodama.eval.riders.score import LogprobLimitError, score_token_nll_batch
+from kotodama.serve.logprobs import LogprobLimitError, score_token_nll_batch
 
 
 def test_resolve_oai_repetition_penalty(monkeypatch):

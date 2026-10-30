@@ -14,9 +14,9 @@ autocast on CUDA), gathers to rank 0 in ONE ``all_gather_object``, and rank 0
 
 Suites:
 
-  riders       riders-lite (``kotodama.eval.riders.lite``): N items x 4 registers x
-               {0shot, 3shot, 3shot_relet}, scored by the SAME function the
-               server's ``/logprobs`` uses (``kotodama.eval.riders.score``)
+  riders       riders-lite (the binding benchmark's ``binding_bench.riders.lite``, from the
+               ``bench`` extra): N items x 4 registers x {0shot, 3shot, 3shot_relet}, scored
+               by the SAME function the server's ``/logprobs`` uses (``kotodama.serve.logprobs``)
   induction    random-token repeat loss drop (``kotodama.eval.induction``)
   uncheatable  bits/byte on the first docs of each domain (``kotodama.eval.uncheatable``)
   nca_gates    NCA ledger accuracy (``kotodama.eval.nca_gates``), for NCA-phase runs
@@ -242,6 +242,17 @@ def _load_tokenizer() -> Any:
 
 # ── The evaluator ─────────────────────────────────────────────────────────────
 
+
+def _bench_riders(*modules: str) -> tuple[Any, ...]:
+    """The binding benchmark's riders modules (``binding_bench.riders.<name>``), or a refusal naming the extra."""
+    from importlib import import_module
+
+    try:
+        return tuple(import_module(f"binding_bench.riders.{m}") for m in modules)
+    except ImportError as exc:
+        raise RuntimeError("the in-loop riders suite needs the binding benchmark: install kotodama[bench], "
+                           "or put the binding-bench checkout on PYTHONPATH") from exc
+
 class InloopEvaluator:
     """Build once at train start (every rank, same args), call :meth:`plan`, then
     :meth:`run` at every step where :meth:`due` is true (every rank)."""
@@ -281,8 +292,7 @@ class InloopEvaluator:
     # ── preparation (deterministic; identical on every rank) ─────────────────
 
     def _prep_riders(self) -> None:
-        from kotodama.eval.riders import items as ri
-        from kotodama.eval.riders import lite
+        ri, lite = _bench_riders("items", "lite")
         cfg = self.cfg
         if (cfg.riders_items is None) != (cfg.riders_shots is None):
             raise ValueError("--inloop_riders_items and --inloop_riders_shots go together")
@@ -439,7 +449,7 @@ class InloopEvaluator:
     def _local(self, suite: str, model_fn: Callable[[torch.Tensor], dict[str, torch.Tensor]]) -> Any:
         r, w = self.rank, self.world_size
         if suite == "riders":
-            from kotodama.eval.riders.score import score_logprob_items
+            from kotodama.serve.logprobs import score_logprob_items
             mine = shard(range(len(self.r_jobs)), r, w)
             jobs = [{"id": self.r_jobs[i].id, "prompt": self.r_jobs[i].prompt,
                      "candidates": self.r_jobs[i].candidates} for _, i in mine]
@@ -548,9 +558,9 @@ class InloopEvaluator:
         return metrics, rows, errors
 
     def _reduce_riders(self, data: list[Any]) -> tuple[dict[str, float], list[dict[str, Any]]]:
-        from kotodama.eval.riders import lite
-        from kotodama.eval.riders.errors import coarse_error_type, error_types, picked
-        from kotodama.eval.riders.grid import chat_family, score_row
+        lite, errors, grid = _bench_riders("lite", "errors", "grid")
+        coarse_error_type, error_types, picked = errors.coarse_error_type, errors.error_types, errors.picked
+        chat_family, score_row = grid.chat_family, grid.score_row
         results = merge_shards(data, len(self.r_jobs))
         chat_fmt = chat_family("koto")[1]
         rows = []

@@ -146,10 +146,10 @@ runner per eval, scored with the same math.
 | induction score | `tools/run_py.sh -m kotodama.eval.induction --checkpoint <ckpt> --config-section <preset> --tag <t>` | — |
 | NCA gates | `python -m kotodama.eval.nca_gates --checkpoint <ckpt> --eval-dir <dir> --tag <t>` · every checkpoint of a run: `tools/run_py.sh -m scripts.eval.nca_gates_sweep --ckpt-dir <run> --eval-dir <dir> --init-seed <seed>` | — |
 | binding suite: score | `tools/run_py.sh -m kotodama.eval.binding run --model koto:<ckpt> --name <m> --batteries <battery or group> --out <dir>` (one model load for every battery; `list` shows batteries and the groups `scorecard`, `bindprobes`, `fluid`, `formupdate`, `all`) | the same with `--model hf:<repo or dir>` |
-| binding suite: read | scorecard `python -m kotodama.eval.binding report --scores <dir>` · capacity size law `… capacity --scores <dir> --params <tsv>` · fluid vs crystallized `… fluid --scores <dir>` · form vs update `… formupdate --scores <dir>` · bindprobes batteries `python -m kotodama.eval.bindprobes aggregate --grids <dir>/<battery>` | same |
+| binding suite: read | scorecard `python -m kotodama.eval.binding report --scores <dir>` · capacity size law `… capacity --scores <dir> --params <tsv>` · fluid vs crystallized `… fluid --scores <dir>` · form vs update `… formupdate --scores <dir>` · bindprobes batteries `python -m binding_bench.bindprobes aggregate --grids <dir>/<battery>` | same |
 | binding suite: regenerate the pinned prompts | `python -m kotodama.eval.binding gen-capacity --out <file>` · `gen-fluid --out <dir>` · `gen-formupdate --out <dir>` (byte-identical to the pins) | — |
-| rider grid (not in the suite) | `python -m kotodama.eval.riders {gen,run,aggregate}` (scored against a server's `/logprobs`) | same, against any server |
-| new bindprobes item sets | `python -m kotodama.eval.bindprobes gen --out <dir> [--families setbind,answer,adjacency,codevarmut] --verify`, then `run` (against a server) / `aggregate` · deixis validity gates: `… gates --grids <dir> --items items.jsonl --chance-model <m> --learn-model <m> [--pilot]`. The frozen sets are the suite's `bp-*` batteries | same |
+| rider grid (not in the suite) | `python -m binding_bench.riders {gen,run,aggregate}` (scored against a server's `/logprobs`) | same, against any server |
+| new bindprobes item sets | `python -m binding_bench.bindprobes gen --out <dir> [--families setbind,answer,adjacency,codevarmut] --verify`, then `run` (against a server) / `aggregate` · deixis validity gates: `… gates --grids <dir> --items items.jsonl --chance-model <m> --learn-model <m> [--pilot]`. The frozen sets are the suite's `bp-*` batteries | same |
 | AttnRes boundaries from one checkpoint | `tools/run_py.sh scripts/eval/nca_profile.py --checkpoint <ckpt> --config-section 1b --out <json>` | — |
 | AttnRes boundaries over a run | `tools/run_py.sh scripts/eval/fit_boundaries.py --run <label> --checkpoint <run>/weights/step_*.pt --config-section 1b --out-dir <dir>`, then `--summarize --run <label> --out-dir <dir>` | — |
 | AttnRes routing matrix | `tools/run_py.sh scripts/eval/routing_matrix.py --run <label> --checkpoint <ckpt> [--checkpoint ...] --config-section 1b --attn-res-boundaries dd3b --out-dir <dir>` (every routing site × source on held-out text, per domain; `--plot` renders finished JSONs) | — |
@@ -291,15 +291,18 @@ Size knobs: `--inloop_max_batch_tokens`, `--no_inloop_riders_relet`.
 
 ### Binding batteries
 
-The binding batteries are judge-free: each item has a closed candidate set of
+The binding batteries belong to the binding benchmark (the `binding-bench`
+package, installed by the `bench` extra); `python -m kotodama.eval.binding`
+runs its suite with kotodama checkpoints loadable (`kotodama.bench_plugin`).
+The batteries are judge-free: each item has a closed candidate set of
 single-token answers, and the read is the logprob of each candidate at the
 answer position, scored through the server's `/logprobs`
-(`kotodama.eval.riders.score`). Chance is 1/C for C candidates;
+(`kotodama.serve.logprobs`, which matches the benchmark's own scorer). Chance is 1/C for C candidates;
 aggregates report chance-corrected accuracy, (acc − chance) / (1 − chance),
 alongside margin (gold logprob minus the best distractor) and typed errors.
 Every item also runs under few-shot conditions with exemplars.
 
-- **Rider grid** (`kotodama.eval.riders`): entity-state tracking. N boxes go
+- **Rider grid** (`binding_bench.riders`): entity-state tracking. N boxes go
   through M operations (swap, move, put, overwrite) and one box is queried;
   the same abstract item is rendered in four registers (Python code, narrative
   prose, screenplay, chat). Candidates are the objects mentioned, so chance is
@@ -307,7 +310,7 @@ Every item also runs under few-shot conditions with exemplars.
   recency-control subset. A difficulty-0 copy tier (1 box, 0 ops, 8 candidates)
   gates harness validity per register. The `3shot_relet` condition re-letters
   the exemplars' boxes to separate following a procedure from copying labels.
-- **Bindprobes, core** (`kotodama.eval.bindprobes`): the same question in
+- **Bindprobes, core** (`binding_bench.bindprobes`): the same question in
   other shapes, each under `0shot`, `fair`, `3shot` (collision-free exemplars)
   and `3shot_collide` (exemplars re-labeled into the item's own names, different
   bindings). An item's own three exemplars come from its own cell, so in some

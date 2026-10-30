@@ -186,7 +186,7 @@ def score_fluency(items: list[dict[str, Any]], endpoint: str, timeout: float = 6
     ``{"items": {id: [sum_nll, n_tokens]}}``. ``transport``: an httpx transport (tests pass a mock)."""
     import httpx
 
-    from kotodama.eval.riders.score import plan_batches
+    from kotodama.serve.logprobs import plan_batches
 
     lens = [len(it["prompt_ids"]) + len(it["completion_ids"]) for it in items]
     per_turn: list[float] = []

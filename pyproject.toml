@@ -28,6 +28,11 @@ training = [
     "einops",
 ]
 
+# The binding benchmark: the in-loop riders suite and `python -m kotodama.eval.binding` (kotodama.bench_plugin)
+bench = [
+    "binding-bench @ git+https://github.com/anima-research/binding-bench@95decbd",
+]
+
 # Eval: benchmarks, analysis, visualization
 eval = [
     "lm-eval",
