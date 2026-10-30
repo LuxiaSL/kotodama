@@ -6,7 +6,7 @@
 
 # Kotodama
 
-> Research, code and development: Luxia ([@LuxiaSL](https://github.com/LuxiaSL)) and
+> Research, code and development: Luxia ([@kataletheia](https://x.com/kataletheia)) and
 > Claude (Anthropic). Trained on compute provided by Anima Labs, which also hosts the
 > [project pages](https://kotodama.animalabs.ai/).
 
