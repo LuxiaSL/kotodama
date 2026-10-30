@@ -33,7 +33,9 @@ With a signing decoder (``sign_decoder``: a ``CascadeDecoder`` built with ``sign
 decoding the tokens it does), a job that sets ``sign`` decodes there: a batch holding one runs on the signing decoder
 (other jobs of the batch decode on it too, unsigned), and a signed job waits while another decoder runs. When a signed
 candidate ends, its row's span is exported (``MultiSampleDecoder.signed``, trimmed to the positions its generated ids
-fed) into ``XBatchResult.signed``, before the row can start anything else.
+fed) into ``XBatchResult.signed``, before the row can start anything else. A signed job whose prefill reused cached
+KV (a prefix cache or pool hit) exports nothing: its prompt's KV came from another prefill's split, so its captured bytes
+would depend on what the cache held; its records are signed cold by the drain.
 
 The runner knows nothing about HTTP: prompts arrive tokenized and validated, steering arrives as the engine's
 ``set_steer`` arguments or as a lever plan, and stop strings are checked through a ``decode`` callable (the
@@ -66,7 +68,7 @@ class XBatchResult:
     timing: dict[str, float]
     stops: list[Optional[int]] = field(default_factory=list)
     # signed jobs: candidate i's signed span (kotodama.model.signing.SignedRow, on the decoder's device), or None when
-    # it fed fewer than one position or its span does not fit the sign tail
+    # it fed fewer than one position, its span does not fit the sign tail, or the job's prefill reused cached KV
     signed: list[Any] = field(default_factory=list)
 
 
@@ -165,6 +167,7 @@ class _Live:
     slot: int = 0  # the job's lever slot (0: none)
     stops: dict[int, int] = field(default_factory=dict)  # candidate -> the stop token that ended it
     signed: dict[int, Any] = field(default_factory=dict)  # candidate -> its exported span (signed jobs)
+    kv_reused: int = 0  # prompt tokens whose KV the prefill took from a prefix cache or pool (signed: not exported)
 
     @property
     def done(self) -> bool:
@@ -215,7 +218,8 @@ class XBatchRunner:
         self.queue = XBatchQueue()
         self.stats: dict[str, float] = {"batches": 0, "steps": 0, "row_steps": 0, "useful_row_steps": 0,
                                         "admitted": 0, "refilled": 0, "restarts": 0, "prefill_s": 0.0,
-                                        "step_s": 0.0, "host_s": 0.0, "signed_rows": 0, "export_s": 0.0}
+                                        "step_s": 0.0, "host_s": 0.0, "signed_rows": 0, "export_s": 0.0,
+                                        "reused_kv_rows": 0}
 
     def bucket_for(self, rows: int) -> MultiSampleDecoder:
         """The narrowest decoder that holds ``rows`` rows (the widest when none does)."""
@@ -273,7 +277,7 @@ class XBatchRunner:
         if slot:
             timing["lever_slot"] = float(slot)
         lv = _Live(job, logits, len(job.prompt_ids), budget, window, timing, t0, out=[[] for _ in range(job.n)],
-                   home=frozenset(rows), slot=slot)
+                   home=frozenset(rows), slot=slot, kv_reused=int(info.get("common_prefix", 0)) if info else 0)
         try:
             self._start(lv, rows, first)
         except Exception as exc:  # the job never joins the batch: its slot and its caller must not wait on it
@@ -328,6 +332,10 @@ class XBatchRunner:
         n = len(lv.out[cand]) + (cand in lv.stops)  # generated ids, the stop token included
         if n < 2 or n > dec.sign.tail:
             lv.signed[cand] = None
+            return
+        if lv.kv_reused:  # the drain signs its record cold (see the module docstring)
+            lv.signed[cand] = None
+            self.stats["reused_kv_rows"] += 1
             return
         t0 = time.perf_counter()
         lv.signed[cand] = trim(dec.signed(row, device=dec.cur_tokens.device, lever_slot=lv.slot), n - 1)

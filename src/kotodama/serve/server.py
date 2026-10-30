@@ -249,7 +249,7 @@ _signer: "RecordSigner | None" = None
 _sign_writer: str = ""
 _sign_weights: str = ""
 _sign_stats: dict[str, Any] = {"records": 0, "batches": 0, "signed": 0, "skipped": 0, "errors": 0,
-                               "opted_out": 0, "unsigned": {}, "skipped_reasons": {}}
+                               "opted_out": 0, "unsigned": {}, "skipped_reasons": {}, "inflight_deferred": {}}
 # In-flight signing (--sign_inflight): signed requests decode on the signer's decoder (the widest bucket's geometry,
 # so their tokens are the unsigned ones'), each candidate's span is exported as it ends, and the rows are reduced on
 # the generation thread in batches of the signer's width (between steps once that many wait, else when idle) and
@@ -2344,7 +2344,9 @@ def _sign_records(request: GenerateRequest, responses: list[GenerateResponse]) -
                                   generated_ids=tuple(generated), weights=_sign_weights,
                                   lever=plan.digest() if plan is not None else None,
                                   meta={**(request.sign_meta or {}), "candidate": i, "seed": request.seed,
-                                        "law": law, "served_by": _sign_writer, **_sign_provenance()}))
+                                        "law": law, "served_by": _sign_writer, **_sign_provenance(),
+                                        # prompt tokens whose KV the prefill took from a prefix cache or pool
+                                        "prefix_reused": int((resp.timing or {}).get("prefix_common_tokens", 0))}))
     return records, plan
 
 
@@ -2354,6 +2356,11 @@ def _sign_add_inflight(request: GenerateRequest, responses: list[GenerateRespons
     records, plan = _sign_records(request, responses)
     if len(signed) != len(records):
         signed = [None] * len(records)
+    # a prefill that reused cached KV exports no span (kotodama.serve.xbatch): the drain signs those records cold
+    deferred = sum(1 for rec, row in zip(records, signed) if row is None and rec.meta.get("prefix_reused"))
+    if deferred:
+        reasons = _sign_stats["inflight_deferred"]
+        reasons["prefix KV reused"] = reasons.get("prefix KV reused", 0) + deferred
     with _sign_pending_lock:
         _sign_pending.extend((rec, row, plan) for rec, row in zip(records, signed))
     _sign_stats["records"] += len(records)
@@ -2479,7 +2486,7 @@ def _sign_info() -> dict | None:
             "reducer": getattr(_signer.reducer, "reducer_identity", None) if _signer is not None else None,
             "stats": dict(_sign_stats),
             "inflight_timing": {**{k: round(v, 3) for k, v in _sign_timing.items()},
-                                **({k: round(_xbatch.runner.stats[k], 3) for k in ("signed_rows", "export_s")}
+                                **({k: round(_xbatch.runner.stats[k], 3) for k in ("signed_rows", "export_s", "reused_kv_rows")}
                                    if _xbatch is not None else {})} if _sign_inflight_arg else None}
 
 

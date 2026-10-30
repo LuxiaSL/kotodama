@@ -228,6 +228,31 @@ def test_spans_past_the_sign_tail_are_not_exported(model: KotodamaModel) -> None
 
 
 @torch.inference_mode()
+def test_a_signed_job_whose_prefill_reused_cached_kv_exports_nothing(model: KotodamaModel) -> None:
+    # a prefix cache or pool hit hands the prompt KV computed in another prefill's split: its captured bytes would
+    # depend on the cache's history, so the candidates export nothing and the drain signs their records cold
+    eng = DecodeEngine(model, max_seq_len=MAX_SEQ, dtype=torch.float32, prefill_backends=[SDPBackend.MATH], levers=2)
+    decs, signer = _decoders(eng)
+    warm = _ids(12, 6)
+
+    def prefill(ids, slot=0, **kw):
+        hit = ids.shape[1] == len(warm) and not kw.get("fresh")
+        return eng.prefill(ids, slot=slot), {"prefix_hit": hit, "common_prefix": 8 if hit else 0}
+
+    out: dict = {}
+    runner = XBatchRunner(decs, prefill=prefill, set_steer=eng.set_steer, decode=lambda ids: "", stop_ids=frozenset(),
+                          max_seq_len=MAX_SEQ, device=torch.device("cpu"), refill=True, levers=eng.levers,
+                          sign_decoder=signer)
+    for name, prompt in (("cold", _ids(9, 5)), ("warm", warm)):
+        runner.queue.put(XBatchJob(key="k", prompt_ids=prompt, n=2, max_new_tokens=6, params=HOT,
+                                   done=lambda o, name=name: out.__setitem__(name, o), sign=True))
+    runner.run_batch()
+    assert all(r is not None for r in out["cold"].signed)
+    assert out["warm"].signed == [None, None] and runner.stats["reused_kv_rows"] == 2
+    assert [len(r) for r in out["warm"].rows] == [6, 6]  # generation itself is unchanged
+
+
+@torch.inference_mode()
 def test_add_signed_writes_records_and_batch_and_the_drain_skips_them(model: KotodamaModel, tmp_path) -> None:
     from kotodama.serve.sign import SignSpool
 
