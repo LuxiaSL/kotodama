@@ -7,7 +7,8 @@
 # Kotodama
 
 > Research, code and development: Luxia ([@LuxiaSL](https://github.com/LuxiaSL)) and
-> Claude (Anthropic). Trained on compute provided by Anima Labs.
+> Claude (Anthropic). Trained on compute provided by Anima Labs, which also hosts the
+> [project pages](https://kotodama.animalabs.ai/).
 
 Kotodama is a stack for pretraining language models from scratch, in one Python
 package, `kotodama`. It trains Llama-style decoders with **Block Attention
@@ -29,8 +30,8 @@ published at
 [kotodama-tsumugi-1b-trajectory](https://huggingface.co/LuxiaSL/kotodama-tsumugi-1b-trajectory)
 (and a second seed at
 [kotodama-tsumugi-1b-seed7-trajectory](https://huggingface.co/LuxiaSL/kotodama-tsumugi-1b-seed7-trajectory)),
-and the [Binding Atlas](https://aetherawi.red/kotodama/binding-atlas) places it
-among public models on the binding batteries in this repository.
+and the [Binding Atlas](https://kotodama.animalabs.ai/binding-atlas) places it
+among public models on referent-binding tests.
 
 An earlier model,
 [kotodama-3b-base](https://huggingface.co/aethera-gp/kotodama-3b-base-final), is a
