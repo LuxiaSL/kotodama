@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import contextvars
 import functools
 import gc
 import hashlib
@@ -791,6 +792,7 @@ class ModelInfo(BaseModel):
     startup: dict | None = None
     sign: dict | None = None
     kernel_pins: dict | None = None
+    request_log: dict | None = None  # --request_log: its dir, writer and row counts
     memory: dict | None = None
 
 
@@ -1607,6 +1609,12 @@ _sign_inflight_arg = False
 _sign_audit_every_arg = 100
 _sign_default_arg = False
 _profile_name: str | None = None
+# The request log (--request_log, kotodama.serve.request_log): one row per request, off unless the flag is given.
+_request_log_arg: str | None = None
+_request_log: "Any" = None
+_request_log_weights: str | None = None
+# the candidates a request produced (their exact ids, stop and sign ids), gathered for its log row
+_logged_candidates: contextvars.ContextVar[list | None] = contextvars.ContextVar("logged_candidates", default=None)
 _sign_engine_digest: str | None = None  # sha256 of the signer's engine identity at startup (records' meta)
 
 
@@ -1669,6 +1677,7 @@ async def lifespan(app: FastAPI):
         emulate_casts=_emulate_casts_arg,
     )
     sign_task = _start_signing()
+    _open_request_log()
     if _pins is not None and _pins.mode == "record":
         logger.info("kernel pins recorded: %s (%d kernels, %s)", _pins.save(), len(_pins.table), _pins.digest[:12])
     elif _pins is not None and _pins.misses:
@@ -1683,7 +1692,128 @@ async def lifespan(app: FastAPI):
         # was cancelled) so the non-daemon worker thread can't stall exit.
         if sign_task is not None:
             sign_task.cancel()
+        if _request_log is not None:
+            _request_log.close()
         _generate_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _open_request_log() -> None:
+    """Open the request log (--request_log): rows name the served weights by their digest."""
+    global _request_log, _request_log_weights
+    if not _request_log_arg:
+        return
+    from kotodama.serve.request_log import RequestLog
+
+    if _sign_weights:
+        _request_log_weights = _sign_weights
+    elif _model is not None:
+        from kotodama.model.signing import weights_digest
+
+        _request_log_weights = weights_digest(_model)
+    _request_log = RequestLog(_request_log_arg)
+    logger.info("request log: %s (writer %s)", _request_log.root, _request_log.writer)
+
+
+def _note_candidates(results: "list[GenerateResponse]") -> None:
+    """Hand a request's candidates to its request-log row (a no-op without --request_log)."""
+    got = _logged_candidates.get()
+    if got is None:
+        return
+    for r in results:
+        got.append({"prompt_ids": r.prompt_ids, "completion_ids": r.completion_ids, "stop_id": r.stop_id,
+                    "sign_id": r.sign_id, "prompt_tokens": r.prompt_tokens, "completion_tokens": r.completion_tokens})
+
+
+class _RequestLogMiddleware:
+    """ASGI middleware writing one request-log row per logged request: the body the client sent, the response it got
+    (a stream's events joined into its text), status, latency and the candidates the endpoint noted. A request whose
+    body sets ``"log": false`` is answered and not written. Client addresses are not recorded."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
+        from kotodama.serve.request_log import LOGGED_PATHS
+
+        log = _request_log
+        if log is None or scope.get("type") != "http" or scope.get("method") != "POST" \
+                or scope.get("path") not in LOGGED_PATHS:
+            await self.app(scope, receive, send)
+            return
+        t0 = time.time()
+        body = bytearray()
+        sent = bytearray()
+        status = [0]
+        streamed = [False]
+
+        async def recv() -> dict:
+            msg = await receive()
+            if msg.get("type") == "http.request":
+                body.extend(msg.get("body", b""))
+            return msg
+
+        async def snd(msg: dict) -> None:
+            if msg.get("type") == "http.response.start":
+                status[0] = int(msg.get("status", 0))
+                ctype = dict(msg.get("headers") or []).get(b"content-type", b"")
+                streamed[0] = b"text/event-stream" in ctype
+            elif msg.get("type") == "http.response.body":
+                sent.extend(msg.get("body", b""))
+            await send(msg)
+
+        token = _logged_candidates.set([])
+        try:
+            await self.app(scope, recv, snd)
+        finally:
+            candidates = _logged_candidates.get() or []
+            _logged_candidates.reset(token)
+            try:
+                _write_request_row(log, scope["path"], bytes(body), bytes(sent), status[0], streamed[0], t0,
+                                   candidates)
+            except Exception:  # the log never fails a request
+                log.stats["errors"] += 1
+                logger.exception("request log: building a row failed")
+
+
+def _parse_json(raw: bytes) -> Any:
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def _stream_text(raw: bytes) -> dict:
+    """A server-sent-event response as the text it streamed and its last event."""
+    text, last, events = [], None, 0
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        try:
+            ev = json.loads(line[6:])
+        except ValueError:
+            continue
+        events += 1
+        last = ev
+        if isinstance(ev.get("token"), str):
+            text.append(ev["token"])
+        for ch in ev.get("choices") or []:
+            piece = (ch.get("delta") or {}).get("content") if "delta" in ch else ch.get("text")
+            if isinstance(piece, str):
+                text.append(piece)
+    return {"text": "".join(text), "events": events, "last": last}
+
+
+def _write_request_row(log: Any, path: str, body: bytes, sent: bytes, status: int, streamed: bool, t0: float,
+                       candidates: list) -> None:
+    request = _parse_json(body)
+    if isinstance(request, dict) and request.get("log") is False:
+        log.opted_out()
+        return
+    log.write({"ts": t0, "latency_ms": round((time.time() - t0) * 1000, 1), "endpoint": path, "status": status,
+               "writer": log.writer, "model": _model_name(), "profile": _profile_name,
+               "weights": _request_log_weights, "request": request,
+               "response": _stream_text(sent) if streamed else _parse_json(sent), "stream": streamed,
+               "candidates": candidates})
 
 
 def _start_signing() -> "asyncio.Task | None":
@@ -1785,6 +1915,7 @@ def _model_name() -> str:
 
 
 app = FastAPI(title="kotodama", lifespan=lifespan)
+app.add_middleware(_RequestLogMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1845,6 +1976,7 @@ async def info():
         cascade=_cascade_info,
         startup=_startup_info,
         sign=_sign_info(),
+        request_log=_request_log.info() if _request_log is not None else None,
         kernel_pins=None if _pins is None else {"mode": _pins.mode, "path": str(_pins.path), "kernels": len(_pins.table),
                                                 "hits": _pins.hits, "recorded": _pins.recorded,
                                                 "misses": len(_pins.misses), "digest": _pins.digest},
@@ -2017,6 +2149,7 @@ async def generate_endpoint(request: GenerateRequest, http_request: Request):
             raise HTTPException(400, "a seeded request cannot stream")
         out = await _batched_candidates(request, 1)
         if out:
+            _note_candidates(out[:1])
             return out[0]
         if _engine_compatible(request):  # a signed request no batched path takes: served serially, drain-signed
             async with _engine_lock:
@@ -2024,6 +2157,7 @@ async def generate_endpoint(request: GenerateRequest, http_request: Request):
         else:
             result = await _run_generation(generate, request=request, model=_model, tokenizer=_tokenizer)
         _sign_serial(request, [result])
+        _note_candidates([result])
         return result
 
     if request.stream:
@@ -2043,15 +2177,18 @@ async def generate_endpoint(request: GenerateRequest, http_request: Request):
 
     if _engine_compatible(request):
         async with _engine_lock:
-            return await _run_generation(engine_generate, request)
-    return await _run_generation(generate, request=request, model=_model, tokenizer=_tokenizer)
+            result = await _run_generation(engine_generate, request)
+    else:
+        result = await _run_generation(generate, request=request, model=_model, tokenizer=_tokenizer)
+    _note_candidates([result])
+    return result
 
 
 # ── OpenAI-compatible /v1/completions (for Loom/Loomsidian) ─────────────────────
 
 # Request fields that only route or label a request (the gateway's affinity key): accepted, and they change nothing
 # that is generated.
-_PASSTHROUGH_FIELDS = frozenset({"user"})
+_PASSTHROUGH_FIELDS = frozenset({"user", "log"})  # log: false keeps a request out of --request_log
 
 
 def _refuse_unserved(request: BaseModel) -> None:
@@ -2610,6 +2747,7 @@ async def oai_completions(request: OAICompletionRequest):
             else:
                 results.append(await _run_generation(generate, model=_model, tokenizer=_tokenizer, request=gen_req))
         _sign_serial(gen_req, results)
+    _note_candidates(results)
     for i, result in enumerate(results):
         choice = {
             "text": html.unescape(result.text),
@@ -2797,6 +2935,7 @@ async def oai_chat_completions(request: OAIChatRequest, http_request: Request):
             else:
                 results.append(await _run_generation(generate, model=_model, tokenizer=_tokenizer, request=gen_req))
         _sign_serial(gen_req, results)
+    _note_candidates(results)
     for i, result in enumerate(results):
         total_completion_tokens += result.completion_tokens
         choice = {
@@ -2978,6 +3117,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "tokens the unsigned bucket decodes), each candidate's span is captured as it ends and "
                              "reduced in this process, and its signatures land in the spool as signed batches (the "
                              "records too); the idle drain signs on the same decoder")
+    parser.add_argument("--request_log", default=None, metavar="DIR",
+                        help="Write one JSON line per generation or scoring request to DIR (kotodama.serve.request_log): "
+                             "the request as sent, the response, latency, the weights digest and each candidate's "
+                             "exact token ids and sign id, in daily files compressed once their day is over. Off "
+                             "unless given; a request's \"log\": false keeps it out. A gateway fleet turns it on for "
+                             "every replica with serve_args: [\"--request_log\", \"DIR\"]")
     parser.add_argument("--sign_default", action=argparse.BooleanOptionalAction, default=False,
                         help="Sign every generation request that does not set `sign` (an explicit `sign: false` "
                              "opts out and is counted); /logprobs and /score_tokens are never signed. A server that "
@@ -3141,6 +3286,7 @@ if __name__ == "__main__":
     _sign_inflight_arg = args.sign_inflight
     _sign_default_arg = args.sign_default
     _profile_name = _profile_arg
+    _request_log_arg = args.request_log
     _sign_audit_every_arg = args.sign_audit_every
 
     import uvicorn
