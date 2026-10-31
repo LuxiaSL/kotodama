@@ -6,9 +6,9 @@
 
 # Kotodama
 
-> Research, code and development: Luxia ([@kataletheia](https://x.com/kataletheia)) and
-> Claude (Anthropic). Trained on compute provided by Anima Labs, which also hosts the
-> [project pages](https://kotodama.animalabs.ai/).
+> Led by [Luxia](https://x.com/kataletheia), with [Anima Labs](https://animalabs.ai/) · built with
+> [Claude](https://www.anthropic.com/claude) · project pages:
+> [kotodama.animalabs.ai](https://kotodama.animalabs.ai/)
 
 Kotodama is a stack for pretraining language models from scratch, in one Python
 package, `kotodama`. It trains Llama-style decoders with **Block Attention
